@@ -18,7 +18,7 @@ name: CI
 # suite with cargo-nextest (one process per test, all cores busy, no slow test holding a binary's other tests back) and builds the release profile without LTO (see the job).
 # The test job does NOT set IBUILDER_STRICT_FIXTURES: the byte-compare oracle tests and the big-fixture tests need files that are not in this repository (a game's dump, the Python
 # oracle), so they skip, loudly (ibuilder_testkit::skip) and are COUNTED in the job summary. A green `test` therefore means "everything that can be checked from the repository alone
-# passed", not "every game was compared"; docs/CONVENTIONS.md rule 5.
+# passed", not "every game was compared"; CONTRIBUTING.md.
 
 on:
   push:

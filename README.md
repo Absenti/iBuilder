@@ -43,7 +43,7 @@ Add the source, then install iBuilder from it:
 * in SideStore (or AltStore), **Sources > +**, and paste `https://raw.githubusercontent.com/Absenti/iBuilder/main/apps.json`.
 
 The IPA is also on the [Releases](https://github.com/Absenti/iBuilder/releases) page with its sha256. Every release IPA is checked by CI before it is listed
-([docs/SIDESTORE.md](docs/SIDESTORE.md)).
+([docs/BUILDING.md](docs/BUILDING.md#releasing-and-the-sidestore--altstore-source)).
 
 **Bundle id:** `dev.ibuilder.app`. It installs as a **new** app: an older install (`dev.nxpocket.gameapp`) is left as it is; copy your games and saves across with the Files app
 (On My iPhone > iBuilder) before deleting it. The app asks for the increased-memory-limit entitlement; it applies only if your installer's provisioning profile carries it too.
@@ -86,7 +86,7 @@ scripts/build-app.sh device           # the app IPA (needs Xcode, the .NET iOS w
 ```
 
 Building the IPA needs inputs that are not in this repository (the prebuilt engine host and the signing/zstd/SPIRV-Cross sources).
-See [CONTRIBUTING.md](CONTRIBUTING.md), [docs/APP-RUST.md](docs/APP-RUST.md) and the index [docs/README.md](docs/README.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the index [docs/README.md](docs/README.md).
 A build made with the default settings embeds stand-in fonts derived from macOS's: keep it for yourself and never share it ([NOTICE.md](NOTICE.md)).
 
 ## Credits

@@ -21,7 +21,7 @@ The engine is third-party. Its source is **not** in this repository: the app emb
 | Component | Author | License | What it is used for here |
 |---|---|---|---|
 | nxnative (<https://github.com/seedds/nxnative>) | seedds | MIT, Copyright (c) 2026 seedds | The engine: ARM64 host, HLE services and the Metal graphics layer. Verified from the LICENSE file of the pinned engine tree. |
-| NX2Apple (<https://github.com/LNPANDY/NX2Apple>) | LNPANDY and contributors | MIT (its license names seedds, jhaizhou, LNPANDY and NX2Apple contributors; see `docs/UPSTREAM-AUDIT.md`) | The pinned engine tree is nxnative plus NX2Apple's patch queue. |
+| NX2Apple (<https://github.com/LNPANDY/NX2Apple>) | LNPANDY and contributors | MIT (its license names seedds, jhaizhou, LNPANDY and NX2Apple contributors) | The pinned engine tree is nxnative plus NX2Apple's patch queue. |
 | `engine-patches/*.patch` | upstream authors (0401 to 0411), this project (0412) | MIT; each header names the upstream commit, its author and its license | Patches applied to the engine tree by `scripts/build-host.sh`. The attribution lines of every upstream patch are kept as the license asks. |
 
 Parts of the engine tree that the engine's own documentation (`dm/third_party/README.md` of the pinned tree) lists as used

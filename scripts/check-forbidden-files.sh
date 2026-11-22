@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/check-forbidden-files.sh [<root>] -- fails, with the list, when the tree holds a secret or a piece of game data.
 #
-# This project ships no game, no firmware, no key and no certificate (README.md, docs/CONVENTIONS.md rule 3). This is the mechanical check of that promise; CI runs it on every push and pull
+# This project ships no game, no firmware, no key and no certificate (README.md, CONTRIBUTING.md). This is the mechanical check of that promise; CI runs it on every push and pull
 # request (job `forbidden-files`), and it can be run by hand before a commit:  scripts/check-forbidden-files.sh
 #
 # <root> defaults to the repository root. A sub-folder of the repository works too (the allowlist is matched on the path relative to the repository); a folder outside it is checked as if it were a

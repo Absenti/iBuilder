@@ -1,8 +1,8 @@
 name: Release
 
-# The ONE path from a published GitHub release to the SideStore / AltStore source (apps.json, docs/SIDESTORE.md). It replaces the former sidestore-source.yml.
+# The ONE path from a published GitHub release to the SideStore / AltStore source (apps.json, docs/BUILDING.md). It replaces the former sidestore-source.yml.
 #
-# Why the IPA is not built here: scripts/build-app.sh needs the prebuilt engine host and inputs that are not in this repository (docs/APP-RUST.md), so the maintainer builds the IPA on a Mac
+# Why the IPA is not built here: scripts/build-app.sh needs the prebuilt engine host and inputs that are not in this repository (docs/BUILDING.md), so the maintainer builds the IPA on a Mac
 # and uploads it to the release. This workflow then checks what was uploaded before anything points phones at it:
 #
 #   verify (macOS)  1. reads the release: exactly one .ipa asset and its <ipa>.sha256 asset; the sha256 must match the file downloaded here AND the digest GitHub computed for the asset;
@@ -240,7 +240,7 @@ jobs:
           git commit --message "$title" --message "Made by .github/workflows/release.yml from the release $TAG after its IPA passed the verifier(s) and the no-spawn check (size and sha256 as downloaded and verified, version and build from the IPA's Info.plist)."
           git push --force origin "$branch"
           body="$(cat <<EOF
-          Lists the IPA of the release [$TAG](https://github.com/$REPO/releases/tag/$TAG) in \`apps.json\`, the SideStore / AltStore source (docs/SIDESTORE.md).
+          Lists the IPA of the release [$TAG](https://github.com/$REPO/releases/tag/$TAG) in \`apps.json\`, the SideStore / AltStore source (docs/BUILDING.md).
 
           * \`$IPA\`, $SIZE bytes, sha256 \`$SHA256\` (equal to \`$IPA.sha256\`, to the file the workflow downloaded and to the digest GitHub computed for the asset)
           * verified on macOS by \`app/verify_ipa.sh\` of the tag (and the verifier shipped with the IPA, when the release has one) and by \`scripts/check-no-spawn.sh\` on the bundle

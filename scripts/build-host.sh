@@ -4,7 +4,7 @@
 #   scripts/build-host.sh                 -> dist/host/host-prebuilt-loadable-ios.dylib, host-prebuilt-loadable-sim.dylib, HOST-MANIFEST.txt
 #   HOST_WORK=<dir> HOST_OUT=<dir> scripts/build-host.sh device
 #
-# What it does (docs/ENGINE-UPDATE.md has the why):
+# What it does (docs/ENGINE.md has the why):
 #   1. APFS-clones the patched engine tree the app ships ($W/out-stage/out-engine/engine = nxnative a3663659 + 54 NX2Apple patches + iOSBuilder paches/engine/*) into $HOST_WORK/engine,
 #      applies engine-patches/0[45]*.patch in name order (04NN: upstream and our own; 05NN: adapted from other MIT ports; a patch kept for a decision lives in engine-patches/optional/, never applied) with `patch -p1 --forward` (the first that does not apply stops the build and is named), then paches/0006 (hle_svc.c:
 #      DM_AS_AT; tools/build_host_ios.sh applies it to the tree itself with git for the length of its compile, which a copy does not need).

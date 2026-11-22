@@ -2,7 +2,7 @@
 # scripts/test-report.sh -- `cargo test --release --workspace --no-fail-fast`, then what the green number really means.
 #
 # libtest counts a test that returns early as PASSED and hides its stderr, so "N passed" also counted every test that compared nothing because a fixture (a game's files, the Python oracle, a tool)
-# is not on this machine (docs/REVIEW-TRIAGE-2026-11-19.md, finding 3.2). Every such test calls `ibuilder_testkit::skip(reason)`, which prints, appends one line `crate<TAB>test<TAB>reason` to a
+# is not on this machine (CONTRIBUTING.md). Every such test calls `ibuilder_testkit::skip(reason)`, which prints, appends one line `crate<TAB>test<TAB>reason` to a
 # log file, and PANICS when IBUILDER_STRICT_FIXTURES=1. This script runs the suite with that log pointed at a fresh file, then prints
 #
 #     N passed, K of them skipped (fully or partly) for missing fixtures      <- the verifications that did NOT happen are K of the N
