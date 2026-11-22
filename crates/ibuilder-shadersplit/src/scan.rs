@@ -828,6 +828,11 @@ fn scan_file_in(cx: &Ctx<'_>, f: &FileRef) -> Res<FileResult> {
         ipk_shaders(cx, &src, rel, &mut found)?;
         return finish(cx, rel, found, [], trees);
     }
+    if h4 == crate::apf::MAGIC {
+        // a Vector Unit APF package: every entry decoded and scanned, without reading the package whole
+        crate::apf::apf_shaders(cx, &src, rel, &mut found)?;
+        return finish(cx, rel, found, [], trees);
+    }
     if sl(&head, 0, 8) == IDRK || sl(&head, 0, 8) == PDRK {
         idrk_shaders(&src, &label, &mut found)?;
         return finish(cx, rel, found, [], trees);

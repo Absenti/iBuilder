@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apf;
 pub mod archive;
 pub mod bytes;
 pub mod ctl;

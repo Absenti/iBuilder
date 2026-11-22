@@ -17,6 +17,7 @@ The Python original is the engine's `shader_split.py` (plus its Unity reader, th
 | RomFS image reader, game profile | `image.rs`, `game.rs` |
 | GLSLC, BNSH, BAHS and the other NVN container readers | `glslc.rs`, `nvn.rs` |
 | archive and compression formats (Yaz0, SARC, gzip, zstd, zip, game-specific paks) | `archive.rs`, `inflate.rs`, `zlibx.rs`, `zstd.rs`, `kit.rs` |
+| Vector Unit APF packages (`apf_entries`, `apf_decompress`, `apf_shaders`: magic `FPUV`, any file name) | `apf.rs` |
 | archives that get jobs of their own | `jobs.rs` |
 | job memo and thread pool | `memo.rs`, `split.rs` |
 | NVN2 ray-tracing module check | `rt.rs` |
@@ -76,8 +77,18 @@ cargo test --release -p ibuilder-shadersplit
 | `tests/differential.rs` | 3,312 vectors made with the engine's own functions: control sections, keys, stages, containers, Yaz0 / SARC, the Unity type-tree interpreter, Unity files and bundles, live package. |
 | `tests/games.rs`, `tests/synthetic.rs` | 14 synthetic games (generated, no game data) split by both implementations; output hashes and log lines compared at several thread counts. |
 | `tests/rebase.rs`, `tests/snowdrop.rs` | newer engine behaviour: ray-tracing control sections, newer container revisions, Snowdrop zlib caches (including 2,400 zlib streams against zlib itself and 1,057 mutated slices). |
+| `tests/apf.rs` | a synthetic Vector Unit APF package (`FPUV` v7: header and directory FNV-1a sums, entries stored, zlib and LZ4 block, an unknown compression) split end to end, and ten damaged packages, each left out with its `[RED]` line. |
 
 Measured on 2026-11-19 on an M1 Pro (shared machine, indicative), one real game with 21,990 shaders and a 2.5 GB RomFS: Python 6 threads about 19 s wall and 2 GB resident; Rust 6 threads 0.9 - 1.4 s wall, peak footprint 160 MiB. The iOS simulator run produced identical output; nothing was measured on a device.
+
+## Vector Unit APF packages
+
+Beach Buggy Racing 2: Island Adventure (`0100C43012344000`) keeps every asset in one `RomFS/Assets.apf` (343 MB, 7,749 entries). Read by its magic, whatever its name (`apf.rs`):
+
+- Header, 0x3c bytes, little-endian: `FPUV`, u32 version (7), u32 directory offset, u32 entry count, u32 directory length, u32 FNV-1a 32 of the directory, the platform's name (`Switch`, 32 bytes NUL-padded), u32 FNV-1a of the 0x38 bytes before it. The entries' data follows; the directory is last.
+- Directory entry: the asset's name (`<asset type>/<asset path>`, NUL-terminated), u32 offset, u32 length, u32 stored length, u32 FNV-1a of the decoded data, u16 the asset type's version, u16 compression (0 stored, 1 zlib, 5 one LZ4 block). `Assets/AssetData` (zlib) lists the assets by type, without offsets.
+- Every entry is decoded and scanned like a file (`scan_blob`, then whole GLSLC outputs), one at a time; the package is never read whole. An unknown compression is counted in one `[WARN]` line per package. The two sums of the header and directory are checked; the entries' sums are not (the Python would hash 750 MB byte by byte).
+- The shaders are the 233 `VuShaderAsset` entries (LZ4): a 0x18-byte header, then GLSLC outputs of a vertex and a pixel program each. Measured 2026-11-22: 1,088 programs, 496 unique keys (229 vertex, 267 pixel), 410 variation pairs; before, 0 (the raw bytes hold the GLSLC magics, but LZ4-compressed). The same reader in the engine's `shader_split.py` (a change proposed upstream, not merged when this was written) gives byte-identical packages and table rows on this game.
 
 ## Known limits
 
