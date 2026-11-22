@@ -57,6 +57,36 @@ Useful variables: `APP_WORK`, `APP_OUT`, `CARGO_TARGET_DIR`, `SKIP_RUST=1` (reus
 Inputs are pinned in `app/inputs.tsv` (size and sha256); a mismatch is a warning in the log and in `MANIFEST.txt`, fatal
 with `PIN_STRICT=1`. `app/refresh-snapshot.sh [--check]` refreshes the C# snapshot from the iOSBuilder tree.
 
+### The framework id
+
+Every build has a build id (`GameAppBuild.Id`, `<yyyymmdd-hhmmss>-rust<hash>`) and a **framework id**
+(`GameAppBuild.FrameworkId`, 16 hex digits). The chain stamps both into a built game's `Documents/gameapp.framework`
+(`app_build=`, `framework_id=`). After an app update, a built game whose stamp names the same framework id is ready: Play
+boots it, nothing is rebuilt. A different framework id means the host or a stage crate changed, so the game is rebuilt. A stamp
+written before framework ids existed is compared by build id, so the first update to an app with framework ids rebuilds every
+game one last time.
+
+The framework id is the first 16 hex digits of the sha256 of a listing of only the inputs that shape a built framework and its
+boot (`scripts/lib-hash.sh`, `framework_id_listing`). `scripts/build-app.sh` writes that listing to
+`<work>/framework-inputs.txt` and `MANIFEST.txt`. The inputs are:
+
+- `FRAMEWORK_EPOCH`, raised by hand when something not listed here changes what a build makes or how a built game boots
+- the sha256 of the host dylib the bundle carries (`dist/host/host-prebuilt-loadable-{ios,sim}.dylib`, pinned in `app/inputs.tsv`)
+- the shader chain (`dmsh_chain.h`) and the `ibuilder-ffi` cargo features
+- the source trees of `ibuilder-nso`, `ibuilder-a64`, `ibuilder-rewrite`, `ibuilder-macho`, `ibuilder-sign`, `ibuilder-profile`,
+  `ibuilder-mods` and `ibuilder-nup`
+- `ibuilder-pipeline`, except the files that never touch a framework or its boot (stage 3's shaders, logs, memory and thermal
+  gates, the stop request, the launch state machine and the stamp); a new file counts until it is excluded by name
+- `crates/ibuilder-cli/src/adapters.rs` and its `Cargo.toml`, and `Cargo.lock`
+- `app/game-tables/`, and the engine's `dm/games/settings.tsv`, `dm/games/*/game.tsv` and the host sources the profile reads
+  (`dm/host`, `dm/gfx`, `dm/gfx/nvn`, `dm/gfx/vk`)
+- the extractor: the engine's `dm/tools/nx_extract/Program.cs` and `app/patches/nx_extract_merged_update.py`
+
+Some things are deliberately left out: the C# app and its patches, the build time, the shader crates (the shader library has its
+own versioning: chain and split version), `ibuilder-ffi`, the shim, and zsign/OpenSSL. The rewrite cache is keyed on the
+framework id too, so an update that keeps the framework id also keeps the cached rewrites. `scripts/framework-id.sh
+[device|simulator] [--id]` prints the id and its inputs without building anything.
+
 ### Fonts
 
 The game needs the Switch's shared fonts. A build with the defaults embeds stand-ins derived from macOS's Arial

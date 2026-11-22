@@ -8,7 +8,7 @@
 #     the signature is ad hoc / unsigned (no identity, no provisioning profile) and carries the RAM entitlement.
 # The checks of the original that read gameapp_pipeline.py / mods.py / shader_device.py / pack_nup.py in the bundle are replaced by checks of the Rust chain's own log strings in the executable.
 #
-# usage: app/verify_ipa.sh <file.ipa> [expected-bundle-id]      env: GAMEAPP_RAM_ENTITLEMENT=0 GAMEAPP_EVA_ENTITLEMENT=1 SHADER_CHAIN=<id>
+# usage: app/verify_ipa.sh <file.ipa> [expected-bundle-id]      env: GAMEAPP_RAM_ENTITLEMENT=0 GAMEAPP_EVA_ENTITLEMENT=1 SHADER_CHAIN=<id> FRAMEWORK_ID=<16 hex>
 set -uo pipefail
 # shellcheck source=../scripts/lib-spawn.sh
 . "$(cd "$(dirname "$0")" && pwd)/../scripts/lib-spawn.sh" || exit 1
@@ -210,6 +210,10 @@ if [ -f "$APP/host-prebuilt.dylib" ]; then
     python3 -I -c 'import sys; sys.exit(0 if sys.argv[2].encode("utf-16-le") in open(sys.argv[1], "rb").read() else 1)' "$APP/GameApp.dll" "$SHADER_CHAIN" \
       && pass "and the app's own constant (GameAppBuild.ShaderChain, GameApp.dll) says the same" || fail "GameApp.dll does not carry the shader chain $SHADER_CHAIN"
   fi
+  if [ -n "${FRAMEWORK_ID:-}" ]; then
+    python3 -I -c 'import sys; sys.exit(0 if sys.argv[2].encode("utf-16-le") in open(sys.argv[1], "rb").read() else 1)' "$APP/GameApp.dll" "$FRAMEWORK_ID" \
+      && pass "the app carries its framework id $FRAMEWORK_ID (GameAppBuild.FrameworkId, GameApp.dll: a game built by an app with this id boots without a rebuild)" || fail "GameApp.dll does not carry the framework id $FRAMEWORK_ID"
+  fi
 fi
 for f in dm/games/settings.tsv; do [ -f "$APP/$f" ] && pass "the bundle carries $f (read by the Rust chain for the launcher catalogue)" || fail "the bundle has no $f"; done
 NT=$(find "$APP/dm/games" -name game.tsv | wc -l | tr -d ' ')
@@ -234,6 +238,7 @@ want = [('the boot-only launch path', 'gameapp.boot-only present'),
         ('a framework another build made is never booted', 'was not built by this version of the app'),
         ('the checklist says when the framework is stale', 'built by an older version of the app'),
         ('the config hands the pipeline the build id', 'app_build='),
+        ('the config hands the pipeline the framework id, stamped with the framework (0099)', 'framework_id='),
         ('a launch does not restart a boot that never came back', 'a boot from it was started and never came back'),
         ('a boot that ran to its time limit is one line, not an interruption', 'ended at its boot time limit'),
         ('and a time limit whose exit never finished is still reported', 'not `graceful exit done`'),
@@ -315,9 +320,14 @@ want = [('the boot-only launch path', 'gameapp.boot-only present'),
         ('the certificate is needed only to play inside iBuilder (0095)', 'needed only to Play inside iBuilder'),
         ('a GPU without BC textures is shown and handled (0096)', 'This GPU has no BC textures'),
         ('an export above 4 GB warns about signing tools (0097)', 'This IPA is larger than 4 GB: some signing tools'),
-        ('the exported Info.plist is checked after writing (0097)', 'export: Info.plist checked: '),
+        ('the exported Info.plist is checked after writing (0097)', 'export: Info.plist checked'),
         ('the person chooses which game prepares its shaders first (0098)', 'Prepare this one now'),
         ('a game can be left unprepared and queued again (0098)', 'Queue its preparation again'),
+        ('a game with no readable shader says it is not supported yet (0100)', 'Not supported yet: iBuilder found no shader it can read in this game'),
+        ('playing a game that will draw nothing asks first (0100)', 'Play anyway (sound and controls)'),
+        ('a game that closed itself is said on the next launch (0100)', 'The game closed itself'),
+        ('the exported Info.plist is normalized for zsign-based signers (0101)', 'export: Info.plist normalized for signers ('),
+        ('an exported Info.plist a signer could not read stops the export (0101)', 'would not be read by a signer (zsign): '),
         ('after a full export the build can be deleted', 'Delete the build?'),
         ('a build queue, one game after another', 'Add to the build queue'),
         ('a build iOS ended is offered back on the library', 'iOS ended the last build (memory). Resume'),

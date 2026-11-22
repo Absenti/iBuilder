@@ -592,6 +592,40 @@ fn a_game_with_no_shader_the_split_reads_is_marked_and_not_tried_again() {
     );
 }
 
+#[test]
+fn a_no_shader_marker_of_another_split_version_is_not_believed() {
+    // Beach Buggy Racing 2: an older split found 0 shaders (it could not read Vector Unit's .apf archive) and wrote the marker; the app's newer split reads it,
+    // so a marker written by another split version (or one without a version, written before it was recorded) is dropped and the game is split again
+    let mut fx = stage3_fixture();
+    let s = Arc::new(ibuilder_pipeline::mock::MockShaders {
+        shaders: 0,
+        ..Default::default()
+    });
+    fx.ctx.adapters.shaders = Some(s.clone());
+    for old in [
+        "the split found 0 shaders in RomFS.img and main\ndlc -\n",
+        "the split found 0 shaders in RomFS.img and main\ndlc -\nsplit rs0000000000\n",
+    ] {
+        write(fx.p(&format!("shaders/{STID}.none")), old);
+        fx.log.clear();
+        let before = s.splits.load(Ordering::SeqCst);
+        build_shaders_on_device(&mut fx.ctx);
+        assert_eq!(s.splits.load(Ordering::SeqCst), before + 1, "split again");
+        assert!(fx.log.contains("for another version of the shader split"));
+        // the new marker carries this split's version and is believed
+        let t = std::fs::read_to_string(fx.p(&format!("shaders/{STID}.none"))).unwrap();
+        assert!(t.contains("split mocksplit001\n"));
+        fx.log.clear();
+        build_shaders_on_device(&mut fx.ctx);
+        assert_eq!(
+            s.splits.load(Ordering::SeqCst),
+            before + 1,
+            "then not tried again"
+        );
+        assert!(fx.log.contains("not tried again"));
+    }
+}
+
 // ---- the kill, said; a build that continues another --------------------------------------------------------------------------------------------------------------------
 
 #[test]

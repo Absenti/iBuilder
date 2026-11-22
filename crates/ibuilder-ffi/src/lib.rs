@@ -951,6 +951,40 @@ pub unsafe extern "C" fn ibuilder_classify_framework(
     })
 }
 
+/// `ibuilder_classify_framework` with this app's framework id (`GameAppBuild.FrameworkId`, NULL or "" for none): FRESH when the stamp's `framework_id` is the same, or, for a stamp
+/// from before framework ids, when its `app_build` is (`state::framework_matches`). The older entry point keeps its answer (build ids only).
+///
+/// # Safety
+/// Strings are NULL or NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ibuilder_classify_framework_id(
+    on_disk: c_int,
+    stamp_content: *const c_char,
+    current_build: *const c_char,
+    current_framework_id: *const c_char,
+) -> c_int {
+    guard(E_PANIC, || {
+        // SAFETY: NUL-terminated by contract.
+        let (s, b, f) = unsafe {
+            (
+                cstr(stamp_content),
+                cstr(current_build),
+                cstr(current_framework_id),
+            )
+        };
+        match state::classify_framework_id(
+            on_disk != 0,
+            s.as_deref(),
+            b.as_deref().unwrap_or(""),
+            f.as_deref().unwrap_or(""),
+        ) {
+            FrameworkState::None => 0,
+            FrameworkState::Fresh => 1,
+            FrameworkState::Stale => 2,
+        }
+    })
+}
+
 /// # Safety
 /// Strings are NULL or NUL-terminated.
 #[unsafe(no_mangle)]
@@ -962,13 +996,54 @@ pub unsafe extern "C" fn ibuilder_classify_previous_run(
     guard(E_PANIC, || {
         // SAFETY: NUL-terminated by contract.
         let (s, c, g) = unsafe { (cstr(stage_line), cstr(chain_last), cstr(guest_last)) };
-        match state::classify_previous_run(s.as_deref(), c.as_deref(), g.as_deref()) {
-            PreviousRun::DesignedEnd => 0,
-            PreviousRun::PlayerEnd => 1,
-            PreviousRun::DesignedEndWithoutCleanExit => 2,
-            PreviousRun::FaultInGuest => 3,
-            PreviousRun::KilledOrUnknown => 4,
-        }
+        previous_run_code(state::classify_previous_run(
+            s.as_deref(),
+            c.as_deref(),
+            g.as_deref(),
+        ))
+    })
+}
+
+/// The C codes of `PreviousRun` (`IBUILDER_PREV_*`): 0-4 as they always were, 5 the game's own exit (svcExitProcess).
+fn previous_run_code(p: PreviousRun) -> c_int {
+    match p {
+        PreviousRun::DesignedEnd => 0,
+        PreviousRun::PlayerEnd => 1,
+        PreviousRun::DesignedEndWithoutCleanExit => 2,
+        PreviousRun::FaultInGuest => 3,
+        PreviousRun::KilledOrUnknown => 4,
+        PreviousRun::GuestExit => 5,
+    }
+}
+
+/// The same with the guest log's last exit-cause line (`[dm] received <cause>: graceful exit`, `state::last_exit_cause`): a game that called svcExitProcess is
+/// `IBUILDER_PREV_GUEST_EXIT`.
+///
+/// # Safety
+/// Strings are NULL or NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ibuilder_classify_previous_run_exit(
+    stage_line: *const c_char,
+    chain_last: *const c_char,
+    guest_last: *const c_char,
+    exit_cause: *const c_char,
+) -> c_int {
+    guard(E_PANIC, || {
+        // SAFETY: NUL-terminated by contract.
+        let (s, c, g, x) = unsafe {
+            (
+                cstr(stage_line),
+                cstr(chain_last),
+                cstr(guest_last),
+                cstr(exit_cause),
+            )
+        };
+        previous_run_code(state::classify_previous_run_exit(
+            s.as_deref(),
+            c.as_deref(),
+            g.as_deref(),
+            x.as_deref(),
+        ))
     })
 }
 
@@ -1074,6 +1149,8 @@ pub unsafe extern "C" fn ibuilder_decide_launch(
             &docs,
             &LaunchFacts {
                 current_build: &b,
+                // this entry point predates framework ids: the build id alone decides, as it always did (ibuilder_classify_framework_id has the framework id rule)
+                current_framework_id: "",
                 cannot_run_here: cannot_run_here != 0,
                 framework: &fw,
                 flat: &flat,

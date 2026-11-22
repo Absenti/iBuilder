@@ -1048,13 +1048,18 @@ fn a_broken_certificate_still_fails_and_an_identity_signs_as_before() {
     assert!(!stamp.contains("signature="));
     assert!(!c.fx.log.contains("sign ad hoc"));
     assert_eq!(
-        ibuilder_pipeline::markers::framework_stamp_text("B1", "G.nsp", "T", "c", false),
+        ibuilder_pipeline::markers::framework_stamp_text("B1", "", "G.nsp", "T", "c", false),
         "app_build=B1\ngame=G.nsp\nbuilt=T\ncontent=c\n",
         "the stamp of a signed framework is byte for byte what it was"
     );
     assert_eq!(
-        ibuilder_pipeline::markers::framework_stamp_text("B1", "G.nsp", "T", "c", true),
+        ibuilder_pipeline::markers::framework_stamp_text("B1", "", "G.nsp", "T", "c", true),
         "app_build=B1\ngame=G.nsp\nbuilt=T\ncontent=c\nsignature=adhoc-export\n"
+    );
+    assert_eq!(
+        ibuilder_pipeline::markers::framework_stamp_text("B1", "F1", "G.nsp", "T", "c", true),
+        "app_build=B1\nframework_id=F1\ngame=G.nsp\nbuilt=T\ncontent=c\nsignature=adhoc-export\n",
+        "the framework id follows the build id"
     );
 }
 

@@ -27,6 +27,8 @@ pub struct ConfigParams {
     pub nup_path: Option<PathBuf>,
     /// the build script's id (`GameAppBuild.Id`)
     pub app_build: String,
+    /// the build script's framework id (`GameAppBuild.FrameworkId`): stamped with the framework; an app whose framework id is the same boots it without a rebuild
+    pub framework_id: String,
     /// the translation chain the host was built with (`engine/dm/gfx/nvn/dmsh_chain.h`)
     pub shader_chain: String,
     /// the update and DLC this build takes (`GameAppUi.ContentSignature`)
@@ -93,6 +95,7 @@ pub fn config_text(p: &ConfigParams) -> String {
         format!("keep_exefs={}", d(&p.keep_exefs, "0")),
         format!("boot_floor_mib={}", d(&p.boot_floor_mib, "2500")),
         format!("app_build={}", p.app_build),
+        format!("framework_id={}", p.framework_id),
         format!("shader_chain={}", p.shader_chain),
         format!("game={}", game.clone().unwrap_or_default()),
         format!(
@@ -124,6 +127,7 @@ mod tests {
             bundle: "/B".into(),
             game: Some("Grizzy.nsp".into()),
             app_build: "20261117-173055-c842913".into(),
+            framework_id: "0123456789abcdef".into(),
             shader_chain: "cc0f2129e1de".into(),
             content: "u:1".into(),
             ..Default::default()
@@ -146,6 +150,7 @@ mod tests {
                 "keep_exefs",
                 "boot_floor_mib",
                 "app_build",
+                "framework_id",
                 "shader_chain",
                 "game",
                 "content"
@@ -164,6 +169,7 @@ mod tests {
         );
         assert_eq!(c.get("boot_floor_mib"), Some("2500"));
         assert_eq!(c.get("content"), Some("u:1"));
+        assert_eq!(c.get("framework_id"), Some("0123456789abcdef"));
     }
 
     #[test]

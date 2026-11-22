@@ -1,0 +1,148 @@
+# 0099-framework-id-no-rebuild-after-app-update.patch -- the owner's report: after every app update every built game was "Needs setup" (stale), although its build was still valid. Applies
+# after 0098. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# Why: the framework stamp (Documents/gameapp.framework, written by the chain) names the app build that made it (app_build=<yyyymmdd-hhmmss>-rust<hash>), and ClassifyFramework compared it with
+#   GameAppBuild.Id, which is new at every build of the app: any update made every game stale.
+# Now: scripts/build-app.sh computes a FRAMEWORK ID, a hash of only what shapes a built framework and its boot (the host dylib, the stage crates, the tables, the shader chain, the extractor;
+#   NOT the C# app, NOT the time, NOT the shader crates: scripts/lib-hash.sh framework_id_listing has the list), and writes it as GameAppBuild.FrameworkId. The app hands it to the chain
+#   (gameapp.config `framework_id=`, right after app_build=), the chain stamps it (`framework_id=` after app_build=), and:
+#    - GameAppUi.FrameworkMatches (pure; the Rust chain's state::framework_matches is the same rule): the stamp and the app both name a framework id -> FRESH iff they are equal (the build
+#      ids do not matter); a stamp from before framework ids -> the build ids decide, as before (so the first update to an app with 0099 rebuilds once, never again for an unchanged host).
+#    - ClassifyFramework(onDisk, stamp, build, frameworkId = ""): GatherFacts (Documents) and ParkedReadyGames (the parked slots, 0073) pass GameAppBuild.FrameworkId; the boot-only
+#      withdrawal at launch follows GatherFacts().Framework, so a request for a framework of the same framework id is honoured, another id is withdrawn as before.
+#    - FrameworkStamp gains FrameworkId (""); "Sign again to play" (0095) keeps the line (StampSignedAgain drops only signature=).
+#    - the launch diagnostics line names the framework id ("| framework id <id> |").
+#   A different framework id (the host or a stage crate changed) is still a rebuild: "Needs setup", the checklist's "built by an older version of the app", the main button builds.
+#   NOT changed on purpose: the shader warm-up's prepared.tsv / warmed.tsv stay keyed on the app build and the chain (the compile runs in the app's own C# code and fills the OS's Metal
+#   cache: another app build may compile differently or find the cache gone); the export manifest and the About line keep showing the build id.
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch 0010-0099 applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile
+#   (-t:Compile, the device project with GameAppBuild.FrameworkId): 0 errors / 40 warnings, the same per file and code as 0098. Host harness (harness99: ... P98;P99): 403 of 403 checks
+#   (16 new: the stamp's framework_id, same id after an update -> Fresh / Ready / "Boot again (no rebuild)", another id -> Stale / Needs setup / builds, an older stamp -> build ids, no id
+#   on this side -> the old rule, the Rust table, Sign again keeps the line, the wiring of the config, of every ClassifyFramework call, of the withdrawal, the Rust rule, the rewrite cache key
+#   and build-app.sh); 7 of 7 mutations killed.
+# NOT VERIFIED: nothing ran on a device or in the simulator: an update over a real built game (the first update to 0099 still rebuilds once: the stamps on phones have no framework_id yet).
+# NEW STRINGS: the config key "framework_id=" (verify_ipa.sh marker), the diagnostics field "| framework id ". No new UI text.
+diff -ruN t98/GameAppDiag.cs t99/GameAppDiag.cs
+--- t98/GameAppDiag.cs	2026-11-22 19:28:06
++++ t99/GameAppDiag.cs	2026-11-22 19:39:41
+@@ -205,7 +205,7 @@
+         try { bundle = NSBundle.MainBundle.BundleIdentifier ?? "?"; version = NSBundle.MainBundle.ObjectForInfoDictionary("CFBundleShortVersionString")?.ToString() ?? "?"; } catch (Exception) { }
+         string os = "?";
+         try { os = UIDevice.CurrentDevice.SystemVersion; } catch (Exception) { }
+-        Write("launch", $"session {session} | build {GameAppBuild.Id} | shader chain {GameAppBuild.ShaderChain} | bundle {bundle} {version} | iOS {os} | {Sysctl("hw.machine")} kernel {Sysctl("kern.osversion")}" +
++        Write("launch", $"session {session} | build {GameAppBuild.Id} | framework id {GameAppBuild.FrameworkId} | shader chain {GameAppBuild.ShaderChain} | bundle {bundle} {version} | iOS {os} | {Sysctl("hw.machine")} kernel {Sysctl("kern.osversion")}" +
+             $" | RAM {RamBytes()} | cores {Environment.ProcessorCount} | thermal {ThermalName()} | low power {SafeLowPower()} | free disk {FreeDiskMiB()} MiB" +
+             $" | increased-memory {Entitlement(gameapp_increased_memory)} extended-va {Entitlement(gameapp_extended_va)} get-task-allow {Entitlement(gameapp_get_task_allow)}" +
+             $" | pid {Environment.ProcessId}", true);
+diff -ruN t98/GameAppMain.cs t99/GameAppMain.cs
+--- t98/GameAppMain.cs	2026-11-22 19:28:07
++++ t99/GameAppMain.cs	2026-11-22 19:39:41
+@@ -350,6 +350,9 @@
+             // the framework with them once it is signed (Documents/gameapp.framework), and the screen offers "Boot
+             // again (no rebuild)" only for a framework THIS build made. `game` is empty for a run with no extraction.
+             "app_build=" + GameAppBuild.Id,
++            // patch 0099: the framework id (scripts/lib-hash.sh: a hash of only what shapes a built framework: the host, the stage crates,
++            // the tables, the shader chain), stamped beside app_build; an app update with the same framework id boots the game already built.
++            "framework_id=" + GameAppBuild.FrameworkId,
+             // The translation chain the host was built with (engine/dm/gfx/nvn/dmsh_chain.h): a shader pack of another
+             // chain is refused by the host, and the pipeline says so by name before the boot.
+             "shader_chain=" + GameAppBuild.ShaderChain,
+@@ -1286,7 +1289,7 @@
+             AddressSpaceFreeGiB: addressSpace.FreeGiB,
+             IncreasedMemory: GameAppMain.IncreasedMemoryValue(),
+             BootRequest: GameAppUi.ClassifyBootRequest(bootExists, bootContent),
+-            Framework: GameAppUi.ClassifyFramework(frameworkOnDisk, stamp, GameAppBuild.Id),
++            Framework: GameAppUi.ClassifyFramework(frameworkOnDisk, stamp, GameAppBuild.Id, GameAppBuild.FrameworkId),   // patch 0099
+             FrameworkGame: GameAppUi.ParseFrameworkStamp(stamp)?.Game,
+             FrameworkContent: GameAppUi.ParseFrameworkStamp(stamp)?.Content,
+             Parked: GameExport.IsPlayer ? null : ParkedReadyGames(),   // GameAppSlotUi.cs (patch 0073): the games whose build is parked and ready
+diff -ruN t98/GameAppSlotUi.cs t99/GameAppSlotUi.cs
+--- t98/GameAppSlotUi.cs	2026-11-22 19:28:07
++++ t99/GameAppSlotUi.cs	2026-11-22 19:39:41
+@@ -51,7 +51,7 @@
+     {
+         var map = new Dictionary<string, string>(StringComparer.Ordinal);
+         foreach (var p in ParkedSlots())
+-            if (!string.IsNullOrEmpty(p.Stamp?.Game) && GameAppUi.ClassifyFramework(p.FrameworkOnDisk && p.FlatOnDisk, p.StampText, GameAppBuild.Id) == FrameworkState.Fresh)
++            if (!string.IsNullOrEmpty(p.Stamp?.Game) && GameAppUi.ClassifyFramework(p.FrameworkOnDisk && p.FlatOnDisk, p.StampText, GameAppBuild.Id, GameAppBuild.FrameworkId) == FrameworkState.Fresh)   // patch 0099
+                 map[p.Stamp.Game] = p.Stamp.Content;
+         return map;
+     }
+diff -ruN t98/GameAppUi.cs t99/GameAppUi.cs
+--- t98/GameAppUi.cs	2026-11-22 19:28:07
++++ t99/GameAppUi.cs	2026-11-22 19:39:41
+@@ -22,13 +22,14 @@
+ public enum BootRequestState { None, Armed, Attempted }
+ 
+ /// Whether the framework on disk can be booted without a rebuild. NONE: there is none (or no extraction beside it).
+-/// FRESH: this build of the app built it (Documents/gameapp.framework names the same build id). STALE: it exists, but
+-/// another build of the app made it, or it predates the stamp: booting it would run an older host and rewrite.
++/// FRESH: this app may boot it as it is (Documents/gameapp.framework names this app's FRAMEWORK ID, or, for a stamp from before
++/// framework ids, the same build id: patch 0099). STALE: it exists, but an app with another framework id (another host, rewrite,
++/// profile or table: scripts/lib-hash.sh) made it, or it predates the stamp: booting it would run an older host and rewrite.
+ public enum FrameworkState { None, Fresh, Stale }
+ 
+ /// What gameapp_pipeline.py writes to Documents/gameapp.framework right after it signs a framework. `ExportOnly` (patch 0095): its `signature=adhoc-export` line: the chain found no
+ /// .p12 here and signed the framework ad hoc, so the build is exported (the installer re-signs it), never played inside iBuilder until it is signed again with a .p12.
+-public sealed record FrameworkStamp(string AppBuild, string Game, string Content = "", bool ExportOnly = false);
++public sealed record FrameworkStamp(string AppBuild, string Game, string Content = "", bool ExportOnly = false, string FrameworkId = "");
+ 
+ /// What the main button does when tapped.
+ public enum ActionKind { Busy, Import, Boot, Run, Export }
+@@ -93,12 +94,13 @@
+ 
+     // ---- the framework on disk ------------------------------------------------------------------------------
+ 
+-    /// The stamp is `key=value` lines (app_build, game, built). Null when there is no stamp or it names no build.
++    /// The stamp is `key=value` lines (app_build, framework_id, game, built). Null when there is no stamp or it names no build.
+     public static FrameworkStamp ParseFrameworkStamp(string content)
+     {
+         if (content == null) return null;
+         string build = null, game = null, built = null;   // no content= line: a stamp from before builds recorded it
+         bool exportOnly = false;   // patch 0095: signature=adhoc-export
++        string frameworkId = "";   // patch 0099: framework_id= (none in a stamp from before framework ids)
+         foreach (var raw in content.Split('\n'))
+         {
+             var line = raw.Trim();
+@@ -110,22 +112,35 @@
+             else if (key == "game") game = value;
+             else if (key == "content") built = value;
+             else if (key == "signature") exportOnly = value == ExportOnlySignature;
++            else if (key == "framework_id") frameworkId = value;
+         }
+-        return string.IsNullOrEmpty(build) ? null : new FrameworkStamp(build, game ?? "", built, exportOnly);
++        return string.IsNullOrEmpty(build) ? null : new FrameworkStamp(build, game ?? "", built, exportOnly, frameworkId);
+     }
+ 
+     /// `onDisk`: the framework and the extraction it boots from are both there. `stampContent`: what
+-    /// Documents/gameapp.framework says, null when it is missing or unreadable. `currentBuild`: this app's build id.
++    /// Documents/gameapp.framework says, null when it is missing or unreadable. `currentBuild`: this app's build id;
++    /// `currentFrameworkId`: this app's framework id (GameAppBuild.FrameworkId, patch 0099; "" for none).
+     /// A framework with no usable stamp is STALE, not fresh: it predates builds being tracked, and the safe reading of
+     /// "I cannot tell who built this" is "not this build".
+-    public static FrameworkState ClassifyFramework(bool onDisk, string stampContent, string currentBuild)
++    public static FrameworkState ClassifyFramework(bool onDisk, string stampContent, string currentBuild, string currentFrameworkId = "")
+     {
+         if (!onDisk) return FrameworkState.None;
+         var stamp = ParseFrameworkStamp(stampContent);
+-        if (stamp == null || string.IsNullOrEmpty(currentBuild)) return FrameworkState.Stale;
+-        return string.Equals(stamp.AppBuild, currentBuild, StringComparison.Ordinal)
++        if (stamp == null) return FrameworkState.Stale;
++        return FrameworkMatches(stamp.AppBuild, stamp.FrameworkId, currentBuild, currentFrameworkId)
+             ? FrameworkState.Fresh
+             : FrameworkState.Stale;
++    }
++
++    /// Patch 0099: whether a framework stamped `stampBuild` / `stampFrameworkId` is this app's to boot without a rebuild (the Rust chain's
++    /// state::framework_matches is the same rule). Both sides name a framework id: they must be equal, and the build ids do not matter (an
++    /// app update that changed nothing a built framework depends on keeps every built game playable: "Play", no rebuild). Otherwise (a stamp
++    /// from before framework ids): the build ids must be equal, as before. An empty id on this side never matches. Ordinal comparisons.
++    public static bool FrameworkMatches(string stampBuild, string stampFrameworkId, string currentBuild, string currentFrameworkId)
++    {
++        if (!string.IsNullOrEmpty(currentFrameworkId) && !string.IsNullOrEmpty(stampFrameworkId))
++            return string.Equals(stampFrameworkId, currentFrameworkId, StringComparison.Ordinal);
++        return !string.IsNullOrEmpty(currentBuild) && string.Equals(stampBuild, currentBuild, StringComparison.Ordinal);
+     }
+ 
+     // ---- the checklist --------------------------------------------------------------------------------------

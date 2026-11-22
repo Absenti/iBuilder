@@ -286,6 +286,58 @@ fn only_a_framework_this_build_made_is_booted_without_a_rebuild() {
     assert_eq!(s.boot.calls(), 1);
 }
 
+#[test]
+fn an_app_update_with_the_same_framework_id_boots_the_framework_already_built() {
+    // the framework id (scripts/lib-hash.sh framework_id_listing): only what shapes a built framework; a new app build id alone is not a rebuild
+    let fresh = |config: &str, stamp: &str| {
+        scenario("ok", true, Some(config), Some(stamp), None)
+            .boot
+            .calls()
+    };
+    let stamp = "app_build=20261120-100000-rustaaaa\nframework_id=F1\ngame=Grizzy.nsp\n";
+    assert_eq!(
+        fresh("20261122-090000-rustbbbb\nframework_id=F1", stamp),
+        1,
+        "same framework id, another build id: booted, no rebuild"
+    );
+    let s = scenario(
+        "ok",
+        true,
+        Some("20261120-100000-rustaaaa\nframework_id=F2"),
+        Some(stamp),
+        None,
+    );
+    assert_eq!(
+        s.boot.calls(),
+        0,
+        "another framework id is a rebuild, even with the same build id"
+    );
+    assert!(!s.req.exists(), "and the request is consumed");
+    assert!(
+        s.fx.log
+            .lines()
+            .iter()
+            .any(|l| l.contains("(framework id F1)") && l.contains("(framework id F2)")),
+        "{:?}",
+        s.fx.log.lines()
+    );
+    // a stamp from before framework ids: the build id decides, as before
+    assert_eq!(
+        fresh(
+            &format!("{BUILD}\nframework_id=F1"),
+            &format!("app_build={BUILD}\ngame=G\n")
+        ),
+        1
+    );
+    assert_eq!(
+        fresh(
+            "20261122-090000-rustbbbb\nframework_id=F1",
+            &format!("app_build={BUILD}\ngame=G\n")
+        ),
+        0
+    );
+}
+
 // ---- the save and temp folders the engine aborts without (DM_SAVE) ---------------------------------------------------------------------------------------
 
 #[test]
@@ -748,6 +800,31 @@ fn the_stamp_records_the_build_and_the_game() {
 }
 
 #[test]
+fn the_stamp_records_the_framework_id_beside_the_build() {
+    let mut fx = Fx::new();
+    fx.cfg(&format!(
+        "app_build={BUILD}\nframework_id=0123456789abcdef\ngame=Grizzy.nsp"
+    ));
+    write_framework_stamp(&fx.ctx);
+    let text = fs::read_to_string(fx.p("gameapp.framework")).unwrap();
+    assert!(
+        text.starts_with(&format!(
+            "app_build={BUILD}\nframework_id=0123456789abcdef\ngame=Grizzy.nsp\nbuilt="
+        )),
+        "{text}"
+    );
+    assert!(fx.log.contains("framework_id=0123456789abcdef"));
+    fx.cfg(&format!("app_build={BUILD}\ngame=Grizzy.nsp"));
+    write_framework_stamp(&fx.ctx);
+    assert!(
+        !fs::read_to_string(fx.p("gameapp.framework"))
+            .unwrap()
+            .contains("framework_id"),
+        "a config with no framework id stamps the four lines it always did"
+    );
+}
+
+#[test]
 fn no_app_build_nothing_is_stamped() {
     // py: "no app_build in the config: nothing is stamped, and it says so"
     let mut fx = Fx::new();
@@ -845,6 +922,32 @@ fn the_rewrite_cache() {
     do_rewrite(&mut fx.ctx).unwrap();
     do_rewrite(&mut fx.ctx).unwrap();
     assert_eq!(runs(&rw), 6, "no app_build: never cached");
+    // with a framework id the cache belongs to it, not to the app build: an app update that keeps the framework id keeps the rewrite cache
+    fx.set_cfg("app_build", "B3");
+    fx.set_cfg("framework_id", "F1");
+    do_rewrite(&mut fx.ctx).unwrap();
+    assert_eq!(
+        runs(&rw),
+        7,
+        "a cache made under an app build is not taken for a framework id"
+    );
+    fx.set_cfg("app_build", "B4");
+    do_rewrite(&mut fx.ctx).unwrap();
+    assert!(
+        runs(&rw) == 7 && fx.log.contains("from the cache"),
+        "same framework id, another app build: from the cache"
+    );
+    assert_eq!(
+        fs::read(out.join("main/main.patched.bin")).unwrap(),
+        b"MAIN-2.patched.bin"
+    );
+    fx.set_cfg("framework_id", "F2");
+    do_rewrite(&mut fx.ctx).unwrap();
+    assert_eq!(runs(&rw), 8, "another framework id rewrites again");
+    fx.ctx.cfg.remove("app_build");
+    fx.set_cfg("framework_id", "F2");
+    do_rewrite(&mut fx.ctx).unwrap();
+    assert_eq!(runs(&rw), 8, "a framework id alone is enough to cache");
 }
 
 // ---- a library of another chain is removed before stage 3 builds ------------------------------------------------------------------------------------------------------

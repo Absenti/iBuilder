@@ -173,12 +173,18 @@ int ibuilder_classify_boot_request(int exists, const char *content);            
 #define IBUILDER_FRAMEWORK_FRESH 1
 #define IBUILDER_FRAMEWORK_STALE 2
 int ibuilder_classify_framework(int on_disk, const char *stamp_content, const char *current_build);
+/* The same with this app's framework id (GameAppBuild.FrameworkId; NULL or "" for none): FRESH when the stamp's framework_id= equals it, or, for a stamp written before framework ids
+ * (no framework_id= line), when its app_build= equals current_build. ibuilder_classify_framework (above) compares the build ids only, as it always did. */
+int ibuilder_classify_framework_id(int on_disk, const char *stamp_content, const char *current_build, const char *current_framework_id);
 #define IBUILDER_PREV_DESIGNED_END 0
 #define IBUILDER_PREV_PLAYER_END   1
 #define IBUILDER_PREV_DESIGNED_END_NO_CLEAN_EXIT 2
 #define IBUILDER_PREV_FAULT_IN_GUEST 3
 #define IBUILDER_PREV_KILLED_OR_UNKNOWN 4
+#define IBUILDER_PREV_GUEST_EXIT 5   /* the game ended itself: the guest called svcExitProcess (not the player's Quit, the time limit or a fault) */
 int ibuilder_classify_previous_run(const char *stage_line, const char *chain_last, const char *guest_last);   /* any may be NULL */
+/* The same with the guest log's last "[dm] received <cause>: graceful exit" line (NULL: none): a game that called svcExitProcess is IBUILDER_PREV_GUEST_EXIT. */
+int ibuilder_classify_previous_run_exit(const char *stage_line, const char *chain_last, const char *guest_last, const char *exit_cause);
 
 typedef struct ibuilder_stage {
     int32_t valid, step, of;

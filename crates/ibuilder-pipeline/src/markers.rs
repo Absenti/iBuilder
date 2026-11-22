@@ -15,13 +15,14 @@ use crate::util::{MIB, utc_now_iso};
 use std::collections::BTreeMap;
 use std::fs;
 
-/// `read_framework_stamp`: the stamp as a map (app_build, game, built, content); empty when there is none.
+/// `read_framework_stamp`: the stamp as a map (app_build, framework_id, game, built, content); empty when there is none.
 pub fn read_framework_stamp(ctx: &Ctx) -> crate::config::Config {
     crate::config::Config::read(&ctx.docs.framework_stamp())
 }
 
 /// `write_framework_stamp`: record that THIS build of the app built and signed the framework, for which game. `app_build` is the build script's id (handed over in the
-/// config): a framework another build made would run an older host and rewrite, which is what an app update must not boot by accident.
+/// config): a framework another build made would run an older host and rewrite, which is what an app update must not boot by accident. `framework_id` (also from the
+/// config, `GameAppBuild.FrameworkId`) is stamped beside it: an app update whose framework id is the same boots this framework without a rebuild (`state::framework_matches`).
 pub fn write_framework_stamp(ctx: &Ctx) {
     let build = ctx.cfg.get_or("app_build", "");
     if build.is_empty() {
@@ -34,8 +35,10 @@ pub fn write_framework_stamp(ctx: &Ctx) {
         None => read_framework_stamp(ctx).get_or("game", "").to_string(),
     };
     // content=: the update and DLC this build took (the app's GameAppUi.ContentSignature, handed over in the config): one added later shows as "rebuild to include it"
+    let framework_id = ctx.cfg.get_or("framework_id", "");
     let text = framework_stamp_text(
         build,
+        framework_id,
         &game,
         &utc_now_iso(),
         ctx.cfg.get_or("content", ""),
@@ -44,8 +47,13 @@ pub fn write_framework_stamp(ctx: &Ctx) {
     let path = ctx.docs.framework_stamp();
     match crate::util::write_atomic(&path, text.as_bytes()) {
         Ok(()) => ctx.log(&format!(
-            "framework stamp: {} (app_build={build}, game={}){}",
+            "framework stamp: {} (app_build={build}{}, game={}){}",
             path.display(),
+            if framework_id.is_empty() {
+                String::new()
+            } else {
+                format!(", framework_id={framework_id}")
+            },
             if game.is_empty() { "-" } else { &game },
             if ctx.export_only {
                 format!(", signature={EXPORT_ONLY_SIGNATURE}: signed ad hoc, for export only")
@@ -60,16 +68,21 @@ pub fn write_framework_stamp(ctx: &Ctx) {
     }
 }
 
-/// The stamp's text. `export_only` (stage 4b signed the framework ad hoc: no identity on this install) adds `signature=adhoc-export`; a framework signed with the identity has
-/// exactly the four lines it always had.
+/// The stamp's text. `framework_id` (non-empty) adds `framework_id=` after `app_build=`; `export_only` (stage 4b signed the framework ad hoc: no identity on this install) adds
+/// `signature=adhoc-export`; with neither, the stamp has exactly the four lines it always had.
 pub fn framework_stamp_text(
     build: &str,
+    framework_id: &str,
     game: &str,
     built: &str,
     content: &str,
     export_only: bool,
 ) -> String {
-    let mut text = format!("app_build={build}\ngame={game}\nbuilt={built}\ncontent={content}\n");
+    let mut text = format!("app_build={build}\n");
+    if !framework_id.is_empty() {
+        text.push_str(&format!("framework_id={framework_id}\n"));
+    }
+    text.push_str(&format!("game={game}\nbuilt={built}\ncontent={content}\n"));
     if export_only {
         text.push_str(&format!("signature={EXPORT_ONLY_SIGNATURE}\n"));
     }

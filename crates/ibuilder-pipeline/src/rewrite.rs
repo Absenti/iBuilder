@@ -23,16 +23,29 @@ fn hex(d: &[u8]) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `rewrite_key(cfg, src, mods_digest)`: what a module's rewrite depends on. `Ok(None)` (no caching) without an `app_build`. `mods_digest` is the digest `mods.plan` made for this
-/// module ("" for none: the key is then what it was before mods existed).
-pub fn rewrite_key(ctx: &Ctx, src: &Path, mods_digest: &str) -> std::io::Result<Option<String>> {
-    let build = ctx.cfg.get_or("app_build", "");
-    if build.is_empty() {
-        return Ok(None);
+/// Which version of the rewriter a cached rewrite belongs to: the config's `framework_id` when it has one (the build script's hash of the stage crates, the host and the tables:
+/// the rewriter's code is part of it, so the same id and the same inputs give byte-identical output, and an app update that keeps the framework id keeps the cache too), else
+/// its `app_build` (a config from before framework ids: the key is then byte for byte what it always was). `None`: neither, no caching.
+fn rewriter_version(ctx: &Ctx) -> Option<(&'static str, &str)> {
+    match ctx.cfg.get_or("framework_id", "") {
+        "" => match ctx.cfg.get_or("app_build", "") {
+            "" => None,
+            b => Some(("app_build", b)),
+        },
+        f => Some(("framework_id", f)),
     }
+}
+
+/// `rewrite_key(cfg, src, mods_digest)`: what a module's rewrite depends on. `Ok(None)` (no caching) without a `framework_id` or an `app_build` (`rewriter_version`).
+/// `mods_digest` is the digest `mods.plan` made for this module ("" for none: the key is then what it was before mods existed).
+pub fn rewrite_key(ctx: &Ctx, src: &Path, mods_digest: &str) -> std::io::Result<Option<String>> {
+    let Some((label, version)) = rewriter_version(ctx) else {
+        return Ok(None);
+    };
     let mut h = Sha256::new();
-    h.update(b"app_build=");
-    h.update(build.as_bytes());
+    h.update(label.as_bytes());
+    h.update(b"=");
+    h.update(version.as_bytes());
     h.update(b"\0");
     if !mods_digest.is_empty() {
         h.update(b"mods=");
@@ -236,10 +249,10 @@ pub fn do_rewrite(ctx: &mut Ctx) -> Result<PathBuf> {
     Ok(out_dir)
 }
 
-/// `rewrite_is_cached`: every module of the rewrite is in the rewrite cache for this app build and these inputs (`do_rewrite` would take them all from it): a launch that
+/// `rewrite_is_cached`: every module of the rewrite is in the rewrite cache for this rewriter (`rewriter_version`) and these inputs (`do_rewrite` would take them all from it): a launch that
 /// comes back for stage 3 then does not pay the rewrite again.
 pub fn rewrite_is_cached(ctx: &Ctx) -> bool {
-    if !ctx.cfg.not_zero("rewrite_cache", "1") || ctx.cfg.get_or("app_build", "").is_empty() {
+    if !ctx.cfg.not_zero("rewrite_cache", "1") || rewriter_version(ctx).is_none() {
         return false;
     }
     let modules = ctx.cfg.modules();
