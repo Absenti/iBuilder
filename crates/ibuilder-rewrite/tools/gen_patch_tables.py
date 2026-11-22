@@ -14,7 +14,9 @@ Reads (read-only) <engine dm dir>/tools/{sdk_patches,engine_patches}.py and <dm 
   the digest it was verified against (`stubs_games::PORTS`), so an engine update that changes a stub's code is caught by
   `scripts/check-patch-coverage.sh` and by the `patch_coverage` test instead of silently running a stale port.
 
-usage: gen_patch_tables.py <engine dm dir> [--coverage <file>] > crates/ibuilder-rewrite/src/tables.rs
+usage: gen_patch_tables.py <engine dm dir> [--coverage <file>] [--no-overlay] > crates/ibuilder-rewrite/src/tables.rs
+  The patch files listed in tools/overlay/overlay.tsv (upstream changes ported before the pinned engine has them) are read from tools/overlay/ instead of the engine,
+  each checked against the sha256 of the engine file it replaces (a moved engine stops the generation); --no-overlay reads the engine's files alone.
   --coverage writes the machine-readable list of everything the patch files register (kind, profile, key, digest, game):
   CUTS / OBS / CAPABILITIES by build ID, MATCH_CUTS by rule, FRAME_STEP / STUBS by build ID, MATCH_FRAME_STEP /
   MATCH_STUBS by rule; `ibuilder-rewrite --list-ported` prints the same rows for what the Rust side can rewrite.
@@ -23,12 +25,38 @@ import ast, glob, hashlib, importlib.util, io, json, os, sys, tokenize
 
 args = sys.argv[1:]
 coverage_path = None
+use_overlay = '--no-overlay' not in args
+args = [a for a in args if a != '--no-overlay']
 if '--coverage' in args:
     i = args.index('--coverage'); coverage_path = args[i + 1]; del args[i:i + 2]
 dm = args[0]
 sys.path.insert(0, os.path.join(dm, 'tools'))   # the patch files import nso_asm / nso_match
 SHARED = ('sdk_patches.py', 'engine_patches.py')
-files = [os.path.join(dm, 'tools', f) for f in SHARED] + sorted(glob.glob(os.path.join(glob.escape(dm), 'games', '*', 'patches.py')))
+OVERLAY = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'overlay')
+REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
+
+
+def overlay_files():
+    """{engine-relative path (dm/...): overlay file} of tools/overlay/overlay.tsv, each checked against the engine file it replaces"""
+    out = {}
+    if not use_overlay: return out
+    for row in open(os.path.join(OVERLAY, 'overlay.tsv'), encoding='utf-8').read().splitlines():
+        if not row.strip() or row.startswith('#'): continue
+        rel, base = row.split('\t')[:2]
+        mine, theirs = os.path.join(OVERLAY, rel), os.path.join(os.path.dirname(dm), rel)
+        have = hashlib.sha256(open(theirs, 'rb').read()).hexdigest() if os.path.exists(theirs) else '-'
+        if have != base and have != hashlib.sha256(open(mine, 'rb').read()).hexdigest():
+            sys.exit(f'[RED] tools/overlay/{rel}: the engine\'s file is not the one this copy was ported onto (sha256 {have}, expected {base}): redo the port (overlay.tsv)')
+        out[rel] = mine
+    return out
+
+
+over = overlay_files()
+games = {os.path.basename(os.path.dirname(p)): p for p in glob.glob(os.path.join(glob.escape(dm), 'games', '*', 'patches.py'))}
+for rel, mine in over.items():
+    parts = rel.split('/')
+    if parts[1] == 'games': games[parts[2]] = mine
+files = [over.get(f'dm/tools/{f}', os.path.join(dm, 'tools', f)) for f in SHARED] + [games[g] for g in sorted(games)]
 
 
 def s(x):
@@ -97,11 +125,13 @@ def code_digest(path):
 
 
 def game_name(profile):
-    try:
-        for row in open(os.path.join(dm, 'games', profile, 'game.tsv'), encoding='utf-8').read().splitlines():
-            c = row.split('\t')
-            if c[0] == 'name' and len(c) > 1: return c[1].strip()
-    except OSError: pass
+    # the engine's profile, else this repository's (app/game-tables/<id>/game.tsv: a game only the overlay registers)
+    for path in (os.path.join(dm, 'games', profile, 'game.tsv'), os.path.join(REPO, 'app', 'game-tables', profile, 'game.tsv')):
+        try:
+            for row in open(path, encoding='utf-8').read().splitlines():
+                c = row.split('\t')
+                if c[0] == 'name' and len(c) > 1: return c[1].strip()
+        except OSError: pass
     return profile
 
 

@@ -1,0 +1,35 @@
+# (after 0531) nvn/pso: every background task drains its own autoreleases (a burst of pipeline builds no longer keeps every build's temporaries)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/de3485804dd32fc215484241e4f03c8a27e6d6a9  ("nvn/pso: drain autoreleases after each background build (PR #2714)")
+#            author seedds, 2026-11-22 10:07 +0800; Co-authored-by: Esteban Viera
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: the private utility queues and the global queues do not drain a worker's autoreleased temporaries at each work item's end (upstream PR #2714: a synthetic 256-job burst kept
+#   256 live temporaries before, one after; in-game memory not measured upstream either).
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m): an @autoreleasepool around the task in bg_async.
+# Adapted to 0412-0415: upstream wraps five dispatch_async blocks; here all five already go through this tree's bg_async (the background group the teardown waits for), as do the prewarm
+#   tail's (0412, 0415), the archive harvest and the other background builds, so the pool is in bg_async (13 call sites; those that had a pool of their own keep it, nested). No upstream hunk
+#   applied as is (5 of 5 rejected). Games: every game (Ocarina of Time upstream). Switches: none.
+# Tests (M1 Pro): t_pso_pending 96, t_warm_head, t_pso_tail_resume 55, t_pso_warm 123, t_submit_compile 11; in HOST_TESTS. NOT measured: memory on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0531, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 09952fb8e50ed3cc91bc7376b538fe73e76cd309..aacd5faa3e2bedc8118461de1a08299714e36e28 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -137,9 +137,13 @@ static inline dispatch_group_t bg_group(void) {
+     dispatch_once(&g_bg_group_once, ^{ g_bg_group = dispatch_group_create(); });
+     return g_bg_group;
+ }
++// Each background task drains its own autoreleases (engine-patches/0532, seedds/nxnative de348580): the private utility queues and the global queues do not drain a worker's
++// temporaries at each work item's end, so a burst of pipeline builds kept every build's temporaries alive until the queue's thread went idle (upstream: 256 jobs, 256 live
++// temporaries before, one after). Upstream gave its five background pipeline workers a pool each; here every task goes through bg_async (those five, the prewarm tail's and the
++// other background builds), so the pool is here, around the task, which publishes its result before the pool drains
+ static inline void bg_async(dispatch_queue_t q, dispatch_block_t b) {
+     if (atomic_load(&g_gfx_teardown)) return;
+-    dispatch_group_async(bg_group(), q, ^{ if (!atomic_load(&g_gfx_teardown)) b(); });
++    dispatch_group_async(bg_group(), q, ^{ if (!atomic_load(&g_gfx_teardown)) { @autoreleasepool { b(); } } });
+ }
+ 
+ static id<MTLDevice> g_dev;

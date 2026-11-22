@@ -581,3 +581,53 @@ fn snowdrop_shaders_is_the_engines() {
         "berg slices: {ok} found the engine's shaders, {red} ended with its [RED] text, {zstd_cases} differ in a damaged zstd frame (libzstd and ruzstd disagree)"
     );
 }
+
+// ---- nxnative e74c3fa7: every block of a bare cache decodes to exactly 64 KB (the last one to the rest) -----------------------------------------------------------------------------
+
+#[test]
+fn a_bare_cache_is_read_in_blocks_of_exactly_64_kb() {
+    let total = 0x18000usize; // 96 KB: one block of 64 KB, one of 32 KB
+    let mut raw = vec![0u8; total];
+    for (k, v) in [
+        0xabcd00d4u32,
+        0x13c,
+        0,
+        (total - 20) as u32,
+        (total - 20) as u32,
+    ]
+    .iter()
+    .enumerate()
+    {
+        raw[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let z = |b: &[u8]| {
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
+        e.write_all(b).unwrap();
+        e.finish().unwrap()
+    };
+    let slice = |cuts: &[usize]| {
+        let mut d = b"BERG".to_vec();
+        d.extend_from_slice(&22u32.to_le_bytes());
+        d.extend_from_slice(&[0u8; 48]);
+        let mut at = 0;
+        for &c in cuts {
+            d.extend_from_slice(&z(&raw[at..c]));
+            at = c;
+        }
+        d
+    };
+    // the engine's layout: read (zeros: no shader in it)
+    assert_eq!(
+        snowdrop_zlib_capped(&slice(&[0x10000, total]), "/s", 1 << 30).unwrap(),
+        vec![]
+    );
+    // two 48 KB streams: the first block is short of its 64 KB (the reader before e74c3fa7 took it)
+    let e = red_text(snowdrop_zlib_capped(&slice(&[0xc000, total]), "/s", 1 << 30).unwrap_err());
+    assert_eq!(
+        e,
+        "/s Snowdrop zlib record @0x38: block @0x38 did not finish at 65536 raw bytes"
+    );
+    // one stream of all 96 KB: more than its block
+    let e = red_text(snowdrop_zlib_capped(&slice(&[total]), "/s", 1 << 30).unwrap_err());
+    assert!(e.ends_with("did not finish at 65536 raw bytes"), "{e}");
+}

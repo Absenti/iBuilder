@@ -30,7 +30,8 @@ impl Source {
 const HEAD: u64 = 32;
 const COPY: usize = 8 << 20;
 
-/// Writes the image (`<dst>.part`, then a rename: an image is whole or absent). Returns `(size, file count)`.
+/// Writes the image (`<dst>.part`, then a rename: an image is whole or absent). Returns `(size, file count)`. A failed write, or a failed rename, removes its `.part`, so a
+/// full drive gets its space back (nxnative e3f2d21f, `shader_lib.write`); only a killed one leaves the `.part`.
 pub fn write_image(mut files: Vec<(String, Source)>, dst: &Path) -> std::io::Result<(u64, usize)> {
     files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     if let Some(w) = files.windows(2).find(|w| w[0].0 == w[1].0) {
@@ -113,10 +114,9 @@ pub fn write_image(mut files: Vec<(String, Source)>, dst: &Path) -> std::io::Res
         Ok((off + (idx.len() + pool.len()) as u64, files.len()))
     })();
     match res {
-        Ok(r) => {
-            std::fs::rename(&part, dst)?;
-            Ok(r)
-        }
+        Ok(r) => std::fs::rename(&part, dst).map(|_| r).inspect_err(|_| {
+            let _ = std::fs::remove_file(&part);
+        }),
         Err(e) => {
             let _ = std::fs::remove_file(&part);
             Err(e)
@@ -185,6 +185,37 @@ mod tests {
         for (name, bytes) in &want {
             assert_eq!(img.bytes(img.find(name).unwrap()), &bytes[..]);
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_or_rename_leaves_no_part() {
+        // nxnative e3f2d21f: a write that fails (a full drive) gives its space back. A rename onto a non-empty folder fails after the whole .part was written
+        let dir = std::env::temp_dir().join(format!("ibsb-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dst = dir.join("b-x.img");
+        std::fs::create_dir_all(dst.join("occupied")).unwrap();
+        let e = write_image(vec![("a".into(), Source::Bytes(vec![1; 100]))], &dst).unwrap_err();
+        assert!(
+            !dir.join("b-x.img.part").exists(),
+            "the .part of a failed rename stays: {e}"
+        );
+        // a source that cannot be read: the copy stops halfway
+        let gone = Source::Range {
+            path: dir.join("missing"),
+            off: 0,
+            len: 10,
+        };
+        let dst2 = dir.join("c.img");
+        write_image(
+            vec![
+                ("a".into(), Source::Bytes(vec![2; 4096])),
+                ("b".into(), gone),
+            ],
+            &dst2,
+        )
+        .unwrap_err();
+        assert!(!dir.join("c.img.part").exists() && !dst2.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,0 +1,21 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_game.bin": "a8310f25beb8487e6d3f69f66367f74d0f65b9e1105244738232431ffc0a6580",
+  "pkg/cs_ue.bin": "4d2b7b6debc22b6e72299e76a2e2bda5953e751c37933899cdac298ba497c259",
+  "pkg/ps_game.bin": "b39fcdfdfb6b8199cc677c908d6f474af8e582cadee769d6c9411e70baaa78dd",
+  "pkg/ps_ue.bin": "451367b6be44a8303e152ba1c8e37f1edec6c5794bb33017838b49c8ed3a48dd",
+  "pkg/vs_game.bin": "9c0f3e7d07e1acd5aa9486ddd23e413776f79347e5daca3561e5cd535897232a",
+  "pkg/vs_ue.bin": "5f246b14edbe51c8f7a1e6863d3063b0e7bfa962aa0bd3d2d5a10fadbad2e6fb",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "95fd89c0c7949776df9cb23ba9690b7847b1e2791b39fb5eb85b7866467e91d5",
+  "tables/shader_map.tsv": "5929454d9c101cb1ae265403ec0424597af5b4494cdfee50dbdc088abda13ea8",
+  "tables/shader_pairs.tsv": "542e5805475e84953bf48da03be449fed8b50b5ab229b88135d9d1101e955e0b"
+ },
+ "log": [
+  "single-stage programs: 4 vertex shaders are paired with a cover of 1 pixel shader(s) (0734415f0a111827)",
+  "shaders: 10 (compute 2, pixel 4, vertex 4); sources ue 5, game 5; compute shader answers 2 rows; variation pairs 4"
+ ],
+ "shaders": 10,
+ "updates": []
+}

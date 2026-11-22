@@ -372,6 +372,16 @@ for p in "$ENGINE"/dm/games/*/game.tsv; do
     [ -f "$over" ] && cp "$over" "$APP/dm/games/$d/$(basename "$over")" && echo "  game table $d/$(basename "$over"): this repository's, not the engine's" >&2
   done
 done
+# a game this repository has a table for and the engine has none (ported from a newer engine: South Park, Stick of Truth) gets its folder too, so the phone renders its
+# registered profile instead of deriving a provisional one
+for over_dir in "$ROOT"/app/game-tables/*/; do
+  d="$(basename "$over_dir")"
+  [ -f "$over_dir/game.tsv" ] || continue
+  [ -d "$APP/dm/games/$d" ] && continue
+  mkdir -p "$APP/dm/games/$d"
+  for over in "$over_dir"*.tsv; do [ -f "$over" ] && cp "$over" "$APP/dm/games/$d/$(basename "$over")"; done
+  tables=$((tables + 1)); echo "  game table $d: this repository's only (the engine has none)" >&2
+done
 cp "$ENGINE/dm/host/"*.c "$APP/dm/host/"; cp "$ENGINE/dm/gfx/"*.c "$APP/dm/gfx/"; cp "$ENGINE/dm/gfx/nvn/"*.c "$APP/dm/gfx/nvn/"; cp "$ENGINE/dm/gfx/vk/"*.m "$APP/dm/gfx/vk/"
 cp "$HOST_DYLIB" "$APP/host-prebuilt.dylib"
 # The shared-font stand-ins (dm/font/: standard.ttf, the Chinese/Korean cuts, nintendo_ext.ttf with the button icons), which the host serves for the system shared fonts and the pipeline hands over as

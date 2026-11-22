@@ -1,0 +1,66 @@
+# (after 0513) nvn/dirty: a write fault on a page already PG_NONE is claimed only when the kernel has it writable (a store no longer loops forever)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/a3d58526bc7d2fa2a8f9b113ce4db5d9003f6fcc  ("gfx/nvn: verify kernel writability before claiming PG_NONE faults")
+#            author seedds, 2026-11-23 00:05 +0800; Co-authored-by: David Padron-Harris
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: release_page saw a page already in PG_NONE with a generation and returned 1, so on_fault re-ran the faulting store without asking page_writable(): a page another subsystem
+#   made read-only (a packaged texture's protection, a guard) looped forever instead of reaching the next fault hook or the crash handler (upstream issues #3097, #3180).
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_dirty.c; test t_dirty_race): release_page returns 0 on PG_NONE, so on_fault falls through to its existing page_writable() and g_mp_begun checks.
+# Games: every game (write-protected pools: packaged textures). Switches: none. Applies as is (the review's candidate 0514).
+# Tests (M1 Pro): t_dirty_race (two new checks: a read-only PG_NONE page is declined, a writable one claimed), in HOST_TESTS. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0513, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/nvn_dirty.c b/dm/gfx/nvn/nvn_dirty.c
+index 226c0e8860afb1a6f1b80146ba8f1c6c2c8945b6..5cd2c189d1aa6754035bae43f092f4d70c9ab045 100644
+--- a/dm/gfx/nvn/nvn_dirty.c
++++ b/dm/gfx/nvn/nvn_dirty.c
+@@ -209,12 +209,12 @@ static int take_page(range_t *r, uintptr_t p, uint8_t *st) {
+     return *st == PG_OPEN && atomic_compare_exchange_strong(&r->state[p], st, PG_BUSY);
+ }
+ // Unprotect one page of a range: if protected, unprotect and stamp it; if another thread is changing its protection, wait for it to finish and look again -- if the other side was setting read-only, the page is PROT after the wait and still has to be unprotected
+-// (an unprotect-before-write never reaches the fault handler, so it must be done here). Returns 1 = this page is managed by this module; 0 = it is not, or the wait on BUSY timed out
++// (an unprotect-before-write never reaches the fault handler, so it must be done here). Returns 1 = this page was protected by this module and is writable now; 0 = it was already NONE or the wait on BUSY timed out
+ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
+     for (;;) {
+         uint8_t st;
+         if (take_page(r, p, &st)) { unprotect_page(r, p); if (count) atomic_fetch_add(count, 1); return 1; }
+-        if (st != PG_BUSY) return atomic_load(&r->gen[p]) != 0;   // already NONE: just unprotected by another thread (the fault happened before the unprotect) -> re-execute; pages never protected are not ours
++        if (st != PG_BUSY) return 0;   // already NONE: either another thread just unprotected it (on_fault checks page_writable), or a read-only protection is not this module's (claiming it would loop forever)
+         if (!busy_wait(r, p)) return 0;
+     }
+ }
+diff --git a/dm/gfx/tests/t_dirty_race.c b/dm/gfx/tests/t_dirty_race.c
+index cc4adba3fd88faa2c5e78bfc142d93958561237a..6d7826a258922a5aa47f3d476676990df4aa7f6a 100644
+--- a/dm/gfx/tests/t_dirty_race.c
++++ b/dm/gfx/tests/t_dirty_race.c
+@@ -210,6 +210,21 @@ static void gpu_written(size_t pg) {
+     nvn_dirty_remove_range(m); munmap(m, 2 * pg);
+ }
+ 
++// A page the tracker previously unprotected (state NONE, non-zero generation) that another subsystem later made read-only:
++// on_fault must check kernel writability instead of claiming it blindly (which would re-execute the faulting store forever).
++static void foreign_ro_on_none_page(size_t pg) {
++    uint8_t *m = mmap(NULL, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    if (m == MAP_FAILED) { perror("mmap"); g_fail++; return; }
++    nvn_dirty_add_range(m, pg);
++    nvn_dirty_protect(m, pg);
++    m[0] = 1;   // faults and leaves the page NONE with a non-zero generation
++    mprotect(m, pg, PROT_READ);
++    EXPECT("write fault on a NONE page the kernel has read-only is declined", 0, on_fault(m, 1, NULL));
++    mprotect(m, pg, PROT_READ | PROT_WRITE);
++    EXPECT("write fault on a NONE page the kernel has writable is claimed", 1, on_fault(m, 1, NULL));
++    nvn_dirty_remove_range(m); munmap(m, pg);
++}
++
+ int main(void) {
+     crash_install();
+     size_t pg = (size_t)getpagesize();
+@@ -239,5 +254,6 @@ int main(void) {
+     open_waits_busy(pg);
+     open_shared_page(pg);
+     gpu_written(pg);
++    foreign_ro_on_none_page(pg);
+     printf("t_dirty_race: %s\n", g_fail ? "FAILED" : "all passed"); return g_fail != 0;
+ }

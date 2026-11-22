@@ -1,0 +1,7 @@
+# Patch files that tools/gen_patch_tables.py reads from this folder INSTEAD of the engine's (or in addition to them): upstream nxnative changes ported before the pinned engine has them.
+# path (relative to the engine's dm folder's parent: dm/...)	sha256 of the engine file it replaces (- = a file the engine does not have)	what it is
+# gen_patch_tables.py stops when the engine's file no longer has that sha256 (or a new file appears in the engine) and differs from this copy: the engine moved, redo the port
+# (an engine file equal to this copy is fine: remove the row and the file then). The Rust tables (src/tables.rs) and coverage.tsv are generated from the engine plus this folder.
+dm/games/010095300B6A4000/patches.py	-	South Park: The Stick of Truth, nxnative 67736c99 verbatim: the 60 fps cut on the Onyx frame-rate setter's caller
+dm/games/01008F2005154000/patches.py	-	South Park: The Fractured But Whole, nxnative e74c3fa7: the Snowdrop three-pool allocator 12 GB -> 4 GB, plus e74c3fa7's SDK 3.5.1 VammManager rule as this profile's 'sdk' rule (upstream: SDK-wide in sdk_patches.py)
+dm/games/0400486024DEC000/patches.py	44138d0e24d5d76443cfb33b361ad7d64aa54e2fdc966eb15b829c53b30839b9	pinned + nxnative c12000da (dynamic-resolution threshold x 60 / target) + b3d287fe (render scale stubs; v131072 main+0x31d3200 also in the FRAME_STEP form)

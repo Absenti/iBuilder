@@ -624,6 +624,46 @@ pub mod shaders {
             }
         }
 
+        fn split_revisions(&self) -> Option<ibuilder_pipeline::adapters::SplitRevisions> {
+            #[cfg(feature = "shadersplit")]
+            {
+                use ibuilder_shadersplit::record::{LEGACY, READERS};
+                Some(ibuilder_pipeline::adapters::SplitRevisions {
+                    readers: READERS
+                        .iter()
+                        .map(|r| ibuilder_pipeline::adapters::SplitReader {
+                            name: r.name.to_string(),
+                            rev: r.rev,
+                            claims: r.claims.iter().map(|c| c.to_string()).collect(),
+                        })
+                        .collect(),
+                    legacy: LEGACY.iter().map(|(n, r)| (n.to_string(), *r)).collect(),
+                })
+            }
+            #[cfg(not(feature = "shadersplit"))]
+            {
+                None
+            }
+        }
+
+        fn split_probe(
+            &self,
+            romfs: &Path,
+            dlc: &[PathBuf],
+            shader_map: Option<&Path>,
+        ) -> Option<String> {
+            #[cfg(feature = "shadersplit")]
+            {
+                let dlc: Vec<&Path> = dlc.iter().map(|p| p.as_path()).collect();
+                ibuilder_shadersplit::record::probe_text(romfs, &dlc, shader_map).ok()
+            }
+            #[cfg(not(feature = "shadersplit"))]
+            {
+                let _ = (romfs, dlc, shader_map);
+                None
+            }
+        }
+
         fn split(&self, req: &SplitRequest<'_>, log: &dyn Log) -> Result<SplitResult> {
             #[cfg(feature = "shadersplit")]
             {
@@ -647,6 +687,9 @@ pub mod shaders {
                 o.dlc = dlc;
                 o.jobs = req.jobs.max(1);
                 o.memo_dir = Some(req.memo_dir);
+                // which readers the game needed, for a targeted re-split (the pipeline keeps it in pack.txt)
+                let record = ibuilder_pipeline::adapters::split_record_path(req.tables_dir);
+                o.record = Some(&record);
                 let l = |s: &str| log.line(s);
                 let st = split(&o, &Ruzstd, &Gate(req.gate), &l)
                     .map_err(|e| PipelineError::failed(e.to_string()))?;

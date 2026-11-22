@@ -3,6 +3,7 @@
 //! ```text
 //! shadersplit --romfs RomFS.img --main ExeFS/main --pkg out/pkg --tables out/tables --profile <folder with <title id>/game.tsv> --game <title id>
 //!             [--jobs 8] [--memo <folder>] [--dlc a.img,b.img] [--update-romfs RomFS2 --update-main main2] [--glslc-capture dir] [--nro-dir dir]
+//!             [--registered shader_map.tsv] [--record split.record]
 //! ```
 
 use ibuilder_shadersplit::{NoGate, Ruzstd, SplitOptions, split};
@@ -25,6 +26,7 @@ fn main() {
         None::<PathBuf>,
     );
     let (mut up_romfs, mut up_main) = (Vec::<PathBuf>::new(), Vec::<PathBuf>::new());
+    let (mut registered, mut record) = (None::<PathBuf>, None::<PathBuf>);
     while let Some(k) = a.next() {
         let mut v = || {
             a.next()
@@ -54,6 +56,8 @@ fn main() {
             "--update-main" => up_main.push(PathBuf::from(v())),
             "--glslc-capture" => cap = Some(PathBuf::from(v())),
             "--nro-dir" => nro = Some(PathBuf::from(v())),
+            "--registered" => registered = Some(PathBuf::from(v())),
+            "--record" => record = Some(PathBuf::from(v())),
             _ => usage(&format!("unknown argument {k}")),
         }
     }
@@ -79,6 +83,8 @@ fn main() {
     o.memo_dir = memo.as_deref();
     o.glslc_capture = cap.as_deref();
     o.nro_dir = nro.as_deref();
+    o.registered = registered.as_deref();
+    o.record = record.as_deref();
     let t0 = std::time::Instant::now();
     let log = |l: &str| println!("{l}");
     match split(&o, &Ruzstd, &NoGate, &log) {
@@ -101,7 +107,7 @@ fn main() {
 
 fn usage(why: &str) -> ! {
     eprintln!(
-        "shadersplit: {why}\nusage: shadersplit --romfs <RomFS.img|folder> --main <main NSO> --pkg <dir> --tables <dir> --profile <dir> --game <title id> [--jobs N] [--memo dir] [--dlc a,b] [--update-romfs R --update-main M] [--glslc-capture dir] [--nro-dir dir]"
+        "shadersplit: {why}\nusage: shadersplit --romfs <RomFS.img|folder> --main <main NSO> --pkg <dir> --tables <dir> --profile <dir> --game <title id> [--jobs N] [--memo dir] [--dlc a,b] [--update-romfs R --update-main M] [--glslc-capture dir] [--nro-dir dir] [--registered shader_map.tsv] [--record split.record]"
     );
     std::process::exit(2);
 }

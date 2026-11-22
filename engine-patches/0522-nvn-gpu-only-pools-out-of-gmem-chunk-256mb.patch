@@ -1,0 +1,218 @@
+# (after 0521) nvn/memory: CPU_NO_ACCESS render-target pools stay out of the raw pool table, and pools of 256 MB or more are wired by chunk (Ocarina of Time: about 274 MB less wired)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/3dd1f7a65525d28e0832b3f13648470461313f5f  ("gfx/nvn: keep CPU_NO_ACCESS texture pools out of gmem_map and chunk from 256 MB")
+#            author seedds, 2026-11-23 01:35 +0800; Co-authored-by: Stan Bono
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why (measured upstream, Ocarina of Time on an 8 GB iPhone 17, Hyrule Field to Kakariko Village): the residency set reached 3.9 GB (wired 5.7 of 7.67 GB, 147 MB free); its 305 MB
+#   physical render-target pool was wired whole although the GPU reads its targets through Metal textures: nvnTextureGetTextureAddress and nvnMemoryPoolMapVirtual marked it addressed,
+#   and one 200 KB storage-buffer lookup inside it made a whole-pool buffer because BIG_MIN was 512 MB. With the change: about 274 MB less wired (with the rest of upstream PR #2566:
+#   residency set 3.5 -> 3.1 GB, wired 5.3 -> 4.9 GB, frame time unchanged).
+# WHAT IT CHANGES (dm/gfx/nvn/hle_nvn.c, nvn_obj.h, nvn_mtl.m; new test t_gpu_only_addr): nvnTextureGetTextureAddress does not admit a block-linear non-buffer texture's CPU_NO_ACCESS pool
+#   into gmem_map; MapVirtual (aliased) admits a CPU_NO_ACCESS virtual pool only once a reachable address was given out (pool_t.asked); BIG_MIN 512 -> 256 MB.
+# Adapted: the Makefile rule by hand (it sits after 0521's t_file_wire). Games: Ocarina of Time; any game with large GPU-only pools. Switches: none.
+# Tests (M1 Pro): t_gpu_only_addr 16, t_addr_known 25, t_pool_chunks 178 (BIG_MIN moved), t_pool_census, t_sparse_pool_cache; all in HOST_TESTS. NOT measured on an iPhone here.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0521, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index d5e4c5be6243b9446fc9b2e6d19dc8406a3b95ab..733142531ca7df1192954788716f2a5a4b0c15c3 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -283,7 +283,7 @@ static uint8_t *pool_cpu_map(const pool_t *p) {
+ static uint8_t *vpool_reserve(pool_t *o); static void vpool_release(pool_t *o); static void vpool_taken(const pool_t *o);   // sparse virtual pools, see MapVirtual
+ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
+     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
+-    o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0;
++    o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0; o->asked = 0;
+     if (!o->mem && (o->flags & 0x200)) { uint8_t *vr = vpool_reserve(o); if (vr) o->mem = vr; }   // a virtual pool's own address range until its first mapping decides (see MapVirtual)
+     else if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
+     if (o->mem && !(o->flags & 0x200)) dm_device_share(o->mem, o->size, 1);   // the GPU maps the storage: the host refuses to unmap it until Finalize, as Horizon does (hle_svc.c)
+@@ -308,7 +308,7 @@ NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off,
+     ft_flush(o->mem + off, n);
+ }
+ // A GPU address exists only once the driver has given one: here, by a buffer (nvnBufferInitialize) or by a texture (nvnTextureGetTextureAddress). Raw global memory can reach only what these name (mtl_pool_addressed)
+-static void pool_mark_addressed(const pool_t *o) { vpool_taken(o); static __thread const uint8_t *last; if (o->mem && o->mem != last) { last = o->mem; mtl_pool_addressed(o->mem, o->size); } }
++static void pool_mark_addressed(const pool_t *o) { vpool_taken(o); ((pool_t *)o)->asked = 1; static __thread const uint8_t *last; if (o->mem && o->mem != last) { last = o->mem; mtl_pool_addressed(o->mem, o->size); } }
+ // A shader-code pool's own address (NVN_MEMORY_POOL_FLAGS_SHADER_CODE, 0x40; not virtual) is asked for to place programs: nvnProgramSetShaders takes code addresses. The GPU never reads that code,
+ // as the shaders run translated and their constants are copied into the host's buffers, so it does not put the pool into the raw pool table, where it would be resident and its pages wired.
+ // Ocarina of Time on the iPhone: 223 such pools, 317 MB, wired for nothing on an 8 GB device that pages the guest's files out. A buffer made in the pool still puts it in (nvnBufferInitialize)
+@@ -667,8 +667,21 @@ NVN(nvnTextureGetSparseTileLayout, void, const NVNtexture *t, NVNtextureSparseTi
+ NVN(nvnTextureGetSamples, int, const NVNtexture *t) { return CTX(t)->d.samples; }
+ NVN(nvnTextureGetMemoryPool, NVNmemoryPool *, const NVNtexture *t) { return (NVNmemoryPool *)CTX(t)->pool; }
+ NVN(nvnTextureGetMemoryOffset, ptrdiff_t, const NVNtexture *t) { return (ptrdiff_t)CTX(t)->off; }
+-// The GPU address of the texture's storage (DRAGON QUEST XI S, Unreal Engine 4.18, asks for it at start): pool address + offset, the same address space as nvnMemoryPoolGetBufferAddress
+-NVN(nvnTextureGetTextureAddress, NVNtextureAddress, const NVNtexture *t) { const tex_t *o = CTX(t); if (o->pool) vpool_taken(o->pool); if (o->pool) mtl_pool_addressed(o->pool->mem + o->off, o->L.size ? o->L.size : 1); return o->pool ? (NVNtextureAddress)(o->pool->mem + o->off) : 0; }
++// The GPU address of the texture's storage (DRAGON QUEST XI S, Unreal Engine 4.18, asks for it at start): pool address + offset, the same address space as nvnMemoryPoolGetBufferAddress.
++// A texture in storage the CPU cannot reach (CPU_NO_ACCESS), block-linear and not a buffer texture, has its content in a Metal texture of its own (a render target, a GPU-made image): its
++// storage's bytes are never its texels here, so a raw pointer to them would find nothing the GPU wrote, and its address does not put the pool into the raw pool table. Ocarina of Time
++// asks for its render targets' addresses, which lie in virtual pools over one 305 MB physical pool; through them and the mappings that pool was wired whole.
++static int tex_bytes_elsewhere(const tex_t *o) {
++    return o->pool && (o->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && o->d.target != NVN_TEXTURE_TARGET_BUFFER && !(o->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET));
++}
++NVN(nvnTextureGetTextureAddress, NVNtextureAddress, const NVNtexture *t) {
++    const tex_t *o = CTX(t);
++    if (o->pool) {
++        vpool_taken(o->pool);
++        if (!tex_bytes_elsewhere(o)) { ((pool_t *)o->pool)->asked = 1; mtl_pool_addressed(o->pool->mem + o->off, o->L.size ? o->L.size : 1); }
++    }
++    return o->pool ? (NVNtextureAddress)(o->pool->mem + o->off) : 0;
++}
+ // The size of a texture's ZCull save area (SaveZCullData / RestoreZCullData). The host does no ZCull and never touches the area, but games allocate it from their own pools, and NVN
+ // does not report 0. Cuphead (Unity 2017.4) allocates one per depth target (main+0x1948060) from its pool allocator, which gives a zero-size request the offset of a live block; its
+ // map of allocations then loses that block (the zero-size one's size overwrites it, and freeing the zero-size one deletes it), and the block's own free later pushes a garbage-sized
+@@ -3244,7 +3257,9 @@ NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappi
+         if (o->mem && o->mem != base) { LOG("[RED] MapVirtual: non-contiguous mapping (true sparse) not implemented: virtual pool %p already maps to %p, this request wants %p", (void *)o, (void *)o->mem, (void *)base); return 0; }
+         if (!o->mem) LOG("[nvn] MapVirtual: the storage of virtual pool %p (%#llx bytes) points at physical pool %p + %#llx", (void *)o, (unsigned long long)o->size, (const void *)ph, (unsigned long long)(r[i].poff - r[i].voff));
+         o->mem = base;
+-        mtl_pool_addressed(o->mem, o->size);   // an address may have been given out before it had storage
++        // An address may have been given out before it had storage (in the pool's own reserved range). Where none was and the CPU cannot reach the pool, it holds only textures whose
++        // content Metal keeps apart (tex_bytes_elsewhere), so the mapping does not put the physical pool into the raw pool table; a buffer or the pool's address given out later does.
++        if (o->asked || !(o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) mtl_pool_addressed(o->mem, o->size);
+     }
+     return 1;
+ }
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 0bb100cb33e0406a301e3498b0d028fe504489d3..c3a9ee881d3a589e738c5d616443bd8eef3f263f 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -1728,8 +1728,10 @@ static void pool_res(int i) {
+ // pools' buffers do at shared pages; GPU addresses are not contiguous across them, so a lookup must say how far it reads. One that does not know (length 1: an indirect draw's index buffer, a storage
+ // buffer whose address the game keeps or pushes) may read on to the pool's end, and takes one buffer of the whole pool, as raw global memory does, whose pool table the shader walks by itself (big_full).
+ // A guess of 64 MB past the address made a chunk of 80 to 96 MB at each stride such a lookup started in, overlapping each other and each counted whole by Metal: Trails in the Sky 1st Chapter
+-// had 4,243 MB of shared buffers over its 1,507 MB pool and its command buffers failed out of memory on an M1 (issue #877)
+-enum { BIG_MIN = 512u << 20, BIG_S = 16u << 20, BIG_MAX = 32 };
++// had 4,243 MB of shared buffers over its 1,507 MB pool and its command buffers failed out of memory on an M1 (issue #877). From 256 MB: Ocarina of Time's render
++// targets live in virtual pools over one 305 MB physical pool, which the raw pool table no longer names (hle_nvn.c tex_bytes_elsewhere); one compute shader still binds a 200 KB
++// storage buffer at an address in it every frame, and that lookup wired all 305 MB on the iPhone 17 (docs/reference/memory.md)
++enum { BIG_MIN = 256u << 20, BIG_S = 16u << 20, BIG_MAX = 32 };
+ typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; NSMutableArray *old; } big_pool;   // chunk: stride → g_pools index + 1; full: the whole pool's entry + 1; old: buffers a longer chunk replaced, alive with the pool
+ static big_pool g_big[BIG_MAX]; static int g_nbig;
+ static id<MTLBuffer> pool_buf(uintptr_t a, uintptr_t b);   // a pool's zero-copy buffer over [a, b), made over writable pages (below)
+diff --git a/dm/gfx/nvn/nvn_obj.h b/dm/gfx/nvn/nvn_obj.h
+index bf56444e2040b83a66a7de4aa036b58f06b0beb8..245673ea624f0ee1270cc8ec1dcae9b6bf8ed843 100644
+--- a/dm/gfx/nvn/nvn_obj.h
++++ b/dm/gfx/nvn/nvn_obj.h
+@@ -23,8 +23,8 @@ FITS(queue_builder_t, NVNqueueBuilder);
+ typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; int origin_ll; uint64_t serial; } queue_t;  FITS(queue_t, NVNqueue);
+ 
+ typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
+-// A virtual pool (flags 0x200) keeps its sparse state in vp (hle_nvn.c struct vpool, NULL for an aliased one); vmode: 0 not mapped yet, 1 aliased onto one physical pool, 2 sparse
+-typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; struct vpool *vp; int vmode; } pool_t;   FITS(pool_t, NVNmemoryPool);
++// A virtual pool (flags 0x200) keeps its sparse state in vp (hle_nvn.c struct vpool, NULL for an aliased one); vmode: 0 not mapped yet, 1 aliased onto one physical pool, 2 sparse; asked: an address that puts the pool in the raw pool table was handed out (hle_nvn.c)
++typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; struct vpool *vp; int vmode; uint8_t asked; } pool_t;   FITS(pool_t, NVNmemoryPool);
+ 
+ typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // Texture / sampler descriptor pool
+ FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+index afbdb8b7a139b5656ebe80f58297fb5b7fcac077..1416f8007657ff250bef2049397b21c7c677260b 100644
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -263,6 +263,8 @@ t_addr_known: t_addr_known.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_addr_known.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+ t_file_wire: t_file_wire.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_file_wire.m $(MTL_T_SRC) $(FW)
++t_gpu_only_addr: t_gpu_only_addr.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_gpu_only_addr.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+ t_vbuf_clamp: t_vbuf_clamp.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_vbuf_clamp.m $(MTL_T_SRC) $(FW)
+ t_present_keep: t_present_keep.m $(MTL_T_DEP)
+diff --git a/dm/gfx/tests/t_gpu_only_addr.m b/dm/gfx/tests/t_gpu_only_addr.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..daa5564e45e9494f332f9f67d770eb4db40cb888
+--- /dev/null
++++ b/dm/gfx/tests/t_gpu_only_addr.m
+@@ -0,0 +1,93 @@
++// The raw pool table (gmem_map) and storage the CPU cannot reach: a block-linear texture there keeps its content in a Metal texture of its own, so its address
++// (nvnTextureGetTextureAddress) and a virtual pool's mapping over a physical pool put nothing into the table, and nothing wires that pool for the table's sake. A buffer, the pool's own
++// address (before or after the mapping), a linear or buffer texture's address, and a texture address in CPU-visible storage still put the pool in. Pools of 256 MB or more wire in chunks
++// (BIG_MIN) so a small binding in a 305 MB GPU-only physical pool does not wire all of it (docs/reference/memory.md).
++#define nvn_game_fps nvn_game_fps_mtl_default
++#include "../nvn/nvn_mtl.m"
++#undef nvn_game_fps
++#define g_ft g_ft_hle
++#include "../nvn/hle_nvn.c"
++#undef g_ft
++uint64_t g_t0_ns;
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(label, c) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
++static int pool_resident(uint64_t a) { pthread_mutex_lock(&g_mu); int i = pool_find(a, 1), r = i >= 0 && g_pools[i].res; pthread_mutex_unlock(&g_mu); return r; }
++static int in_table(uint64_t b) {
++    id<MTLBuffer> t = gmem_map(); const uint8_t *e = (const uint8_t *)t.contents;
++    for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) { uint64_t r[2]; memcpy(r, e + (size_t)k * DMSH_GMEM_MAP_ENTRY, sizeof r); if (r[0] <= b && b < r[1]) return 1; }
++    return 0;
++}
++enum { LEN = 4u << 20, PHYS = 0x18c, VIRT_GPU = 0x2a1, CPU_POOL = 0x24, CPU_NONE = 0xa1 };
++static uint8_t *pages(size_t sz) { uint8_t *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (m == MAP_FAILED) abort(); return m; }
++static void pool_init_sz(pool_t *p, uint8_t *mem, size_t sz, uint32_t flags) { pool_builder_t pb = {.mem = mem, .size = sz, .flags = flags}; if (!h_nvnMemoryPoolInitialize((NVNmemoryPool *)p, (const NVNmemoryPoolBuilder *)&pb)) abort(); }
++static void pool_init(pool_t *p, uint8_t *mem, uint32_t flags) { pool_init_sz(p, mem, LEN, flags); }
++static void map_whole(pool_t *v, pool_t *phys) { map_req m = {.phys = (NVNmemoryPool *)phys, .size = LEN}; if (!h_nvnMemoryPoolMapVirtual((NVNmemoryPool *)v, 1, (const NVNmappingRequest *)&m)) abort(); }
++static uint64_t tex_addr_target(pool_t *pool, int64_t off, int target, uint32_t tflags) {
++    tex_t t; memset(&t, 0, sizeof t); t.magic = MAGIC('T', 'E', 'X', 0); t.pool = pool; t.off = off; t.mem = pool->mem + off;
++    t.d.target = target; t.d.width = t.d.height = 256; t.d.flags = tflags; t.L.size = 256 * 256 * 4;
++    return (uint64_t)h_nvnTextureGetTextureAddress((const NVNtexture *)&t);
++}
++static uint64_t tex_addr(pool_t *pool, int64_t off, uint32_t tflags) { return tex_addr_target(pool, off, NVN_TEXTURE_TARGET_2D, tflags); }
++int main(void) { @autoreleasepool {
++    mtl_init();
++    {   // render targets in a GPU-only virtual pool over a physical pool, as Ocarina of Time keeps them
++        uint8_t *m = pages(LEN); pool_t phys, virt; pool_init(&phys, m, PHYS); pool_init(&virt, NULL, VIRT_GPU); map_whole(&virt, &phys);
++        CHECK("the virtual pool aliases the physical pool's pages", virt.mem == m);
++        uint64_t a = tex_addr(&virt, 65536, 0);
++        CHECK("the texture address is pool address + offset", a == (uint64_t)(uintptr_t)m + 65536);
++        CHECK("neither the mapping nor a block-linear target's address puts the physical pool in the raw pool table", !in_table((uint64_t)(uintptr_t)m + 65536));
++        CHECK("so nothing makes it resident", !pool_resident((uint64_t)(uintptr_t)m));
++        tex_addr(&virt, 131072, NVN_TEXTURE_FLAGS_LINEAR);
++        CHECK("a linear texture's address does: its bytes are its content", in_table((uint64_t)(uintptr_t)m + 65536) && pool_resident((uint64_t)(uintptr_t)m));
++        h_nvnMemoryPoolFinalize((NVNmemoryPool *)&virt); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&phys);
++    }
++    {   // a buffer texture in a GPU-only virtual pool reads guest buffer bytes, so its address admits the pool
++        uint8_t *m = pages(LEN); pool_t phys, virt; pool_init(&phys, m, PHYS); pool_init(&virt, NULL, VIRT_GPU); map_whole(&virt, &phys);
++        tex_addr_target(&virt, 65536, NVN_TEXTURE_TARGET_BUFFER, 0);
++        CHECK("a buffer texture's address puts the physical pool in the raw pool table", in_table((uint64_t)(uintptr_t)m + 65536) && pool_resident((uint64_t)(uintptr_t)m));
++        h_nvnMemoryPoolFinalize((NVNmemoryPool *)&virt); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&phys);
++    }
++    {   // a buffer in the GPU-only virtual pool
++        uint8_t *m = pages(LEN); pool_t phys, virt; pool_init(&phys, m, PHYS); pool_init(&virt, NULL, VIRT_GPU); map_whole(&virt, &phys);
++        CHECK("mapped alone, the pool stays out", !in_table((uint64_t)(uintptr_t)m + 4096));
++        buf_builder_t bb = {.pool = &virt, .off = 8192, .size = 4096}; NVNbuffer buf;
++        CHECK("a buffer initializes in it", h_nvnBufferInitialize(&buf, (const NVNbufferBuilder *)&bb));
++        CHECK("a buffer puts the pool in the table", in_table((uint64_t)(uintptr_t)m + 4096) && pool_resident((uint64_t)(uintptr_t)m));
++        h_nvnBufferFinalize(&buf); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&virt); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&phys);
++    }
++    {   // the virtual pool's own address asked before its first mapping: main makes such a pool sparse (vmode 2), remapping physical pages into the reserved range
++        uint8_t *m = pages(LEN); pool_t phys, virt; pool_init(&phys, m, PHYS); pool_init(&virt, NULL, VIRT_GPU);
++        uint64_t va = h_nvnMemoryPoolGetBufferAddress((const NVNmemoryPool *)&virt);
++        map_whole(&virt, &phys);
++        CHECK("an address given out before the mapping stays in the raw pool table", va && in_table(va + 4096));
++        h_nvnMemoryPoolFinalize((NVNmemoryPool *)&virt); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&phys);
++    }
++    {   // plain pools
++        uint8_t *a = pages(LEN), *b = pages(LEN); pool_t cpu, none; pool_init(&cpu, a, CPU_POOL); pool_init(&none, b, CPU_NONE);
++        tex_addr(&cpu, 4096, 0);
++        CHECK("a texture address in CPU-visible storage puts its pool in, as before", in_table((uint64_t)(uintptr_t)a + 4096));
++        tex_addr(&none, 4096, 0);
++        CHECK("a block-linear texture's address in a CPU_NO_ACCESS pool does not", !in_table((uint64_t)(uintptr_t)b + 4096) && !pool_resident((uint64_t)(uintptr_t)b));
++        h_nvnMemoryPoolGetBufferAddress((const NVNmemoryPool *)&none);
++        CHECK("the pool's own address does", in_table((uint64_t)(uintptr_t)b + 4096));
++        h_nvnMemoryPoolFinalize((NVNmemoryPool *)&cpu); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&none);
++    }
++    {   // 305 MB GPU-only physical pool (as Ocarina of Time's render-target pool): >= BIG_MIN (256 MB), so a 200 KB lookup wires only its chunk, not the whole pool
++        const size_t sz = 305u << 20;
++        uint8_t *m = pages(sz); pool_t phys; pool_init_sz(&phys, m, sz, PHYS);
++        uint64_t base = (uint64_t)(uintptr_t)m;
++        CHECK("a 305 MB pool is tracked in chunks (BIG_MIN <= 256 MB)", big_of(base) >= 0);
++        void *mb = NULL; uint64_t mo = 0;
++        CHECK("a 200 KB lookup resolves in one chunk", mtl_addr(base + (64u << 20), 200u << 10, &mb, &mo));
++        CHECK("that chunk is smaller than the whole 305 MB pool", mb && ((__bridge id<MTLBuffer>)mb).length <= 2u * BIG_S);
++        h_nvnMemoryPoolFinalize((NVNmemoryPool *)&phys);
++        munmap(m, sz);
++    }
++    printf("t_gpu_only_addr: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }

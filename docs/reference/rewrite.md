@@ -21,6 +21,7 @@ interpreter and no process spawning.
 | detectors (UE cvar/fps/malloc/ring/region, Unity fps/bucket, Monolith, Snowdrop) | `detect/*.rs` |
 | `sdk_patches.py`, `engine_patches.py`, `games/*/patches.py` | `tables.rs` (generated), `patches.rs` (registry), `stubs.rs`, `stubs_games/<game>.rs` |
 | game profile `game.tsv` rows | `frame.rs` |
+| `mod_layout.py` (nxnative 17454fc3 + 65dfeb33: writable data on a 16 KB page of its own) | `layout.rs`, called right after the load |
 
 Python `re` patterns over Capstone operand text (tail-call recognisers) are kept verbatim through the `regex` crate;
 hot scans use word-level tests instead.
@@ -57,6 +58,43 @@ The Python loads `games/<id>/patches.py` dynamically. Rust uses a static registr
   `<name>.match.tsv` and the log.
 * After an engine update: regenerate the tables, port what the script lists, check with `tools/stubtest.py --export`
   against the engine's Python, put the new digest in the `GamePort`.
+* `tools/overlay/` holds patch files ported from upstream nxnative before the pinned engine has them; the generator reads
+  them instead of (or beside) the engine's, each checked against the sha256 of the engine file it replaces
+  (`overlay.tsv`; a moved engine stops the generation; `--no-overlay` reads the engine alone, which still gives the
+  tables of before the overlay byte for byte). Since 2026-11-23:
+  * South Park: The Stick of Truth (`010095300B6A4000`), nxnative 67736c99 verbatim: a function-matched cut in the
+    caller of the Onyx frame-rate setter (`mov w0,#30` -> `#60` at +0x19c of a 0x1c8-byte function, the same on 1.0.0
+    and 1.01). The game then runs at 60 fps whatever the launcher says (the game steps by elapsed time; checked by
+    upstream on a Mac only, never on an iPhone; thermal: twice the frames).
+  * South Park: The Fractured But Whole (`01008F2005154000`), nxnative e74c3fa7: the Snowdrop three-pool allocator
+    12 GB -> 4 GB (`main`), and e74c3fa7's SDK 3.5.1 older-VammManager rule (1 GB node area -> 64 MB, 1 GB region
+    alignment -> 32 MB, two functions) as this profile's own `sdk` rule. Upstream makes it SDK-wide and replaces Kingdom
+    Battle's `9de92bad` CUTS with an SDK 4.4.0 twin; here the CUTS stay and the rule is the game's, so no other game's
+    rewrite, and no other `match.tsv`, changes.
+  * The Legend of Zelda: Ocarina of Time (`0400486024DEC000`): the pinned patch file plus nxnative c12000da (the
+    dynamic-resolution threshold scaled by `60 / target fps` under a target below 60, so `DM_FPS_TARGET=30` gives 166
+    instead of 83; only with `DM_DYNAMIC_RESOLUTION=1`) and b3d287fe (`DM_RENDER_SCALE` on the 3D view-size update,
+    v131072 `main+0x31d3200`, +0xce4 / +0xd48, and the level stub held at level 0 under a scale below 1.0;
+    `RENDER_SCALE 1` in `fixups.tsv`). b3d287fe's two branch helpers are renamed in the overlay (`_rs_bcond`,
+    `_rs_cbz_w`): the pinned file's `_cbz_w` has another argument order and serves its screen-shape stubs. The
+    build-ID form (`FRAME_STEP` of v131072) names the view-size function at its offset, as the matched form finds it.
+
+## Module layout on the host's 16 KB pages
+
+Horizon maps modules at 4 KB, the Mac and iOS hosts at 16 KB with W^X: the loader seals `[0, round16K(text_end))`
+read + execute, so a module whose data starts below that boundary has read-only data and faults in `relocate()`
+(FINAL FANTASY VIII Remastered's Math.nro and Platform.nro). `layout::relayout_module` (nxnative 17454fc3 + 65dfeb33)
+moves data and bss up by whole 4 KB pages, keeps text and read-only data in place (jump tables between them stay
+right), and rewrites what crosses into the moved part: the NRO header, MOD0, dynamic tags, symbols (not `STT_TLS`),
+RELA / JMPREL / RELR, the text's adrp / adr / literal loads (not the data blocks and literal pools in text), and
+`.eh_frame_hdr` / `.eh_frame` pointers. The words it changes in text are listed in `changed.tsv` (the original text
+is the file's). A module that already fits, every module rewritten before, is returned untouched, so its rewrite is
+byte for byte what it was. The engine's `loader.c` check (`data_off >= round16K(text_end)`, a clear stop on a module
+rewritten before the fix) is an engine patch, not part of this crate.
+`Options::no_relayout` (`--no-relayout`) leaves the step out: only for the tests whose oracle is the pinned engine's
+`patch_nso.py`, which has no `mod_layout` (`tests/synthetic.rs`, `tests/select.rs`, the stub fixtures, `tools/stubtest.py`):
+54 of their 106 synthetic modules have data on the code's 16 KB page and would move. The real modules (Grizzy, Ocarina
+of Time) run with the step and stay identical to their oracles.
 
 ## Design points
 
@@ -84,14 +122,19 @@ Fixture-dependent tests skip (with a message) without game files or the engine t
 * `tests/synthetic.rs`: 21 synthetic modules with the oracle's hashes in `tests/fixtures/synth/manifest.tsv`
   (no game code; rebuilt by `tools/export_fixtures.py` + `tools/synth_manifest.py`). 17 are rewritten file for
   file; 4 stop with the Python's message.
-* `tests/select.rs` (CSEL/x18 fixtures), `stubs_games::difftest` (84 stub cases: build-keyed live-compared in
+* `tests/select.rs` (CSEL/x18 fixtures), `stubs_games::difftest` (stub cases: build-keyed live-compared in
   development, matched rules as fixtures), `tests/damaged_module.rs`, `tests/patch_coverage.rs`.
+* `tests/layout.rs`: `layout.rs` against nxnative's `mod_layout.py` on 135 synthetic modules (upstream's test images,
+  edge and error cases, 120 fuzzed variants: `tests/fixtures/layout/`, made by `tools/layoutcases.py`), and the whole
+  rewrite of 30 moved modules plus 7 stops against `patch_nso.py` with `mod_layout` called after the load
+  (`rewrite.tsv`). Needs no game files.
 * `ibuilder-a64` tests: encoders against values generated by `tools/gen_asm_tests.py`; `tests/cs_golden.rs` and
   `examples/cs_probe.rs` compare Capstone decoding with the Python binding (bundled Capstone 5.0.6 matches 5.0.7
   on every tested word).
 * `ibuilder-nso/tests/zbic.rs`, `zstd_machinery.rs`: ZBIC/zstd decoder.
 * Development-only differential fuzzers against the Python (not cargo tests): `tools/difftest.py`, `jsfuzz.py`,
-  `selecttest.py`, `stubtest.py`, `bigtext.py`.
+  `selecttest.py`, `stubtest.py`, `bigtext.py`, `layoutcases.py`. They need a Python with Capstone 5 (and lz4 for
+  `stubtest.py --export`). `tests/ocarina.rs` finds the game with `IBUILDER_OCARINA_EXEFS=<extract>/ExeFS`.
 
 Oracle comparisons were run on Grizzy and Ocarina of Time (Switch 2) modules; everything else is covered by the
 synthetic and fuzz tests, not by game files.

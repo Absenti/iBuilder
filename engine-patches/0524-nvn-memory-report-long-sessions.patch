@@ -1,0 +1,55 @@
+# (after 0523) nvn/memory: the memory report keeps a line every 3,000 frames after its first 400 (it went silent in long sessions)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/930fbff2b6a57f14657344c018adea8bd34232d8  ("nvn/mem: keep sparse memory reports in long sessions")
+#            author seedds, 2026-11-22 10:47 +0800; Co-authored-by: Chemi25
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: the "memory up to frame" line stopped after 400 lines; in an Ocarina of Time report the last sample came before the footprint growth and the late frames (upstream refs #2629).
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m mtl_mem_stat, a comment in hle_nvn.c): the first 400 reports as before (every 300 frames on a 64 MB move, else every 3,000), then one every 3,000.
+# Adapted: by hand (this tree's mtl_mem_stat begins with 0505's pool census). Games: every game (diagnostic). Switches: none.
+# Tests: no test (upstream has none); compiled in every gfx test. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0523, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index 733142531ca7df1192954788716f2a5a4b0c15c3..f37488e41e008ee41741108e04b0a572b1f2ded2 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -2120,7 +2120,7 @@ static void dump_frame(void) {
+     else if (g_frame % 300 == 0) LOG("[nvn] frame %llu: %u functions %llu calls", g_frame, nfn, total);
+     g_frame++; cs_dump();
+ counts_done:
+-    // Every 300 frames read resident memory and hand it to the graphics layer to print the memory readout line (mtl_mem_stat, low frequency, capped). Memory watchdog: when resident memory exceeds the cap, log a failure and exit on its own. On by default only on the Mac host (24 GB: runaway host memory
++    // Every 300 frames read resident memory for the graphics layer's memory report (mtl_mem_stat). Memory watchdog: when resident memory exceeds the cap, log a failure and exit on its own. On by default only on the Mac host (24 GB: runaway host memory
+     // drags the whole machine into a kernel panic, which happened twice with other programs on the same machine), or set for tests with DM_MEM_CAP_GB=<integer>; the player's iOS app has no cap (exiting before the system kills it is pointless and only adds another kind of crash)
+     if (g_frame % 300 == 0) { task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+         if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) { unsigned long long mb = (unsigned long long)(vi.phys_footprint >> 20); void mtl_mem_stat(unsigned long long, unsigned long long); mtl_mem_stat(g_frame, mb);
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index f677674c992a62120c76ad7e4fb85c6e495dbc1a..313b1fca0c31823bbd96f76a369a3cccdcb8419e 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -6651,9 +6651,10 @@ static MTLTextureUsage tbuf_usage(MTLPixelFormat pf) {
+     else if (tu) tu_register(mt, t->serial);
+     return tex_mtl_result(got, owned);
+ }
+-// Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
++// Memory readout line: resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
+ // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
+-// Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
++// The frame hook samples every 300 frames. For the first 400 reports, a change of at least 64 MB in resident or GPU allocated memory also triggers a report. After 400 reports, log every 3000 frames.
++// All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting).
+ static _Atomic uint64_t g_gptr_bindings, g_gptr_reads, g_gptr_added, g_gptr_bytes;   // gmem_discover: bindings with sources, readable words, newly addressed logical pool/run ranges and bytes
+ // The pools in the residency set and why (L7.2.1, diagnostic, every 600 frames): a pool's zero-copy buffer in the set wires every page of it, and on an iPhone that is charged to the app's
+ // footprint (the graphics ledger: 2.4-3.9 GB of Ocarina of Time's 3.4-5.2 GB on an iPhone 18 Pro). n_tex_reads / n_other: the first lookups of each pool by texture uploads and by
+@@ -6688,7 +6689,10 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
+     if (!(frame % 600)) pool_census(frame);
+     static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
+     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
+-    if (lines >= 400 || (lines && dr < 64 && dg < 64 && frame - last_frame < 3000)) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
++    int sparse = lines >= 400;   // seedds/nxnative 930fbff2: after 400 reports, one every 3000 frames instead of none (a long session's growth stays visible)
++    if (lines && frame - last_frame < 3000 && (sparse || (dr < 64 && dg < 64))) return;
++    if (!sparse) lines++;
++    last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
+     if (g_bc_cpu) MLOG("no BC: BC textures uploaded with the GPU decode %llu, with the CPU decode %llu; stored as ASTC 4x4, transcoded on the GPU %llu, on the CPU %llu", (unsigned long long)g_bc_up_gpu, (unsigned long long)g_bc_up_cpu,
+                        (unsigned long long)g_bc_astc_gpu, (unsigned long long)g_bc_astc_cpu);   // 0510, 0511
+     pthread_mutex_lock(&g_deferred_mu); unsigned long nd = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);

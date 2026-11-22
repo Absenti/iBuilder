@@ -44,6 +44,9 @@ pub struct Options {
     pub spin_list: bool,
     /// the engine's `dm/tools` folder: only to write `build_src.sha256` (hashes of the Python sources)
     pub py_tools: Option<PathBuf>,
+    /// leave out the 16 KB relayout (`layout`, nxnative mod_layout.py): only for comparisons with a Python oracle made before it (the pinned engine's `patch_nso.py`)
+    /// on synthetic modules whose data shares the code's 16 KB page; the real modules of the games seen so far are not moved anyway. Default: the relayout runs
+    pub no_relayout: bool,
 }
 
 /// `(offset, original bytes hex, new bytes hex, reason)` of a cut applied to the image
@@ -117,6 +120,21 @@ impl Img {
             text_end,
             orig: HashMap::new(),
         }
+    }
+    /// `Img::new` of an image whose text was already changed (the relayout's adrp / adr / literal words): `pre` is the text before, `ORIG_TEXT`
+    pub fn with_orig_text(b: Vec<u8>, text_end: usize, pre: Option<&[u8]>) -> Img {
+        let mut img = Img::new(b, text_end);
+        if let Some(pre) = pre {
+            let mut a = 0;
+            while a + 4 <= text_end.min(pre.len()) {
+                let was = rd32(pre, a);
+                if was != rd32(&img.b, a) {
+                    img.orig.insert(a, was);
+                }
+                a += 4;
+            }
+        }
+        img
     }
     #[inline]
     pub fn w(&self, off: i64) -> u32 {
@@ -499,6 +517,17 @@ fn align_up(v: i64, a: i64) -> i64 {
 pub fn rewrite_once(file: &[u8], file_name: &str, name: &str, opts: &Options) -> Res<Rewritten> {
     let module =
         ibuilder_nso::load(file, file_name).map_err(|e| Fail::new(format!("[RED] {}", e.0)))?;
+    // Horizon maps modules at 4 KB, Apple hosts at 16 KB (W^X / signed __TEXT): writable data that would share the code's 16 KB page moves up by whole 4 KB
+    // pages (`layout`, nxnative mod_layout.py). `ORIG_TEXT` is the text as the file has it, before the move: the words it changes count as changed
+    let pre_text = (!opts.no_relayout
+        && crate::layout::shift_needed(module.text_end() as u64, module.segments[2].0 as u64) != 0)
+        .then(|| module.image[..module.text_end() as usize].to_vec());
+    let (module, _relayout, relayout_notes) = if opts.no_relayout {
+        (module, 0, Vec::new())
+    } else {
+        crate::layout::relayout_module(module)
+            .map_err(|e| Fail::new(format!("[RED] {name}: {e}")))?
+    };
     let bss = module.bss as i64;
     let text_end = module.text_end() as i64;
     let (ro_off, data_off) = (module.segments[1].0 as i64, module.segments[2].0 as i64);
@@ -575,7 +604,7 @@ pub fn rewrite_once(file: &[u8], file_name: &str, name: &str, opts: &Options) ->
         ro_off,
         data_off,
         bss,
-        img: Img::new(image, text_end as usize),
+        img: Img::with_orig_text(image, text_end as usize, pre_text.as_deref()),
         far,
         front,
         big_text,
@@ -629,6 +658,9 @@ pub fn rewrite_once(file: &[u8], file_name: &str, name: &str, opts: &Options) ->
         spin_sites: Vec::new(),
         spin_words: Vec::new(),
     };
+    if !relayout_notes.is_empty() {
+        rw.say(format!("{name}: {}", relayout_notes.join("; ")));
+    }
     rw.run()?;
     rw.finish()
 }

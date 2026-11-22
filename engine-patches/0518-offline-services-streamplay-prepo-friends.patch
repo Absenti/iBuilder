@@ -1,0 +1,242 @@
+# (after 0517) host/offline: four offline service answers (streamplay HID feature query, prepo idle transmission, friend-ID / network Result hooks, friends no-Uid and blocked-user forms)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/b768913fd08fb7b62cc69b00b23b42ff813dc17b  ("host/streamplay: serve the supported HID feature query (PR #3162)")
+#            author seedds, 2026-11-22 23:34 +0800; Co-authored-by: Benjyp
+# Upstream:  https://github.com/seedds/nxnative/commit/1364b89a498fb78af42c8d42e7beebbd3bbd5de6  ("host/prepo: report idle transmission offline (PR #2908)")
+#            author seedds, 2026-11-22 01:15 +0800; Co-authored-by: heavn-r
+# Upstream:  https://github.com/seedds/nxnative/commit/656f8844021012649c5ed3d603180f3676f295ef  ("host/offline: register friend-ID and network Result hooks (PR #3119)")
+#            author seedds, 2026-11-22 02:12 +0800; Co-authored-by: PikaMan80, Eliran Zach
+# Upstream:  https://github.com/seedds/nxnative/commit/977f5cab3a1357a3995fd57c72e43acaa4618034  ("host/friends: hook blocked-user availability, no-Uid forms, and cut-object methods")
+#            author seedds, 2026-11-23 00:21 +0800; Co-authored-by: Anderson Souza
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: each call reached a Nintendo service the host does not run and the SDK aborted with 0xe15 (or entered the service): Star Fox's nn::streamplay::GetSupportedHidFeatureSet
+#   (PR #3162), Nintendo Switch Sports' play-report transmission status after a Chambara win (PR #2908), Super Kirby Clash 1.0.1's account-ID friend lists and
+#   ShowNetworkServiceError(nn::Result) (PR #3119), SUPER BOMBERMAN R 2 1.0.0's EnsureBlockedUserListAvailable at the title screen (issue #3177).
+# WHAT IT CHANGES (dm/host/hle_misc.c, hle_offline.c, hle_friends.c; tests t_pctl, t_server_environment, t_friends):
+#   streamplay: SetSupportedHidFeatureSet keeps its 32-bit mask, a GetSupportedHidFeatureSet takeover returns it. prepo: transmission status idle. offline: the two friend-ID list exports fail
+#   with zero entries and leave the ID array, ShowNetworkServiceError logs the Result and sends the usual applet notifications. friends: 13 more nn::friends symbols under the offline policy
+#   (blocked-user availability with and without Uid, no-Uid overloads, Friend::Update, AsyncContext::Cancel).
+# Adapted: 977f5cab's NotificationQueue::Initialize() / Clear() / Finalize() hooks are NOT taken (they fail the queue); engine-patches/0513 already hooks them with its own meaning
+#   (the queue opens and stays empty, Beach Buggy Racing 2), and 0513 stays as it is. The upstream t_friends block is ported without its NotificationQueue lines (0513 checks those).
+#   One patch for the four commits (the review's candidates 0518, 0519, 0520 and 0523, which apply in a row on disjoint hunks).
+# Games: Star Fox (0400E88025B1A000), Nintendo Switch Sports, Super Kirby Clash, SUPER BOMBERMAN R 2; any game that asks the same. Switches: none.
+# Tests (M1 Pro): t_friends 61 checks (0513's and 977f5cab's), t_pctl, t_server_environment, all in the host-unit run of HOST_TESTS. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0517, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/host/hle_friends.c b/dm/host/hle_friends.c
+index b6066820a7d3196984aca81231b92a2f4ee1570d..399d32908cdd9c9dc4ac66b5b19ea2915709aa37 100644
+--- a/dm/host/hle_friends.c
++++ b/dm/host/hle_friends.c
+@@ -13,19 +13,35 @@ HLE_FORCE("_ZN2nn7friends12AsyncContextC1Ev", "async context creates no session
+ HLE_FORCE("_ZN2nn7friends12AsyncContextD1Ev", "async context has no session to close (cut)", void, h_fr_AcDtor, void *self) { (void)self; }
+ HLE_FORCE("_ZN2nn7friends12AsyncContext14GetSystemEventEPNS_2os11SystemEventE", "completion event fires immediately (cut)", Result, h_fr_AcGetEv, void *self, void *ev) { (void)self; hle_signal_system_event(ev); return RES_OK; }
+ HLE_FORCE("_ZNK2nn7friends12AsyncContext9GetResultEv", "async result always fails (cut)", Result, h_fr_AcResult, const void *self) { (void)self; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends12AsyncContext6CancelEv", "async context has nothing to cancel (cut)", Result, h_fr_AcCancel, void *self) { (void)self; return RES_OK; }
+ // Lists / profiles / play history
+ HLE_FORCE("_ZN2nn7friends13GetFriendListEPiPNS0_6FriendEiiRKNS0_12FriendFilterE", "friend list is empty (cut)", Result, h_fr_GetFriendList, int *count, void *out, int off, int n, const void *filt) {
+     (void)out; (void)off; (void)n; (void)filt; if (count) *count = 0; return RES_FAIL;
+ }
++HLE_FORCE("_ZN2nn7friends25EnsureFriendListAvailableEPNS0_12AsyncContextE", "friend list (cut): the request fails at once", Result, h_fr_ListEnsureNoUid, void *ctx) { (void)ctx; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends27CheckFriendListAvailabilityEPb", "friend list unavailable (cut)", Result, h_fr_ListAvailNoUid, uint8_t *out) { if (out) *out = 0; return RES_OK; }
+ // Blocked users, SDK 4's overload without a Uid: an empty list and success. Dark Souls Remastered asks after the opening movie and turns a failure into an error for the error applet
+ // (main+0x8ff9f0). The Uid overload below reports a failure, which DRAGON QUEST XI S takes as it is
+ HLE_FORCE("_ZN2nn7friends18GetBlockedUserListEPiPNS_7account23NetworkServiceAccountIdEii", "blocked user list is empty (cut)", Result, h_fr_GetBlocked4, int *count, void *out, int off, int n) {
+     (void)out; (void)off; (void)n; if (count) *count = 0; return RES_OK;
+ }
++// Blocked-user list availability (SUPER BOMBERMAN R 2 1.0.0 calls EnsureBlockedUserListAvailable(ctx) at the title screen, aborting 0xe15 when the SDK opens friend:u)
++HLE_FORCE("_ZN2nn7friends30EnsureBlockedUserListAvailableEPNS0_12AsyncContextE", "blocked user list (cut): the request fails at once", Result, h_fr_BlockedEnsureNoUid, void *ctx) { (void)ctx; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends30EnsureBlockedUserListAvailableEPNS0_12AsyncContextERKNS_7account3UidE", "blocked user list (cut): the request fails at once",
++          Result, h_fr_BlockedEnsure, void *ctx, const void *uid) { (void)ctx; (void)uid; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends32CheckBlockedUserListAvailabilityEPb", "blocked user list unavailable (cut)", Result, h_fr_BlockedAvailNoUid, uint8_t *out) { if (out) *out = 0; return RES_OK; }
++HLE_FORCE("_ZN2nn7friends32CheckBlockedUserListAvailabilityEPbRKNS_7account3UidE", "blocked user list unavailable (cut)", Result, h_fr_BlockedAvail, uint8_t *out, const void *uid) {
++    (void)uid; if (out) *out = 0; return RES_OK;
++}
+ HLE_FORCE("_ZN2nn7friends14GetProfileListEPNS0_12AsyncContextEPNS0_7ProfileERKNS_7account3UidEPKNS5_23NetworkServiceAccountIdEi", "profile query fails (cut)",
+           Result, h_fr_GetProfileList, void *ctx, void *out, const void *uid, const void *ids, int n) { (void)ctx; (void)out; (void)uid; (void)ids; (void)n; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends14GetProfileListEPNS0_12AsyncContextEPNS0_7ProfileEPKNS_7account23NetworkServiceAccountIdEi", "profile query fails (cut)",
++          Result, h_fr_GetProfileListNoUid, void *ctx, void *out, const void *ids, int n) { (void)ctx; (void)out; (void)ids; (void)n; return RES_FAIL; }
+ HLE_FORCE("_ZN2nn7friends16UpdateFriendInfoEPNS0_6FriendERKNS_7account3UidEPKNS3_23NetworkServiceAccountIdEi", "friend info update fails (cut)",
+           Result, h_fr_UpdateFriendInfo, void *f, const void *uid, const void *ids, int n) { (void)f; (void)uid; (void)ids; (void)n; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends16UpdateFriendInfoEPNS0_6FriendEPKNS_7account23NetworkServiceAccountIdEi", "friend info update fails (cut)",
++          Result, h_fr_UpdateFriendInfoNoUid, void *f, const void *ids, int n) { (void)f; (void)ids; (void)n; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends6Friend6UpdateEv", "friend info update fails (cut)", Result, h_fr_FriendUpdate, void *self) { (void)self; return RES_FAIL; }
+ HLE_FORCE("_ZN2nn7friends14AddPlayHistoryERKNS0_26PlayHistoryRegistrationKeyERKNS0_15InAppScreenNameES6_", "play history is not registered (cut)",
+           Result, h_fr_AddPlayHistory, const void *k, const void *a, const void *b) { (void)k; (void)a; (void)b; return RES_FAIL; }
+ HLE_FORCE("_ZN2nn7friends29GetPlayHistoryRegistrationKeyEPNS0_26PlayHistoryRegistrationKeyERKNS_7account3UidEb", "play history key unavailable (cut)",
+@@ -70,9 +86,12 @@ HLE_FORCE("_ZN2nn7friends18GetBlockedUserListEPiPNS_7account23NetworkServiceAcco
+           Result, h_fr_GetBlocked, int *count, void *out, const void *uid, int off, int n) { (void)out; (void)uid; (void)off; (void)n; if (count) *count = 0; return RES_FAIL; }
+ // Online play sessions (DRAGON QUEST XI S)
+ HLE_FORCE("_ZN2nn7friends28DeclareOpenOnlinePlaySessionERKNS_7account3UidE", "online play session unavailable (cut)", Result, h_fr_OpenSession, const void *uid) { (void)uid; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends28DeclareOpenOnlinePlaySessionEv", "online play session unavailable (cut)", Result, h_fr_OpenSessionNoUid, void) { return RES_FAIL; }
+ HLE_FORCE("_ZN2nn7friends29DeclareCloseOnlinePlaySessionERKNS_7account3UidE", "online play session unavailable (cut)", Result, h_fr_CloseSession, const void *uid) { (void)uid; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends29DeclareCloseOnlinePlaySessionEv", "online play session unavailable (cut)", Result, h_fr_CloseSessionNoUid, void) { return RES_FAIL; }
+ // A user's own presence succeeds offline. The host accepts initialization, description and commit without publishing to the friends service.
+ // Returning failure here can stop a game's startup; see services.md, "Friends presence is accepted offline".
+ HLE_FORCE("_ZN2nn7friends12UserPresence10InitializeERKNS_7account3UidE", "presence accepted, not published (cut)", Result, h_fr_UpInit, void *self, const void *uid) { (void)self; (void)uid; return RES_OK; }
++HLE_FORCE("_ZN2nn7friends12UserPresence10InitializeEv", "presence accepted, not published (cut)", Result, h_fr_UpInitNoUid, void *self) { (void)self; return RES_OK; }
+ HLE_FORCE("_ZN2nn7friends12UserPresence14SetDescriptionEPKc", "presence accepted, not published (cut)", Result, h_fr_UpDesc, void *self, const char *s) { (void)self; (void)s; return RES_OK; }
+ HLE_FORCE("_ZN2nn7friends12UserPresence6CommitEv", "presence accepted, not published (cut)", Result, h_fr_UpCommit, void *self) { (void)self; return RES_OK; }
+diff --git a/dm/host/hle_misc.c b/dm/host/hle_misc.c
+index a51d69b768961125b51ea40d513a95ab942b1c43..adcc360878348ea2d8d73a729b7a06dcef21ccce 100644
+--- a/dm/host/hle_misc.c
++++ b/dm/host/hle_misc.c
+@@ -213,12 +213,14 @@ static uint8_t g_stpl_ev[0x80] __attribute__((aligned(16)));
+ HLE_FORCE("_ZN2nn10streamplay30GetConnectionStateChangedEventEv", "streamplay connection state event: bound, never signaled", void *, h_stpl_ConnEv, void) {
+     hle_bind_system_event(g_stpl_ev, 0); return g_stpl_ev; }
+ HLE_FORCE("_ZN2nn10streamplay18GetConnectionStateEPNS0_15ConnectionStateE", "streamplay connection state: not connected (0)", void, h_stpl_ConnState, uint32_t *s) { *s = 0; }
+-static _Atomic uint32_t g_stpl_styles, g_stpl_hold;
++static _Atomic uint32_t g_stpl_styles, g_stpl_hold, g_stpl_hid_features;
+ HLE_FORCE("_ZN2nn10streamplay29SetSupportedGuestNpadStyleSetENS_4util10BitFlagSetILi32ENS_3hid12NpadStyleTagEEE", "guest pad styles: kept for the getter", void, h_stpl_SetStyles, uint32_t s) { g_stpl_styles = s; }
+ HLE_FORCE("_ZN2nn10streamplay29GetSupportedGuestNpadStyleSetEv", "guest pad styles: what the game set", uint32_t, h_stpl_GetStyles, void) { return g_stpl_styles; }
+ HLE_FORCE("_ZN2nn10streamplay23SetGuestNpadJoyHoldTypeENS_3hid15NpadJoyHoldTypeE", "guest Joy-Con hold type: kept for the getter", void, h_stpl_SetHold, uint32_t t) { g_stpl_hold = t; }
+ HLE_FORCE("_ZN2nn10streamplay23GetGuestNpadJoyHoldTypeEv", "guest Joy-Con hold type: what the game set", uint32_t, h_stpl_GetHold, void) { return g_stpl_hold; }
+-HLE_FORCE("_ZN2nn10streamplay25SetSupportedHidFeatureSetENS_4util10BitFlagSetILi32ENS0_13HidFeatureTagEEE", "guest hid features: no guest", void, h_stpl_HidFeat, uint32_t s) { (void)s; }
++HLE_FORCE("_ZN2nn10streamplay25SetSupportedHidFeatureSetENS_4util10BitFlagSetILi32ENS0_13HidFeatureTagEEE", "guest hid features: kept for the getter", void, h_stpl_HidFeat, uint32_t s) { g_stpl_hid_features = s; }
++// SDK 21.4.4 opens stpl:u lazily here, even when no guest is connected. Match the setter just as the style / hold queries above do; this is a configured mask, not a connected-pad report.
++HLE_FORCE("_ZN2nn10streamplay25GetSupportedHidFeatureSetEv", "guest hid features: what the game set", uint32_t, h_stpl_GetHidFeat, void) { return g_stpl_hid_features; }
+ HLE_FORCE("_ZN2nn10streamplay19GetGuestPadStyleSetERKNS0_10GuestPadIdE", "guest pad style: none (no guest)", uint32_t, h_stpl_PadStyle, const void *id) { (void)id; return 0; }
+ #define STPL_PAD(mangled, cname) HLE_FORCE(mangled, "guest pad states: none (no guest)", int, cname, void *out, int n, const void *id) { (void)out; (void)n; (void)id; return 0; }
+ STPL_PAD("_ZN2nn10streamplay17GetGuestPadStatesEPNS0_13GuestPadStateINS_3hid16NpadFullKeyStateEEEiRKNS0_10GuestPadIdE", h_stpl_PadFull)
+diff --git a/dm/host/hle_offline.c b/dm/host/hle_offline.c
+index 9b94a0477761cbdda76c765481a97c024ccd91cb..ee143d71c0ccc127f18371234061a47d9c0d9df0 100644
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -19,6 +19,7 @@ HLE_FORCE("_ZN2nn5prepo10InitializeEv", "telemetry init: the original connects t
+ HLE_FORCE("_ZN2nn5prepo12AddSessionIdEPNS0_10PlayReportEPKc", "telemetry session ID: no service connection, nothing added, reports success", Result, h_prepo_AddSess, void *rep, const char *key) { (void)rep; (void)key; return RES_OK; }
+ HLE_FORCE("_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", "telemetry internet connection status: no service connection, nothing added, reports success", Result, h_prepo_AddNet, void *rep, const char *a, const char *b, const char *c) { (void)rep; (void)a; (void)b; (void)c; return RES_OK; }
+ HLE_FORCE("_ZN2nn5prepo28RequestImmediateTransmissionEv", "telemetry immediate upload; nothing is sent, reports success", Result, h_prepo_Tx, void) { return RES_OK; }
++HLE_FORCE("_ZN2nn5prepo21GetTransmissionStatusEPNS0_18TransmissionStatusE", "telemetry upload status: idle (nothing is queued)", Result, h_prepo_TxStatus, uint32_t *st) { if (st) *st = 0; return RES_OK; }
+ 
+ // ---------- ldn: local wireless. Initialization fails, state is always "none" ----------
+ HLE_FORCE("_ZN2nn3ldn10InitializeEv", "local wireless (cut): initialization fails", Result, h_ldn_Init, void) { return RES_FAIL; }
+@@ -151,6 +152,12 @@ HLE_FORCE("_ZN2nn3nsd35GetApplicationServerEnvironmentTypeEv", "server environme
+ HLE_FORCE("_ZN2nn7friends12SetAllocatorEPFPvmEPFvS1_mE", "friends library allocator; no session is created, ignored", void, h_fr_SetAlloc, void *a, void *f) { (void)a; (void)f; }
+ HLE_FORCE("_ZN2nn7friends13GetFriendListEPiPNS0_6FriendERKNS_7account3UidEiiRKNS0_12FriendFilterE", "friend list is empty (cut)", Result, h_fr_List2,
+           int *count, void *out, const void *uid, int off, int n, const void *filt) { (void)out; (void)uid; (void)off; (void)n; (void)filt; if (count) *count = 0; return RES_FAIL; }
++// Super Kirby Clash (SDK 7.4) requests account IDs rather than Friend objects. These
++// overloads need the same offline cut: no service connection, no entries, and failure.
++HLE_FORCE("_ZN2nn7friends13GetFriendListEPiPNS_7account23NetworkServiceAccountIdEiiRKNS0_12FriendFilterE", "friend ID list is empty (cut)", Result, h_fr_IdList,
++          int *count, void *out, int off, int n, const void *filt) { (void)out; (void)off; (void)n; (void)filt; if (count) *count = 0; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends13GetFriendListEPiPNS_7account23NetworkServiceAccountIdERKNS2_3UidEiiRKNS0_12FriendFilterE", "friend ID list is empty (cut)", Result, h_fr_IdList2,
++          int *count, void *out, const void *uid, int off, int n, const void *filt) { (void)out; (void)uid; (void)off; (void)n; (void)filt; if (count) *count = 0; return RES_FAIL; }
+ HLE_FORCE("_ZN2nn7friends27CheckFriendListAvailabilityEPbRKNS_7account3UidE", "friend list unavailable (cut)", Result, h_fr_ListAvail, uint8_t *out, const void *uid) { (void)uid; *out = 0; return RES_OK; }
+ HLE_FORCE("_ZN2nn7friends25EnsureFriendListAvailableEPNS0_12AsyncContextERKNS_7account3UidE", "friend list (cut): the request fails at once", Result, h_fr_ListEnsure, void *ctx, const void *uid) { (void)ctx; (void)uid; return RES_FAIL; }
+ HLE_FORCE("_ZN2nn7friends12AsyncContext7HasDoneEPb", "async context: always done", Result, h_fr_AcHasDone, void *self, uint8_t *done) { (void)self; *done = 1; return RES_OK; }
+@@ -181,6 +188,12 @@ HLE_FORCE("_ZN2nn3err20ShowApplicationErrorERKNS0_19ApplicationErrorArgE", "appl
+ // Pokémon Sword (SDK 7.3.2): the error applet's network service form, after a failed online call
+ HLE_FORCE("_ZN2nn3err23ShowNetworkServiceErrorENS0_9ErrorCodeE", "network service error applet; the host only logs it", void, h_err_ShowNet, uint64_t code) { DM_APPLET("error"); LOG("game asks to show a network service error: %04u-%04u", (unsigned)(code & 0xffffffff), (unsigned)(code >> 32)); }
+ 
++// SDK 7.4 also takes a Result here, not the separate ErrorCode pair. Keep the
++// host's log-only network error behavior rather than entering the absent applet service.
++HLE_FORCE("_ZN2nn3err23ShowNetworkServiceErrorENS_6ResultE", "network service error applet (Result); the host only logs it", void, h_err_ShowNetRes, Result r) {
++    DM_APPLET("error"); LOG("err::ShowNetworkServiceError Result=%#x (module %u, description %u)", r, r & 0x1ff, (r >> 9) & 0x1fff);
++}
++
+ // ---------- pdm: the system's play log ----------
+ // Pokémon Sword asks at boot how often this user has launched two other games (main+0xc88074, one ID each call, 0x18 bytes {application ID, play time, launch count} per entry; the result is
+ // not read, a launch count of at least 1 is): the host keeps no play log, so every one was never played. The SDK's own call opens the pdm service (null read at sdk+0x336ccc)
+diff --git a/dm/host/tests/t_friends.c b/dm/host/tests/t_friends.c
+index 216d9f72f28d00bef65b222872f34beb5a876b6b..7131ec0d452126d3d412cf942cab02353e6f1db3 100644
+--- a/dm/host/tests/t_friends.c
++++ b/dm/host/tests/t_friends.c
+@@ -53,6 +53,56 @@ int main(void) {
+             CHECK(!memcmp(key, before, sizeof key), "failed key query without Uid leaves output untouched");
+         }
+     }
++    // Blocked-user list availability, no-Uid forms, and methods on cut objects (seedds/nxnative 977f5cab, issue #3177; the NotificationQueue forms are engine-patches/0513's, checked above)
++    uint8_t ctx[0x40], ids[16] = {2};
++    memset(ctx, 0x5a, sizeof ctx);
++    memset(obj, 0x5a, sizeof obj);
++    Result (*ac_cancel)(void *) = hook("_ZN2nn7friends12AsyncContext6CancelEv");
++    if (ac_cancel) CHECK(ac_cancel(ctx) == RES_OK, "AsyncContext::Cancel succeeds");
++    Result (*up_init_nouid)(void *) = hook("_ZN2nn7friends12UserPresence10InitializeEv");
++    if (up_init_nouid) CHECK(up_init_nouid(presence) == RES_OK, "UserPresence::Initialize without Uid succeeds");
++    Result (*open_nouid)(void) = hook("_ZN2nn7friends28DeclareOpenOnlinePlaySessionEv");
++    Result (*close_nouid)(void) = hook("_ZN2nn7friends29DeclareCloseOnlinePlaySessionEv");
++    if (open_nouid) CHECK(open_nouid() == RES_FAIL, "DeclareOpenOnlinePlaySession without Uid fails");
++    if (close_nouid) CHECK(close_nouid() == RES_FAIL, "DeclareCloseOnlinePlaySession without Uid fails");
++    Result (*prof_nouid)(void *, void *, const void *, int) =
++        hook("_ZN2nn7friends14GetProfileListEPNS0_12AsyncContextEPNS0_7ProfileEPKNS_7account23NetworkServiceAccountIdEi");
++    if (prof_nouid) {
++        CHECK(prof_nouid(ctx, obj, ids, 1) == RES_FAIL, "GetProfileList without Uid fails");
++        CHECK(!memcmp(obj, ctx, sizeof obj), "failed GetProfileList leaves output untouched");
++    }
++    Result (*upd_nouid)(void *, const void *, int) =
++        hook("_ZN2nn7friends16UpdateFriendInfoEPNS0_6FriendEPKNS_7account23NetworkServiceAccountIdEi");
++    if (upd_nouid) {
++        CHECK(upd_nouid(obj, ids, 1) == RES_FAIL, "UpdateFriendInfo without Uid fails");
++        CHECK(!memcmp(obj, ctx, sizeof obj), "failed UpdateFriendInfo leaves friend untouched");
++    }
++    Result (*fr_upd)(void *) = hook("_ZN2nn7friends6Friend6UpdateEv");
++    if (fr_upd) CHECK(fr_upd(obj) == RES_FAIL, "Friend::Update fails");
++    Result (*fl_ensure_nouid)(void *) = hook("_ZN2nn7friends25EnsureFriendListAvailableEPNS0_12AsyncContextE");
++    Result (*fl_avail_nouid)(uint8_t *) = hook("_ZN2nn7friends27CheckFriendListAvailabilityEPb");
++    if (fl_ensure_nouid) CHECK(fl_ensure_nouid(ctx) == RES_FAIL, "EnsureFriendListAvailable without Uid fails");
++    if (fl_avail_nouid) {
++        uint8_t avail = 1;
++        CHECK(fl_avail_nouid(&avail) == RES_OK && avail == 0, "CheckFriendListAvailability without Uid reports unavailable");
++        CHECK(fl_avail_nouid(NULL) == RES_OK, "CheckFriendListAvailability without Uid tolerates null");
++    }
++    Result (*bl_ensure_nouid)(void *) = hook("_ZN2nn7friends30EnsureBlockedUserListAvailableEPNS0_12AsyncContextE");
++    Result (*bl_ensure)(void *, const void *) = hook("_ZN2nn7friends30EnsureBlockedUserListAvailableEPNS0_12AsyncContextERKNS_7account3UidE");
++    Result (*bl_avail_nouid)(uint8_t *) = hook("_ZN2nn7friends32CheckBlockedUserListAvailabilityEPb");
++    Result (*bl_avail)(uint8_t *, const void *) = hook("_ZN2nn7friends32CheckBlockedUserListAvailabilityEPbRKNS_7account3UidE");
++    if (bl_ensure_nouid) CHECK(bl_ensure_nouid(ctx) == RES_FAIL, "EnsureBlockedUserListAvailable without Uid fails");
++    if (bl_ensure) CHECK(bl_ensure(ctx, uid) == RES_FAIL, "EnsureBlockedUserListAvailable with Uid fails");
++    if (bl_avail_nouid) {
++        uint8_t avail = 1;
++        CHECK(bl_avail_nouid(&avail) == RES_OK && avail == 0, "CheckBlockedUserListAvailability without Uid reports unavailable");
++        CHECK(bl_avail_nouid(NULL) == RES_OK, "CheckBlockedUserListAvailability without Uid tolerates null");
++    }
++    if (bl_avail) {
++        uint8_t avail = 1;
++        CHECK(bl_avail(&avail, uid) == RES_OK && avail == 0, "CheckBlockedUserListAvailability with Uid reports unavailable");
++        CHECK(bl_avail(NULL, uid) == RES_OK, "CheckBlockedUserListAvailability with Uid tolerates null");
++    }
+     printf("t_friends: %d checks, %d failed\n", checks, fails);
+     return fails != 0;
+ }
+diff --git a/dm/host/tests/t_pctl.c b/dm/host/tests/t_pctl.c
+index 030ce927c3b1445dcece748d0ffbe516f227155d..35748583f8f06ef72135576a64db431e5a2a660e 100644
+--- a/dm/host/tests/t_pctl.c
++++ b/dm/host/tests/t_pctl.c
+@@ -28,6 +28,18 @@ static void *hook(const char *name) {
+     return count == 1 ? fn : NULL;
+ }
+ int main(void) {
++    // Resolve the exact public SDK symbols: missing the getter let the guest open stpl:u from its input loop even after the Initialize takeover.
++    void (*set_features)(uint32_t) = hook("_ZN2nn10streamplay25SetSupportedHidFeatureSetENS_4util10BitFlagSetILi32ENS0_13HidFeatureTagEEE");
++    uint32_t (*get_features)(void) = hook("_ZN2nn10streamplay25GetSupportedHidFeatureSetEv");
++    if (set_features && get_features) {
++        CHECK(get_features() == 0, "no guest HID features configured initially");
++        const uint32_t masks[] = {8, 1, 0, 0x80000000u, 0xffffffffu, 0};
++        for (size_t i = 0; i < sizeof masks / sizeof *masks; i++) {
++            set_features(masks[i]);
++            CHECK(get_features() == masks[i], "HID feature mask round-trips, including clearing and high bits");
++        }
++        CHECK(unexpected == 0, "streamplay feature queries need no guest service or event");
++    }
+     // bool arguments are widened as hle.h requires (only the low 8 bits count); the returns are bools in w0, not nn::Result
+     unsigned (*check)(unsigned) = hook("_ZN2nn4pctl32CheckFreeCommunicationPermissionEb");
+     unsigned (*begin)(unsigned) = hook("_ZN2nn4pctl25TryBeginFreeCommunicationEb");
+diff --git a/dm/host/tests/t_server_environment.c b/dm/host/tests/t_server_environment.c
+index c06b5a7a9a0c5c93ab7deddf9e727ef3aa5afe9c..2abc6f651d12fb20275ff20440d9724a6706e080 100644
+--- a/dm/host/tests/t_server_environment.c
++++ b/dm/host/tests/t_server_environment.c
+@@ -48,7 +48,13 @@ int main(void) {
+         // oe::ServerEnvironmentType 1 is lp1 (the game's enum-to-name table): the type agrees with the identifier. oe::GetServerEnvironmentType reaches it through the sdk's PLT
+         CHECK(type() == 1, "the server environment type is retail lp1 (1)");
+     }
+-    CHECK(unexpected == 0, "environment queries need no event, applet or network operation");
++    Result (*status)(uint32_t *) = hook("_ZN2nn5prepo21GetTransmissionStatusEPNS0_18TransmissionStatusE");
++    if (status) {
++        uint32_t out = UINT32_MAX;
++        CHECK(status(&out) == RES_OK, "play report status succeeds offline");
++        CHECK(out == 0, "play report transmission is idle");
++    }
++    CHECK(unexpected == 0, "offline queries need no event, applet or network operation");
+     printf("server environment: %d checks, %d failed\n", checks, failed);
+     return failed != 0;
+ }

@@ -31,6 +31,8 @@ pub enum Special {
     Arh(FileRef, Vec<(String, u64, u64)>),
     /// `(archive, its index, first entry, end entry)`: Koei Tecmo's LINKDATA
     Linkdata(FileRef, FileRef, usize, usize),
+    /// files of an Unreal pak with inline shaders (`ue_legacy_jobs`, uepak.rs)
+    Ue(crate::uepak::UeJob),
 }
 
 impl Special {
@@ -42,6 +44,7 @@ impl Special {
             | Special::Pkz(f, _)
             | Special::Arh(f, _)
             | Special::Linkdata(f, _, _, _) => f,
+            Special::Ue(j) => &j.file,
         }
     }
 
@@ -81,6 +84,7 @@ impl Special {
                 i.rel,
                 i.loc.len()
             )],
+            Special::Ue(j) => j.identity(),
         }
     }
 }
@@ -754,6 +758,15 @@ pub fn arh_entries(d: &[u8]) -> Result<Vec<(String, u64, u64)>, String> {
 
 /// The jobs of the archives among `files`, in the Python's order (linkdata, kpka, trpfs, ue, bdt, smash_arc, pkz, cpk, d3cpk, casc, cra, zip, arh, frostbite, pdat, rpf, lspk)
 pub fn plan(files: &[FileRef], log: &(dyn Fn(&str) + Sync)) -> Result<Plan, SplitError> {
+    plan_with(files, log, &|f: &FileRef| f.rel.clone())
+}
+
+/// [`plan`], `path_of` naming a file as the Python's messages do (the RomFS argument and the path below it: the Unreal pak reader's)
+pub fn plan_with(
+    files: &[FileRef],
+    log: &(dyn Fn(&str) + Sync),
+    path_of: &dyn Fn(&FileRef) -> String,
+) -> Result<Plan, SplitError> {
     let mut jobs: Vec<Special> = Vec::new();
     let mut taken: HashSet<(usize, String)> = HashSet::new();
     let key = |f: &FileRef| (f.root, f.rel.clone());
@@ -851,6 +864,13 @@ pub fn plan(files: &[FileRef], log: &(dyn Fn(&str) + Sync)) -> Result<Plan, Spli
         for (f, _) in &paks {
             taken.insert(key(f));
         }
+    }
+
+    // ue_legacy_jobs (after kpka_jobs and trpfs_jobs, before bdt_jobs, as the Python plans them): Unreal paks with inline shaders
+    {
+        let (ue, ue_taken) = crate::uepak::legacy_jobs(files, path_of, log)?;
+        jobs.extend(ue.into_iter().map(Special::Ue));
+        taken.extend(ue_taken);
     }
 
     // bdt_jobs: the entries of every dvdbnd archive by its .bhd5 index
@@ -1071,6 +1091,16 @@ pub fn scan_special(cx: &Ctx<'_>, job: &Special) -> Result<FileResult, String> {
 
 /// the result of one special job (`scan_file_in` with a job tag): the shaders of its members, as one file's result named after the archive
 pub fn run(cx: &Ctx<'_>, job: &Special) -> Result<FileResult, Failure> {
+    if let Special::Ue(j) = job {
+        // `lost or trees`: the packages that did not read are counted, the shaders of the others kept
+        let mut out = Vec::new();
+        let lost = crate::uepak::legacy_shaders(cx, j, &mut out)?;
+        let mut r = finish(cx, &j.file.rel, out, std::iter::empty(), Trees::new())?;
+        if let Some((why, count)) = lost {
+            r.extra = crate::scan_types::Extra::Unreadable { why, count };
+        }
+        return Ok(r);
+    }
     let (f, found) = match job {
         Special::Zip(f, names) => {
             let src = f
@@ -1211,6 +1241,7 @@ pub fn run(cx: &Ctx<'_>, job: &Special) -> Result<FileResult, Failure> {
             }
             (f, out)
         }
+        Special::Ue(_) => red!("an Unreal pak job reached the archive readers"), // handled above
     };
     // the arh job is named after its ARD: `rel[:-4] + '.ard'` is the file's own rel here
     finish(cx, &f.rel, found, std::iter::empty(), Trees::new())

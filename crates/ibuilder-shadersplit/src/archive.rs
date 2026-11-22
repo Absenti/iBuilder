@@ -1431,32 +1431,27 @@ pub fn snowdrop_zlib_capped(d: &[u8], label: &str, max_raw: usize) -> Res<Vec<Sh
         let mut raw: Vec<u8> = Vec::new();
         let (mut got, mut pos) = (0usize, h);
         while got < nraw {
-            // a file over 64 KB is stored as consecutive zlib streams of 64 KB each (the list's Block column)
-            let lim = pos + (nraw - got).min(0x10000) + 0x500;
-            let seg = &d[pos.min(d.len())..lim.min(d.len())];
-            // one turn may carry ~1000x its input: ask for no more than the room left under the cap (+1, to tell "fits exactly" from "passes it")
-            let room = max_raw.saturating_sub(raw.len());
-            let part = match zlibx::decompress(seg, Some(room.saturating_add(1))) {
-                Ok(z) => z,
-                Err(e) => red!("{label} Snowdrop zlib record @{h:#x}, block @{pos:#x}: {e}"),
-            };
-            if part.out.len() > room {
+            // a file over 64 KB is stored as consecutive zlib streams of 64 KB each (the list's Block column): each block must decode to exactly its size (nxnative e74c3fa7)
+            let size = (nraw - got).min(0x10000);
+            if raw.len() + size > max_raw {
                 red!(
                     "{label} Snowdrop zlib record @{h:#x}: block @{pos:#x} decodes past {max_raw} bytes, the most one cache file may take (its head announces {nraw})"
                 );
             }
-            if !part.eof || part.out.is_empty() {
-                red!("{label} Snowdrop zlib record @{h:#x}: block @{pos:#x} not finished");
+            let lim = (pos + size + 0x500).min(d.len());
+            let seg = &d[pos.min(lim)..lim];
+            let part = match zlibx::decompress(seg, Some(size + 1)) {
+                Ok(z) => z,
+                Err(e) => red!("{label} Snowdrop zlib record @{h:#x}, block @{pos:#x}: {e}"),
+            };
+            if part.out.len() != size || !part.eof {
+                red!(
+                    "{label} Snowdrop zlib record @{h:#x}: block @{pos:#x} did not finish at {size} raw bytes"
+                );
             }
-            got += part.out.len();
+            got += size;
             raw.extend_from_slice(&part.out);
-            pos = pos.min(d.len()) + part.used;
-        }
-        if raw.len() != nraw {
-            red!(
-                "{label} Snowdrop zlib record @{h:#x}: expected {nraw} raw bytes, got {}",
-                raw.len()
-            );
+            pos = pos.min(lim) + part.used;
         }
         end = pos;
         out.extend(snowdrop_objects(&raw, &format!("{label}#SDFZLIB@{h:#x}"))?);

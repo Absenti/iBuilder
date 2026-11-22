@@ -11,6 +11,7 @@ pub mod archive;
 pub mod bytes;
 pub mod ctl;
 pub mod error;
+pub mod falcom;
 pub mod game;
 pub mod glslc;
 pub mod image;
@@ -19,14 +20,18 @@ pub mod jobs;
 pub mod kit;
 pub mod live;
 pub mod memo;
+pub mod mvgl;
 pub mod nvn;
+pub mod nxsd;
 pub mod pyjson;
+pub mod record;
 pub mod rt;
 pub mod scan;
 pub mod scan_types;
 pub mod source;
 pub mod spill;
 pub mod split;
+pub mod uepak;
 pub mod unity;
 // generated file, kept exactly as tools/gen_known_trees.py writes it (rustfmt would reflow it, so a regeneration would not reproduce the committed text)
 #[rustfmt::skip]

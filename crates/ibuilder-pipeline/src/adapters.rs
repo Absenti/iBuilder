@@ -148,6 +148,28 @@ impl ShaderTools {
     }
 }
 
+/// Where a backend that knows which readers its split used leaves that record (`ibuilder_shadersplit::record`: `revs`, `uses` and `unknown` rows, tab-separated): beside the split's
+/// `tables/` folder, `<work>/split.record`. Stage 3 copies its rows into the library's `pack.txt` (`split-revs`, `split-uses`, `split-unknown`) for a targeted re-split.
+pub fn split_record_path(tables_dir: &Path) -> PathBuf {
+    tables_dir.with_file_name("split.record")
+}
+
+/// One reader family of the split and its revision now (`ibuilder_shadersplit::record::READERS`): a library whose record names another revision of a reader it used is split again
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SplitReader {
+    pub name: String,
+    pub rev: u32,
+    /// the unknown kinds the reader would read: `.ext`, or `#<hex prefix of the first bytes>`
+    pub claims: Vec<String>,
+}
+
+/// What `stale` compares a library's record with: this build's reader revisions, and the revisions a library without a record is taken to have
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SplitRevisions {
+    pub readers: Vec<SplitReader>,
+    pub legacy: BTreeMap<String, u32>,
+}
+
 pub struct SplitRequest<'a> {
     pub romfs: &'a Path,
     pub main_nso: &'a Path,
@@ -219,6 +241,20 @@ pub trait ShaderBackend: Send + Sync {
     /// The shader split this build runs, as a short digest ("-" when unknown): a split that finds more shaders is not a chain change, so the
     /// library's chain alone cannot say it is out of date (`split_version`).
     fn split_version(&self) -> String;
+    /// The split's per-reader revisions (None: only `split_version` says whether a library is current). With them, a library is split again only when a reader its game needs changed.
+    fn split_revisions(&self) -> Option<SplitRevisions> {
+        None
+    }
+    /// For a library split before records existed: which readers its game's files need (the record's text: `uses` and `unknown` rows), from the RomFS, the DLC and the library's shader
+    /// map; None when the backend cannot tell (the library is then split again when any reader changed)
+    fn split_probe(
+        &self,
+        _romfs: &Path,
+        _dlc: &[PathBuf],
+        _shader_map: Option<&Path>,
+    ) -> Option<String> {
+        None
+    }
     fn split(&self, req: &SplitRequest<'_>, log: &dyn Log) -> Result<SplitResult>;
     /// Translate and write the library image; returns its path (`b-<chain>.img`).
     fn build(&self, req: &BuildRequest<'_>, progress: &mut dyn FnMut(&str)) -> Result<PathBuf>;

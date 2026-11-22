@@ -31,18 +31,21 @@ use std::time::{Duration, Instant};
 /// 3: Vector Unit APF packages (`FPUV`, `apf.rs`): their entries are decoded and scanned (Beach Buggy Racing 2: 0 shaders before, 496 after)
 pub const SPLIT_REV: u32 = 3;
 
-/// The shader split this build runs, as a short digest (`ShaderBackend::split_version`)
+/// The shader split this build runs, as a short digest (`ShaderBackend::split_version`): the GLOBAL revision. A change to one reader bumps its revision in
+/// `record::READERS` instead, and only the games that need that reader are split again. The crate version in the digest is the one it started with (0.1.0): a release of the
+/// crate does not re-split every game.
 pub fn split_version() -> String {
-    let d = JobMemo::key(&[
-        "ibuilder-shadersplit",
-        env!("CARGO_PKG_VERSION"),
-        &SPLIT_REV.to_string(),
-    ]);
+    let d = JobMemo::key(&["ibuilder-shadersplit", "0.1.0", &SPLIT_REV.to_string()]);
     format!("rs{}", &d[..10])
 }
 
+/// What a memoised job is valid for: the global revision and every reader's (an interrupted split resumed by a build whose readers changed runs its jobs again)
+fn memo_version() -> String {
+    format!("{} {}", split_version(), crate::record::revisions())
+}
+
 /// `shader_split.py`'s `SINGLE_STAGE`: sources whose every shader is a program of one stage
-const SINGLE_STAGE: [&str; 17] = [
+const SINGLE_STAGE: [&str; 19] = [
     "#GLSLC@",
     "#VIPER",
     "#CIVBSF@",
@@ -60,6 +63,8 @@ const SINGLE_STAGE: [&str; 17] = [
     "#NVNSH@",
     "#D3@",
     "#SHAD@",
+    "#NXSD@",
+    "#NXSH@",
 ];
 
 /// Lets a job through when the memory allows (the pipeline's `ShaderMemoryGate::run`)
@@ -112,6 +117,10 @@ pub struct SplitOptions<'a> {
     pub glslc_capture: Option<&'a Path>,
     /// `DM_NRO_DIR`: NROs the game decodes at run time, scanned like main
     pub nro_dir: Option<&'a Path>,
+    /// `DM_SPLIT_REGISTERED_MAP`: a registered `shader_map.tsv` whose sources are kept when the same shader is found in several places (registered packing; None: the first copy)
+    pub registered: Option<&'a Path>,
+    /// where the reader record of this split is written (`record.rs`: which readers the game's files needed, for a targeted re-split); None: not written
+    pub record: Option<&'a Path>,
 }
 
 impl<'a> SplitOptions<'a> {
@@ -134,6 +143,8 @@ impl<'a> SplitOptions<'a> {
             memo_dir: None,
             glslc_capture: None,
             nro_dir: None,
+            registered: None,
+            record: None,
         }
     }
 }
@@ -218,9 +229,14 @@ fn detect_unsupported(files: &[FileRef], index: &FileIndex) -> Result<(), SplitE
             if t.len() == 8 && &t[4..8] == b"LSPK" {
                 return unsup("Larian LSPK package", f);
             }
-            let t = tail_of(f, 256);
-            if t.windows(4).any(|w| w == [0xe1, 0x12, 0x6f, 0x5a]) {
-                return unsup("Unreal Engine pak", f);
+            // an Unreal pak is read (uepak.rs), unless its index is encrypted: the AES key in main is not searched for
+            if let Ok(src) = f.loc.open()
+                && crate::uepak::encrypted_index(&src)
+            {
+                return unsup(
+                    "Unreal Engine pak with an encrypted index (the AES key in main is needed)",
+                    f,
+                );
             }
         }
         if f.rel.ends_with(".utoc") {
@@ -290,28 +306,48 @@ struct Held {
 
 /// The merged shaders of the whole split: `key → first copy`, and where each came from. The bytes are in the spill file (`spill.rs`), the map holds only what the merge and the
 /// package order need.
-struct Merged {
+struct Merged<'r> {
     keys: HashMap<String, Held>,
+    /// the keys in the order they were first found (a Python dict's order: `per_src` counts the groups in it)
+    order: Vec<String>,
     pairs: BTreeSet<Pair>,
-    per_src: Vec<(String, i64)>,
     spill: Spill,
     /// scratch for the first copy of a key being compared with a later one
     old: Vec<u8>,
+    /// `DM_SPLIT_REGISTERED_MAP`: (key, stage name) → the source the registered shader map names
+    registered: &'r Registered,
+    /// copies found at their registered source, chosen once every copy is checked (`merge_keys`'s `preferred`)
+    preferred: HashMap<String, Held>,
 }
 
-impl Merged {
-    fn count(&mut self, g: &str, d: i64) {
-        match self.per_src.iter_mut().find(|(k, _)| k == g) {
-            Some(e) => e.1 += d,
-            None => self.per_src.push((g.to_string(), d)),
+/// (key, stage name) → source, the rows of a registered `shader_map.tsv` (`read_registered_sources`)
+pub type Registered = HashMap<(String, String), String>;
+
+/// `read_registered_sources(path)`: the rows of a registered shader map with five columns; a missing file is an empty map (the packer checks that registered tables exist)
+pub fn read_registered_sources(path: Option<&Path>) -> Result<Registered, SplitError> {
+    let mut out = Registered::new();
+    let Some(p) = path else { return Ok(out) };
+    let text = match fs::read(p) {
+        Ok(b) => String::from_utf8(b).map_err(|e| red(format!("{}: {e}", p.display())))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(io(e)),
+    };
+    for line in text.split_inclusive('\n') {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let f: Vec<&str> = line.splitn(5, '\t').collect();
+        if f.len() == 5 {
+            out.insert((f[3].to_string(), f[2].to_string()), f[4].to_string());
         }
     }
+    Ok(out)
+}
 
-    /// `merge_keys` for one file's result: a key found more than once keeps its first copy, except that the game's own copy takes the place of an add-on's (`/aoc/<index>/`)
+impl Merged<'_> {
+    /// `merge_keys` for one file's result: a key found more than once keeps its first copy, except that the game's own copy takes the place of an add-on's (`/aoc/<index>/`), and that a copy
+    /// at the source the registered map names is preferred (chosen in `finish_preferred`, once every copy has been checked)
     fn add(
         &mut self,
         cx: &Ctx<'_>,
-        prof: &Profile,
         uniq: Vec<(String, Shader)>,
         pairs: Vec<Pair>,
     ) -> Result<(), SplitError> {
@@ -330,14 +366,25 @@ impl Merged {
                     )));
                 }
                 if old_label.starts_with("/aoc/") && !v.label.starts_with("/aoc/") {
-                    let (go, gn) = (
-                        prof.group(&old_label).to_string(),
-                        prof.group(&v.label).to_string(),
-                    );
-                    self.count(&go, -1);
-                    self.count(&gn, 1);
                     let at = self.spill.append(&v.ctl, &v.code).map_err(io)?;
                     self.keys.insert(
+                        key,
+                        Held {
+                            label: v.label,
+                            st: v.st,
+                            at,
+                        },
+                    );
+                } else if !self.registered.is_empty()
+                    && v.label != old_label
+                    && !self.preferred.contains_key(&key)
+                    && self
+                        .registered
+                        .get(&(key.clone(), v.st.name().to_string()))
+                        .is_some_and(|s| *s == v.label)
+                {
+                    let at = self.spill.append(&v.ctl, &v.code).map_err(io)?;
+                    self.preferred.insert(
                         key,
                         Held {
                             label: v.label,
@@ -348,9 +395,8 @@ impl Merged {
                 }
                 continue;
             }
-            let g = prof.group(&v.label).to_string();
-            self.count(&g, 1);
             let at = self.spill.append(&v.ctl, &v.code).map_err(io)?;
+            self.order.push(key.clone());
             self.keys.insert(
                 key,
                 Held {
@@ -361,6 +407,29 @@ impl Merged {
             );
         }
         Ok(())
+    }
+
+    /// the end of `merge_keys`: a preferred copy replaces the chosen one only for the same stage and the same side of the game / add-on line; then the rows per source group, counted over the
+    /// keys in the order they were found (`collections.Counter(group(shader[0]) for shader in keys.values())`)
+    fn finish_preferred(&mut self, prof: &Profile) -> Vec<(String, i64)> {
+        for (key, v) in std::mem::take(&mut self.preferred) {
+            let old = &self.keys[&key];
+            if v.st == old.st
+                && !v.label.starts_with("/glslc_play/")
+                && v.label.starts_with("/aoc/") == old.label.starts_with("/aoc/")
+            {
+                self.keys.insert(key, v);
+            }
+        }
+        let mut per_src: Vec<(String, i64)> = Vec::new();
+        for k in &self.order {
+            let g = prof.group(&self.keys[k].label);
+            match per_src.iter_mut().find(|(x, _)| x == g) {
+                Some(e) => e.1 += 1,
+                None => per_src.push((g.to_string(), 1)),
+            }
+        }
+        per_src
     }
 }
 
@@ -396,6 +465,10 @@ enum Work {
     Special(crate::jobs::Special),
     /// a range of one KIT archive's members (Unravel TWO)
     Kit(crate::kit::KitJob),
+    /// a batch of one MVGL archive's .shad entries (Digimon Story)
+    Mvgl(crate::mvgl::MvglJob),
+    /// a shard of one Falcom .pka archive's blobs (Trails into Reverie)
+    Pka(crate::falcom::PkaJob),
 }
 
 type Results = Vec<FileResult>;
@@ -543,6 +616,7 @@ pub fn split(
 ) -> Result<SplitStats, SplitError> {
     let game = Game::load(opts.profile_dir, opts.game_id).map_err(SplitError::Input)?;
     let prof = Profile::from_game(game).map_err(SplitError::Input)?;
+    let registered = read_registered_sources(opts.registered)?;
     if opts.versions.is_empty() {
         return Err(SplitError::Input("no RomFS and main were given".into()));
     }
@@ -651,25 +725,57 @@ pub fn split(
                 );
             }
         }
-        // Unreal Engine shader code archives decoded on the Mac (uepak.py)
-        let ued = romfs
-            .parent()
-            .map(|p| p.join("ue_shaders"))
-            .unwrap_or_else(|| PathBuf::from("ue_shaders"));
-        if ued.is_dir()
-            && fs::read_dir(&ued)
-                .map_err(io)?
-                .filter_map(|e| e.ok())
-                .any(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .ends_with(".ushaderbytecode")
-                })
+        // Unreal Engine shader code archives: decoded on the Mac into <version dir>/ue_shaders (uepak.py job / finish), else read from the version's paks here (uepak.rs `archives`)
         {
-            return Err(SplitError::Unsupported(format!(
-                "Unreal Engine shader code archives ({})",
-                ued.display()
-            )));
+            let ued = romfs
+                .parent()
+                .map(|p| p.join("ue_shaders"))
+                .unwrap_or_else(|| PathBuf::from("ue_shaders"));
+            let mut names: Vec<String> = if ued.is_dir() {
+                fs::read_dir(&ued)
+                    .map_err(io)?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".ushaderbytecode") && !n.starts_with("._"))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            names.sort();
+            let rerr = |e: Failure| match e {
+                Failure::Unsupported(m) => SplitError::Unsupported(m),
+                e => red(e.to_string()),
+            };
+            if !names.is_empty() {
+                for nm in names {
+                    let b = fs::read(ued.join(&nm)).map_err(io)?;
+                    found.extend(
+                        crate::uepak::ue_shaders_file(&b, &format!("/ue_shaders/{nm}"))
+                            .map_err(rerr)?,
+                    );
+                }
+            } else {
+                let mine: Vec<&FileRef> = files.iter().filter(|f| f.root == root).collect();
+                let tag_of = |f: &FileRef| -> String {
+                    let below = if tag.is_empty() {
+                        f.rel.as_str()
+                    } else {
+                        f.rel.strip_prefix(&format!("{tag}/")).unwrap_or(&f.rel)
+                    };
+                    let r = romfs.display().to_string();
+                    if r.ends_with('/') {
+                        format!("{r}{below}")
+                    } else {
+                        format!("{r}/{below}")
+                    }
+                };
+                for (nm, sh) in crate::uepak::archives(&mine, &tag_of, zstd)? {
+                    found.extend(
+                        crate::uepak::ue_shaders(&sh, &format!("/ue_shaders/{nm}"))
+                            .map_err(rerr)?,
+                    );
+                }
+            }
         }
         // `uniq_keys(found)` (the rebased engine; the older one built `{skey(c, k): (w, s, c, k) for ...}` and let the LAST copy of a key win, at the position of the first): the first copy of a key
         // in main's list stays, and a later copy that is not the same shader is `red()`
@@ -709,6 +815,8 @@ pub fn split(
             pairs.extend(set);
         }
         let mut uniq: Vec<(String, Shader)> = Vec::new();
+        // `uniq_keys(found, registered)`: a later copy at the source the registered map names takes the first one's place (same stage), once every copy is checked
+        let mut preferred: BTreeMap<usize, Shader> = BTreeMap::new();
         for (s, key) in found.into_iter().zip(keys) {
             match at.get(&key) {
                 Some(&p) => {
@@ -721,6 +829,16 @@ pub fn split(
                             s.label
                         )));
                     }
+                    if !registered.is_empty()
+                        && s.st == uniq[p].1.st
+                        && s.label != uniq[p].1.label
+                        && !preferred.contains_key(&p)
+                        && registered
+                            .get(&(key.clone(), s.st.name().to_string()))
+                            .is_some_and(|r| *r == s.label)
+                    {
+                        preferred.insert(p, s);
+                    }
                 }
                 None => {
                     at.insert(key.clone(), uniq.len());
@@ -728,6 +846,9 @@ pub fn split(
                     uniq.push((key, s));
                 }
             }
+        }
+        for (p, s) in preferred {
+            uniq[p].1 = s;
         }
         results0.push((uniq, pairs));
     }
@@ -783,7 +904,6 @@ pub fn split(
 
     // ---- first pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way -------------------
     // the archives the Python plans as jobs of their own come first (`big + files`), their files are not scanned as loose files
-    let plan = crate::jobs::plan(&files, log)?;
     // KIT archives (the rebased engine's `kit_jobs`, after the other planners): the path the Python's messages name a file by is the RomFS argument and the path below it
     let path_of = |f: &FileRef| -> String {
         let tag = &root_names[f.root];
@@ -799,17 +919,36 @@ pub fn split(
             format!("{root}/{below}")
         }
     };
+    let plan = crate::jobs::plan_with(&files, log, &path_of)?;
     let (kit_jobs, kit_taken) = crate::kit::plan(&files, &path_of)?;
+    // Media.Vision's MVGL archives (`mvgl_jobs`, after the PKZ jobs and before the zip jobs) and Falcom's .pka archives (`falcom_pka_jobs`, the Python's last planner)
+    let (mvgl_jobs, mvgl_taken) = crate::mvgl::plan(&files, &path_of);
+    let (pka_jobs, pka_taken) = crate::falcom::plan(&files);
     let plain: Vec<FileRef> = files
         .iter()
         .filter(|f| {
-            !plan.taken.contains(&(f.root, f.rel.clone()))
-                && !kit_taken.contains(&(f.root, f.rel.clone()))
+            let k = (f.root, f.rel.clone());
+            !plan.taken.contains(&k)
+                && !kit_taken.contains(&k)
+                && !mvgl_taken.contains(&k)
+                && !pka_taken.contains(&k)
         })
         .cloned()
         .collect();
     let mut batches: Vec<Work> = plan.jobs.iter().cloned().map(Work::Special).collect();
+    let mvgl_at = plan
+        .jobs
+        .iter()
+        .position(|j| {
+            matches!(
+                j,
+                crate::jobs::Special::Zip(..) | crate::jobs::Special::Arh(..)
+            )
+        })
+        .unwrap_or(plan.jobs.len());
+    batches.splice(mvgl_at..mvgl_at, mvgl_jobs.into_iter().map(Work::Mvgl));
     batches.extend(kit_jobs.into_iter().map(Work::Kit));
+    batches.extend(pka_jobs.into_iter().map(Work::Pka));
     batches.extend(
         plain
             .chunks(16)
@@ -818,10 +957,12 @@ pub fn split(
     let nj = opts.jobs.max(1);
     let mut merged = Merged {
         keys: HashMap::new(),
+        order: Vec::new(),
         pairs: BTreeSet::new(),
-        per_src: Vec::new(),
         spill: Spill::create(opts.pkg_dir).map_err(io)?,
         old: Vec::new(),
+        registered: &registered,
+        preferred: HashMap::new(),
     };
     let mcx = make_cx(
         &prof,
@@ -833,7 +974,7 @@ pub fn split(
         &findex,
     );
     for (uniq, pairs) in results0 {
-        merged.add(&mcx, &prof, uniq, pairs)?;
+        merged.add(&mcx, uniq, pairs)?;
     }
     let mut trees = Trees::new();
     let mut defer: Vec<usize> = Vec::new(); // indices into `files` of the files to scan again
@@ -856,10 +997,12 @@ pub fn split(
                 }
                 Work::Special(s) => Ok(vec![crate::jobs::scan_special(&cx, s)?]),
                 Work::Kit(k) => Ok(vec![crate::kit::scan(&cx, k, &files)?]),
+                Work::Mvgl(m) => Ok(vec![crate::mvgl::scan(&cx, m)?]),
+                Work::Pka(p) => Ok(vec![crate::falcom::scan(&cx, p)?]),
             }
         };
     let job_key = |kind: &str, fs_: &[FileRef]| -> String {
-        let mut parts: Vec<String> = vec![kind.to_string(), split_version()];
+        let mut parts: Vec<String> = vec![kind.to_string(), memo_version()];
         for f in fs_ {
             parts.push(format!("{}:{}:{}", f.root, f.rel, f.loc.len()));
         }
@@ -872,14 +1015,26 @@ pub fn split(
             let key = match job {
                 Work::Batch(b) => job_key("scan_batch", &b.files),
                 Work::Special(sp) => {
-                    let mut parts: Vec<String> = vec!["special".to_string(), split_version()];
+                    let mut parts: Vec<String> = vec!["special".to_string(), memo_version()];
                     parts.extend(sp.identity());
                     let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
                     JobMemo::key(&refs)
                 }
                 Work::Kit(k) => {
-                    let mut parts: Vec<String> = vec!["special".to_string(), split_version()];
+                    let mut parts: Vec<String> = vec!["special".to_string(), memo_version()];
                     parts.extend(k.identity());
+                    let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+                    JobMemo::key(&refs)
+                }
+                Work::Mvgl(m) => {
+                    let mut parts: Vec<String> = vec!["special".to_string(), memo_version()];
+                    parts.extend(m.identity());
+                    let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+                    JobMemo::key(&refs)
+                }
+                Work::Pka(p) => {
+                    let mut parts: Vec<String> = vec!["special".to_string(), memo_version()];
+                    parts.extend(p.identity());
                     let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
                     JobMemo::key(&refs)
                 }
@@ -919,10 +1074,12 @@ pub fn split(
                         for (k, v) in t {
                             trees.insert(k, v);
                         }
-                        merged.add(&mcx, &prof, r.uniq, r.pairs)?;
+                        merged.add(&mcx, r.uniq, r.pairs)?;
                     }
                     Extra::Unreadable { why, count } => {
                         unreadable.push((why, count));
+                        // an Unreal pak job keeps the shaders of the packages that read (`lost or trees`): the others' results carry none
+                        merged.add(&mcx, r.uniq, r.pairs)?;
                     }
                 }
             }
@@ -975,7 +1132,7 @@ pub fn split(
                         )));
                     }
                     Extra::Unreadable { why, count } => unreadable.push((why, count)),
-                    Extra::Trees(_) => merged.add(&mcx, &prof, r.uniq, r.pairs)?,
+                    Extra::Trees(_) => merged.add(&mcx, r.uniq, r.pairs)?,
                 }
             }
             Ok(())
@@ -992,10 +1149,10 @@ pub fn split(
     let n_unreadable = unreadable.iter().map(|u| u.1).sum::<usize>();
 
     // ---- pairs --------------------------------------------------------------------------------------------------------------------
+    let per_src = merged.finish_preferred(&prof);
     let Merged {
         keys,
         pairs: all_pairs,
-        per_src,
         mut spill,
         ..
     } = merged;
@@ -1245,6 +1402,16 @@ pub fn split(
         facts.len(),
         pairs.len()
     ));
+    // which readers this game needed (record.rs): written only for a split that finished
+    if let Some(path) = opts.record {
+        let mut rec = crate::record::classify_files(&files);
+        rec.uses.insert("generic".into()); // main is scanned by the generic readers
+        for r in &rows {
+            rec.add_label(r.4);
+        }
+        let text = rec.text();
+        write_atomic(path, |f| f.write_all(text.as_bytes())).map_err(io)?;
+    }
     let (reused, ran) = memo
         .as_ref()
         .map(|m| {

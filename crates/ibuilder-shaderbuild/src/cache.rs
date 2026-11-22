@@ -227,6 +227,15 @@ pub struct Store {
     pub cache: PathBuf,
     /// the build's own folder of entries (hard links to cache entries, or entries that were not cacheable)
     pub stage: PathBuf,
+    /// an entry the cache could not take (a full drive): only the shaders cached before that are reused by the next build
+    pub cache_full: std::sync::atomic::AtomicBool,
+}
+
+/// Whether an I/O error is a full drive (ENOSPC; EDQUOT, a quota, says the same to the player)
+pub fn is_disk_full(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::StorageFull
+        || e.kind() == std::io::ErrorKind::QuotaExceeded
+        || matches!(e.raw_os_error(), Some(28) | Some(69))
 }
 
 impl Store {
@@ -238,6 +247,7 @@ impl Store {
         Ok(Store {
             cache,
             stage: stage.to_path_buf(),
+            cache_full: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -284,6 +294,8 @@ impl Store {
                 if !linked || fs::rename(&tmp, &cp).is_err() {
                     let _ = fs::remove_file(&tmp);
                     // the cache could not take it (a full drive): the build goes on from its stage folder
+                    self.cache_full
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -387,5 +399,15 @@ mod tests {
             vec!["cas-old.dmsb".to_string()]
         );
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_full_drive_is_told_apart() {
+        assert!(super::is_disk_full(&std::io::Error::from_raw_os_error(28)));
+        assert!(super::is_disk_full(&std::io::Error::from(
+            std::io::ErrorKind::StorageFull
+        )));
+        assert!(!super::is_disk_full(&std::io::Error::from_raw_os_error(13)));
+        assert!(!super::is_disk_full(&std::io::Error::other("no")));
     }
 }

@@ -1,0 +1,9 @@
+# kind: evidence  registered
+package	index	stage	dm_ctl_sha16	source
+x.bin	0	vertex	350f627355bbf698	/Pack/a2.glslc#GLSLC@0x0
+x.bin	1	vertex	01aa352edd535aaf	/aoc/1/Data/c.glslc#GLSLC@0x0
+x.bin	2	vertex	95b854a2495a06b4	/Pack/e2.glslc#GLSLC@0x0
+x.bin	3	pixel	6a5fc8b7306b21b2	/Data/b9.glslc#GLSLC@0x0
+x.bin	4	vertex	30434980b2cbe338	main#GLSLC@0x1aa8
+x.bin	5	pixel	a847a42aa7a5b085	/aoc/1/Data/d.glslc#GLSLC@0x0
+a short row

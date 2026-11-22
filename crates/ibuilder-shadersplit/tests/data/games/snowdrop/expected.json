@@ -18,15 +18,15 @@
   "tables/shader_pairs.tsv": "195a6c72a09e2e8498ef2e6217d7fd47510c76093823cfae86086179e7c88014"
  },
  "log": [
-  "[RED] /Pack/cut_after_first_block.slice Snowdrop zlib record @0x38: block @0x116 not finished (its shaders are left out)",
-  "[RED] /Pack/cut_in_first_block.slice Snowdrop zlib record @0x38: block @0x38 not finished (its shaders are left out)",
-  "[RED] /Pack/cut_in_second_block.slice Snowdrop zlib record @0x38: block @0x116 not finished (its shaders are left out)",
+  "[RED] /Pack/cut_after_first_block.slice Snowdrop zlib record @0x38: block @0x116 did not finish at 35220 raw bytes (its shaders are left out)",
+  "[RED] /Pack/cut_in_first_block.slice Snowdrop zlib record @0x38: block @0x38 did not finish at 65536 raw bytes (its shaders are left out)",
+  "[RED] /Pack/cut_in_second_block.slice Snowdrop zlib record @0x38: block @0x116 did not finish at 35220 raw bytes (its shaders are left out)",
   "[RED] /Pack/damaged_first_block_check.slice Snowdrop zlib record @0x38, block @0x38: Error -3 while decompressing data: incorrect data check (its shaders are left out)",
   "[RED] /Pack/damaged_second_block.slice Snowdrop zlib record @0x38, block @0x116: Error -3 while decompressing data: invalid bit length repeat (its shaders are left out)",
-  "[RED] /Pack/empty_second_block.slice Snowdrop zlib record @0x38: block @0x115 not finished (its shaders are left out)",
-  "[RED] /Pack/head_longer_than_stream.slice Snowdrop zlib record @0x38: block @0x77 not finished (its shaders are left out)",
-  "[RED] /Pack/head_shorter_than_stream.slice Snowdrop zlib record @0x38: expected 276 raw bytes, got 14740 (its shaders are left out)",
-  "[RED] 8 file(s) could not be read, their shaders are left out (first: /Pack/cut_after_first_block.slice Snowdrop zlib record @0x38: block @0x116 not finished)",
+  "[RED] /Pack/empty_second_block.slice Snowdrop zlib record @0x38: block @0x115 did not finish at 8 raw bytes (its shaders are left out)",
+  "[RED] /Pack/head_longer_than_stream.slice Snowdrop zlib record @0x38: block @0x38 did not finish at 65536 raw bytes (its shaders are left out)",
+  "[RED] /Pack/head_shorter_than_stream.slice Snowdrop zlib record @0x38: block @0x38 did not finish at 276 raw bytes (its shaders are left out)",
+  "[RED] 8 file(s) could not be read, their shaders are left out (first: /Pack/cut_after_first_block.slice Snowdrop zlib record @0x38: block @0x116 did not finish at 35220 raw bytes)",
   "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (c060aabb3a7a3298)",
   "shaders: 24 (compute 3, domain 1, geometry 1, hull 1, pixel 7, vertex 11); sources data 16, pack 6, main 2; compute shader answers 3 rows; variation pairs 2"
  ],

@@ -5,7 +5,7 @@
 //! The split and the translation themselves are `ShaderBackend` (the `ibuilder-shader` crate); the translator (`dmsh_xlate`, C#) and SPIRV-Cross (C) are the host's `ShaderTools`.
 
 use crate::adapters::{
-    BuildRequest, LiveEntry, LiveRequest, ShaderBackend, ShaderTools, SplitRequest,
+    BuildRequest, LiveEntry, LiveRequest, ShaderBackend, ShaderTools, SplitReader, SplitRequest,
 };
 use crate::ctx::Ctx;
 use crate::error::{PipelineError, Result};
@@ -16,8 +16,7 @@ use crate::log::Log;
 use crate::memory::{MemSource, SHADER_PER_JOB, mem_line, release_memory, shader_jobs_for_memory};
 use crate::settings::shader_pulling_wanted;
 use crate::shaderpack::{
-    aoc_images, dlc_signature, install_shader_packs, shader_cache_folder, stale_dlc, stale_split,
-    top_up_pack,
+    aoc_images, dlc_signature, install_shader_packs, shader_cache_folder, stale_dlc, top_up_pack,
 };
 use crate::stage::write_stage;
 use crate::stop;
@@ -226,11 +225,22 @@ impl ShaderResume {
     }
 }
 
-/// A `<pack>.none` marker ("this game holds no shader this split reads") is only believed when the split that wrote it is this app's:
+/// A `<pack>.none` marker ("this game holds no shader this split reads") is only believed when the split that wrote it reads the game as this app's would (`split_verdict`):
 /// a newer split may read the game (Beach Buggy Racing 2's Vector Unit .apf archive: 0 shaders, then 496 with SPLIT_REV 3).
-/// A marker without a `split` line was written before the version was recorded and is stale for the same reason.
-fn none_marker_current(text: &str, split_ver: &str) -> bool {
-    text.lines().any(|l| l == format!("split {split_ver}"))
+/// A marker without a `split` line was written before the version was recorded and is stale for the same reason. Its rows are `<key> <value>` lines.
+fn marker_rows(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// `pack.txt`'s rows (`<key> TAB <value>`)
+fn pack_rows(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn split_version(ctx: &Ctx) -> String {
@@ -239,6 +249,193 @@ fn split_version(ctx: &Ctx) -> String {
         .as_ref()
         .map(|b| b.split_version())
         .unwrap_or_else(|| "-".to_string())
+}
+
+/// The rows of a split's record (`split_record_path`: `revs`, `uses`, `unknown`) as the library keeps them: `split-revs`, `split-uses`, `split-unknown`
+pub fn record_rows(record: &str) -> Vec<(String, String)> {
+    record
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(k, _)| matches!(*k, "revs" | "uses" | "unknown"))
+        .map(|(k, v)| (format!("split-{k}"), v.to_string()))
+        .collect()
+}
+
+/// What `split_verdict` says of a library (or a no-shader marker) made on this device
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitVerdict {
+    /// split by this app's split, or by one that reads the game the same way
+    Current,
+    /// current, after a look at what changed: these record rows replace the library's (this app's revisions, what the game uses), so the next run does not look again
+    Kept(Vec<(String, String)>),
+    /// split again: why
+    Stale(String),
+}
+
+fn revs_of(t: &str) -> BTreeMap<String, u32> {
+    t.split_whitespace()
+        .filter_map(|w| w.split_once('='))
+        .filter_map(|(n, r)| r.parse().ok().map(|r| (n.to_string(), r)))
+        .collect()
+}
+
+/// `<ext>#<magic>` read by a reader that claims `.ext` or `#<hex prefix>` (`<ext>#*`: more first-byte kinds than the record keeps, any magic claim matches)
+fn claims_kind(claims: &[String], kind: &str) -> bool {
+    let (ext, magic) = kind.split_once('#').unwrap_or((kind, ""));
+    claims.iter().any(|c| match c.strip_prefix('#') {
+        Some(hex) => magic == "*" || (!hex.is_empty() && magic.starts_with(hex)),
+        None => !c.is_empty() && ext == c,
+    })
+}
+
+/// `split_verdict`: is the split a library (`rows`: its `pack.txt`, or a no-shader marker's lines) was made with current for this app? The split version is the GLOBAL revision: another
+/// one makes every library stale. With per-reader revisions (`ShaderBackend::split_revisions`) only a library whose game needs a reader that changed is split again: a reader its
+/// record uses, or one that claims a kind of file its record lists as read by no reader. A library from before records existed is taken to have the legacy revisions, and what its game
+/// needs is asked of the backend (`split_probe`: its files classified again, the labels of its shader map); the answer is kept (`Kept`) so it is asked once.
+pub fn split_verdict(
+    backend: Option<&dyn ShaderBackend>,
+    rows: &BTreeMap<String, String>,
+    split_ver: &str,
+    romfs: &Path,
+    dlc: &[PathBuf],
+    shader_map: Option<&Path>,
+) -> SplitVerdict {
+    let have = rows.get("split").map(String::as_str).unwrap_or("none");
+    if split_ver == "-" {
+        return SplitVerdict::Current;
+    }
+    if have != split_ver {
+        return SplitVerdict::Stale(format!(
+            "split by another version of the shader split ({have}, this app {split_ver})"
+        ));
+    }
+    let Some(now) = backend.and_then(|b| b.split_revisions()) else {
+        return SplitVerdict::Current;
+    };
+    let recorded = rows.get("split-revs").map(|t| revs_of(t));
+    let pack_revs = recorded.clone().unwrap_or_else(|| now.legacy.clone());
+    let changed: Vec<&SplitReader> = now
+        .readers
+        .iter()
+        .filter(|r| pack_revs.get(&r.name).copied().unwrap_or(0) != r.rev)
+        .collect();
+    if changed.is_empty() {
+        return SplitVerdict::Current;
+    }
+    let (uses, unknown) = match (rows.get("split-uses"), recorded.is_some()) {
+        (Some(u), true) => (
+            u.clone(),
+            rows.get("split-unknown").cloned().unwrap_or_default(),
+        ),
+        _ => {
+            let probed = backend.and_then(|b| b.split_probe(romfs, dlc, shader_map));
+            let Some(text) = probed else {
+                return SplitVerdict::Stale(format!(
+                    "split before the split recorded its readers, and reader {} changed since",
+                    changed
+                        .iter()
+                        .map(|r| r.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            };
+            let r: BTreeMap<String, String> = record_rows(&text).into_iter().collect();
+            (
+                r.get("split-uses").cloned().unwrap_or_default(),
+                r.get("split-unknown").cloned().unwrap_or_default(),
+            )
+        }
+    };
+    let used: Vec<&str> = uses.split_whitespace().collect();
+    for r in &changed {
+        let was = pack_revs.get(&r.name).copied().unwrap_or(0);
+        if used.contains(&r.name.as_str()) {
+            return SplitVerdict::Stale(format!(
+                "its game needs reader {}, which is at revision {} in this app ({was} when it was split)",
+                r.name, r.rev
+            ));
+        }
+        if let Some(k) = unknown
+            .split_whitespace()
+            .find(|k| claims_kind(&r.claims, k))
+        {
+            return SplitVerdict::Stale(format!(
+                "reader {} (revision {} in this app, {was} when it was split) may read its files of kind {k}, which no reader read then",
+                r.name, r.rev
+            ));
+        }
+    }
+    let revs: BTreeMap<&str, u32> = now
+        .readers
+        .iter()
+        .map(|r| (r.name.as_str(), r.rev))
+        .collect();
+    SplitVerdict::Kept(vec![
+        (
+            "split-revs".into(),
+            revs.iter()
+                .map(|(n, r)| format!("{n}={r}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        ("split-uses".into(), uses),
+        ("split-unknown".into(), unknown),
+    ])
+}
+
+/// `text` with the record rows replaced by `rows` (`sep`: a tab in `pack.txt`, a space in a marker)
+fn with_record_rows(text: &str, rows: &[(String, String)], sep: char) -> String {
+    let mut out: String = text
+        .lines()
+        .filter(|l| {
+            !rows
+                .iter()
+                .any(|(k, _)| l.split_once(sep).is_some_and(|(x, _)| x == k))
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    for (k, v) in rows {
+        out.push_str(&format!("{k}{sep}{v}\n"));
+    }
+    out
+}
+
+/// The record a finished split left in the work folder, as library rows (empty without one)
+fn work_record_rows(work: &Path) -> Vec<(String, String)> {
+    read_text(&crate::adapters::split_record_path(&work.join("tables")))
+        .map(|t| record_rows(&t))
+        .unwrap_or_default()
+}
+
+/// `split_verdict` of the game's library (`pack.txt`), or None when there is none or it was not made on this device (an imported pack is never second-guessed)
+fn pack_verdict(ctx: &Ctx, tid: &str, pack: &Path) -> Option<SplitVerdict> {
+    let rows = pack_rows(&read_text(&pack.join("pack.txt")).ok()?);
+    if !rows
+        .get("made")
+        .is_some_and(|m| m.starts_with("on this device"))
+    {
+        return None;
+    }
+    Some(split_verdict(
+        ctx.adapters.shaders.as_deref(),
+        &rows,
+        &split_version(ctx),
+        Path::new(ctx.cfg.get_or("romfs", "")),
+        &aoc_images(ctx, tid),
+        Some(&pack.join("shader_map.tsv")),
+    ))
+}
+
+/// `split_verdict` of a no-shader marker's text
+fn marker_verdict(ctx: &Ctx, tid: &str, text: &str) -> SplitVerdict {
+    split_verdict(
+        ctx.adapters.shaders.as_deref(),
+        &marker_rows(text),
+        &split_version(ctx),
+        Path::new(ctx.cfg.get_or("romfs", "")),
+        &aoc_images(ctx, tid),
+        None,
+    )
 }
 
 /// `shaders_will_build`: whether `build_shaders_on_device` would translate this game's shaders (no side effects): it has no library of this host's chain yet, is not marked as
@@ -263,7 +460,7 @@ pub fn shaders_will_build(ctx: &Ctx) -> bool {
     let none_marker = with_ext(&pack, ".none");
     if is_file(&none_marker) {
         let t = read_text(&none_marker).unwrap_or_default();
-        if none_marker_current(&t, &split_version(ctx))
+        if !matches!(marker_verdict(ctx, &tid, &t), SplitVerdict::Stale(_))
             && (dlc_sig == "-" || t.contains(&format!("dlc {dlc_sig}\n")))
         {
             return false;
@@ -274,7 +471,7 @@ pub fn shaders_will_build(ctx: &Ctx) -> bool {
         .any(|n| *n == format!("b-{chain}.img") || *n == format!("b-{chain}"));
     if have
         && map_has_rows(&pack.join("shader_map.tsv"))
-        && stale_split(&pack, &split_version(ctx)).is_none()
+        && !matches!(pack_verdict(ctx, &tid, &pack), Some(SplitVerdict::Stale(_)))
         && stale_dlc(&pack, &dlc_sig).is_none()
     {
         return false;
@@ -404,9 +601,16 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
     let split_ver = split_version(ctx);
     if is_file(&none_marker) {
         let t = read_text(&none_marker).unwrap_or_default();
-        if !none_marker_current(&t, &split_ver) {
-            ctx.log(&format!("stage 3 shaders: {tid} held no shader for another version of the shader split; this app's is {split_ver} -- split again"));
-            let _ = fs::remove_file(&none_marker);
+        match marker_verdict(ctx, &tid, &t) {
+            SplitVerdict::Current => {}
+            SplitVerdict::Kept(rows) => {
+                ctx.log(&format!("stage 3 shaders: {tid} held no shader for an earlier split ({split_ver} now): no reader its files need changed since -- the marker is kept"));
+                let _ = write_atomic(&none_marker, with_record_rows(&t, &rows, ' ').as_bytes());
+            }
+            SplitVerdict::Stale(why) => {
+                ctx.log(&format!("stage 3 shaders: {tid} held no shader for another version of the shader split ({why}); this app's is {split_ver} -- split again"));
+                let _ = fs::remove_file(&none_marker);
+            }
         }
     }
     if is_file(&none_marker) {
@@ -424,11 +628,25 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         ));
         return Ok(None);
     }
-    if let Some(stale) = stale_split(&pack, &split_ver) {
-        ctx.log(&format!(
-            "stage 3 shaders: Documents/shaders/{tid} was split by another version of the shader split ({stale}, this app {split_ver}): it may miss shaders this version finds -- built again"
-        ));
-        rmtree(&pack);
+    match pack_verdict(ctx, &tid, &pack) {
+        None | Some(SplitVerdict::Current) => {}
+        Some(SplitVerdict::Kept(rows)) => {
+            ctx.log(&format!("stage 3 shaders: Documents/shaders/{tid}: the readers of the shader split changed since it was split, none its game needs -- kept"));
+            let txt = pack.join("pack.txt");
+            let t = read_text(&txt).unwrap_or_default();
+            if let Err(e) = write_atomic(&txt, with_record_rows(&t, &rows, '\t').as_bytes()) {
+                ctx.log(&format!(
+                    "stage 3 shaders: could not update {}: {e} (looked at again next run)",
+                    txt.display()
+                ));
+            }
+        }
+        Some(SplitVerdict::Stale(why)) => {
+            ctx.log(&format!(
+                "stage 3 shaders: Documents/shaders/{tid} was {why}: it may miss shaders this version finds -- built again"
+            ));
+            rmtree(&pack);
+        }
     }
     if let Some((had, want)) = stale_dlc(&pack, &dlc_sig) {
         ctx.log(&format!("stage 3 shaders: Documents/shaders/{tid} was split with DLC {had}, installed now {want}: split again so the DLC's own shaders are translated too"));
@@ -578,8 +796,24 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
     );
     ctx.log(&format!("stage 3 shaders: parallel shader preparation {why}; the build finishes shaders on {build_jobs} thread{} (Rust threads: no interpreter lock)", if build_jobs == 1 { "" } else { "s" }));
     release_memory("before-shaders", &*ctx.log, &*ctx.mem);
+    // the readers' revisions too: a work folder an older build left is not resumed by one whose readers changed (its memoised jobs would mix two splits)
+    let split_ident = match ctx
+        .adapters
+        .shaders
+        .as_ref()
+        .and_then(|b| b.split_revisions())
+    {
+        Some(r) => {
+            let mut v = split_ver.clone();
+            for x in &r.readers {
+                v.push_str(&format!(" {}={}", x.name, x.rev));
+            }
+            v
+        }
+        None => split_ver.clone(),
+    };
     let sig = shader_work_signature(
-        &split_ver,
+        &split_ident,
         &tid,
         &chain,
         &dlc,
@@ -698,13 +932,17 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         "stage 3 shaders: {n} shaders found in {:.0} s",
         t0.elapsed().as_secs_f64()
     ));
+    let record = work_record_rows(&work); // which readers the game needed (the split's record): kept with the library or the marker
     if n == 0 {
         ctx.log("stage 3 shaders: the game ships no shader this split reads (it may compile them at run time: a Mac capture is needed for such a game) -- nothing built");
         rmtree(&work);
-        let marker = format!(
+        let mut marker = format!(
             "the split found 0 shaders in RomFS.img and main\ndlc {dlc_sig}\nsplit {}\n",
             split_version(ctx)
         );
+        for (k, v) in &record {
+            marker.push_str(&format!("{k} {v}\n"));
+        }
         if let Err(e) = write_atomic(&none_marker, marker.as_bytes()) {
             ctx.log(&format!(
                 "stage 3 shaders: could not write {}: {e} (the next run splits again)",
@@ -864,13 +1102,14 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
                 fs::copy(built.join(name), tmp.join(name))?;
             }
         }
-        fs::write(
-            tmp.join("pack.txt"),
-            format!(
-                "game\t{tid}\nchain\t{chain}\nmade\ton this device, {}\nshaders\t{n}\nsplit\t{split_ver}\ndlc\t{dlc_sig}\n",
-                utc_now_iso()
-            ),
-        )?;
+        let mut txt = format!(
+            "game\t{tid}\nchain\t{chain}\nmade\ton this device, {}\nshaders\t{n}\nsplit\t{split_ver}\ndlc\t{dlc_sig}\n",
+            utc_now_iso()
+        );
+        for (k, v) in &record {
+            txt.push_str(&format!("{k}\t{v}\n"));
+        }
+        fs::write(tmp.join("pack.txt"), txt)?;
         install_pack(&tmp, &pack)
     };
     if let Err(e) = assemble() {

@@ -1,0 +1,27 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "3cba7c95b42f982ac1cdb120855b5e516949057f051434a3b26b606caaf02c39",
+  "pkg/cs_pack.bin": "c94b5f7e081a7de8565606ddb282c6f2c12d1aa1fc3731964fe2656d423db73b",
+  "pkg/ps_data.bin": "c69c61750bd13416abf488f0d1ceb1cc7ad41a8a66c632914581d0de45f162e1",
+  "pkg/ps_pack.bin": "e4089f1540fecb9bf2897f643b64e1ea930a58c312f92143a0195f7d3f37497b",
+  "pkg/vs_data.bin": "468faf63ab65122ce1612b6e8a3e9353d05642c079ed1b8f01c94839b04eb16a",
+  "pkg/vs_pack.bin": "576126c3f090b995f58be0ffb5aae32242f9013874f62a863a68d1d10f4e7d96",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "694824340218e3c70e2fb553b3f4b78f9b5f33d455a76b995f3a35cf1e4b6aa0",
+  "tables/shader_map.tsv": "bd4f077e18b7024f7f76a4c7fcf0d6cc112a51a745f582bc27f1a44d2ccae731",
+  "tables/shader_pairs.tsv": "e7b1833d8f67bcd8bc413343eb36cbf9bc5e304e70257c0ace4c54c5a18eece8"
+ },
+ "log": [
+  "[RED] /Pack/broken.pka: PKA header lists 1000 packages, more than fit in the archive (its shaders are left out)",
+  "[WARN] /Pack/assets.pka: 1 entries not read, their storage flags (0x9 \u00d7 1) are not ones this reader knows (0 = stored, 1 = LZ4, 0x10 = zstd)",
+  "[RED] /Data/bad.pkg/broken.fx.phyre: zstd stream length does not match 0xaa8 (its shaders are left out)",
+  "[RED] /Data/bad_lz4.pkg/big.fx.phyre: 0xab0 bytes from 0x4 stored is more than an LZ4 block can hold (255 to 1) (its shaders are left out)",
+  "[WARN] /Data/fx.pkg: 1 entries not read, their storage flags (0x9 \u00d7 1) are not ones this reader knows (0 = stored, 1 = LZ4, 0x10 = zstd)",
+  "[RED] 3 file(s) could not be read, their shaders are left out (first: /Pack/broken.pka: PKA header lists 1000 packages, more than fit in the archive)",
+  "single-stage programs: 9 vertex shaders are paired with a cover of 1 pixel shader(s) (1443fe7c1ee2fdcd)",
+  "shaders: 20 (compute 2, pixel 9, vertex 9); sources pack 15, data 5; compute shader answers 2 rows; variation pairs 9"
+ ],
+ "shaders": 20,
+ "updates": []
+}

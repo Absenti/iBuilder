@@ -1,0 +1,266 @@
+# (after 0530) nvn/present: the presentation-time and display-link histories are published and read under a leaf lock (no torn reads, no stale wrapped entries)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/7ff0aef4e202f553ffab02ef0af31aec72593f02  ("gfx/nvn: publish coherent presentation-time and display-link history snapshots (PR #2194)")
+#            author seedds, 2026-11-23 02:18 +0800; Co-authored-by: Adam Kratch
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: the drawable callbacks, the queue-drop paths and the timing readers used g_pres and g_link_ring with no synchronization: a data race, torn reads across ticket / timestamp
+#   fields, a wrapped entry overwritten while read (upstream PR #2194).
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m, new nvn_present_history.h; new tests t_present_history, present-history-tsan): both rings behind a private leaf mutex, older generations and
+#   ticket 0 rejected.
+# Adapted: three hunks by hand (this tree drops queued presents inline in two places). The .github workflow hunk not taken. Games: every game. Switches: none.
+# Tests (M1 Pro): t_present_history 11 checks + 48,000 concurrent publications (also under TSan, `make present-history-tsan`), t_present_rescue, t_present_keep, t_present_crop; in HOST_TESTS.
+# NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0530, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 9cbab04dd7fa55f0fbb43feb1c68b2236cd5da8b..09952fb8e50ed3cc91bc7376b538fe73e76cd309 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -42,6 +42,7 @@
+ #include "nvn_primitive.h"
+ #include "nvn_link_drain.h"
+ #include "nvn_link_latch.h"
++#include "nvn_present_history.h"
+ #include "nvn_timestamp.h"
+ #include "nvn_rt_recycle.h"
+ #include "nvn_warm_head.h"   // DM_PSO_PREPARE_PERCENT: the head of the prewarm lists built before the first frame (pure C, dm/gfx/tests/t_warm_head.c)
+@@ -20509,11 +20510,10 @@ void ts_after(void) {
+     g_ts_on = 0;
+ }
+ // Ring of actual presentation times: present sequence number -> presentedTime (seconds; -1 = dropped by the system, not presented)
+-#define PRING 1024
+-typedef struct { uint64_t n; double t; } pres_ent;
+-static pres_ent g_pres[PRING];
+-// Get the actual presentation time of the nth present (returns 0 if not ready, -1 if dropped)
+-double mtl_presented_time(uint64_t n) { pres_ent e = g_pres[n % PRING]; return e.n == n ? e.t : 0; }
++#define PRING NVN_PRESENT_HISTORY_CAP
++static nvn_present_history g_present_history = NVN_PRESENT_HISTORY_INIT;
++// Get the actual presentation time of the nth present (returns 0 if not ready or overwritten, -1 if dropped)
++double mtl_presented_time(uint64_t n) { return nvn_present_history_get(&g_present_history, n); }
+ // The screen's progress, for the acquire's wait without the display link (mtl_present_screen_wait, DM_PRESENT_DEPTH) and the queue-to-screen statistics: by ticket, when the game
+ // queued the present (CACurrentMediaTime, the presentedTime base), and the newest ticket the system has reported shown or dropped (the drawable's presented handler, on a system thread)
+ static double g_pres_tin[PRING];
+@@ -20543,12 +20543,10 @@ static void pres_seen(uint64_t pn, double tt) {
+     }
+     pthread_mutex_unlock(&mu);
+ }
+-// Ring of the display-link tick that took each present (written on the display-link callback thread, read 8 presents later for DM_NVN_TSV, as g_pres): its target display time
++// Ring of the display-link tick that took each present (written on the display-link callback thread, read 8 presents later for DM_NVN_TSV, as the presentation history): its target display time
+ // (seconds, CACurrentMediaTime base), how long before it the callback ran, the callbacks since the previous present's (1 = no tick without a frame) and the longest interval between them
+-typedef struct { uint64_t n; double target, lead_ms, gap_ms; int ticks; } link_ent;
+-static link_ent g_link_ring[PRING];
+ int mtl_link_tick(uint64_t n, double *target, double *lead_ms, int *ticks, double *gap_ms) {
+-    link_ent e = g_link_ring[n % PRING]; if (e.n != n) return 0;
++    nvn_link_time e; if (!nvn_link_history_get(&g_present_history, n, &e)) return 0;
+     *target = e.target; *lead_ms = e.lead_ms; *ticks = e.ticks; *gap_ms = e.gap_ms; return 1;
+ }
+ static _Atomic uint64_t g_drawable_ns;   // Accumulated wall clock waiting for nextDrawable in present (timing instrumentation)
+@@ -21200,7 +21198,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     uint64_t pn = ticket;   // Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
+     if (!g_fg_owing) [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base; for a present with a generated frame, that frame's)
+         CFTimeInterval tt = d.presentedTime;
+-        g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
++        nvn_present_history_put(&g_present_history, pn, tt > 0 ? tt : -1);
+         pres_seen(pn, tt);
+     }];
+     // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
+@@ -21344,7 +21342,7 @@ - (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayL
+         static double t_prev; double t = update.targetPresentationTimestamp, dt = t - t_prev; t_prev = t;
+         if (dt > 0.004 && dt < 0.1) { double m = atomic_load(&g_fg_tick); atomic_store(&g_fg_tick, m > 0 ? m * 0.9 + dt * 0.1 : dt); }
+     }
+-    static double cb_prev, gap_max; static int nticks;   // for g_link_ring: callbacks counted as ticks since the previous present, and the longest interval between them
++    static double cb_prev, gap_max; static int nticks;   // for link history: callbacks counted as ticks since the previous present, and the longest interval between them
+     if (cb_prev > 0 && cb - cb_prev > gap_max) gap_max = cb - cb_prev;
+     cb_prev = cb; nticks++;
+     pthread_mutex_lock(&g_link_mu);
+@@ -21436,9 +21434,9 @@ - (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayL
+         if (it.gen && behind) { it.gen = 0; g_fg_paused_behind++; }   // the screen is behind: this present alone, its own picture
+     }
+     g_pq_read = ticket;
+-    if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) { g_pres[k % PRING] = (pres_ent){k, -1}; mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); } }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
++    if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) { nvn_present_history_put(&g_present_history, k, -1); mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); } }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
+     if (ticket > 1 && g_pq_done < ticket - 1) g_pq_done = ticket - 1;
+-    g_link_ring[ticket % PRING] = (link_ent){ticket, update.targetPresentationTimestamp, (update.targetPresentationTimestamp - cb) * 1e3, gap_max * 1e3, nticks}; nticks = 0; gap_max = 0;
++    nvn_link_history_put(&g_present_history, (nvn_link_time){ticket, update.targetPresentationTimestamp, (update.targetPresentationTimestamp - cb) * 1e3, gap_max * 1e3, nticks}); nticks = 0; gap_max = 0;
+     pthread_cond_broadcast(&g_pq_cv);
+     pthread_mutex_unlock(&g_pq_mu);
+     // Hold the whole ticks of the frame's period. The acquire distributes fractional ticks (e.g. 75 fps on a 120 Hz link), and present_period truncates to whole nanoseconds.
+@@ -21602,7 +21600,7 @@ static void present_drop_for_suspend(void) {
+     g_fg_owed = 0;
+     if (g_link_owns_layer) {
+         uint64_t n = g_pq_in - g_pq_read;
+-        for (uint64_t k = g_pq_read + 1; k <= g_pq_in; k++) { g_pres[k % PRING] = (pres_ent){k, -1}; mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); }
++        for (uint64_t k = g_pq_read + 1; k <= g_pq_in; k++) { nvn_present_history_put(&g_present_history, k, -1); mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); }
+         g_link_dropped += n; g_pq_read = g_pq_in;
+         while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+         if (g_pq_done < g_pq_in) g_pq_done = g_pq_in;
+@@ -22321,7 +22319,7 @@ void mtl_present_wait(uint64_t tk) {
+         if (g_pq_read >= tk) continue;
+         if (now - last < STALL_NS) { pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts); continue; }   // The display link is still running, it is just not this one's turn yet: keep waiting (bounded, no busy spinning)
+         uint64_t n = tk - g_pq_read;
+-        for (uint64_t k = g_pq_read + 1; k <= tk; k++) { g_pres[k % PRING] = (pres_ent){k, -1}; mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); }
++        for (uint64_t k = g_pq_read + 1; k <= tk; k++) { nvn_present_history_put(&g_present_history, k, -1); mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); }
+         g_link_dropped += n; g_pq_read = tk;
+         while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+         if (g_pq_done < tk) g_pq_done = tk;
+diff --git a/dm/gfx/nvn/nvn_present_history.h b/dm/gfx/nvn/nvn_present_history.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e8348f86763d7ce36140fe29bd344bcf0452980
+--- /dev/null
++++ b/dm/gfx/nvn/nvn_present_history.h
+@@ -0,0 +1,51 @@
++// Drawable callbacks and queue-drop paths publish presentation history on different threads
++// while guest timing readers inspect it. Keep each sequence number and its timing fields as
++// one coherent snapshot under a private leaf mutex (never acquires renderer or queue locks).
++#pragma once
++#include <pthread.h>
++#include <stdint.h>
++
++#define NVN_PRESENT_HISTORY_CAP 1024
++typedef struct { uint64_t n; double t; } nvn_present_time;
++typedef struct { uint64_t n; double target, lead_ms, gap_ms; int ticks; } nvn_link_time;
++typedef struct {
++    pthread_mutex_t mutex;
++    nvn_present_time presented[NVN_PRESENT_HISTORY_CAP];
++    nvn_link_time link[NVN_PRESENT_HISTORY_CAP];
++} nvn_present_history;
++#define NVN_PRESENT_HISTORY_INIT {.mutex = PTHREAD_MUTEX_INITIALIZER}
++
++static inline void nvn_present_history_put(nvn_present_history *h, uint64_t n, double t) {
++    if (!n) return;
++    pthread_mutex_lock(&h->mutex);
++    nvn_present_time *e = &h->presented[n % NVN_PRESENT_HISTORY_CAP];
++    // A delayed callback for an old wrap must not evict a newer generation.
++    if (n >= e->n) *e = (nvn_present_time){n, t};
++    pthread_mutex_unlock(&h->mutex);
++}
++
++static inline double nvn_present_history_get(nvn_present_history *h, uint64_t n) {
++    if (!n) return 0;
++    pthread_mutex_lock(&h->mutex);
++    nvn_present_time e = h->presented[n % NVN_PRESENT_HISTORY_CAP];
++    pthread_mutex_unlock(&h->mutex);
++    return e.n == n ? e.t : 0;
++}
++
++static inline void nvn_link_history_put(nvn_present_history *h, nvn_link_time value) {
++    if (!value.n) return;
++    pthread_mutex_lock(&h->mutex);
++    nvn_link_time *e = &h->link[value.n % NVN_PRESENT_HISTORY_CAP];
++    if (value.n >= e->n) *e = value;
++    pthread_mutex_unlock(&h->mutex);
++}
++
++static inline int nvn_link_history_get(nvn_present_history *h, uint64_t n, nvn_link_time *out) {
++    if (!n) return 0;
++    pthread_mutex_lock(&h->mutex);
++    nvn_link_time e = h->link[n % NVN_PRESENT_HISTORY_CAP];
++    pthread_mutex_unlock(&h->mutex);
++    if (e.n != n) return 0;
++    *out = e;
++    return 1;
++}
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+index b71971a1341fd14711724f3893a28b538b509c17..c139c110c520c865c69f762f1ae2298026b75f77 100644
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -173,6 +173,13 @@ t_link_latch_cb: t_link_latch_cb.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_link_latch_cb.m $(MTL_T_SRC) $(FW)
+ t_link_latch: t_link_latch.c ../nvn/nvn_link_latch.h
+ 	clang -O1 -Wall -o $@ t_link_latch.c
++t_present_history: t_present_history.c ../nvn/nvn_present_history.h
++	clang -O2 -Wall -Wextra -Werror -o $@ t_present_history.c
++t_present_history_tsan: t_present_history.c ../nvn/nvn_present_history.h
++	clang -O1 -g -fsanitize=thread -Wall -Wextra -Werror -o $@ t_present_history.c
++.PHONY: present-history-tsan
++present-history-tsan: t_present_history_tsan
++	./t_present_history_tsan
+ t_thermal: t_thermal.c $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_thermal.c $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
+ t_thermal_tsan: t_thermal.c $(MTL_T_DEP)
+diff --git a/dm/gfx/tests/t_present_history.c b/dm/gfx/tests/t_present_history.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..fefbd0e511b0fc2427bbd37acab22b4523b422b5
+--- /dev/null
++++ b/dm/gfx/tests/t_present_history.c
+@@ -0,0 +1,78 @@
++// Concurrent callbacks/drop writers and readers must never combine the sequence
++// number of one present with the timing fields of another. No GPU or game data.
++#include "../nvn/nvn_present_history.h"
++#include <stdatomic.h>
++#include <stdio.h>
++#include <sched.h>
++
++enum { WRITERS = 4, READERS = 4, ITERATIONS = 12000 };
++static nvn_present_history history = NVN_PRESENT_HISTORY_INIT;
++static _Atomic int start, done, errors;
++static _Atomic uint64_t heads[WRITERS];
++static int checks, failed;
++#define CHECK(c, label) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s\n", label); } } while (0)
++
++static double stamp(uint64_t n) { return (double)n / 8 + 0.25; }
++static void *writer(void *arg) {
++    uintptr_t id = (uintptr_t)arg;
++    while (!atomic_load(&start)) sched_yield();
++    for (uint64_t i = 1; i <= ITERATIONS; i++) {
++        // Deliberately collide writers on the same slot while generations advance.
++        uint64_t n = (i * WRITERS + id) * NVN_PRESENT_HISTORY_CAP + 7;
++        nvn_present_history_put(&history, n, stamp(n));
++        nvn_link_history_put(&history, (nvn_link_time){n, stamp(n), (double)(n % 127), (double)(n % 17), (int)(n % 7)});
++        atomic_store(&heads[id], n);
++    }
++    atomic_fetch_add(&done, 1);
++    return NULL;
++}
++static void *reader(void *unused) {
++    (void)unused;
++    while (!atomic_load(&start)) sched_yield();
++    do {
++        for (unsigned i = 0; i < WRITERS; i++) {
++            uint64_t n = atomic_load(&heads[i]);
++            if (!n) continue;
++            double t = nvn_present_history_get(&history, n);
++            if (t && t != stamp(n)) atomic_fetch_add(&errors, 1);
++            nvn_link_time value;
++            if (nvn_link_history_get(&history, n, &value)
++                && (value.n != n || value.target != stamp(n) || value.lead_ms != n % 127
++                    || value.gap_ms != n % 17 || value.ticks != (int)(n % 7))) atomic_fetch_add(&errors, 1);
++        }
++    } while (atomic_load(&done) != WRITERS);
++    return NULL;
++}
++
++int main(void) {
++    CHECK(nvn_present_history_get(&history, 1) == 0, "unpublished present stays unknown");
++    nvn_present_history_put(&history, 0, -1);
++    CHECK(nvn_present_history_get(&history, 0) == 0, "ticket 0 is ignored in present history");
++    nvn_link_time out = {.n = 999};
++    nvn_link_history_put(&history, (nvn_link_time){0, 1.0, 2.0, 3.0, 4});
++    CHECK(!nvn_link_history_get(&history, 0, &out) && out.n == 999, "unpublished link history does not write outputs");
++    nvn_present_history_put(&history, 1, -1);
++    CHECK(nvn_present_history_get(&history, 1) == -1, "an explicit drop is preserved");
++    nvn_present_history_put(&history, 1, 2.5);
++    CHECK(nvn_present_history_get(&history, 1) == 2.5, "a completion for that same generation is visible");
++    uint64_t newer = 1 + NVN_PRESENT_HISTORY_CAP;
++    nvn_present_history_put(&history, newer, 3.5);
++    nvn_present_history_put(&history, 1, 2.5);
++    CHECK(nvn_present_history_get(&history, 1) == 0 && nvn_present_history_get(&history, newer) == 3.5,
++          "a delayed old completion cannot displace a newer wrap");
++    nvn_link_history_put(&history, (nvn_link_time){newer, 3.5, 2, 3, 4});
++    nvn_link_history_put(&history, (nvn_link_time){1, 2.5, 5, 6, 7});
++    CHECK(nvn_link_history_get(&history, newer, &out) && out.target == 3.5 && out.ticks == 4,
++          "link timing fields retain their generation too");
++    CHECK(!nvn_link_history_get(&history, 1, &out), "overwritten link history stays unknown");
++    pthread_t threads[WRITERS + READERS];
++    for (uintptr_t i = 0; i < WRITERS; i++) if (pthread_create(&threads[i], NULL, writer, (void *)i)) return 2;
++    for (unsigned i = 0; i < READERS; i++) if (pthread_create(&threads[WRITERS + i], NULL, reader, NULL)) return 2;
++    atomic_store(&start, 1);
++    for (unsigned i = 0; i < WRITERS + READERS; i++) if (pthread_join(threads[i], NULL)) return 2;
++    CHECK(!atomic_load(&errors), "all concurrent timing snapshots are coherent");
++    CHECK(atomic_load(&done) == WRITERS, "all publishers completed");
++    CHECK(!pthread_mutex_destroy(&history.mutex), "history mutex can retire after all users join");
++    printf("t_present_history: %d checks, %d failed; %d concurrent publications\n", checks, failed, WRITERS * ITERATIONS);
++    return failed != 0;
++}

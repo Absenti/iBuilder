@@ -546,6 +546,42 @@ fn batch_one_done(sh: &Shared, b: &Batch) {
 
 /// The build ends because of a stop. What it made for this run only (the stage folder of hard links, the batches' folders) goes; every shader that finished is in the translation cache, whole.
 /// The error text is the one `BuildEnv::cancel` has always given.
+/// What a build that could not write its outputs leaves: nothing of its own but the cache entries (the stage, the work files, the mesh outputs and the tables it wrote go;
+/// `keep_work` keeps the work folders for a look)
+fn clean_failed_build(
+    o: &BuildOptions,
+    store: &Store,
+    tmp: &Path,
+    mesh_dir: Option<&Path>,
+    tables: &[PathBuf],
+) {
+    if !o.keep_work {
+        store.remove_stage();
+        rmtree(tmp);
+        if let Some(m) = mesh_dir {
+            rmtree(m);
+        }
+    }
+    for t in tables {
+        let _ = std::fs::remove_file(t);
+    }
+}
+
+/// The second half of a failed build's red line: what the next build reuses, and what to do (upstream's wording)
+fn failed_build_hint(store: &Store, disk_full: bool) -> String {
+    let reuse = if store.cache_full.load(Ordering::Relaxed) {
+        "The shader cache filled up earlier in this build, so only the shaders cached before that will be reused"
+    } else {
+        "The shaders compiled so far are in the shader cache, and a build again takes them from there"
+    };
+    let action = if disk_full {
+        "free space on the drive and build again"
+    } else {
+        "fix the error and build again"
+    };
+    format!("{reuse}: {action}")
+}
+
 fn stopped_build(o: &BuildOptions, store: &Store, tmp: &Path) -> String {
     if !o.keep_work {
         store.remove_stage();
@@ -973,8 +1009,14 @@ pub fn build(o: &BuildOptions, env: &BuildEnv) -> Result<BuildReport, String> {
             .find(|r| r.status == "library write failed")
             .map(|r| r.detail.clone())
             .unwrap_or_default();
+        // the stage and the work files go (the next build starts from an empty work folder anyway), so a full drive gets that space back now
+        clean_failed_build(o, &store, &tmp, None, &[]);
         return Err(format!(
-            "[RED] {n} finished shader(s) could not be written ({why}): is the drive full? what was written stays in the shader cache and is not translated again"
+            "[RED] {n} finished shader(s) could not be written ({why}): is the drive full? {}",
+            failed_build_hint(
+                &store,
+                why.contains("No space left") || why.contains("Disk quota")
+            )
         ));
     }
     // a stop that came after the last shader: the library is not composed (every shader is in the cache, the next build only has to compose it)
@@ -1068,8 +1110,21 @@ pub fn build(o: &BuildOptions, env: &BuildEnv) -> Result<BuildReport, String> {
         Source::Bytes(stamp_text(&game.id, &inputs).into_bytes()),
     ));
     let img = out_dir.join(format!("b-{}.img", o.chain));
-    let (size, nfiles) = write_image(files, &img)
-        .map_err(|e| format!("[RED] could not write {}: {e}", img.display()))?;
+    // nxnative e3f2d21f: a library that cannot be written (a full drive at the end of a build) leaves no partial output (write_image removes its .part; the stage, the work
+    // files, the mesh outputs and this build's two tables go) and stops with one red line that says what to do
+    let (size, nfiles) = write_image(files, &img).map_err(|e| {
+        let tables: Vec<PathBuf> = if tables_wanted {
+            vec![game.table("c1_full.tsv"), game.table("cb_extent.tsv")]
+        } else {
+            Vec::new()
+        };
+        clean_failed_build(o, &store, &tmp, Some(&mesh_dir), &tables);
+        format!(
+            "[RED] could not write {}: {e}. {}",
+            img.display(),
+            failed_build_hint(&store, crate::cache::is_disk_full(&e))
+        )
+    })?;
     let library_s = t_lib.elapsed().as_secs_f64();
     log(&format!(
         "{}: {nfiles} files, {size} bytes, {:.0} s",

@@ -26,7 +26,7 @@
 # Left out: the fork's front_ios.m part (the dump when the app goes to the background, and the 25 s background task for the pipeline archive's writes): front_ios.m is not in our host build
 #   (load/front_*.m); the archive's writes at the end are engine-patches/0414's. The fork's t_dump_live test was not ported (it includes ../hle_thread.c with its own stubs).
 # Shader chain: not touched. Checked: patch -p1 --forward --dry-run, no fuzz, on the tree + 0401..0415 + 0500, 0503; hle_thread.c and hle_nvn.c pass clang -fsyntax-only (the host's
-#   include paths, profile 010015100B514000). NOT run, NOT run on a device.
+#   include paths, profile 010015100B514000, Super Mario Bros. Wonder). NOT run, NOT run on a device.
 # Use: nothing to set (watchdog on). DM_STALL_DUMP=0 to turn it off; DM_THREAD_DUMP_AT=120 for a dump 2 minutes in.
 
 # REVISION 2 (2026-11-21, review L7): DM_STALL_DUMP is read by dm/host/dm_envflag.h (engine-patches/0415, needed before this patch): off / 0 / false / no turn the watchdog off

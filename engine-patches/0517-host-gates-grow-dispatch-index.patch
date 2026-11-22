@@ -1,0 +1,179 @@
+# (after 0516) host/gates: the gate dispatch index grows during module preload instead of aborting past 8,192 gates
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/184847c51117bdee6502b654d72585bc69d7e1f5  ("host/gates: grow the dispatch index during module preload (PR #3121)")
+#            author seedds, 2026-11-23 03:22 +0800; Co-authored-by: Eliran Zach
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: hle.c aborted once the combined NSO and NRO gates passed 8,192 (upstream issue #3118).
+# WHAT IT CHANGES (dm/host/hle.c; new test t_gates, wired into dm/host/tests' run): the hash table grows and rehashes during preload at a load factor of at most 1/4; dispatch stays lock-free.
+# Games: games with many modules / gates. Switches: none. Applies as is (the review's candidate 0517).
+# Tests (M1 Pro): t_gates (multi-growth registration and dispatch, abort checks), in the host-unit run of HOST_TESTS. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0516, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/host/hle.c b/dm/host/hle.c
+index 621a7d4ee3e799f36dba58c1af894df42bcab176..d757b4fac37621a149d0d6ec566ae16a2d9aaca6 100644
+--- a/dm/host/hle.c
++++ b/dm/host/hle.c
+@@ -91,25 +91,41 @@ static void (*g_obs_fn[OBS_MAX])(uint64_t *regs, int param); static int g_obs_ha
+ void gate_obs_set(int id, void (*fn)(uint64_t *regs, int param)) { if (id <= 0 || id >= OBS_MAX) die("observation gate number out of range %d", id); g_obs_fn[id] = fn; }
+ int gate_obs_present(int id) { return id > 0 && id < OBS_MAX && g_obs_have[id]; }
+ typedef struct { uint64_t ret; int kind, arg; uint64_t orig; } gate_t;
+-#define GATE_BITS 15                     // 32768 slots, gate count ≤ 8192, load factor ≤ 1/4 (spin wait gates: Tears of the Kingdom's main has 843)
+-static gate_t g_gate[1u << GATE_BITS];
+-static int g_ngate;
+-static inline unsigned gate_h(uint64_t a) { return (unsigned)(((a >> 2) * 0x9E3779B97F4A7C15ull) >> (64 - GATE_BITS)); }
++// All gates, including NROs, are registered by load_modules before guest execution. Grow and rehash there;
++// dispatch only reads the finished table, so no allocation, lock or relocation is needed on the hot path.
++static gate_t *g_gate;
++static size_t g_ngate, g_gate_cap;
++static unsigned g_gate_bits = 15;   // initially 32768 slots; keep the load factor at most 1/4
++static inline size_t gate_h(uint64_t a, unsigned bits) { return (size_t)(((a >> 2) * 0x9E3779B97F4A7C15ull) >> (64 - bits)); }
++static void gate_grow(void) {
++    if (g_gate_cap > SIZE_MAX / 2 / sizeof *g_gate) die("gate table too large");
++    size_t cap = g_gate_cap ? g_gate_cap * 2 : (size_t)1 << g_gate_bits;
++    unsigned bits = g_gate_bits + (g_gate != NULL);
++    gate_t *tab = calloc(cap, sizeof *tab);
++    if (!tab) die("gate table allocation for %zu entries", cap);
++    for (size_t j = 0; g_gate && j < g_gate_cap; j++) if (g_gate[j].ret) {
++        size_t i = gate_h(g_gate[j].ret, bits) & (cap - 1);
++        while (tab[i].ret) i = (i + 1) & (cap - 1);
++        tab[i] = g_gate[j];
++    }
++    free(g_gate); g_gate = tab; g_gate_cap = cap; g_gate_bits = bits;
++}
+ 
+ void gate_register(uint64_t ret_abs, const char *kind, int arg, uint64_t orig) {
+     int k = !strcmp(kind, "svc") ? G_SVC : !strcmp(kind, "cntpct") ? G_CNTPCT : !strcmp(kind, "cntvct") ? G_CNTVCT : !strcmp(kind, "obs") ? G_OBS : !strcmp(kind, "spin") ? G_SPIN : -1;
+     if (k < 0) die("unknown gate kind %s", kind);
+     if (k == G_OBS) { if ((arg & 0xff) <= 0 || (arg & 0xff) >= OBS_MAX) die("observation gate number out of range %d", arg & 0xff); g_obs_have[arg & 0xff] = 1; }
+-    if (++g_ngate > (1 << GATE_BITS) / 4) die("gate overflow");
+-    unsigned i = gate_h(ret_abs);
+-    while (g_gate[i].ret) { if (g_gate[i].ret == ret_abs) die("gate registered twice %#llx", ret_abs); i = (i + 1) & ((1u << GATE_BITS) - 1); }
+-    g_gate[i] = (gate_t){ret_abs, k, arg, orig};
++    if (g_ngate == g_gate_cap / 4) gate_grow();
++    size_t i = gate_h(ret_abs, g_gate_bits) & (g_gate_cap - 1);
++    while (g_gate[i].ret) { if (g_gate[i].ret == ret_abs) die("gate registered twice %#llx", ret_abs); i = (i + 1) & (g_gate_cap - 1); }
++    g_gate[i] = (gate_t){ret_abs, k, arg, orig}; g_ngate++;
+ }
+ 
+ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr);   // hle_svc.c
+ 
+ uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs) {
+-    for (unsigned i = gate_h(ret_addr);; i = (i + 1) & ((1u << GATE_BITS) - 1)) {
++    if (!g_gate) die("unknown gate at %#llx", ret_addr);
++    for (size_t i = gate_h(ret_addr, g_gate_bits) & (g_gate_cap - 1);; i = (i + 1) & (g_gate_cap - 1)) {
+         const gate_t *g = &g_gate[i];
+         if (g->ret == ret_addr) switch (g->kind) {
+             case G_CNTPCT: case G_CNTVCT: {
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 8c819f695fdec56db6cbcd2129c01d133ad2b48c..1ffa8a76be9c497cef97f7e683315e610955c2a2 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -90,6 +90,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	TMPDIR="$(abspath $(B))" $(B)/t_cheats $(QUIET)
+ 	$(B)/t_nro
+ 	$(B)/t_symbols
++	$(B)/t_gates
+ 	$(B)/t_server_environment
+ 	$(B)/t_pad_map
+ 	$(B)/t_pad_motion
+@@ -103,6 +104,12 @@ sync-wait: $(B)/t_sync_wait
+ 	$(B)/t_sync_wait
+ .PHONY: sync-wait
+ run: $(B)/t_symbols
++run: $(B)/t_gates
++$(B)/t_gates: t_gates.c ../hle.c ../hle.h ../dm.h $(GAME_H) | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -Wno-deprecated-declarations -I.. $(GINC) -o $@ t_gates.c
++.PHONY: gates
++gates: $(B)/t_gates
++	$(B)/t_gates
+ run: $(B)/t_server_environment
+ $(B)/t_server_environment: t_server_environment.c ../hle_offline.c ../hle_net.h ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_server_environment.c
+diff --git a/dm/host/tests/t_gates.c b/dm/host/tests/t_gates.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8270672a381410abe849512db1e8469d8509539
+--- /dev/null
++++ b/dm/host/tests/t_gates.c
+@@ -0,0 +1,80 @@
++// Dispatch valid synthetic gates across multiple NSO/NRO-sized batches, without game code.
++#include "../hle.c"
++#include <assert.h>
++#include <signal.h>
++#include <sys/resource.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++struct dm_flags g_flag;
++pthread_key_t g_key18;
++uint64_t unimpl_stubs[MAX_STUB];
++void *hlecount_wrap(const char *kind, const char *name, void *fn) { (void)kind; (void)name; return fn; }
++uint64_t guest_ticks(void) { return 123456789; }
++void guest_clock_read_wait(void) {}
++static uint64_t entered, spun_ret, spun_orig;
++static unsigned enters, leaves;
++void thr_svc_enter(uint64_t *regs, uint64_t orig) { (void)regs; entered = orig; enters++; }
++void thr_svc_leave(void) { leaves++; }
++void dm_spin_wait(uint64_t ret, uint64_t orig) { spun_ret = ret; spun_orig = orig; }
++uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig) { regs[0] = orig + (unsigned)num; return regs[0]; }
++static void observe(uint64_t *regs, int param) { regs[0] = (unsigned)param; }
++
++static uint64_t address(unsigned n) { return 0x100000000ull + (uint64_t)(n / 6251) * 0x10000000 + (n % 6251) * 16 + 4; }
++static const char *kinds[] = {"svc", "cntpct", "cntvct", "obs", "spin"};
++static int argument(unsigned n) { return n % 5 == 3 ? (int)(n << 8) | 1 : (int)(n % 18); }
++
++// Reject unknown and duplicate gates in a child process so the suite keeps running.
++static void expect_abort(int mode, uint64_t addr) {
++    fflush(NULL);
++    pid_t pid = fork(); assert(pid >= 0);
++    if (!pid) {
++        struct rlimit lim = {0, 0}; setrlimit(RLIMIT_CORE, &lim);
++        freopen("/dev/null", "w", stderr);
++        uint64_t regs[30] = {0};
++        if (mode == 0) gate_dispatch(addr, regs);
++        else gate_register(addr, "svc", 1, addr - 4);
++        _exit(0);
++    }
++    int status; assert(waitpid(pid, &status, 0) == pid);
++    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
++}
++
++static void check(unsigned count) {
++    for (unsigned n = 0; n < count; n++) {
++        uint64_t regs[30] = {0}, ret = address(n), orig = ret - 4;
++        unsigned before = enters;
++        uint64_t result = gate_dispatch(ret, regs);
++        switch (n % 5) {
++            case 0: assert(result == orig + (unsigned)argument(n) && regs[0] == result); break;
++            case 1: case 2: assert(result == guest_ticks() && regs[argument(n)] == result); break;
++            case 3: assert(result == 0 && regs[0] == n); break;
++            case 4: assert(result == 0 && spun_ret == ret && spun_orig == orig); break;
++        }
++        assert(enters == before + (n % 5 == 0 || n % 5 == 4));
++        assert(enters == leaves);
++        if (enters != before) assert(entered == orig);
++    }
++}
++int main(void) {
++    // Dispatch before any gate is registered must abort cleanly instead of dereferencing NULL.
++    expect_abort(0, address(0));
++
++    gate_obs_set(1, observe);
++    const unsigned batches[] = {6251, 12502, 22502};
++    unsigned start = 0;
++    for (unsigned b = 0; b < sizeof batches / sizeof *batches; b++) {
++        for (unsigned n = start; n < batches[b]; n++)
++            gate_register(address(n), kinds[n % 5], argument(n), address(n) - 4);
++        check(batches[b]);
++        assert(gate_obs_present(1));
++        printf("gates: %u registered and dispatched across module addresses\n", batches[b]);
++        start = batches[b];
++    }
++
++    // Duplicate registration and unknown dispatch must still abort after rehashing.
++    expect_abort(1, address(0));
++    expect_abort(1, address(22501));
++    expect_abort(0, address(22502));
++    return 0;
++}

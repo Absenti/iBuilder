@@ -72,6 +72,9 @@ fn run_game(
     }
     o.dlc = dlc.iter().map(|p| p.as_path()).collect();
     o.jobs = jobs;
+    // `DM_SPLIT_REGISTERED_MAP` (tools/gen_registered.py): a registered shader map beside the game
+    let registered = exp["registered"].as_str().map(|r| g.join(r));
+    o.registered = registered.as_deref();
     let log = Mutex::new(Vec::new());
     let r = split(&o, &Ruzstd, &NoGate, &|l| {
         log.lock().unwrap().push(l.to_string())
@@ -135,6 +138,7 @@ fn every_synthetic_game_is_split_to_the_bytes_of_the_python() {
                 if l.starts_with("shaders: ")
                     || l.starts_with("single-stage programs")
                     || l.starts_with("[RED]")
+                    || l.starts_with("[WARN]")
                 {
                     assert!(
                         log.iter().any(|m| m == l),

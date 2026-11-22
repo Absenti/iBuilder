@@ -146,9 +146,9 @@ for KIND in "${KINDS[@]}"; do
   STR="$HOST_WORK/strings-$PLAT.txt"; strings -a "$DYL" > "$STR"
   CHAIN_HITS="$(grep -c "^$CHAIN\$" "$STR")"      # dmsh_chain.h's DMSH_CHAIN, a plain string next to the library directory format "b-%s"
   [ "$CHAIN_HITS" -ge 1 ] || die "$KIND: the chain id $CHAIN is not in the dylib's strings"
-  # markers: paches/0006 (DM_AS_AT), 0401 (DM_AUDREN_TRACE: both hosts), and on the device host (the simulator has no nvn_mtl.m) 0202/0203 (still there) and 0404/0405
+  # markers: paches/0006 (DM_AS_AT), 0401 (DM_AUDREN_TRACE: both hosts), and on the device host (the simulator has no nvn_mtl.m) 0202/0203 (still there), 0404/0405 ... 0512, 0525 (DM_NVN_TEX_EVICT_IDLE)
   for m in DM_AS_AT DM_AUDREN_TRACE; do grep -q "$m" "$STR" || die "$KIND: marker $m missing from the dylib"; done
-  if [ "$PLAT" = ios ]; then for m in DM_PSO_NOWAIT DM_LOW_MEMORY DM_RT_SHARE DM_NVN_UPLOAD_IDLE_MS DM_NVN_UPLOAD_SRC_MB DM_PSO_PREPARE_PERCENT DM_PSO_PREPARE_TAIL DM_PSO_USER_FIRST DM_PSO_TAIL_RESUME DM_PSO_TAIL_HOT DM_NVN_TEX_MIP_SKIP DM_STALL_DUMP DM_NVN_VBUF_CLAMP DM_NVN_PRESENT_KEEP DM_NVN_RENDER_COND DM_PSO_ARCHIVE_NOFRAG DM_TEST_NO_BC DM_NO_BC_GPU DM_NO_BC_ASTC DM_MEM_PRESSURE; do grep -q "$m" "$STR" || die "$KIND: marker $m missing from the dylib"; done; fi
+  if [ "$PLAT" = ios ]; then for m in DM_PSO_NOWAIT DM_LOW_MEMORY DM_RT_SHARE DM_NVN_UPLOAD_IDLE_MS DM_NVN_UPLOAD_SRC_MB DM_PSO_PREPARE_PERCENT DM_PSO_PREPARE_TAIL DM_PSO_USER_FIRST DM_PSO_TAIL_RESUME DM_PSO_TAIL_HOT DM_NVN_TEX_MIP_SKIP DM_STALL_DUMP DM_NVN_VBUF_CLAMP DM_NVN_PRESENT_KEEP DM_NVN_RENDER_COND DM_PSO_ARCHIVE_NOFRAG DM_TEST_NO_BC DM_NO_BC_GPU DM_NO_BC_ASTC DM_MEM_PRESSURE DM_NVN_TEX_EVICT_IDLE; do grep -q "$m" "$STR" || die "$KIND: marker $m missing from the dylib"; done; fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%ss\n' "$KIND" "$(basename "$DYL")" "$(stat -f %z "$DYL")" "$(sha "$DYL")" "platform $GOT_PLATFORM minos $GOT_MINOS" "chain id $CHAIN x$CHAIN_HITS in strings" "$ELAPSED" >> "$SUMMARY"
   cp "$DYL" "$HOST_OUT/host-prebuilt-loadable-$PLAT.dylib.new" && mv "$HOST_OUT/host-prebuilt-loadable-$PLAT.dylib.new" "$HOST_OUT/host-prebuilt-loadable-$PLAT.dylib"
 done
@@ -156,15 +156,17 @@ done
 TESTS_TXT="$HOST_OUT/HOST-TESTS.txt"; rm -f "$TESTS_TXT"
 if [ "${HOST_TESTS:-0}" = 1 ]; then
   say "5b. engine self-tests on this Mac (no game files), logs in $HOST_WORK/logs/test-*.log"
-  TG=010015100B514000; NJ="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-  { echo "engine self-tests run on the built tree ($ENGINE), $(date '+%Y-%m-%d %H:%M:%S'), profile $TG, this Mac: $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+  TG=010015100B514000   # the self-tests' game profile: 010015100B514000 = Super Mario Bros. Wonder (no game file is read)
+  NJ="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  { echo "engine self-tests run on the built tree ($ENGINE), $(date '+%Y-%m-%d %H:%M:%S'), profile $TG (Super Mario Bros. Wonder), this Mac: $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
     echo "(commands as .github/workflows/tests.yml of the engine runs them; none needs a game or a key)"; } > "$TESTS_TXT"
   run_t() { local name=$1 t0=$SECONDS; shift
     if ( cd "$ENGINE" && "$@" ) > "$HOST_WORK/logs/test-$name.log" 2>&1; then echo "PASS  $name  ($((SECONDS - t0))s)  $*"; else echo "FAIL  $name  ($((SECONDS - t0))s)  $*"; fi; }
   { run_t host-unit make -C dm/host/tests GAME=$TG -j"$NJ" run
+    run_t host-memory make -C dm/host/tests GAME=$TG memory
     run_t cpu-texture make -C dm/gfx/tex/tests run
-    for t in rt_recycle_policy gfx_suspend lazy_clear_order zero_colour upload_idle upload_src pso_pending cbs_fault bc_cpu warm_head pso_head pso_user_first pso_binary_archive pso_tail_resume pso_warm pso_admission present_rescue res_commit dispatch_pipeline sparse_pool_cache pso_archive present_crop dispatch_zero env_flag mip_skip_limits pool_census stall_watch submit_compile session_reset vbuf_clamp present_keep drop_reasons render_cond_switch pso_archive_nofrag vbuf pull nobc_order bc_astc bc2astc_gpu astc_hw mem_trim; do run_t "gfx-$t" make -C dm/gfx/tests GAME=$TG check_t_$t; done; } | tee -a "$TESTS_TXT" >&2
-  { echo "not run: dm/gfx/tests t_geometry_mesh (0408's test): t_geometry.m reads g_mdi_v, which nvn_mtl.m of the base tree (nxnative a3663659 + 54 NX2Apple patches, before any patch here) does not define: it does not compile there either;"
+    for t in rt_recycle_policy gfx_suspend lazy_clear_order zero_colour upload_idle upload_src pso_pending cbs_fault bc_cpu warm_head pso_head pso_user_first pso_binary_archive pso_tail_resume pso_warm pso_admission present_rescue res_commit dispatch_pipeline sparse_pool_cache pso_archive present_crop dispatch_zero env_flag mip_skip_limits pool_census stall_watch submit_compile session_reset vbuf_clamp present_keep drop_reasons render_cond_switch pso_archive_nofrag vbuf pull nobc_order bc_astc bc2astc_gpu astc_hw mem_trim dirty_race sbw addr_known file_wire fstep gpu_only_addr pool_chunks pkg_share cpu_tex cpu_storage linear_readback read_owner readback pkg_spare pkg_evict rt_recycle shmap_warm nvn ir_gpu_write present_history tiled_resolve; do run_t "gfx-$t" make -C dm/gfx/tests GAME=$TG check_t_$t; done; } | tee -a "$TESTS_TXT" >&2
+  { echo "not run: dm/gfx/tests t_geometry_mesh (0408's test; 0520's upstream cases) and t_geometry (0515's part): t_geometry.m reads g_mdi_v, which nvn_mtl.m of the base tree (nxnative a3663659 + 54 NX2Apple patches, before any patch here) does not define: it does not compile there either;"
     echo "         with g_mdi_v renamed to g_mdi_waits in a scratch copy it passes (47 checks). dm/tools/tests/test_x18_select.py (0409): needs the Python module capstone, not installed."; } >> "$TESTS_TXT"
   ! grep -q '^FAIL' "$TESTS_TXT" || die "an engine self-test failed: $TESTS_TXT"
 fi
