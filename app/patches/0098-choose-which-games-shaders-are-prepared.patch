@@ -1,0 +1,484 @@
+# 0098-choose-which-games-shaders-are-prepared.patch -- the owner's request W: Mario Kart's ~60,000 libraries kept South Park's shader preparation from ever getting its turn; the person
+# chooses the order. Applies after 0097. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# W. WarmOrder (GameAppField.cs, pure) over the warm queue (GameAppWarm.cs: WarmQueue gains Held and Skipped):
+#    - The Build tab's SHADERS section lists the games in their order, then the skipped ones: "Mario Kart 8 Deluxe · 12,400 of 60,112" (being prepared, live), "South Park · waiting · 5,009"
+#      (its libraries; "1,200 of 5,009" once begun: its warmed.tsv rows for this app build and chain over its pack's .metal entries, read on the sync's worker, the image's count kept while
+#      the image is the same file), "· paused", "· skipped". Each game has a "…" menu: "Prepare this one now", "Pause" / "Resume" (that game only: it keeps its place and is passed over),
+#      "Skip" (left unprepared, out of the queue; "Queue again" puts it back at the end). The game's sheet: "Prepare this one now", "Pause / Resume this game's preparation", "Skip its
+#      preparation" / "Queue its preparation again" (values "Paused (this game)", "Skipped"). Its long-press menu: "Prepare its shaders now" (a skipped game too).
+#    - "Prepare this one now": the game first (un-paused, un-skipped), saved at once; the game being prepared stops at its next library (StopWarm; what it finished is in its warmed.tsv and
+#      is skipped when its turn comes back: it RESUMES, it does not restart); the chosen game starts (WarmSync -> WarmKick); one log line: "shader warm-up: South Park moved first by you
+#      (Mario Kart 8 Deluxe paused at 12,400 of 60,112)". Never two runs at once (WarmOrder.Next: none while one runs, while everything is paused or something else has the phone;
+#      GameWarm's one-run rule of 0087/0093 stays).
+#    - The order persists in gameapp.warmqueue.tsv ("held" and "skipped" rows beside "paused" and "title"; an older app reads it and ignores them); a game the person put first stays first; a
+#      game newly built goes to the END (a finished build put its game first before: PrepareAfterBuild no longer passes it as the front); a game that owes nothing any more (prepared,
+#      deleted) leaves and is forgotten as paused or skipped.
+#    - The lock screen / Dynamic Island: the warm-up's background task is retargeted to the game being prepared at every start (BackgroundRetargetWarm, as before).
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch 0010-0098 applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile
+#   (-t:Compile): 0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness98: … P97;P98): 387 of 387 checks (19 new: a new game at the end, move first, the
+#   order kept, per-game pause, no double run, skip / queue again, the file's round trip and an older file, the list's words, the switch line, resume not restart, the lock screen, the
+#   wiring); 11 of 11 mutations killed.
+# NOT VERIFIED: nothing ran on a device: a real switch from a 60,000-library run (the stop comes at the run's next library), the list's look, the counts of a real pack.
+# NEW UI STRINGS: "Prepare this one now", "Prepare its shaders now", "Pause", "Resume", "Skip", "Left unprepared; it can be queued again", "Queue again", "Pause this game's preparation",
+#   "Resume this game's preparation", "Skip its preparation", "Queue its preparation again", "Paused (this game)", "Skipped"; log lines " moved first by you", "(it waits at the end of the
+#   queue)", "paused by you (it keeps its place; what it finished is kept)", "skipped by you: left unprepared (Queue again puts it back)", "queued again by you, at the end".
+diff -ruN t97b/GameAppField.cs q/GameAppField.cs
+--- t97b/GameAppField.cs	2026-11-22 16:10:16
++++ q/GameAppField.cs	2026-11-22 16:06:27
+@@ -687,3 +687,118 @@
+         catch (Exception) { return -1; }
+     }
+ }
++
++/// Patch 0098 (the owner: Mario Kart's ~60,000 libraries kept South Park's preparation from ever getting its turn): the order of the shader preparation is the person's. The queue's titles
++/// in order, the games the person paused (held: passed over, kept in place), the games the person skipped (out of the queue until queued again); a game newly built goes to the END
++/// (it went first before); "Prepare this one now" moves a game first and the game being prepared stops at its next library (what it finished is kept in its warmed.tsv: it goes on from
++/// there when its turn comes back). Kept in gameapp.warmqueue.tsv ("held" and "skipped" rows beside "paused" and "title"; an older app reads the file and ignores them).
++public static class WarmOrder
++{
++    public const string Header = "# shader preparation queue v1";
++
++    private static string Norm(string t) => t?.Trim().ToUpperInvariant();
++    private static bool Ok(string t) => t != null && t.Length == 16 && t.All(Uri.IsHexDigit);
++
++    /// The queue against what owes a preparation now (`owing`, in the shelf's order): titles that owe nothing leave (and are forgotten as held or skipped); owing ones that are not in it and
++    /// not skipped are added at the END, in that order. The person's order is kept. Returns whether anything changed.
++    public static bool Sync(List<string> titles, ISet<string> held, ISet<string> skipped, IEnumerable<string> owing)
++    {
++        var before = string.Join(",", titles) + "|" + string.Join(",", held.OrderBy(x => x)) + "|" + string.Join(",", skipped.OrderBy(x => x));
++        var owe = (owing ?? Enumerable.Empty<string>()).Select(Norm).Where(Ok).Distinct().ToList();
++        var set = new HashSet<string>(owe, StringComparer.Ordinal);
++        titles.RemoveAll(x => !set.Contains(x));
++        foreach (var x in held.Where(x => !set.Contains(x)).ToList()) held.Remove(x);
++        foreach (var x in skipped.Where(x => !set.Contains(x)).ToList()) skipped.Remove(x);
++        foreach (var x in owe) if (!titles.Contains(x) && !skipped.Contains(x)) titles.Add(x);
++        return before != string.Join(",", titles) + "|" + string.Join(",", held.OrderBy(x => x)) + "|" + string.Join(",", skipped.OrderBy(x => x));
++    }
++
++    /// "Prepare this one now": first, not paused, not skipped. Returns whether it moved.
++    public static bool MoveFirst(List<string> titles, ISet<string> held, ISet<string> skipped, string title)
++    {
++        var t = Norm(title);
++        if (!Ok(t)) return false;
++        bool was = titles.Count > 0 && titles[0] == t && !held.Contains(t) && !skipped.Contains(t);
++        titles.Remove(t); titles.Insert(0, t);
++        held.Remove(t); skipped.Remove(t);
++        return !was;
++    }
++
++    /// Pause / Resume one game: a paused game keeps its place and is passed over.
++    public static bool Hold(List<string> titles, ISet<string> held, string title, bool on)
++    {
++        var t = Norm(title);
++        if (!titles.Contains(t)) return false;
++        return on ? held.Add(t) : held.Remove(t);
++    }
++
++    /// Skip: out of the queue, left unprepared, until it is queued again (Requeue) or moved first.
++    public static bool Skip(List<string> titles, ISet<string> held, ISet<string> skipped, string title)
++    {
++        var t = Norm(title);
++        if (!titles.Remove(t)) return false;
++        held.Remove(t);
++        skipped.Add(t);
++        return true;
++    }
++
++    /// A skipped game queued again: at the end.
++    public static bool Requeue(List<string> titles, ISet<string> skipped, string title)
++    {
++        var t = Norm(title);
++        if (!skipped.Remove(t)) return false;
++        if (!titles.Contains(t)) titles.Add(t);
++        return true;
++    }
++
++    /// The game to prepare now: the first one not paused by the person, unless the whole preparation is paused or something else has the phone. One run at a time: never while one runs.
++    public static string Next(IReadOnlyList<string> titles, ISet<string> held, bool allPaused, bool busy, bool running) =>
++        allPaused || busy || running ? null : titles.FirstOrDefault(x => !held.Contains(x));
++
++    /// "Mario Kart 8 Deluxe · 12,400 of 60,112" (being prepared), "South Park · waiting · 5,009" (its libraries; "1,200 of 5,009" once begun), "· paused", "· skipped".
++    public static string RowText(string name, int done, int total, bool active, bool held, bool skippedNow)
++    {
++        string N(int n) => n.ToString("N0", CultureInfo.InvariantCulture);
++        string count = total > 0 ? (done > 0 ? N(Math.Min(done, total)) + " of " + N(total) : N(total)) : done > 0 ? N(done) + " done" : "";
++        string state = active ? "" : skippedNow ? "skipped" : held ? "paused" : "waiting";
++        return string.Join(" · ", new[] { name, state, active && total > 0 ? N(Math.Min(done, total)) + " of " + N(total) : count }.Where(x => !string.IsNullOrEmpty(x)));
++    }
++
++    /// The log at a switch: "shader warm-up: South Park moved first by you (Mario Kart 8 Deluxe paused at 12,400 of 60,112)".
++    public static string SwitchLine(string chosen, string other, int done, int total) =>
++        "shader warm-up: " + chosen + " moved first by you" + (other == null ? "" : $" ({other} paused at {done.ToString("N0", CultureInfo.InvariantCulture)} of {total.ToString("N0", CultureInfo.InvariantCulture)})");
++
++    public static string Format(bool paused, IEnumerable<string> titles, IEnumerable<string> held, IEnumerable<string> skipped)
++    {
++        var sb = new System.Text.StringBuilder(Header).Append('\n').Append("paused\t").Append(paused ? "1" : "0").Append('\n');
++        foreach (var x in titles ?? Enumerable.Empty<string>()) sb.Append("title\t").Append(x).Append('\n');
++        foreach (var x in (held ?? Enumerable.Empty<string>()).OrderBy(x => x, StringComparer.Ordinal)) sb.Append("held\t").Append(x).Append('\n');
++        foreach (var x in (skipped ?? Enumerable.Empty<string>()).OrderBy(x => x, StringComparer.Ordinal)) sb.Append("skipped\t").Append(x).Append('\n');
++        return sb.ToString();
++    }
++
++    /// Null when the text is not a queue this reads. A bad or repeated title is dropped; a held title that is not in the queue is dropped.
++    public static (bool Paused, List<string> Titles, HashSet<string> Held, HashSet<string> Skipped)? Parse(string text)
++    {
++        if (string.IsNullOrEmpty(text)) return null;
++        var lines = text.Split('\n');
++        if (lines[0].TrimEnd('\r') != Header) return null;
++        bool paused = false;
++        var titles = new List<string>();
++        var held = new HashSet<string>(StringComparer.Ordinal);
++        var skipped = new HashSet<string>(StringComparer.Ordinal);
++        foreach (var raw in lines.Skip(1))
++        {
++            var c = raw.TrimEnd('\r').Split('\t');
++            if (c.Length < 2) continue;
++            var v = Norm(c[1]);
++            if (c[0] == "paused") paused = c[1].Trim() == "1";
++            else if (!Ok(v)) continue;
++            else if (c[0] == "title" && !titles.Contains(v) && !skipped.Contains(v)) titles.Add(v);
++            else if (c[0] == "held") held.Add(v);
++            else if (c[0] == "skipped") { skipped.Add(v); titles.Remove(v); }
++        }
++        held.IntersectWith(titles);
++        return (paused, titles, held, skipped);
++    }
++}
+diff -ruN t97b/GameAppRedesignUi.cs q/GameAppRedesignUi.cs
+--- t97b/GameAppRedesignUi.cs	2026-11-22 16:10:16
++++ q/GameAppRedesignUi.cs	2026-11-22 16:08:24
+@@ -1121,7 +1121,7 @@
+         bool local = e.Cloud == null || File.Exists(path);
+         var tid = GameAppUi.BaseTitleIdOf(name);
+         bool warmShown = WarmShown.On(tid, state == LibState.Built, WarmShownTitle());   // patch 0087: a built game only
+-        bool warmQueued = tid != null && warmQueue.Titles.Contains(tid.ToUpperInvariant());
++        bool warmQueued = tid != null && (warmQueue.Titles.Contains(tid.ToUpperInvariant()) || warmQueue.Skipped.Contains(tid.ToUpperInvariant()));   // patch 0098: a skipped game too
+         bool update = state == LibState.Built && GameAppUi.ContentChangedSinceBuild(name, libNames ?? Dumps().Select(Path.GetFileName).ToList(), facts);
+         var targets = UploadTargets().Where(t => e.Cloud == null || e.Cloud.SourceId != t.Id).ToList();
+         // patch 0082 (review L7): "Remove download" only for the file the app brought from that source (or of its size)
+@@ -1146,7 +1146,7 @@
+                 case HoldItem.Export: list.Add(new HoldOverlay.Entry("Export IPA", "square.and.arrow.up", false, () => { selected = name; ConfirmExport(name); }, "hold-export")); break;
+                 case HoldItem.Update: list.Add(new HoldOverlay.Entry("Update (build again with the update or DLC)", "arrow.triangle.2.circlepath", false, () => DoUpdate(name), "hold-update")); break;
+                 case HoldItem.WarmToggle: list.Add(new HoldOverlay.Entry(warmQueue.Paused ? "Resume the shader preparation" : "Pause the shader preparation", warmQueue.Paused ? "play.fill" : "pause.fill", false, ToggleWarmPause, "hold-warm")); break;
+-                case HoldItem.WarmNow: list.Add(new HoldOverlay.Entry("Prepare the shaders now", "bolt.fill", false, () => PrepareNow(name), "hold-warm-now")); break;
++                case HoldItem.WarmNow: list.Add(new HoldOverlay.Entry("Prepare its shaders now", "bolt.fill", false, () => PrepareNow(name), "hold-warm-now")); break;   // patch 0098: first in the queue
+                 case HoldItem.CancelPaused: list.Add(new HoldOverlay.Entry("Cancel the paused build…", "xmark", false, () => AskCancel(name), "build-cancel")); break;
+                 case HoldItem.FetchExtras:   // patch 0094 (T, V): the update and DLC the cloud has for this game, downloaded now
+                     list.Add(new HoldOverlay.Entry(ContentFetch.FetchLabel(ExtrasToFetch(name).Sum(f => Math.Max(0, f.Size))), "arrow.down.circle", false, () => FetchExtras(name), "hold-fetch-extras"));
+diff -ruN t97b/GameAppShelf.cs q/GameAppShelf.cs
+--- t97b/GameAppShelf.cs	2026-11-22 16:10:16
++++ q/GameAppShelf.cs	2026-11-22 16:08:38
+@@ -1036,15 +1036,26 @@
+             string preparedText = null;
+             try { var mk = Path.Combine(docs, "games", (tid ?? "").ToUpperInvariant(), "prepared.tsv"); if (tid != null && File.Exists(mk)) preparedText = File.ReadAllText(mk); } catch (Exception) { }
+             bool prepared = !GameExport.IsPlayer && !thisOne && preparedText != null && GameWarmLogic.PreparedDone(preparedText, GameWarmLogic.Header(GameAppBuild.Id, GameAppBuild.ShaderChain), true);
+-            var prepare = SettingsRow(GameExport.IsPlayer ? "Prepare the shaders…" : prepared ? "Shaders prepared" : thisOne ? "Pause the preparation" : "Prepare now", prepared ? null : () => Then(() => PrepareShadersFor(game)), !prepared, false);
++            var prepare = SettingsRow(GameExport.IsPlayer ? "Prepare the shaders…" : prepared ? "Shaders prepared" : thisOne ? "Pause the preparation" : "Prepare this one now", prepared ? null : () => Then(() => PrepareShadersFor(game)), !prepared, false);
++            var wt = (tid ?? "").ToUpperInvariant();
+             prepare.Value.Text = GameExport.IsPlayer ? (GameWarm.Active ? "Running" : "")
+                                : prepared ? WarmDone.Label(WarmDone.Count(preparedText))
+-                               : thisOne ? "Preparing" : ready && tid != null && warmQueue.Titles.Contains(tid) ? (warmQueue.Paused ? "Paused" : "In the queue") : "";
+-            var shaderViews = new List<UIView> { Look.Section("Shaders"), Look.Group(prepare.Button) };
++                               : thisOne ? "Preparing" : ready && tid != null && warmQueue.Skipped.Contains(wt) ? "Skipped"
++                               : ready && tid != null && warmQueue.Held.Contains(wt) ? "Paused (this game)"
++                               : ready && tid != null && warmQueue.Titles.Contains(wt) ? (warmQueue.Paused ? "Paused" : "In the queue") : "";
++            var shaderRows = new List<UIView> { prepare.Button };
++            // patch 0098: this game's own place in the preparation: paused (it keeps its place), skipped (left unprepared until queued again)
++            if (!GameExport.IsPlayer && !prepared && ready && tid != null && (warmQueue.Titles.Contains(wt) || warmQueue.Skipped.Contains(wt)))
++            {
++                bool heldNow = warmQueue.Held.Contains(wt), skippedNow = warmQueue.Skipped.Contains(wt);
++                if (!skippedNow) shaderRows.Add(SettingsRow(heldNow ? "Resume this game's preparation" : "Pause this game's preparation", () => Then(() => WarmHoldGame(wt, !heldNow)), false, false, -1, "sheet-warm-hold").Button);
++                shaderRows.Add(SettingsRow(skippedNow ? "Queue its preparation again" : "Skip its preparation", () => Then(() => WarmSkipGame(wt, !skippedNow)), false, false, -1, "sheet-warm-skip").Button);
++            }
++            var shaderViews = new List<UIView> { Look.Section("Shaders"), Look.Group(shaderRows.ToArray()) };
+             warmSheetViews.Clear();
+             if (WarmStrip(game, true, ready) is UIView sheetWarm) shaderViews.Add(sheetWarm);   // GameAppWarm.cs (patch 0070): the automatic preparation of this game, live
+             shaderViews.Add(Theme.Label("After a build, and whenever you open iBuilder, it compiles all the built games' shaders by itself, one game after another, at low priority: the ones the game asks for first, then the rest. "
+-                + "Play stays available and stops it; it resumes by itself. \"Prepare now\" puts this game first. Settings › Shader preparation sets the cores.", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0));
++                + "Play stays available and stops it; it resumes by itself. \"Prepare this one now\" puts this game first (the game being prepared keeps what it finished). Settings › Shader preparation sets the cores.", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0));
+             shadersBlock = Theme.Column(8, shaderViews.ToArray());
+         }
+ 
+diff -ruN t97b/GameAppWarm.cs q/GameAppWarm.cs
+--- t97b/GameAppWarm.cs	2026-11-22 16:10:16
++++ q/GameAppWarm.cs	2026-11-22 16:08:23
+@@ -421,6 +421,8 @@
+     {
+         public List<string> Titles = new List<string>();
+         public bool Paused;
++        public HashSet<string> Held = new HashSet<string>(StringComparer.Ordinal);      // patch 0098: the games the person paused (passed over, kept in place)
++        public HashSet<string> Skipped = new HashSet<string>(StringComparer.Ordinal);   // patch 0098: the games the person skipped (out of the queue until queued again)
+     }
+ 
+     public const string QueueHeader = "# shader preparation queue v1";
+@@ -431,50 +433,31 @@
+     /// The queue in the file's text; null when the text is not a queue this reads (no header: the caller rebuilds it from disk). Rows: "paused<TAB>0|1", "title<TAB><id>"; a bad or repeated title is dropped.
+     public static WarmQueue ParseQueue(string text)
+     {
+-        if (string.IsNullOrEmpty(text)) return null;
+-        var lines = text.Split('\n');
+-        if (lines[0].TrimEnd('\r') != QueueHeader) return null;
+-        var q = new WarmQueue();
+-        foreach (var raw in lines.Skip(1))
+-        {
+-            var c = raw.TrimEnd('\r').Split('\t');
+-            if (c.Length < 2) continue;
+-            if (c[0] == "paused") q.Paused = c[1].Trim() == "1";
+-            else if (c[0] == "title")
+-            {
+-                var t = c[1].Trim().ToUpperInvariant();
+-                if (TitleOk(t) && !q.Titles.Contains(t)) q.Titles.Add(t);
+-            }
+-        }
++        var p = WarmOrder.Parse(text);   // patch 0098 (GameAppField.cs): with the held and skipped rows
++        if (p == null) return null;
++        var q = new WarmQueue { Paused = p.Value.Paused, Titles = p.Value.Titles };
++        q.Held.UnionWith(p.Value.Held);
++        q.Skipped.UnionWith(p.Value.Skipped);
+         return q;
+     }
+ 
+-    public static string FormatQueue(WarmQueue q)
+-    {
+-        var sb = new StringBuilder(QueueHeader).Append('\n').Append("paused\t").Append(q.Paused ? "1" : "0").Append('\n');
+-        foreach (var t in q.Titles) sb.Append("title\t").Append(t).Append('\n');
+-        return sb.ToString();
+-    }
++    public static string FormatQueue(WarmQueue q) => WarmOrder.Format(q.Paused, q.Titles, q.Held, q.Skipped);
+ 
+     /// The queue against what is on disk now: `owing` the title ids that owe a preparation, in the shelf's order. Titles that owe none leave; owing ones not in the queue are appended in that order;
+     /// `front` (a game whose build just finished, or the owner's "Prepare now") goes first when it owes one. Returns whether the queue changed.
++    /// Patch 0098: the person's order kept, a new game at the END (WarmOrder.Sync); `front` only from the person's "Prepare this one now" (WarmOrder.MoveFirst).
+     public static bool SyncQueue(WarmQueue q, IReadOnlyList<string> owing, string front)
+     {
+-        var before = string.Join(",", q.Titles);
+-        var owe = new HashSet<string>((owing ?? Array.Empty<string>()).Where(TitleOk).Select(t => t.ToUpperInvariant()), StringComparer.Ordinal);
+-        q.Titles.RemoveAll(t => !owe.Contains(t));
+-        foreach (var t in (owing ?? Array.Empty<string>()).Where(TitleOk).Select(t => t.ToUpperInvariant()))
+-            if (!q.Titles.Contains(t)) q.Titles.Add(t);
+-        var f = front?.ToUpperInvariant();
+-        if (f != null && q.Titles.Remove(f)) q.Titles.Insert(0, f);
+-        return before != string.Join(",", q.Titles);
++        bool changed = WarmOrder.Sync(q.Titles, q.Held, q.Skipped, owing);
++        if (front != null && (owing ?? Array.Empty<string>()).Any(o => string.Equals(o, front, StringComparison.OrdinalIgnoreCase))) changed |= WarmOrder.MoveFirst(q.Titles, q.Held, q.Skipped, front);
++        return changed;
+     }
+ 
+     /// A game leaves the queue (its preparation completed, or it was deleted). Returns whether it was in it.
+-    public static bool RemoveFromQueue(WarmQueue q, string title) => title != null && q.Titles.Remove(title.ToUpperInvariant());
++    public static bool RemoveFromQueue(WarmQueue q, string title) { if (title == null) return false; q.Held.Remove(title.ToUpperInvariant()); return q.Titles.Remove(title.ToUpperInvariant()); }
+ 
+     /// The game to prepare now: the queue's first, unless the owner paused the queue or something else has the phone (a build, a boot, an export, a delete, a download, the build queue).
+-    public static string NextToRun(WarmQueue q, bool busy) => q == null || q.Paused || busy ? null : q.Titles.FirstOrDefault();
++    public static string NextToRun(WarmQueue q, bool busy) => q == null ? null : WarmOrder.Next(q.Titles, q.Held, q.Paused, busy, false);   // patch 0098: a game the person paused is passed over
+ 
+     /// The games waiting behind the one being prepared (`active`, which may have left the queue already: then they all wait), or behind the queue's first when none is.
+     public static int Waiting(WarmQueue q, string active)
+@@ -996,9 +979,11 @@
+             var owing = new List<string>();
+             foreach (var (t, _) in built)
+                 try { if (GameWarm.FirstStartPending(t, root, all: true)) owing.Add(t); } catch (Exception) { }
++            var counts = WarmCountsOf(owing, root);   // patch 0098: each game's "N of M" for the list (its warmed.tsv rows, its pack's libraries), on this worker
+             BeginInvokeOnMainThread(() =>
+             {
+                 foreach (var (t, g) in built) warmGames[t] = g;
++                foreach (var (t, c) in counts) warmCounts[t] = c;
+                 if (front != null && !owing.Contains(front, StringComparer.OrdinalIgnoreCase))
+                     Write($"shader warm-up: nothing to prepare for {WarmName(front)}: its shaders are prepared for this app build (prepared.tsv), or it has no library of this app's chain");
+                 if (GameWarmLogic.SyncQueue(warmQueue, owing, front))
+@@ -1050,13 +1035,14 @@
+     {
+         if (GameExport.IsPlayer) return;
+         warmHeldAtLaunch = false;
+-        string front = null, built = null;
++        string built = null;
+         if (outcome == StopOutcome.Finished && !failedRun)
+         {
+             var facts = GatherFacts();
+-            if (facts.Framework == FrameworkState.Fresh) { built = facts.FrameworkGame; front = WarmTitleOf(built); }
++            if (facts.Framework == FrameworkState.Fresh) built = facts.FrameworkGame;
+         }
+-        WarmSync(front != null ? $"after the build of {GameAppUi.DisplayName(built)}" : $"after the build ended ({outcome})", front);
++        // patch 0098 (the owner): a newly built game waits at the END of the queue (it went first, and a big game kept the others from ever getting their turn); "Prepare this one now" moves it
++        WarmSync(built != null ? $"after the build of {GameAppUi.DisplayName(built)} (it waits at the end of the queue)" : $"after the build ended ({outcome})");
+     }
+ 
+     /// The owner's "Prepare now" (the game's sheet and settings): this game first, the queue resumed. The run of another game stops (what it did is kept) and this one starts when it has returned.
+@@ -1068,10 +1054,140 @@
+         warmHeldAtLaunch = false;
+         if (warmQueue.Paused) { warmQueue.Paused = false; SaveWarmQueue(); Write("shader warm-up: resumed by you"); }
+         warmGames[tid] = game;
+-        if (GameWarm.Active && !string.Equals(GameWarm.ActiveGame, tid, StringComparison.OrdinalIgnoreCase)) StopWarm($"you asked for {GameAppUi.DisplayName(game)} first");
++        // patch 0098: one line per switch; the game being prepared stops at its next library (its warmed.tsv keeps what it finished: it goes on from there when its turn comes back)
++        if (GameWarm.Active && GameWarm.ActiveGame is string other && !string.Equals(other, tid, StringComparison.OrdinalIgnoreCase))
++        {
++            Write(WarmOrder.SwitchLine(GameAppUi.DisplayName(game), WarmName(other), GameWarm.Done, GameWarm.Total));
++            warmCounts[other.ToUpperInvariant()] = (GameWarm.Done, GameWarm.Total);
++            StopWarm($"you asked for {GameAppUi.DisplayName(game)} first");
++        }
++        else Write(WarmOrder.SwitchLine(GameAppUi.DisplayName(game), null, 0, 0));
++        if (WarmOrder.MoveFirst(warmQueue.Titles, warmQueue.Held, warmQueue.Skipped, tid)) SaveWarmQueue();   // first now, kept across launches (WarmSync drops it again if it owes nothing)
+         WarmSync($"you asked for {GameAppUi.DisplayName(game)} first", front: tid);
+     }
+ 
++    // ---- patch 0098: the person's order (WarmOrder, GameAppField.cs) -----------------------------------------------------------------------------------------
++
++    private readonly Dictionary<string, (int Done, int Total)> warmCounts = new Dictionary<string, (int, int)>(StringComparer.OrdinalIgnoreCase);
++    private static readonly Dictionary<string, (DateTime Stamp, int Total)> warmTotals = new Dictionary<string, (DateTime, int)>(StringComparer.OrdinalIgnoreCase);
++
++    /// Worker thread: for each title, the rows of its warmed.tsv for this app build and chain (what is done) and its pack's libraries (what there is; the image's index, kept while the image is
++    /// the same file).
++    private static List<(string Tid, (int Done, int Total) Count)> WarmCountsOf(IEnumerable<string> titles, string root)
++    {
++        var list = new List<(string, (int, int))>();
++        var header = GameWarmLogic.Header(GameAppBuild.Id, GameAppBuild.ShaderChain);
++        foreach (var t in titles)
++        {
++            int done = 0, total = -1;
++            try
++            {
++                var warmed = Path.Combine(GameAppMain.Documents, "games", t.ToUpperInvariant(), "warmed.tsv");
++                done = File.Exists(warmed) ? GameWarmLogic.ParseWarmed(File.ReadAllText(warmed), header).Count : 0;
++                var image = Path.Combine(root, t, "b-" + GameAppBuild.ShaderChain + ".img");
++                if (File.Exists(image))
++                {
++                    var stamp = File.GetLastWriteTimeUtc(image);
++                    lock (warmTotals)
++                        if (warmTotals.TryGetValue(t, out var known) && known.Stamp == stamp) total = known.Total;
++                    if (total < 0)
++                    {
++                        total = GameWarmLogic.ReadImageIndex(image)?.Count(f => f.Name.EndsWith(".metal", StringComparison.Ordinal)) ?? -1;
++                        lock (warmTotals) warmTotals[t] = (stamp, total);
++                    }
++                }
++            }
++            catch (Exception) { }
++            list.Add((t.ToUpperInvariant(), (done, total)));
++        }
++        return list;
++    }
++
++    /// Pause / Resume ONE game (the Build tab's list, its sheet): a paused game keeps its place and is passed over; pausing the game being prepared stops its run at its next library.
++    private void WarmHoldGame(string tid, bool on)
++    {
++        if (!WarmOrder.Hold(warmQueue.Titles, warmQueue.Held, tid, on)) return;
++        SaveWarmQueue();
++        Write($"shader warm-up: {WarmName(tid)} {(on ? "paused by you (it keeps its place; what it finished is kept)" : "resumed by you")}");
++        if (on && GameWarm.Active && string.Equals(GameWarm.ActiveGame, tid, StringComparison.OrdinalIgnoreCase)) { warmCounts[tid.ToUpperInvariant()] = (GameWarm.Done, GameWarm.Total); StopWarm("this game paused by you"); }
++        RefreshScreen();
++        WarmKick(on ? "the next game in the queue" : "resumed by you");
++    }
++
++    /// Skip: the game leaves the queue, unprepared, until it is queued again; Queue again: back at the end.
++    private void WarmSkipGame(string tid, bool skip)
++    {
++        bool changed = skip ? WarmOrder.Skip(warmQueue.Titles, warmQueue.Held, warmQueue.Skipped, tid) : WarmOrder.Requeue(warmQueue.Titles, warmQueue.Skipped, tid);
++        if (!changed) return;
++        SaveWarmQueue();
++        Write($"shader warm-up: {WarmName(tid)} {(skip ? "skipped by you: left unprepared (Queue again puts it back)" : "queued again by you, at the end")}");
++        if (skip && GameWarm.Active && string.Equals(GameWarm.ActiveGame, tid, StringComparison.OrdinalIgnoreCase)) StopWarm("this game skipped by you");
++        RefreshScreen();
++        WarmKick("the next game in the queue");
++    }
++
++    /// One row of the list: "Mario Kart 8 Deluxe · 12,400 of 60,112" for the game being prepared (its live counts), else what its warmed.tsv and pack said.
++    private string WarmRowText(string tid)
++    {
++        bool active = GameWarm.Active && string.Equals(GameWarm.ActiveGame, tid, StringComparison.OrdinalIgnoreCase);
++        var c = active ? (GameWarm.Done, GameWarm.Total) : warmCounts.TryGetValue(tid, out var k) ? k : (0, -1);
++        return WarmOrder.RowText(WarmName(tid), c.Item1, c.Item2, active, warmQueue.Held.Contains(tid), warmQueue.Skipped.Contains(tid));
++    }
++
++    /// The actions of one game of the list (a "…" menu): Prepare this one now, Pause / Resume, Skip; a skipped game: Queue again, Prepare this one now.
++    private UIMenu WarmGameMenu(string tid)
++    {
++        warmGames.TryGetValue(tid, out var game);
++        var items = new List<UIMenuElement>();
++        bool active = GameWarm.Active && string.Equals(GameWarm.ActiveGame, tid, StringComparison.OrdinalIgnoreCase);
++        if (!active && game != null) items.Add(UIAction.Create("Prepare this one now", UIImage.GetSystemImage("bolt.fill"), "warm-game-now", _ => PrepareNow(game)));
++        if (warmQueue.Skipped.Contains(tid)) items.Add(UIAction.Create("Queue again", UIImage.GetSystemImage("arrow.uturn.backward"), "warm-game-requeue", _ => WarmSkipGame(tid, false)));
++        else
++        {
++            bool held = warmQueue.Held.Contains(tid);
++            items.Add(UIAction.Create(held ? "Resume" : "Pause", UIImage.GetSystemImage(held ? "play.fill" : "pause.fill"), "warm-game-pause", _ => WarmHoldGame(tid, !held)));
++            var skip = UIAction.Create("Skip", UIImage.GetSystemImage("forward.end"), "warm-game-skip", _ => WarmSkipGame(tid, true));
++            skip.Subtitle = "Left unprepared; it can be queued again";
++            items.Add(skip);
++        }
++        return UIMenu.Create(items.ToArray());
++    }
++
++    private UIStackView warmListView;
++    private string warmListKey;
++    private readonly Dictionary<string, UILabel> warmListLabels = new Dictionary<string, UILabel>(StringComparer.OrdinalIgnoreCase);
++
++    /// The list under the Build tab's line: every game of the queue in its order, then the skipped ones; a "…" per game. Rebuilt when the order or a state changes; the words every time.
++    private void UpdateWarmList()
++    {
++        if (warmListView == null) return;
++        var order = warmQueue.Titles.Concat(warmQueue.Skipped.OrderBy(x => x, StringComparer.Ordinal)).ToList();
++        var key = string.Join(",", order) + "|" + string.Join(",", warmQueue.Held.OrderBy(x => x, StringComparer.Ordinal)) + "|" + (GameWarm.Active ? GameWarm.ActiveGame : "");
++        if (key == warmListKey)
++        {
++            foreach (var (tid, label) in warmListLabels) label.Text = WarmRowText(tid);
++            return;
++        }
++        warmListKey = key;
++        warmListLabels.Clear();
++        foreach (var v in warmListView.ArrangedSubviews.ToArray()) { warmListView.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        foreach (var tid in order)
++        {
++            var text = Theme.Label(WarmRowText(tid), Theme.Font(13, UIFontWeight.Regular), warmQueue.Skipped.Contains(tid) || warmQueue.Held.Contains(tid) ? Theme.Muted : Theme.Text, 2);
++            text.LineBreakMode = UILineBreakMode.TailTruncation;
++            text.SetContentCompressionResistancePriority(SheetPriority.Title, UILayoutConstraintAxis.Horizontal);
++            text.AccessibilityIdentifier = "warm-row";
++            warmListLabels[tid] = text;
++            var more = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "warm-game-more", AccessibilityLabel = "Actions for " + WarmName(tid), ShowsMenuAsPrimaryAction = true, Menu = WarmGameMenu(tid) };
++            more.SetImage(UIImage.GetSystemImage("ellipsis.circle"), UIControlState.Normal);
++            more.TintColor = Theme.Muted;
++            more.SetContentHuggingPriority(1000, UILayoutConstraintAxis.Horizontal);
++            more.WidthAnchor.ConstraintEqualTo(36).Active = true;
++            warmListView.AddArrangedSubview(Theme.Row(8, text, new UIView(), more));
++        }
++    }
++
++
+     /// Pause / Resume (the game's sheet, the Library's menu, the Build tab): kept in the queue file, so a paused preparation stays paused at the next launches until the owner resumes it. Pausing stops
+     /// the run (what is done is kept) and ends its background task (StopWarm).
+     private void ToggleWarmPause()
+@@ -1258,7 +1374,9 @@
+         var pause = warmBuildPause = WarmPauseButton("build-warm-pause");
+         var note = Theme.Label("iBuilder compiles the built games' shaders by itself, one game after another, at low priority, while you are in the app and in the background. Play and builds stay available "
+                                + "and stop it; it resumes by itself. Settings › Shader preparation sets the cores.", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
+-        warmBuildSection = Theme.Column(8, SectionLabel("SHADERS"), warmBuildLine, warmBuildBar, pause, note);
++        warmListView = Theme.Column(2);   // patch 0098: the games in their order, each with its "…"
++        warmListView.AccessibilityIdentifier = "build-warm-list";
++        warmBuildSection = Theme.Column(8, SectionLabel("SHADERS"), warmBuildLine, warmBuildBar, warmListView, pause, note);
+         UpdateWarmBuildSection();
+         return warmBuildSection;
+     }
+@@ -1266,9 +1384,10 @@
+     private void UpdateWarmBuildSection()
+     {
+         if (warmBuildSection == null) return;
+-        bool show = !GameExport.IsPlayer && (GameWarm.Active || warmQueue.Titles.Count > 0);
++        bool show = !GameExport.IsPlayer && (GameWarm.Active || warmQueue.Titles.Count > 0 || warmQueue.Skipped.Count > 0);
+         warmBuildSection.Hidden = !show;
+         if (!show) return;
++        UpdateWarmList();   // patch 0098
+         warmBuildLine.Text = WarmLine();
+         warmBuildBar.Hidden = !GameWarm.Active;
+         warmBuildBar.SetProgress(GameWarm.Fraction, false);
+@@ -1282,8 +1401,8 @@
+         if (tid == null) yield break;
+         if (string.Equals(tid, WarmShownTitle(), StringComparison.OrdinalIgnoreCase))
+             yield return UIAction.Create(warmQueue.Paused ? "Resume the shader preparation" : "Pause the shader preparation", UIImage.GetSystemImage(warmQueue.Paused ? "play.fill" : "pause.fill"), null, _ => ToggleWarmPause());
+-        else if (warmQueue.Titles.Contains(tid.ToUpperInvariant()))
+-            yield return UIAction.Create("Prepare the shaders now", UIImage.GetSystemImage("bolt.fill"), null, _ => PrepareNow(game));
++        else if (warmQueue.Titles.Contains(tid.ToUpperInvariant()) || warmQueue.Skipped.Contains(tid.ToUpperInvariant()))
++            yield return UIAction.Create("Prepare its shaders now", UIImage.GetSystemImage("bolt.fill"), null, _ => PrepareNow(game));   // patch 0098
+     }
+ 
+     /// Main thread: the bars follow GameWarm.Fraction and the line; a run that started or ended, or a pause, redraws the shelf (coalesced, RefreshScreen).
