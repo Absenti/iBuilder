@@ -50,8 +50,8 @@ The IPA is also on the [Releases](https://github.com/Absenti/iBuilder/releases) 
 
 ## What you need
 
-* An iPhone or iPad (tested on iOS 27; minimum iOS 26). A GPU without BC textures (an iPhone before the A17 Pro, an iPad before the M1) works too:
-  iBuilder decodes the textures on the CPU, which is slower and uses more memory (Settings › This iPhone says so).
+* An iPhone 12 or later (A14 chip or later: a Metal 4 GPU), or an iPad with an A14 / M1 chip or later; iOS / iPadOS 26 or later (tested on iOS 27). iPhones 12 to 15 (the 15, not the 15 Pro) and
+  A14-A16 iPads have no BC textures: they take the no-BC path ported from mianmuhammadse/nxnative (textures transcoded or decoded at upload), which uses more memory (Settings › This iPhone says so).
 * Your game: `.nsp`, `.xci`, `.nsz` (Switch) or `.nup` (Switch 2).
 * `prod.keys` from your own console (not needed for a `.nup`).
 * Optional: your signing certificate (`.p12` and its password), needed only to **play inside iBuilder**. Without it a build is signed ad hoc

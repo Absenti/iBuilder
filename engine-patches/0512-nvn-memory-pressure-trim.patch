@@ -1,0 +1,215 @@
+# nvn/memory: a memory-pressure response that trims caches at the next submission (system pressure source, app request, headroom watermark); DM_MEM_PRESSURE, DM_MEM_TRIM, DM_MEM_HEADROOM
+#
+# Source:    https://github.com/mianmuhammadse/nxnative  branch no-bc, commits 2ad4c0d4 ("Memory-pressure response: trims caches on a memory warning, a system memory-pressure event or low
+#            headroom (iOS)") and 69e26193 ("Use the texture registry unfair lock during pressure trim")
+# Author:    Mian Muhammad (the commits' author)
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE; the fork keeps it). The attribution above is kept as the licence asks.
+#
+# Why: iOS stops an app at its footprint limit (about 3 GB on a 6 GB iPhone 15, the fork measured), usually with no warning it can act on; the no-BC iPhones are the 4-6 GB ones.
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m; test t_mem_trim):
+#   Requests (they only set a tier): the system memory-pressure source mtl_init_once already had (warn = tier 1, critical = tier 2; it still trims the render-target heaps at once),
+#   mtl_mem_pressure_request(tier, reason) for the app (exported: the app's memory warning can call it with reason 3), and a watermark on os_proc_available_memory() every 30 game frames
+#   (mtl_mem_pressure_tick from mtl_set_frame): tier 1 under 300 MB of headroom, tier 2 under 150 MB, asked again at most every 300 frames unless the tier rises.
+#   The trim, at the next mtl_sub_begin (submit thread, nothing encoded yet): the view cache (g_vc) emptied, rh_trim, one GPU wait then defer_drain, the staging slots' blocks of batches
+#   not in flight dropped (made again by the next upload), malloc_zone_pressure_relief. One line: "memory pressure: tier N (reason, frame), headroom, footprint, GPU allocated before ->
+#   after: ...". Nothing runs while the headroom is fine (one os_proc_available_memory call every 30 frames).
+# Adapted: the fork's trim cuts upstream's ghost table and drops unreferenced shared textures and re-upload spares; this tree keeps those in nvn_owner.m with other lifetimes (a spare is
+#   reused by a re-upload on another thread, under other locks), so they are NOT trimmed here. The fork also moved later deferred releases forward after its GPU wait: not here (an upload
+#   batch committed outside a submission may still hold them). Its UIApplicationDidReceiveMemoryWarning hook is in dm/ios (not our app's front end): the app may call
+#   mtl_mem_pressure_request(1, 3) itself. Its hle_nvn.c frame hook is replaced by mtl_set_frame (same thread as the trim, no new symbol between files).
+# Defaults: on. DM_MEM_PRESSURE=0: requests ignored, no trim (the system source's render-target heap trim stays, as before). Test switches: DM_MEM_TRIM=<frame>:<tier>[,...],
+#   DM_MEM_HEADROOM=<MB> (stands in for os_proc_available_memory, -1 = unknown on a Mac).
+# On a GPU with BC: the same (this is not a no-BC feature), and nothing runs unless a request comes.
+# Shader chain: not touched (b24b25240cad).
+# Tests (M1 Pro): t_mem_trim (new; make check_t_mem_trim runs it and "off") 18/0 + 7/0. NOT run on a device: a real system pressure event or watermark on an iPhone is not verified.
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index bbc2c94..30d21fe 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -22,6 +22,7 @@
+ #if TARGET_OS_IPHONE
+ #include <os/proc.h>   // os_proc_available_memory: for the memory readout line
+ #endif
++#include <malloc/malloc.h>   // malloc_zone_pressure_relief: the memory-pressure response (0512)
+ #include "nvn_mtl.h"
+ #include "nvn_queue.h"
+ #include <mach/mach.h>
+@@ -589,6 +590,7 @@ static void dva_save(int wait_ms, int ending) {
+     plain_compile_begin(); NSError *e = nil; id lib = host_msl_lib(g_dev, compiler, name, &e); return compile_done(lib, e, out);
+ }
+ static id<MTLLibrary> host_lib(const char *name, NSError **e) { return host_lib_from(nil, name, e); }
++void mtl_mem_pressure_request(int tier, int reason); static void mem_trim_if_requested(void);   // the memory-pressure response (engine-patches/0512), with the view cache below
+ static int g_bc_gpu = 1;   // the device advertises BC texture compression (set where the device is made; DM_TEST_NO_BC=1 says it does not)
+ static int g_bc_cpu;       // the no-BC path: BC textures are stored in a format the GPU has (decompressed; 0511: ASTC 4x4 for BC1-3). On by itself on a GPU without BC (engine-patches/0510)
+ static int g_bc_gdec = 1;  // no-BC path: BC1-5 deswizzled and decoded on the GPU at upload (kernel bcd); DM_NO_BC_GPU=0 = every BC texture on the CPU, as before 0510
+@@ -1543,6 +1545,7 @@ static void mtl_init_once(void) {
+             if (flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)) {
+                 atomic_store_explicit(&g_rh_pressure, 1, memory_order_release);
+                 rh_trim();
++                mtl_mem_pressure_request(flags & DISPATCH_MEMORYPRESSURE_CRITICAL ? 2 : 1, flags & DISPATCH_MEMORYPRESSURE_CRITICAL ? 2 : 1);   // 0512: the trim at the next submission
+             } else if (flags & DISPATCH_MEMORYPRESSURE_NORMAL) {
+                 atomic_store_explicit(&g_rh_pressure, 0, memory_order_release);
+             }
+@@ -2409,7 +2412,8 @@ void mtl_prepare(void) {
+ static uint64_t g_setrt_n;   // render target changes so far (pass_split_try: splits per NVN pass)
+ static int g_split_resume;   // the pass was split at this draw: it opens again where the dispatch scan already looked (cs_hoist_try)
+ void mtl_sub_begin(void) {
+-    mtl_init(); g_sub_serial++; g_seg = 0; g_vis_need = 1;   // until its first samples-passed reset or report (vis_need_scan)
++    mtl_init(); mem_trim_if_requested();   // 0512: a trim asked for since the last submission, before anything of this one is encoded
++    g_sub_serial++; g_seg = 0; g_vis_need = 1;   // until its first samples-passed reset or report (vis_need_scan)
+     treg_sparse_notes();   // the mappings made before this submission
+     if (g_pkg_kept) { g_pkg_kept = 0; nvn_dirty_touch(); } seg_clk_put(g_sclk); g_sclk = NULL;
+     sub_cut_begin();
+@@ -3369,7 +3373,8 @@ static void gpu_capture_frame(uint64_t f) {
+         else MLOG("[RED] DM_GPU_CAPTURE: the capture did not start: %s", err.localizedDescription.UTF8String);
+     } else if (g_cap_on && f >= (uint64_t)g_cap_f0 + (uint64_t)g_cap_n) { [m stopCapture]; g_cap_on = 0; g_cap_f0 = -1; gpu_thr = 0; MLOG("DM_GPU_CAPTURE: capture stopped at frame %llu (the trace is written in the background)", (unsigned long long)f); }
+ }
+-void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); gpu_capture_frame(f); }
++void mtl_mem_pressure_tick(unsigned long long frame);
++void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); gpu_capture_frame(f); mtl_mem_pressure_tick(f); }   // 0512: the headroom watermark
+ // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
+ // Old-queue command buffers go through gpu_tag_f; the Metal 4 main submission backfills in the feedback of mtl_sub_commit (when switching to Metal 4 all the call sites were lost and the GPU column of the timing line became empty)
+ static void gpu_tag_begin(uint64_t f) {
+@@ -8489,6 +8494,74 @@ static void vc_set_free(void *p) {
+     vc_rows_drop(s);
+     free(s);
+ }
++// ---- Memory-pressure response (engine-patches/0512, adapted from mianmuhammadse/nxnative no-bc 2ad4c0d4 / 69e26193, MIT) ----
++// iOS stops an app at its footprint limit (about 3 GB on a 6 GB iPhone 15, the fork measured), usually without a warning it can act on. The triggers only set a request: the system's
++// memory-pressure source (warn = tier 1, critical = tier 2; mtl_init_once's handler, which also trims the render-target heaps at once as before), mtl_mem_pressure_request from the app
++// (its memory warning, reason 3), and a watermark on os_proc_available_memory() every 30 frames (mtl_mem_pressure_tick, from mtl_set_frame, each game frame): tier 1 under 300 MB of headroom,
++// tier 2 under 150 MB, asked again at most every 300 frames unless the tier rises. The trim runs at the next submission's start on the submit thread, before anything is encoded:
++// the view cache is emptied (its views go after the GPU is past them), the render-target heaps are trimmed (rh_trim), the GPU is waited for once so every deferred
++// release goes now, the staging slots' blocks of batches not in flight are dropped (made again by the next upload) and malloc returns its free pages. One log line per trim says what
++// it freed. Nothing runs while the headroom is fine. Not ported from the fork: its ghost-table cut and the drop of unreferenced shared textures and of re-upload spares (upstream
++// structures this tree keeps in nvn_owner.m, with other lifetimes), the UIKit memory-warning hook (the app's front end is not dm/ios: it can call mtl_mem_pressure_request).
++// DM_MEM_PRESSURE=0: no trim (the requests are ignored; the render-target heap trim of the system source stays). Test switches (Mac): DM_MEM_TRIM=<frame>:<tier>[,...] asks for tiers
++// at frames, DM_MEM_HEADROOM=<MB> stands in for os_proc_available_memory()
++size_t malloc_zone_pressure_relief(malloc_zone_t *zone, size_t goal);
++static _Atomic int g_mp_req, g_mp_reason; static _Atomic uint64_t g_mp_trims;
++static uint64_t g_mp_last_frame; static int g_mp_last_tier; static long g_mp_fake = -2;
++enum { MP_SRC_WARN = 1, MP_SRC_CRIT = 2, MP_APP = 3, MP_WATER = 4, MP_TEST = 5 };
++static int mp_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_MEM_PRESSURE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_MEM_PRESSURE=0: the memory-pressure trim is off"); } return v; }
++void mtl_mem_pressure_request(int tier, int reason) {
++    if (tier < 1) return; if (tier > 2) tier = 2;
++    int cur = atomic_load(&g_mp_req); while (tier > cur && !atomic_compare_exchange_weak(&g_mp_req, &cur, tier)) {}
++    atomic_store(&g_mp_reason, reason);
++}
++static long mp_headroom_mb(void) {   // -1: unknown (a Mac without DM_MEM_HEADROOM)
++    if (g_mp_fake == -2) { const char *e = getenv("DM_MEM_HEADROOM"); g_mp_fake = e && *e ? atol(e) : -1; }
++    if (g_mp_fake >= 0) return g_mp_fake;
++#if TARGET_OS_IPHONE
++    return (long)(os_proc_available_memory() >> 20);
++#else
++    return -1;
++#endif
++}
++static uint64_t mp_footprint_mb(void) { task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT; return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS ? vi.phys_footprint >> 20 : 0; }
++void mtl_mem_pressure_tick(unsigned long long frame) {   // each game frame (mtl_set_frame)
++    static const char *sched; static int init;
++    if (!init) { init = 1; sched = getenv("DM_MEM_TRIM"); }
++    if (sched && *sched) { char *end; unsigned long long at = strtoull(sched, &end, 10);
++        if (*end == ':' && frame >= at) { mtl_mem_pressure_request(atoi(end + 1), MP_TEST); const char *c = strchr(end, ','); sched = c ? c + 1 : ""; } else if (*end != ':') sched = ""; }
++    if (frame % 30) return;
++    long h = mp_headroom_mb();
++    if (h < 0) return;
++    int tier = h < 150 ? 2 : h < 300 ? 1 : 0;
++    if (tier && (tier > g_mp_last_tier || frame - g_mp_last_frame >= 300)) { mtl_mem_pressure_request(tier, MP_WATER); g_mp_last_tier = tier; g_mp_last_frame = frame; }
++    if (!tier && h >= 600) g_mp_last_tier = 0;
++}
++static void mem_trim_if_requested(void) {
++    if (!atomic_load_explicit(&g_mp_req, memory_order_relaxed)) return;
++    int tier = atomic_exchange(&g_mp_req, 0); if (!tier || !mp_on() || !g_dev || atomic_load(&g_gfx_teardown)) return;
++    int reason = atomic_load(&g_mp_reason); unsigned long long frame = (unsigned long long)atomic_load(&g_cur_frame);
++    static const char *const rn[] = {"", "system warning", "system critical", "app memory warning", "headroom watermark", "test switch"};
++    long h0 = mp_headroom_mb(); uint64_t gpu0 = g_dev.currentAllocatedSize >> 20, fp0 = mp_footprint_mb();
++    os_unfair_lock_lock(&g_rmu); unsigned nvc = g_vc.n; nvn_hm_clear(&g_vc, vc_set_free); os_unfair_lock_unlock(&g_rmu);   // the fork's 69e26193: g_rmu is an unfair lock
++    rh_trim();   // under the policy of the moment: the system source sets and clears g_rh_pressure itself (a watermark trim does not leave it set)
++    mtl_finish_gpu_at(WS_FINISH);   // the GPU is idle and nothing of this submission is encoded: what was retired behind the submissions run so far goes now
++    defer_drain();   // (the fork also moved later releases forward; not here: an upload batch committed outside a submission may still hold them)
++    unsigned nblk = 0; size_t blkb = 0;
++    if (!g_up_cb) for (unsigned i = 0; i < 3; i++) {   // the staging slots of batches not in flight (as up_idle_release does for idle ones)
++        if (atomic_load(&g_up_alloc_busy[i])) continue;
++        if (g_up_slot_blk[i]) { nblk++; blkb += g_up_slot_blk[i].length; up_idle_drop(&g_up_slot_blk[i]); }
++        if (g_up_slot_over[i]) { nblk++; blkb += g_up_slot_over[i].length; up_idle_drop(&g_up_slot_over[i]); }
++        g_up_slot_want[i] = 0; g_up_idle_slot[i] = (up_idle_slot){0};
++    }
++    if (nblk) res_commit();
++    malloc_zone_pressure_relief(NULL, 0);
++    atomic_fetch_add(&g_mp_trims, 1);
++    long h1 = mp_headroom_mb(); uint64_t gpu1 = g_dev.currentAllocatedSize >> 20, fp1 = mp_footprint_mb();
++    MLOG("memory pressure: tier %d (%s, frame %llu), headroom %ld -> %ld MB (-1 = unknown), footprint %llu -> %llu MB, GPU allocated %llu -> %llu MB: view cache %u entries, "
++         "render-target heaps trimmed, deferred releases drained after a GPU wait, staging slot blocks %u (%zu MB), malloc relief", tier, reason >= 1 && reason <= 5 ? rn[reason] : "?", frame,
++         h0, h1, (unsigned long long)fp0, (unsigned long long)fp1, (unsigned long long)gpu0, (unsigned long long)gpu1, nvc, nblk, blkb >> 20);
++}
+ static id<MTLTexture> vc_get(id<MTLTexture> base, const vc_key *k) {
+     uint64_t a = vc_addr(base); vc_set *s = nvn_hm_get(&g_vc, &a); if (!s) return nil;
+     for (int i = 0; i < VC_WAYS; i++) if (s->view[i] && !memcmp(&s->k[i], k, sizeof *k)) { g_vc_hit++; return (__bridge id<MTLTexture>)s->view[i]; }
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+index 4abafce..269e719 100644
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -998,6 +998,11 @@ t_astc_hw: t_astc_hw.m ../tex/nvn_bc2astc.c ../tex/nvn_bc2astc.h ../tex/bc2astc_
+ t_bc_astc: t_bc_astc.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_bc_astc.m $(MTL_T_SRC) $(FW)
+ check_t_bc_astc: RUN_ENV = MTL_DEBUG_LAYER=1
++# engine-patches/0512: the memory-pressure response (watermark, test switches, the trim at the next submission), and DM_MEM_PRESSURE=0
++t_mem_trim: t_mem_trim.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_mem_trim.m $(MTL_T_SRC) $(FW)
++check_t_mem_trim: t_mem_trim
++	MTL_DEBUG_LAYER=1 ./t_mem_trim && MTL_DEBUG_LAYER=1 ./t_mem_trim off
+ # engine-patches/0415 revision 3 (review L8): the learned list's state is set back at graphics teardown
+ t_session_reset: t_session_reset.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_session_reset.m $(MTL_T_SRC) $(FW)
+diff --git a/dm/gfx/tests/t_mem_trim.m b/dm/gfx/tests/t_mem_trim.m
+new file mode 100644
+index 0000000..f7c8a8e
+--- /dev/null
++++ b/dm/gfx/tests/t_mem_trim.m
+@@ -0,0 +1,45 @@
++// The memory-pressure response (engine-patches/0512, adapted from mianmuhammadse/nxnative no-bc 2ad4c0d4, MIT): a request sets only a flag, the trim runs at the next submission's start.
++//   t_mem_trim            DM_MEM_HEADROOM=100 stands in for os_proc_available_memory(): no trim before frame 30, a tier-2 request at frame 30 (the watermark), one trim at the next submission that
++//                         empties the view cache and drops the idle staging blocks; not asked again before frame 330; DM_MEM_TRIM=400:1 asks at frame 400; an app request (reason 3) trims too
++//   t_mem_trim off        DM_MEM_PRESSURE=0: requests are ignored, nothing is trimmed
++// Usage: t_mem_trim [off]
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(c, ...) do { checks++; if (!(c)) { failed++; printf("  FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
++static void sub(void) { mtl_sub_begin(); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "submission completes"); }
++static void put_vc(void) {   // one view-cache entry and one staging block, so a trim has something to drop
++    os_unfair_lock_lock(&g_rmu); vc_set *s = calloc(1, sizeof *s); uint64_t a = 0x1234000; nvn_hm_put(&g_vc, &a, s); os_unfair_lock_unlock(&g_rmu);
++    mtl_sub_begin(); up_begin(); size_t off; up_alloc(4096, &off); up_flush(); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "staging submission completes");
++    for (int i = 0; i < 5000 && atomic_load(&g_up_pending); i++) usleep(1000);
++}
++static int staged(void) { int n = 0; for (int i = 0; i < 3; i++) n += g_up_slot_blk[i] != nil; return n; }
++int main(int argc, char **argv) { @autoreleasepool {
++    int off = argc > 1 && !strcmp(argv[1], "off");
++    setenv("DM_MEM_HEADROOM", "100", 1); setenv("DM_MEM_TRIM", "400:1", 1);
++    if (off) setenv("DM_MEM_PRESSURE", "0", 1);
++    mtl_init();
++    put_vc(); CHECK(g_vc.n == 1 && staged() >= 1, "setup: a view-cache entry (%u) and a staging block (%d)", g_vc.n, staged());
++    for (unsigned long long f = 1; f < 30; f++) mtl_mem_pressure_tick(f);
++    sub(); CHECK(atomic_load(&g_mp_trims) == 0, "no trim before frame 30 (%llu)", (unsigned long long)atomic_load(&g_mp_trims));
++    mtl_mem_pressure_tick(30); CHECK(atomic_load(&g_mp_req) == 2, "the watermark (100 MB) asks for tier 2 at frame 30 (%d)", atomic_load(&g_mp_req));
++    sub();
++    if (off) {
++        CHECK(atomic_load(&g_mp_trims) == 0 && g_vc.n == 1, "DM_MEM_PRESSURE=0: nothing trimmed (trims %llu, view cache %u)", (unsigned long long)atomic_load(&g_mp_trims), g_vc.n);
++    } else {
++        CHECK(atomic_load(&g_mp_trims) == 1, "one trim at the next submission (%llu)", (unsigned long long)atomic_load(&g_mp_trims));
++        CHECK(g_vc.n == 0, "the view cache is empty after the trim (%u)", g_vc.n);
++        CHECK(staged() == 0, "the idle staging blocks are dropped (%d left)", staged());
++        for (unsigned long long f = 31; f < 330; f++) mtl_mem_pressure_tick(f);
++        sub(); CHECK(atomic_load(&g_mp_trims) == 1, "not asked again within 300 frames at the same tier (%llu)", (unsigned long long)atomic_load(&g_mp_trims));
++        for (unsigned long long f = 330; f <= 400; f++) mtl_mem_pressure_tick(f);
++        sub(); CHECK(atomic_load(&g_mp_trims) == 2, "the watermark again after 300 frames, with DM_MEM_TRIM=400:1 merged into it (%llu)", (unsigned long long)atomic_load(&g_mp_trims));
++        mtl_mem_pressure_request(1, 3); sub(); CHECK(atomic_load(&g_mp_trims) == 3, "an app request trims at the next submission (%llu)", (unsigned long long)atomic_load(&g_mp_trims));
++        put_vc(); sub(); CHECK(atomic_load(&g_mp_trims) == 3 && g_vc.n == 1, "no request, no trim (%llu, view cache %u)", (unsigned long long)atomic_load(&g_mp_trims), g_vc.n);
++    }
++    printf("t_mem_trim%s: %d checks, %d failed\n", off ? " off" : "", checks, failed); return failed != 0;
++}}
