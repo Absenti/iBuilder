@@ -75,6 +75,30 @@ static int on_sign(void *user, const char *framework_dir, const char *exe, char 
     return 0;
 }
 
+/* stage 4b's fallback with no identity (rc 10/12/13): an ad hoc signature, for export only */
+static int g_adhoc_calls;
+static int on_sign_adhoc(void *user, const char *framework_dir, const char *exe, char *mode, int mode_cap, char *ident, int ident_cap, char *err, int err_cap)
+{
+    (void) user; (void) framework_dir; (void) exe; (void) err_cap;
+    g_adhoc_calls++;
+    snprintf(mode, (size_t) mode_cap, "adhoc(zsign, no certificate: export only)");
+    snprintf(ident, (size_t) ident_cap, "dev.ibuilder.app");
+    err[0] = 0;
+    return 0;
+}
+
+static int file_has(const char *docs, const char *rel, const char *text)
+{
+    char p[2048], buf[4096];
+    snprintf(p, sizeof p, "%s/%s", docs, rel);
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return strstr(buf, text) != NULL;
+}
+
 static struct seen *g_tool_seen;
 static int tool(int argc, const char **argv, char **out, char **err, int rc, int *counter)
 {
@@ -249,7 +273,34 @@ int main(int argc, char **argv)
     }
     ibuilder_finish_run(docs);
     CHECK(ibuilder_run_chain(h, NULL) == IBUILDER_RC_OK, "and the next build, signed, is 0 again");
+    CHECK(!file_has(docs, "gameapp.framework", "signature="), "a framework signed with the identity has no signature= line in its stamp");
+    ibuilder_finish_run(docs);
     ibuilder_destroy(h);
+
+    /* ---- no identity, with the ad hoc fallback: the build succeeds for export only (stamped), not booted ---- */
+    {
+        ibuilder_options oa = o;
+        oa.sign_adhoc = on_sign_adhoc;
+        ibuilder_t *ha = ibuilder_create(&oa, &err);
+        CHECK(ha != NULL, "ibuilder_create with sign_adhoc");
+        if (ha) {
+            g_sign_rc = 12; g_adhoc_calls = 0;
+            rc = ibuilder_run_chain(ha, NULL);
+            g_sign_rc = 0;
+            CHECK(rc == IBUILDER_RC_OK && g_adhoc_calls == 1, "no certificate (rc 12) with sign_adhoc: signed ad hoc once, the build is 0");
+            CHECK(file_has(docs, "gameapp.framework", "signature=adhoc-export"), "the stamp says the framework is signed ad hoc for export only");
+            ibuilder_finish_run(docs);
+            g_sign_rc = 14; g_adhoc_calls = 0;
+            rc = ibuilder_run_chain(ha, NULL);
+            g_sign_rc = 0;
+            CHECK(rc == IBUILDER_RC_NO_FRAMEWORK && g_adhoc_calls == 0, "a .p12 that cannot be used (rc 14) still fails: no ad hoc fallback for a broken certificate");
+            ibuilder_finish_run(docs);
+            CHECK(ibuilder_run_chain(ha, NULL) == IBUILDER_RC_OK && g_adhoc_calls == 0 && !file_has(docs, "gameapp.framework", "signature="),
+                  "with the identity the fallback is never called and the stamp is as before");
+            ibuilder_finish_run(docs);
+            ibuilder_destroy(ha);
+        }
+    }
 
     /* ---- memory: the kernel's numbers ---- */
     ibuilder_mem m; memset(&m, 0, sizeof m);

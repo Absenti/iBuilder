@@ -63,6 +63,7 @@ The host reads `DM_*` environment variables. On the phone they go in a game's `D
 | `DM_PSO_TAIL_RESUME=0`, `DM_PSO_TAIL_HOT=1` | resume on, wait when hot | tail resume and heat behaviour (0415) |
 | `DM_PSO_NOWAIT=0` | set by the app | whether a draw that needs a pipeline waits for its compile |
 | `DM_PSO_MTL4=0` | per game | use the MTLDevice path instead of Metal 4 pipelines |
+| `DM_PROF_TEX_BC_CPU=1` | set by the chain on a GPU without BC textures | decode BC textures on the CPU (0410 / 0411); without it such a GPU stops at `mtl_init` |
 | `DM_AUDREN_RT=0` | on | turn the audio real-time deadline off (0453) |
 | `DM_AUDREN_TRACE=1` | off | print the first 200 audio updates with their times |
 | `DM_NVN_UPLOAD_IDLE_MS=<ms>`, `DM_NVN_UPLOAD_SRC_MB=<MB>` | off | trim idle upload staging, bound zero-copy sources (0404, 0405) |

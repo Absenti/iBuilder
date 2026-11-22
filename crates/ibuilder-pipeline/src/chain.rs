@@ -491,6 +491,12 @@ fn chain_inner(ctx: &mut Ctx) -> ChainReport {
             if ctx.boot_enabled && fs::remove_file(ctx.docs.running()).is_ok() {
                 ctx.log("the chain finished (marker cleared): the run ends here, with no boot");
             }
+        } else if ctx.export_only {
+            // signed ad hoc (no identity on this install): iOS would refuse the dlopen from Documents; the build is for Export as its own app (the installer re-signs it)
+            ctx.log("stage 5 NOT STARTED: the framework is signed ad hoc for export only (no .p12 here): Export it as its own app, or import your .p12 and sign it again to play inside iBuilder");
+            if ctx.boot_enabled && fs::remove_file(ctx.docs.running()).is_ok() {
+                ctx.log("the chain finished (marker cleared): the run ends here, with no boot");
+            }
         } else if ctx.boot_enabled {
             // Stage 5 in THIS process: the boot is called from here, because iOS reaps a UI-less app the moment the host returns. The guest runs inside this process.
             boot_after_build(ctx, &fw, &flat_p);

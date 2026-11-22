@@ -1,6 +1,6 @@
 //! Stage 4: write the framework with no linker (4a, `assemble.py`'s job, behind `Assembler`), then sign it in process (4b, behind `Signer`; zsign on the phone).
 
-use crate::adapters::AssembleRequest;
+use crate::adapters::{AssembleRequest, SignOutcome};
 use crate::ctx::Ctx;
 use crate::error::{PipelineError, Result};
 use crate::markers::write_framework_stamp;
@@ -64,6 +64,33 @@ pub fn sign_failure_reason(rc: i32, err: &str) -> String {
         14 => "the .p12's passphrase is longer than 511 bytes (UTF-8): the app cannot hand it to the signer whole -- re-import the certificate with a shorter passphrase".into(),
         _ => format!("zsign refused the framework: {}", if err.is_empty() { "(no message)" } else { err }),
     }
+}
+
+/// What the framework stamp says (`signature=`) of a framework signed AD HOC because this install had no signing identity: built for export only (Export as its own app; the
+/// installer re-signs the IPA). The app shows such a build with Export IPA and no Play, and a boot refuses it (iOS would refuse to map it from Documents).
+pub const EXPORT_ONLY_SIGNATURE: &str = "adhoc-export";
+
+/// The signer's rc that means "no signing identity on this install", not "a broken one": 10 no embedded.mobileprovision, 12 no certificate in this app's Keychain, 13 the
+/// item carries no .p12. Stage 4b then signs the framework ad hoc (`Signer::sign_adhoc`) instead of failing: the game can be exported (the installer re-signs every executable
+/// of an IPA), and importing the .p12 later lets the app sign it again to play. 11 (unreadable), 14 (a passphrase that does not fit) and 20 (zsign refused) are a .p12 that is
+/// there and could not be used: those still fail, so the player fixes the certificate instead of getting an export-only build without being told why.
+pub fn adhoc_fallback(rc: i32) -> bool {
+    matches!(rc, 10 | 12 | 13)
+}
+
+/// The log line of a sign outcome (`stage 4b sign rc=... mode=... identifier=...`), `what` is "sign" or "sign ad hoc".
+fn outcome_line(what: &str, r: &SignOutcome) -> String {
+    format!(
+        "stage 4b {what} rc={} mode={} identifier={}{}",
+        r.rc,
+        r.mode,
+        r.identifier,
+        if r.err.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", r.err)
+        }
+    )
 }
 
 /// `do_assemble`: stage 4a assembles, 4b signs. Returns `(framework, flat)`.
@@ -150,20 +177,38 @@ pub fn do_assemble(ctx: &mut Ctx) -> Result<(PathBuf, PathBuf)> {
     ));
     let t0 = Instant::now();
     let signer = ctx.adapters.signer.clone();
-    let r = signer.sign(&framework_dir, &exe, &ctx.view());
+    let mut r = signer.sign(&framework_dir, &exe, &ctx.view());
+    ctx.log(&outcome_line("sign", &r));
+    // No identity on this install (no .p12 imported): the framework is signed ad hoc instead of failing the build, and stamped "export only" (the app offers Export IPA, whose
+    // installer re-signs it; importing the .p12 later offers "Sign again to play"). A signer with no ad hoc mode keeps the failure below. With an identity nothing here runs.
+    if r.rc != 0
+        && adhoc_fallback(r.rc)
+        && let Some(a) = signer.sign_adhoc(&framework_dir, &exe, &ctx.view())
+    {
+        ctx.log(&format!(
+            "stage 4b no signing identity here (rc={}: {}): the framework is signed AD HOC instead -- built for export only: Export as its own app works now (the installer re-signs the IPA); to play inside iBuilder, import your .p12 and sign it again",
+            r.rc,
+            sign_failure_reason(r.rc, &r.err)
+        ));
+        ctx.log(&outcome_line("sign ad hoc", &a));
+        if a.rc == 0 {
+            ctx.export_only = true;
+            r = a;
+        } else {
+            let why = format!(
+                "{}; the ad hoc signature (export only) failed too: {}",
+                sign_failure_reason(r.rc, &r.err),
+                sign_failure_reason(20, &a.err)
+            );
+            ctx.log(&format!("stage 4b sign FAILED (rc={}): {why}", r.rc));
+            return Err(PipelineError::failed(format!(
+                "stage 4b sign failed (rc={}): {why}",
+                r.rc
+            )));
+        }
+    }
     let dt = t0.elapsed().as_secs_f64();
     let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
-    ctx.log(&format!(
-        "stage 4b sign rc={} mode={} identifier={}{}",
-        r.rc,
-        r.mode,
-        r.identifier,
-        if r.err.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", r.err)
-        }
-    ));
     if r.rc != 0 {
         let why = sign_failure_reason(r.rc, &r.err);
         ctx.log(&format!("stage 4b sign FAILED (rc={}): {why}", r.rc));

@@ -7,6 +7,7 @@
 //! (`attempted ...`: a boot began from it and never came back; a launch does NOT start it again -- that would be a retry loop -- but the file stays, so a tap
 //! boots once more for the price of a dlopen instead of a rebuild).
 
+use crate::assemble::EXPORT_ONLY_SIGNATURE;
 use crate::ctx::Ctx;
 use crate::state::BOOT_ONLY_ATTEMPTED;
 use crate::timings::read_kv;
@@ -33,23 +34,51 @@ pub fn write_framework_stamp(ctx: &Ctx) {
         None => read_framework_stamp(ctx).get_or("game", "").to_string(),
     };
     // content=: the update and DLC this build took (the app's GameAppUi.ContentSignature, handed over in the config): one added later shows as "rebuild to include it"
-    let text = format!(
-        "app_build={build}\ngame={game}\nbuilt={}\ncontent={}\n",
-        utc_now_iso(),
-        ctx.cfg.get_or("content", "")
+    let text = framework_stamp_text(
+        build,
+        &game,
+        &utc_now_iso(),
+        ctx.cfg.get_or("content", ""),
+        ctx.export_only,
     );
     let path = ctx.docs.framework_stamp();
     match crate::util::write_atomic(&path, text.as_bytes()) {
         Ok(()) => ctx.log(&format!(
-            "framework stamp: {} (app_build={build}, game={})",
+            "framework stamp: {} (app_build={build}, game={}){}",
             path.display(),
-            if game.is_empty() { "-" } else { &game }
+            if game.is_empty() { "-" } else { &game },
+            if ctx.export_only {
+                format!(", signature={EXPORT_ONLY_SIGNATURE}: signed ad hoc, for export only")
+            } else {
+                String::new()
+            }
         )),
         Err(e) => ctx.log(&format!(
             "framework stamp: could not write {}: {e} -- the framework will read as stale",
             path.display()
         )),
     }
+}
+
+/// The stamp's text. `export_only` (stage 4b signed the framework ad hoc: no identity on this install) adds `signature=adhoc-export`; a framework signed with the identity has
+/// exactly the four lines it always had.
+pub fn framework_stamp_text(
+    build: &str,
+    game: &str,
+    built: &str,
+    content: &str,
+    export_only: bool,
+) -> String {
+    let mut text = format!("app_build={build}\ngame={game}\nbuilt={built}\ncontent={content}\n");
+    if export_only {
+        text.push_str(&format!("signature={EXPORT_ONLY_SIGNATURE}\n"));
+    }
+    text
+}
+
+/// The stamp of the framework on disk says it was signed ad hoc for export only (`signature=adhoc-export`).
+pub fn framework_is_export_only(ctx: &Ctx) -> bool {
+    read_framework_stamp(ctx).get_or("signature", "") == EXPORT_ONLY_SIGNATURE
 }
 
 /// `boot_only_mark_attempted`: the boot is about to start: rewrite the request, in place, as `attempted`. It is not removed.

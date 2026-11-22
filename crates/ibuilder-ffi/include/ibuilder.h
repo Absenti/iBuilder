@@ -36,7 +36,7 @@ extern "C" {
                                          * game reads as not built); a boot-only launch refused the boot and consumed its request (the framework stays: a later boot tries the library
                                          * again).  "shaders=none (...)" (nothing to build) is not this: it keeps IBUILDER_RC_OK. */
 #define IBUILDER_RC_NO_FRAMEWORK   5    /* no framework to play: stage 4 failed, the assembly or the signature ("assemble=failed" in ibuilder_chain_status(); the signer's rc 10-14 for a
-                                         * missing or unreadable certificate, ...).  Nothing was stamped or booted.  It wins over IBUILDER_RC_NO_SHADER_LIBRARY when stage 3 failed too
+                                         * missing or unreadable certificate, ...; with sign_adhoc set, 10, 12 and 13 sign ad hoc instead: see ibuilder_options).  Nothing was stamped or booted.  It wins over IBUILDER_RC_NO_SHADER_LIBRARY when stage 3 failed too
                                          * (the status names both).  It was IBUILDER_RC_OK, as in Python. */
 #define IBUILDER_RC_RESTART        75   /* the chain ended on purpose before stage 3: close the app, the next launch continues (Documents/gameapp.continue) */
 #define IBUILDER_RC_CANCELLED      130  /* ibuilder_cancel(), or ibuilder_request_stop(IBUILDER_STOP_CANCEL): stopped at the next safe point; the caller removes the partial build */
@@ -74,6 +74,8 @@ typedef void (*ibuilder_live_notify_fn)(void *user, int busy);
 
 #define IBUILDER_FLAG_BOOT_IN_PROCESS 0x1u  /* PIPELINE_BOOT=1: stage 5 runs in this process (the app).  Without it the chain only builds. */
 #define IBUILDER_FLAG_MOCK_STAGES     0x2u  /* deterministic stand-in stage workers (only in a build with the mock-stages feature: a test aid, refused otherwise) */
+#define IBUILDER_FLAG_GPU_NO_BC       0x4u  /* the device's GPU has no BC texture formats (MTLDevice.supportsBCTextureCompression is NO, asked by the caller): every boot sets DM_PROF_TEX_BC_CPU=1, so the
+                                             * host decodes BC1-7 on the CPU (nvn_bcdec.c) instead of stopping at mtl_init.  Not set (a GPU with them, or not known): nothing changes. */
 
 typedef struct ibuilder_options {
     uint32_t struct_size;               /* sizeof(ibuilder_options): lets the struct grow without breaking old callers */
@@ -86,6 +88,10 @@ typedef struct ibuilder_options {
     ibuilder_tool_fn spirv_cross;
     ibuilder_live_notify_fn live_notify; void *live_notify_user; /* may be NULL */
     uint32_t flags;
+    /* Stage 4b's fallback when sign returned 10, 12 or 13 (no identity on this install: no profile, no certificate, no .p12): sign the framework AD HOC (called with sign_user, same
+     * buffers and rc as sign).  The build then succeeds for EXPORT ONLY: the framework stamp says "signature=adhoc-export", no boot starts from it (iOS refuses to map such a framework
+     * from Documents on a device), and the app offers Export as its own app (the installer re-signs every executable of the IPA).  NULL: no fallback, rc 10-13 fail the build as before. */
+    ibuilder_sign_fn sign_adhoc;
 } ibuilder_options;
 
 uint32_t ibuilder_abi_version(void);          /* IBUILDER_ABI_VERSION of the library: compare with the header you compiled against */

@@ -14,7 +14,8 @@ follows the chain from the input file to the running game. Details of each part 
    3  shaders       ibuilder-shadersplit -> translate (Ryujinx translator, SPIRV-Cross) -> ibuilder-shaderbuild
                     (+ ibuilder-shader) -> a shader library image per game
    4  assemble      ibuilder-macho links the engine host + rewritten modules into one Mach-O framework
-      sign          ad hoc signature (ibuilder-sign on the Mac; zsign with the Keychain identity in the app)
+      sign          ad hoc signature (ibuilder-sign on the Mac; zsign with the Keychain identity in the app; with no .p12
+                    in the app, zsign ad hoc: an export-only build, stamped signature=adhoc-export and never booted)
    5  boot          the app dlopens the framework and calls the host's entry point: the game runs in-process
 ```
 
@@ -58,6 +59,10 @@ The app is a .NET iOS application (C#, `app/gameapp/`, a snapshot of the origina
   and the chain's result code.
 * The result code of a build: 0 ok, 4 no shader library, 5 not assembled or signed, 75 stopped on purpose before stage 3
   (next launch continues), 130 cancelled, 131 paused. A build that returns 4 or 5 is never stamped as ready.
+* With no signing identity (the signer's rc 10, 12, 13) stage 4b signs ad hoc through `ibuilder_options.sign_adhoc` and the
+  build is 0, stamped for export only: the app offers Export IPA, not Play, and "Sign again to play" once a `.p12` is imported.
+* The shim asks Metal whether the GPU reads BC textures; without them (`IBUILDER_FLAG_GPU_NO_BC`) every boot sets
+  `DM_PROF_TEX_BC_CPU=1` and the host decodes them on the CPU. A GPU with them gets no change.
 * The patches in `app/patches/` are applied, in order, to a copy of the snapshot by `scripts/build-app.sh`;
   `scripts/check-patches-apply.sh` proves they apply.
 * The bundle carries only the data the Rust chain reads (`dm/games/*/game.tsv`, `settings.tsv`, host sources for the
