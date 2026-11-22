@@ -1,0 +1,132 @@
+# 0101-export-info-plist-for-zsign.patch -- the FlareStore signing failure, root cause found and reproduced on the Mac by the main agent: NSPropertyListSerialization writes an XML plist's empty
+# elements with a space before the slash (`<true />`, `<false />`): valid XML (plutil -lint), but zsign's own plist reader (jvalue::read_plist, FlareStore's signer) accepts only `<true/>`; it
+# stops ("Syntax error: value, dictionary or array expected"), finds no CFBundleIdentifier / CFBundleExecutable, and signing fails: "Can't get BundleID, BundleVersion, or BundleExecute in
+# Info.plist!" (full and light exports). The owner's exported Info.plist with `<x />` -> `<x/>` parses (dev.ibuilder.app.g010095300b6a4000, GameApp, 8). Applies after 0100.
+# UNTESTED ON DEVICE: compiled, and its pure part ran in the host harness (below).
+#
+# FIX: PlistText (GameAppField.cs): every self-closing tag `<name [white space]/>` becomes `<name/>` in BOTH exported Info.plists (the app's and DmGameProbe.framework's, Plan's ForSigners),
+#   after their serialization (and after OpenInPlist's rewrite); a value's text is never touched (its "<" is written "&lt;"). The log says "export: Info.plist normalized for signers (N
+#   self-closing tags)". 0097's check of the written .ipa reads its Info.plist again the way zsign does (PlistText.StrictMissing: no `<x />`, and CFBundleIdentifier, CFBundleExecutable and
+#   CFBundleVersion each found as `<key>K</key>` then `<string>…</string>` by a plain scan, which stops at a spaced tag as zsign does); otherwise the export fails with "the written .ipa's
+#   Info.plist would not be read by a signer (zsign): …" and its .part is removed. The log line becomes "export: Info.plist checked (also as zsign reads it): …".
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch 0010-0101 applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile
+#   (-t:Compile): 0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness101: … P100;P101): 411 of 411 checks (9 new: the plist as NSPropertyListSerialization
+#   writes it read the strict way (nothing found), the normalizer on <true />, <false />, <dict />, <array />, <string />, nested and white-space variants, a value's text untouched, the
+#   owner's id / executable / version found after it, idempotence, entities, the version required, the log line, the wiring); 6 of 6 mutations killed.
+# NOT VERIFIED: a real FlareStore install of a new export (the main agent's Mac reproduction used zsign's parser on the owner's file).
+# NEW STRINGS (log / export error): "export: Info.plist normalized for signers (", " self-closing tag", "would not be read by a signer (zsign): ", "export: Info.plist checked (also as zsign reads it): ".
+diff -ruN t100b/GameAppExport.cs u/GameAppExport.cs
+--- t100b/GameAppExport.cs	2026-11-22 20:26:29
++++ u/GameAppExport.cs	2026-11-22 20:25:27
+@@ -214,8 +214,11 @@
+ 
+     /// Everything the export needs, before anything is written: the entries and their total size. Throws with a
+     /// sentence the player can act on when something is missing.
+-    private static List<Entry> Plan(string documents, string bundle, string dump, string titleId, bool slim, out string appName, out string romfsPath)
++    /// `plistTags` (patch 0101): the self-closing tags written without their space in the two Info.plists (PlistText.Normalize).
++    private static List<Entry> Plan(string documents, string bundle, string dump, string titleId, bool slim, out string appName, out string romfsPath, out int plistTags)
+     {
++        int tags = 0;
++        byte[] ForSigners(byte[] plist) { var b = PlistText.Normalize(plist, out int n); tags += n; return b; }   // patch 0101: `<true/>`, never `<true />` (zsign's reader)
+         var name = GameAppUi.DisplayName(dump);
+         appName = GameAppUi.ExportFileName(name);
+         var app = "Payload/" + appName + ".app/";
+@@ -252,7 +255,7 @@
+                                     || rel == "ALTCertificate.p12" || rel.EndsWith(".mobileprovision"));
+         AddTree(framework, app + "Frameworks/DmGameProbe.framework/", rel => rel.StartsWith("_CodeSignature/") || rel == "Info.plist");
+         AddBytes(app + "Frameworks/DmGameProbe.framework/Info.plist",
+-                 FrameworkPlist(Path.Combine(framework, "Info.plist"), Path.Combine(bundle, "Info.plist"), titleId));
++                 ForSigners(FrameworkPlist(Path.Combine(framework, "Info.plist"), Path.Combine(bundle, "Info.plist"), titleId)));
+         AddTree(flat, app + Folder + "/extract/flat/");
+         if (!slim) AddFile(romfs, app + Folder + "/extract/RomFS.img");   // slim: beside the .ipa (RomfsFileName)
+         AddTree(pack, app + Folder + "/shaders/" + titleId + "/");
+@@ -298,7 +301,8 @@
+                 AddBytes(app + "GameIcon60x60" + suffix + ".png", art);
+                 hasIcon = true;
+             }
+-        AddBytes(app + "Info.plist", InfoPlist(Path.Combine(bundle, "Info.plist"), titleId, name, hasIcon));
++        AddBytes(app + "Info.plist", ForSigners(InfoPlist(Path.Combine(bundle, "Info.plist"), titleId, name, hasIcon)));
++        plistTags = tags;
+         // patch 0097: the bundle's own files first (the app's Info.plist the very first), the game's small files, then its big ones, RomFS.img last: every piece of bundle metadata below
+         // 4 GiB (its Info.plist was the LAST entry, beyond the RomFS: a signer's unzip that mishandles ZIP64 found none: "Can't get BundleID … in Info.plist!")
+         return ExportZip.Order(entries, e => e.Name, e => e.Size, app, Folder);
+@@ -400,7 +404,8 @@
+     /// `log` gets a line per tenth of the bytes. Returns the .ipa's path.
+     public static string Export(string documents, string bundle, string dump, string titleId, bool slim, Action<string> log)
+     {
+-        var entries = Plan(documents, bundle, dump, titleId, slim, out var appName, out var romfsSource);
++        var entries = Plan(documents, bundle, dump, titleId, slim, out var appName, out var romfsSource, out int plistTags);
++        log(PlistText.NormalizedLine(plistTags));   // patch 0101
+         long total = entries.Sum(e => e.Size);
+         var outDir = Path.Combine(documents, "Exports");
+         Directory.CreateDirectory(outDir);
+@@ -482,8 +487,11 @@
+                    ?? throw new InvalidOperationException("the written .ipa's Info.plist does not parse: " + error?.LocalizedDescription);
+         var missing = ExportZip.Missing(k => (dict[k] as NSString)?.ToString());
+         if (missing.Count > 0) throw new InvalidOperationException("the written .ipa's Info.plist has no " + string.Join(", ", missing));
++        // patch 0101: read again the way zsign reads it (FlareStore's signer): no `<x />`, and each required key's <string> found by a plain scan
++        var strict = PlistText.StrictMissing(System.Text.Encoding.UTF8.GetString(bytes));
++        if (strict.Count > 0) throw new InvalidOperationException("the written .ipa's Info.plist would not be read by a signer (zsign): " + string.Join(", ", strict));
+         if (offset < 0 || offset > ExportZip.Limit) throw new InvalidOperationException($"the written .ipa's Info.plist starts at byte {offset} (beyond 4 GB, or not found): a signer could not read it");
+-        log($"export: Info.plist checked: {dict["CFBundleIdentifier"]} · {dict["CFBundleExecutable"]} · {dict["CFBundleVersion"]}, at byte {offset.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} (below 4 GB)");
++        log($"export: Info.plist checked (also as zsign reads it): {dict["CFBundleIdentifier"]} · {dict["CFBundleExecutable"]} · {dict["CFBundleVersion"]}, at byte {offset.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} (below 4 GB)");
+     }
+ 
+     [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
+diff -ruN t100b/GameAppField.cs u/GameAppField.cs
+--- t100b/GameAppField.cs	2026-11-22 20:26:29
++++ u/GameAppField.cs	2026-11-22 20:25:27
+@@ -859,3 +859,52 @@
+ 
+     public static Show Of(bool built, bool shownLive, bool queued, bool skipped) => !built ? Show.None : shownLive ? Show.Live : queued || skipped ? Show.Static : Show.None;
+ }
++
++/// Patch 0101 (the FlareStore signing failure, reproduced on the Mac by the main agent): NSPropertyListSerialization writes the empty elements of an XML plist as `<true />`, `<false />`
++/// (a SPACE before the slash): valid XML, but zsign's own plist reader (jvalue::read_plist, FlareStore's signer) takes only `<true/>`; it stops ("Syntax error: value, dictionary or array
++/// expected"), finds no CFBundleIdentifier / CFBundleExecutable and the signing fails: "Can't get BundleID, BundleVersion, or BundleExecute in Info.plist!". Every self-closing tag of the
++/// exported Info.plists is written without the space, and the written one is checked the way zsign reads it.
++public static class PlistText
++{
++    // a tag name, spaces, "/>": never inside a value (a value's "<" is written "&lt;")
++    private static readonly Regex SelfClosing = new Regex(@"<([A-Za-z][A-Za-z0-9_.:-]*)\s+/>");
++
++    public static string Normalize(string xml, out int count)
++    {
++        int n = 0;
++        var outText = SelfClosing.Replace(xml ?? "", m => { n++; return "<" + m.Groups[1].Value + "/>"; });
++        count = n;
++        return outText;
++    }
++
++    public static byte[] Normalize(byte[] xml, out int count) => System.Text.Encoding.UTF8.GetBytes(Normalize(System.Text.Encoding.UTF8.GetString(xml ?? Array.Empty<byte>()), out count));
++
++    public static bool HasSpacedSelfClosing(string xml) => SelfClosing.IsMatch(xml ?? "");
++
++    /// The string value of `key` read the strict way (a scan, as a simple signer's parser reads it): `<key>K</key>`, white space, `<string>…</string>`; null when it is not so.
++    public static string StrictString(string xml, string key)
++    {
++        if (xml == null || HasSpacedSelfClosing(xml)) return null;   // zsign's reader stops at the first `<x />`: nothing after it is read
++        var k = "<key>" + key + "</key>";
++        int i = xml.IndexOf(k, StringComparison.Ordinal);
++        if (i < 0) return null;
++        i += k.Length;
++        while (i < xml.Length && char.IsWhiteSpace(xml[i])) i++;
++        const string open = "<string>", close = "</string>";
++        if (string.CompareOrdinal(xml, i, open, 0, open.Length) != 0) return null;
++        int end = xml.IndexOf(close, i + open.Length, StringComparison.Ordinal);
++        if (end < 0) return null;
++        return System.Net.WebUtility.HtmlDecode(xml.Substring(i + open.Length, end - i - open.Length));
++    }
++
++    /// What a strict reader would not find: the required keys (ExportZip.Required) it cannot read, and "spaced self-closing tags" when the text has any.
++    public static List<string> StrictMissing(string xml)
++    {
++        var missing = new List<string>();
++        if (HasSpacedSelfClosing(xml)) missing.Add("spaced self-closing tags (<x />)");
++        missing.AddRange(ExportZip.Required.Where(k => string.IsNullOrEmpty(StrictString(xml, k))));
++        return missing;
++    }
++
++    public static string NormalizedLine(int count) => "export: Info.plist normalized for signers (" + count.ToString(CultureInfo.InvariantCulture) + " self-closing tag" + (count == 1 ? "" : "s") + ")";
++}
