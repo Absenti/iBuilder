@@ -1,0 +1,404 @@
+# 0094-sheet-width-first-build-content-tab-pill-nas-listing.patch -- the owner's field report on dev.ibuilder.app (0093): points S, T, U, V. Applies after 0093.
+# UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# S. The game sheet was WIDER than the screen (Delete, "Choose a cover…" and the segmented rows cut). Cause: the row "Update (build again with the update or DLC)" (shown while the build
+#    lacks an update that is here: South Park after its first build, hence "it goes away once the update is added") had its title REQUIRED at its full width (compression 1000) while the
+#    page's width to the screen is 999 (Theme.PinColumn): the title won and widened the whole page. Now a row's title wraps on 2 lines then truncates (SheetPriority.Title 900; the Sources
+#    rows too), and the segmented rows are FitRows: label beside the control while both fit (SheetFit.Stacked), else the label above and the control on the whole width; each segment is as
+#    wide as its own title (ApportionsSegmentWidthsByContent). Decided at every layout (any size class, the iPad's inspector).
+# T. Updates and DLC came only with a SECOND build. Cause (the owner's log): the first build of South Park started while its update was still downloading (".nsz.part"), and the chain's
+#    content signature even named the .part. Now every build (Library, Build tab, the queue: SetUpAndPlay) first WAITS for an update or DLC of the game still being copied in (it starts
+#    when they have landed: StartBuildsAfterDownload), and FETCHES from the cloud the game's newer update and missing DLC (ContentFetch.ToFetch, any source) before it starts (one download,
+#    then the build: "build: <game>: first its update v327680 from On the NAS (5.9 GB), then the build: it includes them"); the content signature never takes a .part. The Build row and the
+#    card of a game not built say what its first build includes: "update v327680 · 1 DLC (On the NAS: 5.9 GB, fetched before the build)".
+# U. The lit tab pill drew its gear over "Settings": its new configuration was laid out inside the animation of the page that was closing. The pills are now styled with no animation and laid
+#    out at once (icon leading, label truncating); the same for the three tabs (the iPad's sidebar has no pill).
+# V. The NAS listing now says what it holds: "NAS: 4 games, 2 updates, 3 DLC (1 classified by content)" (one line per listing, after the classification of 0091). A game on this iPhone whose
+#    update or DLC is only in the cloud says so on its card ("update v327680 on the NAS") and its menu has "Download its update and DLC (5.9 GB)".
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch 0010-0094 applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile
+#   (-t:Compile): 0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness94: … P93;P94): 358 of 358 checks (16 new: the rows' widths at 320/375/393 pt with
+#   the longest strings, the priorities, the tab pills, the .part, the fetch, the Build line, the listing line, the menu entry, the wiring); 12 of 12 mutations killed.
+# NOT VERIFIED: nothing ran on a device: the sheet's real layout (the widths are estimated, not measured with UIKit), the tab pill after a pushed page, a real first build with its update.
+# NEW UI STRINGS: "Download its update and DLC (", ", fetched before the build)", " on the NAS"; log lines " classified by content)", "build: … waits for ", ": first its ",
+#   "its update and DLC are here, the build starts".
+diff -ruN t93b/GameAppAttach.cs o/GameAppAttach.cs
+--- t93b/GameAppAttach.cs	2026-11-22 12:19:44
++++ o/GameAppAttach.cs	2026-11-22 12:18:37
+@@ -231,3 +231,92 @@
+         return "games found: " + (l.Count - u - d) + (u + d > 0 ? $" (+{u} update{(u == 1 ? "" : "s")}, {d} DLC)" : "");
+     }
+ }
++
++/// Patch 0094 (the owner's field report): the FIRST build of a game takes its update and DLC (T), the NAS listing says what it holds (V).
++public static class ContentFetch
++{
++    /// The update or DLC files of `game` still being copied in (a `<name>.part` in Documents): a build started now would miss them (South Park's first build had
++    /// "content: u:… [v327680] (5.92 GB).nsz.part": it started while its update was still downloading, so the update came only with a second build).
++    public static List<string> StillComing(string game, IEnumerable<string> documentNames)
++    {
++        var id = GameAppUi.BaseTitleIdOf(game);
++        if (id == null || GameAppUi.IsNup(game)) return new List<string>();
++        return (documentNames ?? Enumerable.Empty<string>()).Where(n => n.EndsWith(".part", StringComparison.OrdinalIgnoreCase)).Select(n => n.Substring(0, n.Length - 5))
++            .Where(n => Cloud.IsGameFile(n) && ContentSet.Of(n) != ContentSet.Kind.Game && string.Equals(GameAppUi.BaseTitleIdOf(n), id, StringComparison.OrdinalIgnoreCase)).ToList();
++    }
++
++    /// The names a build reads: the game files of Documents, never a `.part` (the content signature took "…nsz.part" as the update).
++    public static List<string> Whole(IEnumerable<string> documentNames) =>
++        (documentNames ?? Enumerable.Empty<string>()).Where(n => !n.EndsWith(".part", StringComparison.OrdinalIgnoreCase)).ToList();
++
++    /// What to fetch before the build of a game on this iPhone: from every cloud source, its NEWEST update when it is newer than the one here (or there is none here), and each DLC
++    /// this iPhone does not have (its newest copy). Empty for a .nup, a name with no id, or when nothing is missing.
++    public static List<CloudFile> ToFetch(string game, IEnumerable<CloudFile> cloud, IEnumerable<string> local)
++    {
++        var l = (local ?? Enumerable.Empty<string>()).ToList();
++        var c = (cloud ?? Enumerable.Empty<CloudFile>()).Where(f => Cloud.IsGameFile(f.Name)).ToList();
++        if (GameAppUi.IsNup(game) || GameAppUi.ContentKindOf(game) != GameAppUi.ContentKind.Base) return new List<CloudFile>();
++        var here = ContentSet.ExtrasOf(game, l);
++        var there = ContentSet.ExtrasOf(game, c.Select(f => f.Name));
++        var want = new List<string>();
++        if (there.Update != null && (here.Update == null || GameAppUi.VersionOf(there.Update) > GameAppUi.VersionOf(here.Update))) want.Add(there.Update);
++        var haveDlc = new HashSet<string>(here.Dlc.Select(GameAppUi.TitleIdHexOf), StringComparer.OrdinalIgnoreCase);
++        want.AddRange(there.Dlc.Where(d => !haveDlc.Contains(GameAppUi.TitleIdHexOf(d))));
++        return want.Select(n => c.First(f => string.Equals(f.Name, n, StringComparison.OrdinalIgnoreCase))).ToList();
++    }
++
++    /// The Build row / the card before a build: "update v327680 · 1 DLC (from the NAS: 5.9 GB, fetched before the build)", or what this iPhone has, or "".
++    public static string BuildLine(string game, IEnumerable<string> local, IReadOnlyList<CloudFile> fetch, string where)
++    {
++        var l = (local ?? Enumerable.Empty<string>()).ToList();
++        var all = ContentSet.ExtrasOf(game, l.Concat((fetch ?? new List<CloudFile>()).Select(f => f.Name)));
++        var line = ContentSet.Summary(all.Update, all.Dlc.Count);
++        if (fetch == null || fetch.Count == 0 || line.Length == 0) return line;
++        return line + $" ({where ?? "in the cloud"}: {GameAppUi.SizeText(fetch.Sum(f => Math.Max(0, f.Size)))}, fetched before the build)";
++    }
++
++    /// A built game's: "update v327680 on the NAS" (a newer update, or DLC, the build does not have yet), or "".
++    public static string NewerLine(IReadOnlyList<CloudFile> fetch, string where)
++    {
++        if (fetch == null || fetch.Count == 0) return "";
++        var u = fetch.FirstOrDefault(f => ContentSet.Of(f.Name) == ContentSet.Kind.Update);
++        int d = fetch.Count(f => ContentSet.Of(f.Name) == ContentSet.Kind.Dlc);
++        var parts = new List<string>();
++        if (u != null) parts.Add("update v" + GameAppUi.VersionOf(u.Name).ToString(CultureInfo.InvariantCulture));
++        if (d > 0) parts.Add(d + " DLC");
++        return string.Join(" · ", parts) + " " + (where ?? "in the cloud").Replace("On the", "on the").Replace("In ", "in ");
++    }
++
++    public static string FetchLabel(long bytes) => "Download its update and DLC (" + GameAppUi.SizeText(bytes) + ")";
++
++    /// The log of a cloud listing: "NAS: 4 games, 2 updates, 3 DLC (1 classified by content)".
++    public static string ListingLine(string who, IEnumerable<string> names, Func<string, bool> byContent)
++    {
++        var l = (names ?? Enumerable.Empty<string>()).Where(Cloud.IsGameFile).ToList();
++        int u = l.Count(n => ContentSet.Of(n) == ContentSet.Kind.Update), d = l.Count(n => ContentSet.Of(n) == ContentSet.Kind.Dlc);
++        int c = byContent == null ? 0 : l.Count(byContent);
++        return $"{who}: {l.Count - u - d} game{(l.Count - u - d == 1 ? "" : "s")}, {u} update{(u == 1 ? "" : "s")}, {d} DLC ({c} classified by content)";
++    }
++}
++
++/// Patch 0094 (S, the owner's screenshot: the game sheet wider than the screen, "Delete" and the segmented rows cut): a row of the sheet keeps its label beside its control while both fit,
++/// else the label goes ABOVE the control (which then takes the whole width). Widths in points.
++public static class SheetFit
++{
++    public static bool Stacked(double labelWidth, double controlWidth, double available, double spacing = 10) => labelWidth + spacing + controlWidth > available;
++
++    /// The width a row of the settings card has on a screen `screen` points wide: the sheet's margins (20 each side) and the card's insets (16 each side).
++    public static double RowWidth(double screen) => screen - 2 * 20 - 2 * 16;
++
++    /// A rough width of `text` at `points` (the harness's estimate of SF Pro: 0.56 em a character on average, 0.62 for semibold).
++    public static double Estimate(string text, double points, bool semibold = false) => (text ?? "").Length * points * (semibold ? 0.62 : 0.56);
++
++    /// A UISegmentedControl's width: its segments are as wide as its widest title, plus 16 points of padding each.
++    public static double SegmentedWidth(IEnumerable<string> titles, double points) => (titles ?? Enumerable.Empty<string>()).Select(x => Estimate(x, points, true) + 16).DefaultIfEmpty(0).Max() * (titles ?? Enumerable.Empty<string>()).Count();
++}
++
++/// Patch 0094 (S): the priorities that keep the game sheet as wide as the screen: the page's width is 999 (Theme.PinColumn), so nothing inside may be required (1000) at its full width.
++public static class SheetPriority
++{
++    public const float Title = 900, Control = 800;
++}
+diff -ruN t93b/GameAppAttachUi.cs o/GameAppAttachUi.cs
+--- t93b/GameAppAttachUi.cs	2026-11-22 12:19:44
++++ o/GameAppAttachUi.cs	2026-11-22 12:17:20
+@@ -201,7 +201,13 @@
+         var local = libNames ?? Dumps().Select(Path.GetFileName).ToList();
+         if ((state == LibState.CloudOnly || state == LibState.Downloading) && e.Cloud != null)
+             return ContentSet.CloudSummary(e.Name, cloudFiles.Where(f => f.SourceId == e.Cloud.SourceId).Select(f => f.Name), local);
+-        return ContentAttach.Summary(e.Name, local);
++        // patch 0094 (T, V): a game on this iPhone also says what the cloud has for it: before its build, what the build will fetch; built, the newer update or DLC there
++        var fetch = ContentFetch.ToFetch(e.Name, cloudFiles, local);
++        var where = fetch.Count > 0 ? CloudWords(fetch[0]).Where : null;
++        if (state == LibState.NotBuilt) return ContentFetch.BuildLine(e.Name, local, fetch, where);
++        var here = ContentAttach.Summary(e.Name, local);
++        var newer = ContentFetch.NewerLine(fetch, where);
++        return string.Join(" · ", new[] { here, newer }.Where(x => x.Length > 0));
+     }
+ 
+     /// The bytes a cloud game's download takes: the game, its newest update and its DLC from the same source, minus what this iPhone has (Cloud.DownloadSet, what Download fetches).
+@@ -267,6 +273,55 @@
+             views.Add(Look.Card(Theme.Column(8, rows), 12, 14));
+         }
+         return Theme.Column(8, views.ToArray());
++    }
++
++    // ---- patch 0094 (T): the FIRST build takes the update and DLC (ContentFetch, GameAppAttach.cs) -------------------------------------------------------
++
++    private readonly HashSet<string> buildsAfterDownload = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++    private readonly HashSet<string> fetchTried = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++
++    /// Before a build: its update or DLC still being copied in -> the build waits for them (it starts when they have landed); its update or DLC in a cloud source and not here -> they are
++    /// downloaded first (one download, its own progress), then the build starts. True when the build waits. A failed or cancelled fetch is tried once: the next Build goes on without it.
++    private bool WaitForExtras(string game)
++    {
++        if (GameExport.IsPlayer) return false;
++        var docs = GameAppMain.Documents;
++        List<string> names;
++        try { names = Directory.EnumerateFiles(docs).Select(Path.GetFileName).ToList(); } catch (Exception) { return false; }
++        var coming = ContentFetch.StillComing(game, names);
++        if (coming.Count > 0)
++        {
++            buildsAfterDownload.Add(game);
++            Write($"build: {GameAppUi.DisplayName(game)} waits for {string.Join(", ", coming.Select(ContentSet.Label))} (still downloading): it starts when they have landed");
++            return true;
++        }
++        var fetch = ContentFetch.ToFetch(game, cloudFiles, ContentFetch.Whole(names));
++        if (fetch.Count == 0 || !fetchTried.Add(game)) return false;
++        Write($"build: {GameAppUi.DisplayName(game)}: first its {string.Join(", ", fetch.Select(f => ContentSet.Label(f.Name)))} from {string.Join(", ", fetch.Select(f => CloudWords(f).Where).Distinct())} "
++              + $"({GameAppUi.SizeText(fetch.Sum(f => Math.Max(0, f.Size)))}), then the build: it includes them");
++        Download(fetch, docs, _ => { fetchTried.Remove(game); KnowExtras(fetch.Select(f => f.Name)); QueueNow(game); });
++        return true;
++    }
++
++    /// A download ended: a build that waited for its update or DLC starts when nothing of it is still coming.
++    private void StartBuildsAfterDownload()
++    {
++        if (buildsAfterDownload.Count == 0) return;
++        List<string> names;
++        try { names = Directory.EnumerateFiles(GameAppMain.Documents).Select(Path.GetFileName).ToList(); } catch (Exception) { return; }
++        foreach (var g in buildsAfterDownload.ToList())
++            if (ContentFetch.StillComing(g, names).Count == 0) { buildsAfterDownload.Remove(g); Write($"build: {GameAppUi.DisplayName(g)}: its update and DLC are here, the build starts"); QueueNow(g); }
++    }
++
++    /// What a game on this iPhone lacks from the cloud (its newer update, its DLC), for its row, its card and its menu.
++    private List<CloudFile> ExtrasToFetch(string game) =>
++        GameExport.IsPlayer ? new List<CloudFile>() : ContentFetch.ToFetch(game, cloudFiles, libNames ?? Dumps().Select(Path.GetFileName).ToList());
++
++    private void FetchExtras(string game)
++    {
++        var fetch = ExtrasToFetch(game);
++        if (fetch.Count == 0) return;
++        Download(fetch, GameAppMain.Documents, _ => KnowExtras(fetch.Select(f => f.Name)));
+     }
+ 
+     // ---- covers before the download --------------------------------------------------------------------------------
+diff -ruN t93b/GameAppLibrary.cs o/GameAppLibrary.cs
+--- t93b/GameAppLibrary.cs	2026-11-22 12:19:44
++++ o/GameAppLibrary.cs	2026-11-22 12:17:20
+@@ -1850,6 +1850,9 @@
+                     {
+                         cloudFiles = Cloud.Replace(cloudFiles, id, files);
+                         sourceState[id] = $"{cloudFiles.Count(f => f.SourceId == id)} file(s) · refreshed {DateTime.Now:HH:mm}";
++                        // patch 0094 (V): what the listing holds, the updates and DLC told apart (by name, or by what the cover pass read in the package)
++                        Write(ContentFetch.ListingLine(id == NasId ? "NAS" : "cloud " + (cloudSources.FirstOrDefault(s => s.Id == id)?.Name ?? id), files.Select(f => f.Name),
++                                                       n => GameAppUi.IconRelativePath(n) != null && GameAppUi.HasTitleFromContent(n)));
+                     }
+                     else
+                     {
+@@ -2081,6 +2084,7 @@
+                 }
+                 KnowExtras(files.Select(f => f.Name));   // patch 0091: a download's update and DLC came with their game: not announced again
+                 RefreshGames();
++                StartBuildsAfterDownload();   // patch 0094 (T): a build that waited for its update or DLC
+                 RefreshScreen();
+                 if (error == null && !cancelled) done?.Invoke(key);
+             });
+diff -ruN t93b/GameAppMain.cs o/GameAppMain.cs
+--- t93b/GameAppMain.cs	2026-11-22 12:19:44
++++ o/GameAppMain.cs	2026-11-22 12:17:20
+@@ -346,7 +346,7 @@
+             "shader_chain=" + GameAppBuild.ShaderChain,
+             "game=" + (game ?? ""),
+             // The update and DLC this build takes (stamped with the framework: one added later asks for a rebuild).
+-            "content=" + (game == null || player ? "" : GameAppUi.ContentSignature(game, DocumentNames(documents))),
++            "content=" + (game == null || player ? "" : GameAppUi.ContentSignature(game, ContentFetch.Whole(DocumentNames(documents)))),   // patch 0094 (T): never a .part
+         };
+         return string.Join("\n", lines.Concat(playerLines)) + "\n";
+     }
+@@ -2071,6 +2071,7 @@
+         if (!nup && !fromExtraction && !File.Exists(keys)) { Write("no prod.keys in Documents: the tool cannot read an NSP without them"); return; }
+         if (!File.Exists(path)) { Write($"{game} is no longer in Documents"); return; }
+         if (!fromExtraction && !GameFileHasContent(game)) return;   // GameAppSourceUi.cs: the file was removed after the build: it says so and offers to add it again (patch 0068)
++        if (!fromExtraction && WaitForExtras(game)) return;   // patch 0094 (T, GameAppAttachUi.cs): its update and DLC first, then this build
+         rebuildRequested = true;
+         BeginRunWithArguments(keys, path, "--romfs-image");
+     }
+diff -ruN t93b/GameAppRedesign.cs o/GameAppRedesign.cs
+--- t93b/GameAppRedesign.cs	2026-11-22 12:19:44
++++ o/GameAppRedesign.cs	2026-11-22 12:17:30
+@@ -190,10 +190,10 @@
+ /// Play with a development certificate), Export IPA for a built game, Settings, Choose a cover… (not for a game only in the cloud), then the long-press menu's items of the patches before
+ /// where they apply (Update, 0076 the shader preparation's Pause / Resume and "Prepare the shaders now", 0065 the paused build's Cancel, the queue, the uploads, Remove download), and last
+ /// Delete… (a game on this iPhone) or Hide from the library (a game only in the cloud).
+-public enum HoldItem { Primary, Settings, ChooseCover, Export, Update, WarmToggle, WarmNow, CancelPaused, AddToQueue, Upload, RemoveDownload, Delete, Hide, AddContent, Mods, QueueRebuild, Discard }
++public enum HoldItem { Primary, Settings, ChooseCover, Export, Update, WarmToggle, WarmNow, CancelPaused, AddToQueue, Upload, RemoveDownload, Delete, Hide, AddContent, Mods, QueueRebuild, Discard, FetchExtras }
+ 
+ public sealed record HoldFacts(LibState State, bool CanRunHere, bool Update, bool LocalFile, bool Busy, bool WarmShown, bool WarmQueued, int UploadTargets, bool HasCloudCopy, bool CanAttach = false, bool HasTitle = false, bool ModsChanged = false,
+-                               bool ContentMissing = false);
++                               bool ContentMissing = false, bool ExtrasInCloud = false);
+ 
+ public static class HoldMenuPlan
+ {
+@@ -221,6 +221,7 @@
+         else if (f.LocalFile && queue == QueuePlan.Entry.Rebuild) items.Add(HoldItem.QueueRebuild);
+         if (f.LocalFile && f.UploadTargets > 0) items.Add(HoldItem.Upload);
+         if (f.LocalFile && f.HasCloudCopy) items.Add(HoldItem.RemoveDownload);
++        if (f.LocalFile && f.ExtrasInCloud && f.State is LibState.NotBuilt or LibState.Built or LibState.Paused) items.Add(HoldItem.FetchExtras);   // patch 0094: its update / DLC in the cloud
+         if (f.LocalFile && !f.Busy) items.Add(HoldItem.Delete);
+         else if (!f.LocalFile && f.State == LibState.CloudOnly) items.Add(HoldItem.Hide);   // patch 0082 (review L5): never while it downloads (Cancel must stay reachable)
+         return items;
+diff -ruN t93b/GameAppRedesignUi.cs o/GameAppRedesignUi.cs
+--- t93b/GameAppRedesignUi.cs	2026-11-22 12:19:44
++++ o/GameAppRedesignUi.cs	2026-11-22 12:18:37
+@@ -1127,7 +1127,8 @@
+         bool canAttach = GameAppUi.ContentKindOf(name) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(name);   // patch 0084
+         bool modsChanged = state == LibState.Built && tid != null && GameMods.ExefsChangedSinceBuild(GameAppMain.Documents, tid);   // patch 0086: a code mod changed since the build
+         var plan = HoldMenuPlan.Items(new HoldFacts(state, canRun, update, local, facts.Running, warmShown, warmQueued, targets.Count, downloaded, canAttach, tid != null, modsChanged,
+-                                                    ContentMissing: state == LibState.Paused && ContentMissing(name).Count > 0));   // patch 0088
++                                                    ContentMissing: state == LibState.Paused && ContentMissing(name).Count > 0,   // patch 0088
++                                                    ExtrasInCloud: local && ExtrasToFetch(name).Count > 0));   // patch 0094
+         var list = new List<HoldOverlay.Entry>();
+         var primary = LibraryActions.For(state, canRun)[0];
+         foreach (var item in plan)
+@@ -1145,6 +1146,9 @@
+                 case HoldItem.WarmToggle: list.Add(new HoldOverlay.Entry(warmQueue.Paused ? "Resume the shader preparation" : "Pause the shader preparation", warmQueue.Paused ? "play.fill" : "pause.fill", false, ToggleWarmPause, "hold-warm")); break;
+                 case HoldItem.WarmNow: list.Add(new HoldOverlay.Entry("Prepare the shaders now", "bolt.fill", false, () => PrepareNow(name), "hold-warm-now")); break;
+                 case HoldItem.CancelPaused: list.Add(new HoldOverlay.Entry("Cancel the paused build…", "xmark", false, () => AskCancel(name), "build-cancel")); break;
++                case HoldItem.FetchExtras:   // patch 0094 (T, V): the update and DLC the cloud has for this game, downloaded now
++                    list.Add(new HoldOverlay.Entry(ContentFetch.FetchLabel(ExtrasToFetch(name).Sum(f => Math.Max(0, f.Size))), "arrow.down.circle", false, () => FetchExtras(name), "hold-fetch-extras"));
++                    break;
+                 case HoldItem.Discard:   // patch 0088: the paused game's (any game, not only the selected one); greyed with its reason while it builds
+                 {
+                     var d = PartialDiscard.For(state, facts.Running, state == LibState.Paused && ContentMissing(name).Count > 0);
+@@ -1182,12 +1186,21 @@
+ 
+     private void StyleTabs(int lit)
+     {
++        // patch 0094 (U, the owner's screenshot "⚙ettings"): the lit pill's icon stayed where the icon-only button had it (a new configuration laid out inside the animation of the page
++        // that was closing). The configurations are set with no animation and each button is laid out at once
++        UIView.PerformWithoutAnimation(() => StyleTabsNow(lit));
++    }
++
++    private void StyleTabsNow(int lit)
++    {
+         for (int i = 0; i < tabs.Length; i++)
+         {
+             bool on = i == lit;
+             var config = on ? UIButtonConfiguration.FilledButtonConfiguration : UIButtonConfiguration.PlainButtonConfiguration;
+             config.Image = UIImage.GetSystemImage(TabIcons[i], UIImageSymbolConfiguration.Create(UIFont.SystemFontOfSize(16, UIFontWeight.Semibold)));
+             config.ImagePadding = 7;
++            config.ImagePlacement = NSDirectionalRectEdge.Leading;   // patch 0094: the icon before the label, always
++            config.TitleLineBreakMode = UILineBreakMode.TailTruncation;
+             config.ContentInsets = new NSDirectionalEdgeInsets(0, 8, 0, 8);
+             config.AttributedTitle = on ? new NSAttributedString(TabTitles[i], new UIStringAttributes { Font = Theme.Font(13, UIFontWeight.Semibold) }) : null;
+             config.CornerStyle = UIButtonConfigurationCornerStyle.Capsule;
+@@ -1196,6 +1209,9 @@
+             tabs[i].Configuration = config;
+             tabs[i].AccessibilityLabel = TabTitles[i];
+             tabs[i].AccessibilityTraits = on ? UIAccessibilityTrait.Button | UIAccessibilityTrait.Selected : UIAccessibilityTrait.Button;
++            tabs[i].SetNeedsUpdateConfiguration();
++            tabs[i].SetNeedsLayout();
++            tabs[i].LayoutIfNeeded();   // the icon and the label placed now, beside each other
+         }
+     }
+ 
+@@ -1443,5 +1459,41 @@
+         if (!running || launchingGame != game) return ("", 0, false);
+         var s = GameAppUi.ParseStage(lastStage);
+         return (s.Valid ? s.Text : "Loading the game", (float) Math.Max(0.05, s.Valid ? s.Fraction : 0.05), true);
++    }
++}
++
++/// Patch 0094 (S): a settings row: its label beside its control while both fit (SheetFit.Stacked), else the label above and the control on the whole width. Decided again at every layout
++/// (another size class, the iPad's inspector, a rotation).
++internal sealed class FitRow : UIStackView
++{
++    private readonly UIView label, control, spacer = new UIView();
++
++    public FitRow(UIView label, UIView control) : base(new[] { label })
++    {
++        this.label = label;
++        this.control = control;
++        Spacing = 10;
++        Axis = UILayoutConstraintAxis.Horizontal;
++        Alignment = UIStackViewAlignment.Center;
++        AddArrangedSubview(spacer);
++        AddArrangedSubview(control);
++    }
++
++    public override void LayoutSubviews()
++    {
++        var w = Bounds.Width;
++        if (w > 0)
++        {
++            bool stack = SheetFit.Stacked((double) label.IntrinsicContentSize.Width, (double) control.IntrinsicContentSize.Width, (double) w, (double) Spacing);
++            var axis = stack ? UILayoutConstraintAxis.Vertical : UILayoutConstraintAxis.Horizontal;
++            if (Axis != axis)
++            {
++                Axis = axis;
++                Alignment = stack ? UIStackViewAlignment.Fill : UIStackViewAlignment.Center;
++                Spacing = stack ? 8 : 10;
++                spacer.Hidden = stack;
++            }
++        }
++        base.LayoutSubviews();
+     }
+ }
+diff -ruN t93b/GameAppShelf.cs o/GameAppShelf.cs
+--- t93b/GameAppShelf.cs	2026-11-22 12:19:44
++++ o/GameAppShelf.cs	2026-11-22 12:17:20
+@@ -287,7 +287,7 @@
+             var state = LibStateOf(e, facts, out var fraction);
+             bool update = state == LibState.Built && GameAppUi.ContentChangedSinceBuild(name, localNames, facts);
+             rowsOf[name] = e;
+-            games.Add(new BuildGame(name, state, GameFileSizeText(name), null, update, fraction, ContentAttach.Summary(name, localNames)));   // patch 0084: what the build merges
++            games.Add(new BuildGame(name, state, GameFileSizeText(name), null, update, fraction, ExtrasLine(e, state)));   // patch 0084: what the build merges; 0094: and what it fetches first
+         }
+         foreach (var f in shownCloud)
+         {
+@@ -487,8 +487,11 @@
+     private SettingsRowRef SettingsRow(string title, Action tap, bool chevron, bool dot, int navPage = -1, string id = null)
+     {
+         var b = new UIButton(UIButtonType.System) { AccessibilityIdentifier = id };
+-        var label = Theme.Label(title, Theme.Font(16, UIFontWeight.Medium), Theme.Text);
+-        label.SetContentCompressionResistancePriority(1000, UILayoutConstraintAxis.Horizontal);
++        // patch 0094 (S): a long title ("Update (build again with the update or DLC)") was required at its full width (1000, above the sheet's own 999): the whole sheet grew wider than the
++        // screen. It wraps on two lines now, then truncates; it still wins over the value (250)
++        var label = Theme.Label(title, Theme.Font(16, UIFontWeight.Medium), Theme.Text, 2);
++        label.LineBreakMode = UILineBreakMode.TailTruncation;
++        label.SetContentCompressionResistancePriority(SheetPriority.Title, UILayoutConstraintAxis.Horizontal);
+         var value = Theme.Label("", Theme.Font(14, UIFontWeight.Regular), Theme.Muted);
+         value.TextAlignment = UITextAlignment.Right;
+         value.LineBreakMode = UILineBreakMode.TailTruncation;
+@@ -663,7 +666,8 @@
+         v.LineBreakMode = UILineBreakMode.TailTruncation;
+         v.SetContentCompressionResistancePriority(250, UILayoutConstraintAxis.Horizontal);
+         var name = Theme.Label(title, Theme.Font(15, UIFontWeight.Regular), Theme.Text);
+-        name.SetContentCompressionResistancePriority(1000, UILayoutConstraintAxis.Horizontal);
++        name.LineBreakMode = UILineBreakMode.TailTruncation;
++        name.SetContentCompressionResistancePriority(SheetPriority.Title, UILayoutConstraintAxis.Horizontal);   // patch 0094 (S): never above the page's width (999)
+         var row = Theme.Row(12, Theme.Symbol(symbol, 18, Theme.Accent), name, new UIView(), v, Theme.Symbol("chevron.right", 12, UIColor.FromWhiteAlpha(1f, 0.45f)));
+         row.UserInteractionEnabled = false;
+         row.TranslatesAutoresizingMaskIntoConstraints = false;
+@@ -920,8 +924,10 @@
+             control.HeightAnchor.ConstraintEqualTo(36).Active = true;
+             control.ValueChanged += (_, __) => { if (control.SelectedSegment >= 0) set(values[(int) control.SelectedSegment]); };
+             control.SetContentHuggingPriority(1000, UILayoutConstraintAxis.Horizontal);
++            control.ApportionsSegmentWidthsByContent = true;   // patch 0094 (S): each segment as wide as its own title ("Memory saver" no longer widens "Standard")
++            control.SetContentCompressionResistancePriority(SheetPriority.Control, UILayoutConstraintAxis.Horizontal);
+             var l = Theme.Label(label, Theme.Font(14, UIFontWeight.Regular), Theme.Text, 2);
+-            return Theme.Row(10, l, new UIView(), control);
++            return new FitRow(l, control);   // GameAppRedesignUi.cs (patch 0094): the label above the control when both do not fit beside
+         }
+         var launcher = tid != null ? LoadLauncher(game) : null;
+         if (launcher != null)
