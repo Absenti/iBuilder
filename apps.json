@@ -19,6 +19,16 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.1.4",
+          "buildVersion": "5",
+          "date": "2026-11-22T16:28:12Z",
+          "localizedDescription": "> [!WARNING]\n> No game, firmware or key is included or downloaded. Use iBuilder only with games you own and the `prod.keys` dumped from your own console. Not affiliated with Nintendo or Apple.\n\n**New: iPhone 12 and later**\n- **GPUs without BC textures** (A14–A16, e.g. iPhone 12–15 non-Pro, A14–A16 iPads) now take the engine path ported from the community fork [mianmuhammadse/nxnative `no-bc`](https://github.com/mianmuhammadse/nxnative/tree/no-bc) (MIT): BC1–5 decoded on the GPU at upload, BC1/2/3 stored as ASTC 4x4 (a quarter of the memory), CPU only for BC6H/BC7/3D. Automatic. `DM_NO_BC_GPU=0` / `DM_NO_BC_ASTC=0` switch back for comparison.\n- **Memory-pressure response** on iOS: the engine trims its caches on a system memory warning or low headroom.\n- Not yet tested on an A14–A16 device here: reports with logs are welcome.\n\nRequirements: iPhone 12 or later (A14+, Metal 4) or an iPad with A14/M1 or later, iOS/iPadOS 26+.\n\n**Install**: SideStore source `https://raw.githubusercontent.com/Absenti/iBuilder/main/apps.json`, or the `.ipa` below. Bundle id `dev.ibuilder.app`. Assets: the `.ipa`, its `.sha256`, and `.ipa.verify.tar.gz` (the verifier that checked it: 244 checks passed).",
+          "downloadURL": "https://github.com/Absenti/iBuilder/releases/download/v0.1.4/GameApp-rust-20261122-162610-rust7d81008a.ipa",
+          "size": 40938569,
+          "sha256": "3138649e53715cdcb228532620a9c06778d778a46974ec1210fd26a3042f37e4",
+          "minOSVersion": "26.0"
+        },
+        {
           "version": "0.1.3",
           "buildVersion": "4",
           "date": "2026-11-22T15:19:40Z",
