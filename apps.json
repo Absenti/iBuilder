@@ -19,6 +19,16 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.1.1",
+          "buildVersion": "2",
+          "date": "2026-11-22T11:29:50Z",
+          "localizedDescription": "> [!WARNING]\n> No game, firmware or key is included or downloaded. Use iBuilder only with games you own and the `prod.keys` dumped from your own console. Not affiliated with Nintendo or Apple.\n\n**Fixes**\n- The first build of a game now waits for, and includes, its update and DLC (it could start while the update was still downloading)\n- A game's settings sheet no longer grows wider than the screen\n- The selected tab no longer draws its icon over its label\n- NAS listing: updates and DLC are classified and grouped under their game; a base game on the iPhone offers its update from the NAS\n- Review fixes (r5): NAS cover reads, free space never read as 0, warm-up wait bounded, discarding a paused rebuild keeps the working build, boot-loop guard on device, stricter no-spawn gate\n\n**Install**: SideStore source `https://raw.githubusercontent.com/Absenti/iBuilder/main/apps.json`, or the `.ipa` below. Bundle id `dev.ibuilder.app`, iOS 26+. Assets: the `.ipa`, its `.sha256`, and `.ipa.verify.tar.gz` (the verifier that checked it: 236 checks passed).",
+          "downloadURL": "https://github.com/Absenti/iBuilder/releases/download/v0.1.1/GameApp-rust-20261122-112359-ruste60b40aa.ipa",
+          "size": 40842032,
+          "sha256": "26df6758bd5580187771769967cf0fa83dac20a8b90dec7b948f8a33b79f0cf1",
+          "minOSVersion": "26.0"
+        },
+        {
           "version": "0.1.0",
           "buildVersion": "1",
           "date": "2026-11-22T11:21:28Z",
