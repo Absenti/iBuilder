@@ -19,6 +19,16 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.1.3",
+          "buildVersion": "4",
+          "date": "2026-11-22T15:19:40Z",
+          "localizedDescription": "> [!WARNING]\n> No game, firmware or key is included or downloaded. Use iBuilder only with games you own and the `prod.keys` dumped from your own console. Not affiliated with Nintendo or Apple.\n\n**New**\n- **Choose which game's shaders are prepared**: the Build tab lists the games waiting for shader preparation with their progress. Per game: *Prepare this one now* (the current one pauses and keeps what it finished), *Pause / Resume*, *Skip / Queue again*. The order persists; a newly built game now goes to the end of the queue.\n\n**Fixes**\n- **Full IPA export rejected by on-device signers** (FlareStore: \"Can't get BundleID, BundleVersion, or BundleExecute in Info.plist!\"): `Info.plist` is now written first in the IPA (it sat past 4 GB behind the game's RomFS, a ZIP64 offset many unzippers mishandle). Exports above 4 GB warn and offer the light export; the written IPA is reopened and checked.\n\n**Install**: SideStore source `https://raw.githubusercontent.com/Absenti/iBuilder/main/apps.json`, or the `.ipa` below. Bundle id `dev.ibuilder.app`, iOS 26+. Assets: the `.ipa`, its `.sha256`, and `.ipa.verify.tar.gz` (the verifier that checked it: 244 checks passed).",
+          "downloadURL": "https://github.com/Absenti/iBuilder/releases/download/v0.1.3/GameApp-rust-20261122-151758-rust7d81008a.ipa",
+          "size": 40921895,
+          "sha256": "342354c3b34ae15c3a26b04c661e555e7f725cf58d34d37e6f33482a49d5ac41",
+          "minOSVersion": "26.0"
+        },
+        {
           "version": "0.1.2",
           "buildVersion": "3",
           "date": "2026-11-22T14:45:59Z",
