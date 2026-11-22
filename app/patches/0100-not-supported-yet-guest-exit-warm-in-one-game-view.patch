@@ -1,0 +1,415 @@
+# 0100-not-supported-yet-guest-exit-warm-in-one-game-view.patch -- the owner's points X, Y and Z. Applies after 0099. With it, outside the patches: crates/ibuilder-pipeline src/state.rs
+# (PreviousRun::GuestExit, last_exit_cause, classify_previous_run_exit, a test), crates/ibuilder-ffi (src/lib.rs ibuilder_classify_previous_run_exit, include/ibuilder.h
+# IBUILDER_PREV_GUEST_EXIT 5, tests/c/test_abi.c). UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, its pure part ran in the host harness, the Rust in cargo test (below).
+#
+# X. "Not supported yet". A build whose shader split found NO shader (the chain writes Documents/shaders/<id>.none and no shaders/<id>/b-<chain>.img: "the game will draw nothing until it
+#    has a library") is said before the person plays it, read from those existing outputs (no new FFI), and, for a game with no engine table, profile-derived/<id>/game.tsv (the provisional
+#    profile) adds "Its engine is not one iBuilder knows yet (a provisional profile).": "Not supported yet: iBuilder found no shader it can read in this game, so it will draw nothing (its
+#    engine packs them in a format not handled yet). Logs help add it." On the grid card ("Not supported yet: no shader found"), the cover flow's and the iPad hero's note, the game's sheet
+#    (a card at the top), the build screen's end (its line under the title) and the log ("[RED] build: <game>: …"), the notification ("Built, but not supported yet: no shader found"). Play
+#    stays possible: the first time it asks "This game will draw nothing" with "Play anyway (sound and controls)" (remembered for this game), "Share the log", Cancel.
+# Y. "The game closed itself". A boot that ended because the guest called svcExitProcess (the guest log's "[dm] received svcExitProcess: graceful exit"; its own output follows, so the cause is
+#    read where it is: LastExitCause) is GuestExit (GameAppUi.ClassifyPreviousRun, the same rule as state.rs classify_previous_run_exit): not the player's Quit (the shim's "the player ended
+#    the game" line wins), not the time limit, not a fault (a fatal signal's line), not a kill (a memory kill writes nothing: KilledOrUnknown). At the next launch: "<Game> closed itself after
+#    N s (the game called exit). It may need a service iBuilder does not emulate yet; the log says which call came last." with "Share the log" and OK (titled "… right away" within 30 s);
+#    N is the time from the boot's stage line (gameapp.stage's last write) to the guest log's last write: the guest log has no clock of its own. The log also gets the guest's last line before its
+#    exit. No banner, no "interrupted", no resume offer: the marker is cleared as for the player's Quit.
+# Z. The shader preparation in the Library's one-game view (the cover flow) and the iPad hero, as on the grid card: the live line and accent bar for the game being prepared (or the paused
+#    queue's first), updated with the other views (UpdateWarmViews, its pace); "Shaders: <game> · waiting · 5,009" / "· paused" / "· skipped" (0098's words) for a built game in the queue;
+#    nothing for a game with no preparation (WarmFlow.Of).
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch 0010-0100 applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile
+#   (-t:Compile, GameAppBuild.cs with FrameworkId as build-app.sh now writes it): 0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness100: … P98;P100): 402
+#   of 402 checks (15 new); 10 of 10 mutations killed. cargo test -p ibuilder-pipeline 267 passed (1 new: a guest exit vs the player's quit, a fault, the time limit, a kill, a run that never
+#   booted), -p ibuilder-ffi 20 passed + c_abi 2 (test_abi.c: the new function and value); clippy -D warnings and fmt clean.
+# NOT VERIFIED: nothing ran on a device: a real game that calls svcExitProcess, the alert at the next launch, a real .none build's warnings, the one-game view's bar.
+# NEW UI STRINGS: Unsupported.Text, "Not supported yet: no shader found", " Its engine is not one iBuilder knows yet (a provisional profile).", "This game will draw nothing", "Play anyway (sound
+#   and controls)", "Built, but not supported yet: no shader found", " closed itself", " (the game called exit). It may need a service iBuilder does not emulate yet; the log says which call
+#   came last.", "The game closed itself", "The game closed itself right away", "Share the log", "Shaders: "; log lines "[RED] build: ", "the guest's last line before its exit: ".
+diff -ruN t99/GameAppField.cs s/GameAppField.cs
+--- t99/GameAppField.cs	2026-11-22 20:11:21
++++ s/GameAppField.cs	2026-11-22 20:08:24
+@@ -802,3 +802,60 @@
+         return (paused, titles, held, skipped);
+     }
+ }
++
++/// Patch 0100 (X, the owner): a game the build found NO shader in (the shader split wrote Documents/shaders/<id>.none and no library image) draws nothing: said before the person plays it,
++/// on its card, its sheet, the cover flow, the iPad's hero and the build's end; Play stays possible behind one confirmation (sound and controls can still be tried). Read from what the
++/// chain already writes: shaders/<id>.none (with no shaders/<id>/b-<chain>.img) and, for "especially", profile-derived/<id>/game.tsv (the provisional profile of a game with no engine table).
++public static class Unsupported
++{
++    public const string Text = "Not supported yet: iBuilder found no shader it can read in this game, so it will draw nothing (its engine packs them in a format not handled yet). Logs help add it.";
++    public const string Short = "Not supported yet: no shader found";
++    public const string ProvisionalNote = " Its engine is not one iBuilder knows yet (a provisional profile).";
++    public const string PlayTitle = "This game will draw nothing";
++    public const string PlayAnyway = "Play anyway (sound and controls)";
++
++    public static bool Is(bool noneMarker, bool hasLibrary) => noneMarker && !hasLibrary;
++
++    public static string Full(bool provisional) => Text + (provisional ? ProvisionalNote : "");
++
++    /// The first Play of such a game asks; once the person said "Play anyway" for this game it does not ask again.
++    public static bool AskBeforePlay(bool unsupported, bool accepted) => unsupported && !accepted;
++
++    /// The log line at the end of a build: "build: <game>: NOT SUPPORTED YET: …".
++    public static string LogLine(string game, bool provisional) => "[RED] build: " + game + ": " + Full(provisional);
++}
++
++/// Patch 0100 (Y): the game ended ITSELF (the guest called svcExitProcess): said at the next launch, apart from the person's Quit, a fault, a kill and the time limit
++/// (GameAppUi.ClassifyPreviousRun's GuestExit, crates/ibuilder-pipeline state.rs PreviousRun::GuestExit).
++public static class GuestExitText
++{
++    /// "South Park closed itself after 12 s (the game called exit). It may need a service iBuilder does not emulate yet; the log says which call came last."
++    public static string Line(string game, double? seconds) =>
++        (string.IsNullOrEmpty(game) ? "The game" : game) + " closed itself" + (seconds is double s && s >= 0 ? " after " + Math.Round(s).ToString("0", CultureInfo.InvariantCulture) + " s" : "")
++        + " (the game called exit). It may need a service iBuilder does not emulate yet; the log says which call came last.";
++
++    /// Whether it ended soon after it started (the owner's case: within ~30 s): the alert is shown then; later it is said in the log.
++    public static bool Early(double? seconds) => seconds is double s && s >= 0 && s <= 30;
++
++    /// The guest log's last line before its `svcExitProcess` line (what the game did last), or null.
++    public static string LastCallBefore(IReadOnlyList<string> guestLines)
++    {
++        if (guestLines == null) return null;
++        for (int i = guestLines.Count - 1; i > 0; i--)
++            if (guestLines[i].Contains("svcExitProcess") && !guestLines[i].Contains("received "))
++            {
++                for (int j = i - 1; j >= 0; j--) if (!string.IsNullOrWhiteSpace(guestLines[j])) return guestLines[j].Trim();
++                return null;
++            }
++        return null;
++    }
++}
++
++/// Patch 0100 (Z): the shader preparation under the cover flow's game (and the iPad's hero), as on the grid card: the live line and bar for the game being prepared (or the paused queue's
++/// first), a quiet line for a built game waiting in the queue, paused or skipped (0098's words), nothing for a game with no preparation.
++public static class WarmFlow
++{
++    public enum Show { None, Live, Static }
++
++    public static Show Of(bool built, bool shownLive, bool queued, bool skipped) => !built ? Show.None : shownLive ? Show.Live : queued || skipped ? Show.Static : Show.None;
++}
+diff -ruN t99/GameAppFieldUi.cs s/GameAppFieldUi.cs
+--- t99/GameAppFieldUi.cs	2026-11-22 20:11:21
++++ s/GameAppFieldUi.cs	2026-11-22 20:09:15
+@@ -96,6 +96,48 @@
+         Write("background: back in the app: the pause iOS asked for (its task expired) is withdrawn; the build goes on");
+     }
+ 
++    // ---- patch 0100 (X): a game the build found no shader in (GameAppField.cs Unsupported) ----------------------------------------------------------------
++
++    /// From what the chain already wrote: Documents/shaders/<id>.none with no shaders/<id>/b-<chain>.img (the split found no shader), and profile-derived/<id>/game.tsv (no engine table:
++    /// the provisional profile). Three file looks.
++    private static (bool Unsupported, bool Provisional) UnsupportedOf(string game)
++    {
++        var tid = GameAppUi.BaseTitleIdOf(game);
++        if (tid == null || GameExport.IsPlayer) return (false, false);
++        try
++        {
++            var docs = GameAppMain.Documents;
++            var shaders = Path.Combine(docs, "shaders");
++            bool none = File.Exists(Path.Combine(shaders, tid + ".none")) || File.Exists(Path.Combine(shaders, tid.ToLowerInvariant() + ".none"));
++            if (!none) return (false, false);
++            var chain = "b-" + GameAppBuild.ShaderChain;
++            bool library = File.Exists(Path.Combine(shaders, tid, chain + ".img")) || Directory.Exists(Path.Combine(shaders, tid, chain));
++            bool provisional = File.Exists(Path.Combine(docs, "profile-derived", tid, "game.tsv"));
++            return (Unsupported.Is(none, library), provisional);
++        }
++        catch (Exception) { return (false, false); }
++    }
++
++    private static string UnsupportedAcceptedKey(string game) => "unsupported_play_ok_" + (GameAppUi.BaseTitleIdOf(game) ?? game);
++
++    /// The first Play of a game that draws nothing asks: "Play anyway (sound and controls)" (remembered for this game), "Share the log", Cancel. True when it asked.
++    private bool AskIfUnsupported(string game, Action again)
++    {
++        var u = UnsupportedOf(game);
++        if (!Unsupported.AskBeforePlay(u.Unsupported, NSUserDefaults.StandardUserDefaults.BoolForKey(UnsupportedAcceptedKey(game)))) return false;
++        var a = UIAlertController.Create(Unsupported.PlayTitle, Unsupported.Full(u.Provisional), UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create(Unsupported.PlayAnyway, UIAlertActionStyle.Default, _ =>
++        {
++            NSUserDefaults.StandardUserDefaults.SetBool(true, UnsupportedAcceptedKey(game));
++            Write($"play: {GameAppUi.DisplayName(game)}: played although it draws nothing (no shader found): you said so once, it does not ask again");
++            again();
++        }));
++        a.AddAction(UIAlertAction.Create("Share the log", UIAlertActionStyle.Default, _ => ShareGameLogs(game, View)));
++        a.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(a);
++        return true;
++    }
++
+     // ---- patch 0089: the main-thread watchdog while a game is on screen (GameAppField.cs MainStall) -----------------------------------------------------
+ 
+     private volatile bool stallWatching;
+diff -ruN t99/GameAppLibrary.cs s/GameAppLibrary.cs
+--- t99/GameAppLibrary.cs	2026-11-22 20:11:21
++++ s/GameAppLibrary.cs	2026-11-22 20:09:15
+@@ -1391,6 +1391,7 @@
+         if (at < 0) at = steps.Count - 1;
+         var names = Dumps().Select(Path.GetFileName).ToList();
+         string meta = game == null ? "" : GameAppUi.ContentLine(game, names) ?? GameFileSizeText(game);
++        if (game != null && buildFinished && !failedRun && !running && UnsupportedOf(game) is { Unsupported: true } nu) meta = Unsupported.Full(nu.Provisional);   // patch 0100 (X): the build's end says it
+         var fraction = buildFinished && !failedRun && !EndedByUser ? 1.0 : BuildProgress.Fraction(lastStage, lastReadingLine);
+         var primary = game != null ? GameAppUi.GameAction(game, facts) : null;
+         var window = LiveLogWindow();
+@@ -1442,7 +1443,8 @@
+         var content = new UserNotifications.UNMutableNotificationContent
+         {
+             Title = selected != null ? GameAppUi.DisplayName(selected) : "iBuilder",
+-            Body = failedRun ? ChainResult.FailureText(lastChainRc, runBootOnly) ?? "The build stopped: open iBuilder to see why." : LastBuildExportOnly() ? LibraryActions.BuiltForExport : "Built: ready to play.",   // patch 0093: a Play's own words; 0095: a build with no .p12
++            Body = failedRun ? ChainResult.FailureText(lastChainRc, runBootOnly) ?? "The build stopped: open iBuilder to see why." : LastBuildExportOnly() ? LibraryActions.BuiltForExport
++                 : selected != null && UnsupportedOf(selected).Unsupported ? "Built, but " + Unsupported.Short.Substring(0, 1).ToLowerInvariant() + Unsupported.Short.Substring(1) : "Built: ready to play.",   // patch 0100   // patch 0093: a Play's own words; 0095: a build with no .p12
+             Sound = UserNotifications.UNNotificationSound.Default,
+         };
+         var request = UserNotifications.UNNotificationRequest.FromIdentifier("build-ended", content, null);
+diff -ruN t99/GameAppMain.cs s/GameAppMain.cs
+--- t99/GameAppMain.cs	2026-11-22 20:11:21
++++ s/GameAppMain.cs	2026-11-22 20:09:15
+@@ -2057,6 +2057,7 @@
+         var next = GameAppUi.GameAction(selected, facts);
+         // A hot phone is asked first; "Start anyway" and a cooled phone come back here.
+         if ((next.Kind == ActionKind.Boot || next.Kind == ActionKind.Run) && AskIfHot(PrimaryTapped)) return;
++        if (next.Kind == ActionKind.Boot && AskIfUnsupported(selected, PrimaryTapped)) return;   // patch 0100 (X): a game that draws nothing asks once
+         switch (next.Kind)
+         {
+             case ActionKind.Import: Import(); break;
+@@ -2951,6 +2952,8 @@
+                 // would draw nothing or that is not there
+                 if (failedRun && ChainResult.LogLine(lastChainRc, runBootOnly) is string why) Write(why);   // patch 0093: a Play's own words
+                 if (!failedRun && !bootOnly && outcome == StopOutcome.Finished && LastBuildExportOnly()) Write("build: " + LibraryActions.BuiltForExport);   // patch 0095
++                if (!failedRun && !bootOnly && outcome == StopOutcome.Finished && lastRunGame != null && UnsupportedOf(lastRunGame) is { Unsupported: true } nu)
++                    Write(Unsupported.LogLine(GameAppUi.DisplayName(lastRunGame), nu.Provisional));   // patch 0100 (X): said at the build's end, before anyone plays it
+                 // patch 0073: a .nup the chain was given (nup=) is extracted when the chain derived its profile in this run (that stage runs only once the package is read): its marker, then "Optimize storage".
+                 // Any outcome, except a cancel that frees the space (it deletes the extraction).
+                 var profilePath = Path.Combine(GameAppMain.Documents, "profile.tsv");
+@@ -3176,7 +3179,34 @@
+         var stageLine = LastLine("gameapp.stage");
+         string chainLast = GameAppUi.LastRunLine(ReadLinesOrEmpty("gameapp.chain.log"));
+         string guestLast = LastLine("gameapp.guest.log");
+-        var kind = GameAppUi.ClassifyPreviousRun(stageLine, chainLast, guestLast == "(none)" ? null : guestLast);
++        var guestLines = ReadLinesOrEmpty("gameapp.guest.log");
++        var exitCause = GameAppUi.LastExitCause(guestLines);   // patch 0100: "[dm] received svcExitProcess: graceful exit" (the game's own exit), not the log's last line
++        var kind = GameAppUi.ClassifyPreviousRun(stageLine, chainLast, guestLast == "(none)" ? null : guestLast, exitCause);
++        if (kind == GameAppUi.PreviousRun.GuestExit)
++        {
++            // patch 0100 (Y): how long it ran: from the boot's stage line (gameapp.stage, written at "booting the guest") to the guest log's last write
++            double? seconds = null;
++            try
++            {
++                var stageAt = File.GetLastWriteTimeUtc(Path.Combine(GameAppMain.Documents, "gameapp.stage"));
++                var guestAt = File.GetLastWriteTimeUtc(Path.Combine(GameAppMain.Documents, "gameapp.guest.log"));
++                if (guestAt >= stageAt) seconds = (guestAt - stageAt).TotalSeconds;
++            }
++            catch (Exception) { }
++            string game = null;
++            try { game = GatherFacts().FrameworkGame; } catch (Exception) { }
++            var name = game != null ? GameAppUi.DisplayName(game) : null;
++            var line = GuestExitText.Line(name, seconds);
++            Write("");
++            Write($"Previous run: {line} (started {started})");
++            if (GuestExitText.LastCallBefore(guestLines) is string lastCall) Write($"  the guest's last line before its exit: \"{lastCall}\" (gameapp.guest.log)");
++            try { File.Delete(marker); } catch { }
++            var a = UIAlertController.Create(GuestExitText.Early(seconds) ? "The game closed itself right away" : "The game closed itself", line, UIAlertControllerStyle.Alert);
++            if (game != null) a.AddAction(UIAlertAction.Create("Share the log", UIAlertActionStyle.Default, _ => ShareGameLogs(game, View)));
++            a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++            PresentWhenFree(a);
++            return false;
++        }
+         if (kind == GameAppUi.PreviousRun.DesignedEnd || kind == GameAppUi.PreviousRun.PlayerEnd)
+         {
+             // Every boot that runs to its time limit, or that the player ends with Quit game, ends this way (the
+diff -ruN t99/GameAppPadUi.cs s/GameAppPadUi.cs
+--- t99/GameAppPadUi.cs	2026-11-22 20:11:21
++++ s/GameAppPadUi.cs	2026-11-22 20:09:15
+@@ -181,7 +181,8 @@
+         heroButtons = new UIStackView { Axis = UILayoutConstraintAxis.Horizontal, Spacing = 10, Alignment = UIStackViewAlignment.Center };
+         heroNote = Theme.Label(LibraryActions.NoGetTaskAllowNote, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
+         heroPillRow = new UIStackView { Axis = UILayoutConstraintAxis.Horizontal };
+-        var text = Theme.Column(0, heroPillRow, heroTitle, heroMeta, Theme.Row(0, heroButtons, new UIView()), heroNote);
++        heroWarm = new UIStackView { Axis = UILayoutConstraintAxis.Vertical, Spacing = 4, AccessibilityIdentifier = "hero-warm" };   // patch 0100 (Z)
++        var text = Theme.Column(0, heroPillRow, heroTitle, heroMeta, Theme.Row(0, heroButtons, new UIView()), heroWarm, heroNote);
+         text.SetCustomSpacing(12, heroPillRow);
+         text.SetCustomSpacing(6, heroTitle);
+         text.SetCustomSpacing(20, heroMeta);
+@@ -245,6 +246,9 @@
+         }
+         heroNote.Hidden = !LibraryActions.ShowsNote(state, canRun);
+         heroNote.Text = LibraryActions.NoteText(GameAppUi.CannotRunHere(facts), GameAppUi.IsExportOnlyBuild(e.Name, facts));   // patch 0095
++        heroNote.TextColor = Theme.Muted;
++        if (state == LibState.Built && UnsupportedOf(e.Name) is { Unsupported: true } hu) { heroNote.Text = Unsupported.Full(hu.Provisional); heroNote.TextColor = Theme.Warn; heroNote.Hidden = false; }   // patch 0100 (X)
++        FillWarmHolder(heroWarm, e, state);   // patch 0100 (Z)
+         ambient.SetHue(e.Icon != null ? Look.HueOf(e.Icon) : -1, true);
+     }
+ 
+diff -ruN t99/GameAppRedesignUi.cs s/GameAppRedesignUi.cs
+--- t99/GameAppRedesignUi.cs	2026-11-22 20:11:21
++++ s/GameAppRedesignUi.cs	2026-11-22 20:09:15
+@@ -690,6 +690,7 @@
+ 
+     private CoverFlowView flow;
+     private UILabel flowTitle, flowMeta, flowNote;
++    private UIStackView flowWarm, heroWarm;   // patch 0100 (Z): the shader preparation of the game shown alone (the cover flow, the iPad's hero)
+     private UIStackView flowDots, flowButtons, gridRows;
+     private UIView carouselBlock, gridBlock, libEmpty;
+     private UIButton libToggle;
+@@ -776,7 +777,8 @@
+         flowNote.AccessibilityIdentifier = "library-note-get-task-allow";
+         UIView Centred(UIView v) { var r = Theme.Row(0, new UIView(), v, new UIView()); r.Distribution = UIStackViewDistribution.EqualCentering; return r; }
+         var words = Theme.Column(6, flowTitle, flowMeta);
+-        carouselBlock = Theme.Column(16, flow, words, Centred(flowDots), Centred(flowButtons), flowNote);
++        flowWarm = new UIStackView { Axis = UILayoutConstraintAxis.Vertical, Spacing = 4, AccessibilityIdentifier = "library-warm" };   // patch 0100 (Z)
++        carouselBlock = Theme.Column(16, flow, words, Centred(flowDots), Centred(flowButtons), flowWarm, flowNote);
+         ((UIStackView) carouselBlock).SetCustomSpacing(20, flowDots);
+         ((UIStackView) carouselBlock).SetCustomSpacing(12, flowButtons);
+ 
+@@ -985,7 +987,10 @@
+         }
+         flowNote.Hidden = !LibraryActions.ShowsNote(state, canRun);
+         flowNote.Text = LibraryActions.NoteText(GameAppUi.CannotRunHere(facts), GameAppUi.IsExportOnlyBuild(e.Name, facts));   // patch 0095
+-        if (!running && playStopped is { } ps && ps.Game == e.Name) { flowNote.Text = ps.Line; flowNote.Hidden = false; }   // patch 0083: an interrupted Play, said once under its buttons
++        flowNote.TextColor = Theme.Muted;
++        if (state == LibState.Built && UnsupportedOf(e.Name) is { Unsupported: true } fu) { flowNote.Text = Unsupported.Full(fu.Provisional); flowNote.TextColor = Theme.Warn; flowNote.Hidden = false; }   // patch 0100 (X)
++        if (!running && playStopped is { } ps && ps.Game == e.Name) { flowNote.Text = ps.Line; flowNote.TextColor = Theme.Muted; flowNote.Hidden = false; }   // patch 0083: an interrupted Play, said once under its buttons
++        FillWarmHolder(flowWarm, e, state);   // patch 0100 (Z): the shader preparation under the cover flow's buttons
+         // the ground's glow: the dominant hue of the cover in focus (a fixed amber when it has none)
+         ambient.SetHue(e.Icon != null ? Look.HueOf(e.Icon) : -1, true);
+         currentTint = accent;
+@@ -1037,6 +1042,12 @@
+         name.LineBreakMode = UILineBreakMode.TailTruncation;   // one line, with an ellipsis
+         var line = Theme.Label(status.Text, Theme.Font(12, UIFontWeight.Regular), Look.ToneColor(status.Tone), 2);
+         var texts = new List<UIView> { art, name, line };
++        if (state == LibState.Built && UnsupportedOf(e.Name).Unsupported)   // patch 0100 (X): a game that draws nothing says so on its card
++        {
++            var u = Theme.Label(Unsupported.Short, Theme.Font(11, UIFontWeight.Semibold), Theme.Warn, 2);
++            u.AccessibilityIdentifier = "game-unsupported";
++            texts.Add(u);
++        }
+         if (ExtrasLine(e, state) is { Length: > 0 } extras)   // patch 0091: its update and DLC, under it (never cards of their own)
+         {
+             var x = Theme.Label(extras, Theme.Font(11, UIFontWeight.Regular), Theme.Muted, 1);
+diff -ruN t99/GameAppShelf.cs s/GameAppShelf.cs
+--- t99/GameAppShelf.cs	2026-11-22 20:11:21
++++ s/GameAppShelf.cs	2026-11-22 20:09:33
+@@ -1073,6 +1073,12 @@
+         };
+ 
+         var body = new List<UIView> { actionRow, launchCard, stats, optionsCard, mainRows };
++        if (ready && UnsupportedOf(game) is { Unsupported: true } su)   // patch 0100 (X): the sheet of a game that draws nothing says so first
++        {
++            var warn = Look.Card(Theme.Label(Unsupported.Full(su.Provisional), Theme.Font(13, UIFontWeight.Medium), Theme.Warn, 0), 12, 14);
++            warn.AccessibilityIdentifier = "sheet-unsupported";
++            body.Insert(1, warn);
++        }
+         if (exportOnlyNote != null) body.Insert(1, exportOnlyNote);   // patch 0095
+         if (shadersBlock != null) body.Add(shadersBlock);
+         if (more.Count > 0) { body.Add(Look.Section("More")); body.Add(Look.Group(more.ToArray())); }
+diff -ruN t99/GameAppUi.cs s/GameAppUi.cs
+--- t99/GameAppUi.cs	2026-11-22 20:11:21
++++ s/GameAppUi.cs	2026-11-22 20:08:24
+@@ -1424,8 +1424,18 @@
+     /// FAULTINGUEST: the shim named a fatal signal before re-raising. KILLEDORUNKNOWN: nothing says how it ended.
+     /// PLAYEREND: the same clean end, ordered by the player with "Quit game" (the shim's `the player ended the game`
+     /// line) instead of by the time limit; the game has no time limit by default now, so this is the usual end.
+-    public enum PreviousRun { DesignedEnd, PlayerEnd, DesignedEndWithoutCleanExit, FaultInGuest, KilledOrUnknown }
++    /// GUESTEXIT (patch 0100): the GAME ended itself, the guest called svcExitProcess (`[dm] received svcExitProcess: graceful exit`): not the player's Quit, the time limit or a fault
++    /// (crates/ibuilder-pipeline state.rs PreviousRun::GuestExit, IBUILDER_PREV_GUEST_EXIT).
++    public enum PreviousRun { DesignedEnd, PlayerEnd, DesignedEndWithoutCleanExit, FaultInGuest, KilledOrUnknown, GuestExit }
+ 
++    /// Patch 0100: the guest log's last exit-cause line ("[dm] received <cause>: graceful exit"): the guest's own output follows the exit, so the cause is not the log's last line.
++    public static string LastExitCause(IReadOnlyList<string> guestLines)
++    {
++        for (int i = (guestLines?.Count ?? 0) - 1; i >= 0; i--)
++            if (guestLines[i].Contains("received ") && guestLines[i].Contains(": graceful exit")) return guestLines[i].Trim();
++        return null;
++    }
++
+     /// The last line of gameapp.chain.log that belongs to the PREVIOUS run. The shim's launch constructor writes its
+     /// census and reservation lines into the same file at the start of THIS process (it does for any launch with a
+     /// request or a framework on disk), so at report time they sit at the end of the file, after the line that says
+@@ -1446,7 +1456,7 @@
+     /// `stageLine`: gameapp.stage. `chainLast`: LastRunLine of the chain log. `guestLast`: the last line of
+     /// gameapp.guest.log (null when there is none). Only a run that reached the boot can have ended at its time limit,
+     /// so an older run's time-limit line never excuses a run that died earlier.
+-    public static PreviousRun ClassifyPreviousRun(string stageLine, string chainLast, string guestLast)
++    public static PreviousRun ClassifyPreviousRun(string stageLine, string chainLast, string guestLast, string exitCause = null)
+     {
+         if (stageLine == null || !stageLine.Contains("booting the guest")) return PreviousRun.KilledOrUnknown;
+         bool cleanExit = guestLast != null && guestLast.Contains("graceful exit done");
+@@ -1458,6 +1468,8 @@
+         if (chainLast != null && chainLast.Contains("time limit") && !chainLast.Contains("disarmed"))
+             return cleanExit ? PreviousRun.DesignedEnd : PreviousRun.DesignedEndWithoutCleanExit;
+         if (chainLast != null && chainLast.Contains("received SIG")) return PreviousRun.FaultInGuest;
++        // patch 0100: the game's own exit (state.rs classify_previous_run_exit)
++        if ((exitCause != null && exitCause.Contains("received svcExitProcess")) || (guestLast != null && guestLast.Contains("received svcExitProcess"))) return PreviousRun.GuestExit;
+         return PreviousRun.KilledOrUnknown;
+     }
+ 
+diff -ruN t99/GameAppWarm.cs s/GameAppWarm.cs
+--- t99/GameAppWarm.cs	2026-11-22 20:11:21
++++ s/GameAppWarm.cs	2026-11-22 20:09:33
+@@ -1339,7 +1339,7 @@
+ 
+     /// A bar and its line for `game`'s tile, row (`sheet` false) or sheet, when `game` is the one being prepared (or, paused, the queue's first); else null. The sheet's has Pause / Resume; a tile
+     /// or a row is one big button, so theirs is in its long-press menu (WarmMenuItems). `built`: the game is built here (patch 0087: never on a cloud card or a game with no build). Main thread.
+-    private UIView WarmStrip(string game, bool sheet, bool built)
++    private UIView WarmStrip(string game, bool sheet, bool built, List<(UIProgressView Bar, UILabel Text)> into = null)
+     {
+         var tid = GameAppUi.BaseTitleIdOf(game);
+         if (tid == null) return null;
+@@ -1353,7 +1353,7 @@
+             ProgressTintColor = Theme.Accent, TrackTintColor = UIColor.FromWhiteAlpha(1f, 0.14f), Progress = GameWarm.Fraction,
+             AccessibilityIdentifier = sheet ? "sheet-warm-progress" : "game-warm-progress",
+         };
+-        (sheet ? warmSheetViews : warmShelfViews).Add((bar, text));
++        (into ?? (sheet ? warmSheetViews : warmShelfViews)).Add((bar, text));   // `into`: patch 0100 (Z), the cover flow's and the hero's own list
+         if (!sheet)
+         {
+             var strip = Theme.Column(4, text, bar);
+@@ -1365,6 +1365,37 @@
+         return Theme.Column(6, text, bar, Theme.Row(8, new UIView(), pause));
+     }
+ 
++    // ---- patch 0100 (Z): the shader preparation of the game shown alone (WarmFlow, GameAppField.cs) -----------------------------------------------------------
++
++    private readonly List<(UIProgressView Bar, UILabel Text)> warmFlowViews = new List<(UIProgressView, UILabel)>();
++    private readonly Dictionary<UIView, (string Key, List<(UIProgressView, UILabel)> Views)> warmHolders = new Dictionary<UIView, (string, List<(UIProgressView, UILabel)>)>();
++
++    /// Under the cover flow's (or the iPad hero's) buttons: the live line and bar for the game being prepared, the same as its grid card (updated in place by UpdateWarmViews, at its pace);
++    /// a quiet line for a built game waiting, paused or skipped in the queue (0098's words); nothing for a game with no preparation. Rebuilt only when what it shows changes.
++    private void FillWarmHolder(UIStackView holder, LibraryEntry e, LibState state)
++    {
++        if (holder == null) return;
++        var tid = GameAppUi.BaseTitleIdOf(e?.Name)?.ToUpperInvariant();
++        bool built = state == LibState.Built && !GameExport.IsPlayer;
++        var show = tid == null ? WarmFlow.Show.None
++                 : WarmFlow.Of(built, WarmShown.On(tid, built, WarmShownTitle()), warmQueue.Titles.Contains(tid), warmQueue.Skipped.Contains(tid));
++        var key = show + "|" + tid + "|" + (show == WarmFlow.Show.Static ? WarmRowText(tid) : warmQueue.Paused ? "p" : "");
++        if (warmHolders.TryGetValue(holder, out var had) && had.Key == key) return;
++        if (had.Views != null) foreach (var v in had.Views) warmFlowViews.Remove(v);
++        foreach (var v in holder.ArrangedSubviews.ToArray()) { holder.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        var mine = new List<(UIProgressView, UILabel)>();
++        if (show == WarmFlow.Show.Live && WarmStrip(e.Name, false, true, mine) is UIView strip) holder.AddArrangedSubview(strip);
++        else if (show == WarmFlow.Show.Static)
++        {
++            var line = Theme.Label("Shaders: " + WarmRowText(tid), Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 2);
++            line.AccessibilityIdentifier = "game-warm-queued";
++            holder.AddArrangedSubview(line);
++        }
++        warmFlowViews.AddRange(mine);
++        warmHolders[holder] = (key, mine);
++        holder.Hidden = holder.ArrangedSubviews.Length == 0;
++    }
++
+     /// The Build tab's SHADERS section (BuildBuildTab): the line, the bar, Pause / Resume, the same look as the build queue's section above it. Hidden when the queue is empty and nothing runs.
+     private UIView WarmBuildTabSection()
+     {
+@@ -1418,7 +1449,7 @@
+         }
+         var fraction = GameWarm.Fraction;
+         var line = WarmLine();
+-        foreach (var (bar, text) in warmShelfViews.Concat(warmSheetViews))
++        foreach (var (bar, text) in warmShelfViews.Concat(warmSheetViews).Concat(warmFlowViews))   // + patch 0100 (Z): the cover flow and the iPad's hero
+         {
+             bar.SetProgress(fraction, false);
+             text.Text = line;

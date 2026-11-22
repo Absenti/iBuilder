@@ -337,6 +337,9 @@ int main(int argc, char **argv)
           ibuilder_classify_framework(1, "app_build=B1\nframework_id=F1\n", "B2") == IBUILDER_FRAMEWORK_STALE, "ibuilder_classify_framework_id: the framework id decides, an older stamp falls back to the build id");
     CHECK(ibuilder_classify_previous_run("stage 5/5: booting the guest (x)", "[gameapp] the player ended the game: sending SIGTERM to self", "[dm] graceful exit done") == IBUILDER_PREV_PLAYER_END &&
           ibuilder_classify_previous_run("stage 2/5: rewriting", "[gameapp] dlopen OK", NULL) == IBUILDER_PREV_KILLED_OR_UNKNOWN, "ibuilder_classify_previous_run");
+    CHECK(ibuilder_classify_previous_run_exit("stage 5/5: booting the guest (x)", "[gameapp] dm_host_probe_boot(x)", "[dm] graceful exit done", "[dm] received svcExitProcess: graceful exit") == IBUILDER_PREV_GUEST_EXIT &&
+          ibuilder_classify_previous_run_exit("stage 5/5: booting the guest (x)", "[gameapp] the player ended the game: sending SIGTERM to self", "[dm] graceful exit done", "[dm] received SIGTERM: graceful exit") == IBUILDER_PREV_PLAYER_END &&
+          ibuilder_classify_previous_run_exit("stage 5/5: booting the guest (x)", "[gameapp] dlopen OK", NULL, NULL) == IBUILDER_PREV_KILLED_OR_UNKNOWN, "ibuilder_classify_previous_run_exit");
     ibuilder_stage st;
     CHECK(ibuilder_parse_stage("stage 2/5: rewriting the modules (2/3: subsdk0)", &st) == 1 && st.step == 2 && st.of == 5 && st.fraction > 0.4 && strstr(st.text, "subsdk0"), "ibuilder_parse_stage");
     CHECK(ibuilder_parse_stage("stage 1/5 profile: derived in 5.2s", &st) == 0 && ibuilder_is_boot_stage("stage 5/5: booting the guest") == 1 && ibuilder_is_boot_stage("stage 4/5: signing") == 0, "stage line validity");

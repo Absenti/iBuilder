@@ -166,6 +166,20 @@ pub enum PreviousRun {
     FaultInGuest,
     /// nothing says how it ended
     KilledOrUnknown,
+    /// the GAME ended itself: the guest called `svcExitProcess` (the engine's `received svcExitProcess: graceful exit`), not the player's Quit, not the time limit, not a fault.
+    /// Often a service the host does not emulate yet: the guest log's last calls say which.
+    GuestExit,
+}
+
+/// The guest log's last exit-cause line (`[dm] received <cause>: graceful exit`): `svcExitProcess` when the game ended itself, `SIGTERM` when the shim ended it. The log appends the
+/// guest's own output after the exit, so the cause is not its last line.
+pub fn last_exit_cause<S: AsRef<str>>(guest_lines: &[S]) -> Option<String> {
+    guest_lines
+        .iter()
+        .rev()
+        .map(|l| l.as_ref())
+        .find(|l| l.contains("received ") && l.contains(": graceful exit"))
+        .map(|l| l.trim().to_string())
 }
 
 /// `LastRunLine`: the last line of `gameapp.chain.log` that belongs to the PREVIOUS run. The launch constructor writes its census and reservation lines into the same
@@ -194,6 +208,17 @@ pub fn classify_previous_run(
     stage_line: Option<&str>,
     chain_last: Option<&str>,
     guest_last: Option<&str>,
+) -> PreviousRun {
+    classify_previous_run_exit(stage_line, chain_last, guest_last, None)
+}
+
+/// The same, with the guest log's `last_exit_cause` (`exit_cause`): a run whose guest called `svcExitProcess` and that the player did not end, the time limit did not end and no fault
+/// ended is `GuestExit`. `guest_last` naming `received svcExitProcess` counts as that cause too.
+pub fn classify_previous_run_exit(
+    stage_line: Option<&str>,
+    chain_last: Option<&str>,
+    guest_last: Option<&str>,
+    exit_cause: Option<&str>,
 ) -> PreviousRun {
     let Some(stage) = stage_line else {
         return PreviousRun::KilledOrUnknown;
@@ -225,6 +250,10 @@ pub fn classify_previous_run(
         if c.contains("received SIG") {
             return PreviousRun::FaultInGuest;
         }
+    }
+    let guest_exit = |l: &str| l.contains("received svcExitProcess");
+    if exit_cause.map(guest_exit).unwrap_or(false) || guest_last.map(guest_exit).unwrap_or(false) {
+        return PreviousRun::GuestExit;
     }
     PreviousRun::KilledOrUnknown
 }
@@ -1039,6 +1068,114 @@ mod tests {
             classify_previous_run(Some("stage 3/5: shaders"), Some(quit), Some(clean)),
             KilledOrUnknown
         );
+    }
+
+    #[test]
+    fn a_game_that_called_svc_exit_process_is_a_guest_exit_not_a_quit_a_crash_or_a_kill() {
+        use PreviousRun::*;
+        let booting = "stage 5/5: booting the guest (dlopen + dm_host_probe_boot -> nnMain; quit from the gear menu)";
+        let boot_call =
+            "[gameapp] dm_host_probe_boot(patched=\"x\" modules=\"main\", profile=\"p\")";
+        // the guest log of a game that ended itself: the cause, then the host's own output after it
+        let guest = [
+            "[dm] >>> nnMain",
+            "[dm] ngc: ProfanityFilter host vtable of 9 slots",
+            "[dm] svcExitProcess",
+            "[dm] received svcExitProcess: graceful exit",
+            "[dm] audio suspended (background / interruption)",
+            "[dm] graceful exit done (0.000 s)",
+            "",
+            "==== guest output, pid 10757 (what the host and the game wrote to fd 1/2) ====",
+            "[dm] [nvn] null device: 743 names",
+        ];
+        let cause = last_exit_cause(&guest);
+        assert_eq!(
+            cause.as_deref(),
+            Some("[dm] received svcExitProcess: graceful exit")
+        );
+        assert_eq!(
+            classify_previous_run_exit(
+                Some(booting),
+                Some(boot_call),
+                Some(guest[8]),
+                cause.as_deref()
+            ),
+            GuestExit
+        );
+        // the old three-argument call sees it when its guest line is the cause
+        assert_eq!(
+            classify_previous_run(Some(booting), Some(boot_call), Some(guest[3])),
+            GuestExit
+        );
+        // the player's Quit stays the player's (the shim's line), even with an exit line in the guest log
+        let quit = "[gameapp] the player ended the game: sending SIGTERM to self (the CAUSE of this exit, not a crash)";
+        assert_eq!(
+            classify_previous_run_exit(
+                Some(booting),
+                Some(quit),
+                Some("[dm] graceful exit done"),
+                Some("[dm] received SIGTERM: graceful exit")
+            ),
+            PlayerEnd
+        );
+        assert_eq!(
+            classify_previous_run_exit(
+                Some(booting),
+                Some(quit),
+                Some("[dm] graceful exit done"),
+                cause.as_deref()
+            ),
+            PlayerEnd
+        );
+        // a fault, the time limit and a kill keep their own words
+        assert_eq!(
+            classify_previous_run_exit(
+                Some(booting),
+                Some("[gameapp] received SIGSEGV: the process is terminating here"),
+                None,
+                cause.as_deref()
+            ),
+            FaultInGuest
+        );
+        assert_eq!(
+            classify_previous_run_exit(
+                Some(booting),
+                Some("[gameapp] boot time limit 30 s reached: sending SIGTERM to self"),
+                Some("[dm] graceful exit done"),
+                Some("[dm] received SIGTERM: graceful exit")
+            ),
+            DesignedEnd
+        );
+        assert_eq!(
+            classify_previous_run_exit(
+                Some(booting),
+                Some(boot_call),
+                Some("[dm] >>> nnMain"),
+                None
+            ),
+            KilledOrUnknown
+        );
+        assert_eq!(
+            classify_previous_run_exit(
+                Some(booting),
+                Some(boot_call),
+                Some("[dm] graceful exit done"),
+                Some("[dm] received SIGTERM: graceful exit")
+            ),
+            KilledOrUnknown,
+            "a SIGTERM the log does not explain is not the game's own exit"
+        );
+        // a run that never booted is never a guest exit, whatever an older guest log says
+        assert_eq!(
+            classify_previous_run_exit(
+                Some("stage 3/5: shaders"),
+                Some(boot_call),
+                None,
+                cause.as_deref()
+            ),
+            KilledOrUnknown
+        );
+        assert_eq!(last_exit_cause(&["[dm] >>> nnMain"]), None);
     }
 
     #[test]

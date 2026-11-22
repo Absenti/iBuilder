@@ -996,13 +996,54 @@ pub unsafe extern "C" fn ibuilder_classify_previous_run(
     guard(E_PANIC, || {
         // SAFETY: NUL-terminated by contract.
         let (s, c, g) = unsafe { (cstr(stage_line), cstr(chain_last), cstr(guest_last)) };
-        match state::classify_previous_run(s.as_deref(), c.as_deref(), g.as_deref()) {
-            PreviousRun::DesignedEnd => 0,
-            PreviousRun::PlayerEnd => 1,
-            PreviousRun::DesignedEndWithoutCleanExit => 2,
-            PreviousRun::FaultInGuest => 3,
-            PreviousRun::KilledOrUnknown => 4,
-        }
+        previous_run_code(state::classify_previous_run(
+            s.as_deref(),
+            c.as_deref(),
+            g.as_deref(),
+        ))
+    })
+}
+
+/// The C codes of `PreviousRun` (`IBUILDER_PREV_*`): 0-4 as they always were, 5 the game's own exit (svcExitProcess).
+fn previous_run_code(p: PreviousRun) -> c_int {
+    match p {
+        PreviousRun::DesignedEnd => 0,
+        PreviousRun::PlayerEnd => 1,
+        PreviousRun::DesignedEndWithoutCleanExit => 2,
+        PreviousRun::FaultInGuest => 3,
+        PreviousRun::KilledOrUnknown => 4,
+        PreviousRun::GuestExit => 5,
+    }
+}
+
+/// The same with the guest log's last exit-cause line (`[dm] received <cause>: graceful exit`, `state::last_exit_cause`): a game that called svcExitProcess is
+/// `IBUILDER_PREV_GUEST_EXIT`.
+///
+/// # Safety
+/// Strings are NULL or NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ibuilder_classify_previous_run_exit(
+    stage_line: *const c_char,
+    chain_last: *const c_char,
+    guest_last: *const c_char,
+    exit_cause: *const c_char,
+) -> c_int {
+    guard(E_PANIC, || {
+        // SAFETY: NUL-terminated by contract.
+        let (s, c, g, x) = unsafe {
+            (
+                cstr(stage_line),
+                cstr(chain_last),
+                cstr(guest_last),
+                cstr(exit_cause),
+            )
+        };
+        previous_run_code(state::classify_previous_run_exit(
+            s.as_deref(),
+            c.as_deref(),
+            g.as_deref(),
+            x.as_deref(),
+        ))
     })
 }
 
