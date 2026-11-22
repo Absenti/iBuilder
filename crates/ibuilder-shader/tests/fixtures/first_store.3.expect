@@ -1,0 +1,20 @@
+OK
+{"stores":[["cp_s2",3,9]]}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]])
+{
+
+    float _108 = as_type<float>(gl_WorkGroupID.x);
+float _189 = as_type<float>(gl_LocalInvocationID.x);
+int _136 = as_type<int>(_108) << 7;
+int _111 = ~as_type<int>(_189);
+int _131 = _111 + 1;
+bool _156 = _131 != _136;
+    float _99 = 1.0;
+}

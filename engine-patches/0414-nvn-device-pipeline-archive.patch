@@ -1,0 +1,877 @@
+# nvn/pso: the MTLDevice path's pipeline archive in the engine: render, compute and mesh pipelines, no adds dropped for heat, written at every end, survives a failed write
+#
+# Origin:  written in this repository after the Ocarina of Time (Switch 2) device session of 2026-11-20 (iPhone 15 Pro). It takes over the role of iOSBuilder's paches/0009 (a host-level
+#          patch load/prebuild_loadable.sh applies to a copy of nvn_mtl.m after 0007 and 0008): same file, same switches, the defects below fixed. No upstream commit. Applies after 0413
+#          (patch -p1 --forward, no fuzz). paches/0007, 0008, 0009 still apply on top of it and land exactly where they did; 0009's code is then compiled but never reached (below).
+# Licence: the licence of the tree it patches (the engine's MIT licence, Copyright (c) 2026 seedds and contributors).
+#
+# CLAIM CHECKED ("the pipeline archive gives 0 hits because arch_sweep deletes the files whose pipelines no lookup took, on the premise that the lists asked for every pipeline")
+#   REFUTED for this device. "archive lookups found 0 / 0.0 ms, found none 0 / 0.0 ms" counts the Metal 4 archive (arch_lookup), which iOS does not run: pso4_on() is 0 there unless
+#   DM_PSO_MTL4=1 or the profile's pso_mtl4 (the log: "render pipelines through the MTLDevice (iOS: DM_PSO_MTL4=1 ... turns on the Metal 4 bases, the pipeline archive ..."), so
+#   pso4_init returns before opening anything, g_arch_use is empty and arch_sweep returns at its first test; "found none 0" shows that no lookup was even tried. 0412 already keeps the
+#   sweep until the tail has asked for every line (warm_finish_ex(0, ..) after a head). The archive iOS does use is paches/0009's MTLBinaryArchive; the device log shows why it kept
+#   nothing:
+#   * session 1 ended by SIGTERM about 90 s after its start, before 0009's first timed write (60 s after the archive opened at the first present, t = 56.8 s); the graceful exit
+#     (hle_lifecycle.c) ends with _exit(0), which skips 0009's end-of-run write (an atexit handler), and dm_gfx_quit_begin / dm_gfx_quit write only the Metal 4 archive
+#     (mtl_arch_save returns at once without g_arch_cap): no file, so session 2 started "(new)";
+#   * session 2: "written, 3.3 MB: 4 pipelines taken from it, 472 built, 24 added, 451 dropped (queue full or too hot)": 0009 drops every batch at thermal Serious or worse and every
+#     descriptor beyond 48 waiting, and the session ran at thermal state 2 for its first 1,150 s (on-screen lines "thermal 2" up to frame 4200);
+#   * then "[RED] pipeline binary archive: off for this run (Failed to generate machO: ... missing 'vertex' stage in pipeline no. '32')": the third write failed although the second
+#     (40 pipelines) had been written, and 0009 turns itself off for the rest of the run;
+#   * mesh pipelines (dev_mps) are never archived: 57 mesh pipelines took 92.1 s on the submit thread in session 2 (37 of them, 50.0 s, in frame 4342). Compute pipelines did: 136 built,
+#     196.4 s, the first 11 of them 117.5 s (frame 270: "new pipelines 12 ... 117714.1 ms").
+#   Of the session's 930 s of compiles in frames (the [longframe] lines), 580 s were pipelines, the part an archive can save (the 350 s of libraries are Metal's compile cache's).
+#
+# WHAT IT CHANGES (DM_PSO_BINARY_ARCHIVE: on unless 0 / off, as 0009's; only where pso4_on() is 0: iOS, or the Mac with DM_PSO_MTL4=0; a folder from DM_PSO_BINARY_DIR or DM_SAVE)
+#   * dva_rps / dva_cps / dva_mps after dev_lib, and three #defines that make every later call of dev_rps / dev_cps / dev_mps go through them: a lookup in the archive first
+#     (binaryArchives + MTLPipelineOptionFailOnBinaryArchiveMiss; a miss or a busy archive is the compile made before), then the compile and an offer. paches/0009's dev_* above the
+#     #defines are not called any more, so its pa_on never runs: one archive, one writer. Same file <folder>/pipelines-<chain>-<gpu>.mtlarchive and .hdr (now "iBuilderPSO2" with the
+#     kern.osversion build too: an 0009 file is dropped once, as any new host build's was), DM_PSO_ARCHIVE_SECS (60); DM_PSO_ARCHIVE_MB now 24 by default (was 256: see REVISION 2).
+#   * Heat holds adds back, never drops them: below thermal Serious every waiting descriptor is added at the 2 s tick, at Serious DVA_HOT_BATCH (8) a tick, at Critical or below 400 MiB
+#     available none (they wait, ticks every 10 s). At most DVA_PENDING_MAX (512) wait; more are dropped (they come again at the next start). One add per write-lock hold.
+#   * Mesh pipelines: addMeshRenderPipelineFunctionsWithDescriptor and the mesh descriptor's binaryArchives (iOS 18 / macOS 15; the host's minimum is iOS 26).
+#   * Writes: DM_PSO_ARCHIVE_SECS after the last, or the file's size at 512 KB/s when longer (every write rewrites the file: a 100 MB file every 200 s), plus at every end the host
+#     controls, through mtl_arch_save, the call the Metal 4 archive already had: dm_gfx_suspend(1) (the app's DidEnterBackground, app patch 0030), dm_gfx_quit_begin and dm_gfx_quit
+#     (the graceful exit, waiting up to DM_QUIT_ARCH_MS), atexit, and the DidEnterBackground notification itself. An end first adds what waits, whatever the heat, within
+#     DVA_BG_ADD_MS (4 s) or half of the wait. Written to .tmp and renamed, under the host's serialization gate (ser_begin), as 0009 did.
+#   * A failed write: the archive goes on from its last written file (newBinaryArchiveWithDescriptor on it); what was added since is lost and built again when drawn; off after
+#     DVA_FAIL_MAX (3) failures in a run. Any other failure turns it off for the run, as before. It is a cache, never a condition of drawing.
+#   * Log: "pipeline binary archive (engine-patches/0414): <file>, X MB of the 256 MB cap ...", "written, X MB in T ms: H taken from it, B built, A added, W waiting, D dropped
+#     (queue full), K adds held back for heat or memory", "at exit: written in T ms (...)", "[RED] ... the write failed (...); it goes on from its last written file".
+#
+# MEASURED on this Mac (M1 Pro, macOS 27.3; an MTLBinaryArchive probe first: render, rasterization-off, compute and mesh pipelines added, serialized, and all four found by a SECOND
+#   process with FailOnBinaryArchiveMiss): dm/gfx/tests t_pso_binary_archive, 11 sessions (processes), 0 failed: a session that quits, one that ends by SIGTERM's graceful exit
+#   (_exit), and one that goes to the background (dm_gfx_suspend(1)) and is then killed with SIGKILL each leave a file from which the next process takes all five pipelines (two render,
+#   a rasterization-off one, a compute, a mesh) and builds the one it never saw; a header for another host build is dropped, an unreadable file started again; Critical / low memory
+#   add none, Serious 8 a tick, nominal the rest, nothing dropped for heat; the 512 cap; a failed write goes on from the last file (a pipeline written before is still found, the one
+#   added since is built again), off after 3; the Metal 4 path and DM_PSO_BINARY_ARCHIVE=0 do not use it. The engine's other tests unchanged (see the section of docs/ENGINE-UPDATE.md).
+#   Mutations (target/agent-work/eng/tools/mutate.py): nothing added at Serious, an end that does not add what waits, and off at the first failed write each fail sessions.
+#   NOT reproduced on the Mac: the device's "missing 'vertex' stage" write failure (the rasterization-off pipeline is archived and found here); the recovery is what was tested.
+# NOT VERIFIED (iPhone only): hits in a second session on the phone, the time a lookup and an add take there, a write's time for a large file, whether iOS's write failure comes back
+#   after a reopen, frame time while adds run at Serious, flash wear.
+# REVISION 2 (2026-11-21, after the read-only review target/agent-work/review-eng/REVIEW.txt, findings H1, M1, M2, M3, L1):
+#   * H1 (HIGH): opening an MTLBinaryArchive costs a phys_footprint that grows with the SQUARE of the file and is not given back (the review's probe on this Mac: 22.8 MB / 400 pipelines
+#     +46 MB, 68.6 MB / 1,200 +367 MB, 103 MB / 1,800 +843 MB; Ocarina already ended a session at 4.2 GB). Now: DM_PSO_ARCHIVE_MB 24 by default (1..4096), DM_PSO_ARCHIVE_COUNT 400
+#     pipelines by default (1..100000, the count kept in the .hdr's "pipelines=" line); dva_add never grows the archive past either (the size at the file's bytes per pipeline so far),
+#     an offer past the count is dropped, a file past either cap (or of unknown count: an archive of revision 1) is DELETED UNOPENED; the open is measured with
+#     os_proc_available_memory() before and after (one log line on iOS) and a drop past DM_PSO_ARCHIVE_GUARD_MB (150 by default, 0 = no guard) turns the archive off for the run and
+#     deletes the file ("opening it took X MB of available memory, over DM_PSO_ARCHIVE_GUARD_MB ...: the file is deleted"), so the next start does not pay it again.
+#   * M1: a lookup that finds an add holding the lock waits for it up to DVA_LOOKUP_WAIT_US (30 ms; a compile costs far more), one that finds a write (g_dva_writing) misses at once;
+#     dva_tick spaces its adds by DVA_ADD_GAP_US (1 ms). Counters "lookups waited for an add" / "missed it busy" in the exit line.
+#   * M2: going to the background (mtl_arch_save(0, 0)): inside a UIApplication background task (beginBackgroundTaskWithName / endBackgroundTask, found at run time with
+#     NSClassFromString: no UIKit link; none on the Mac), what is already added is written FIRST, then what waits is added within DVA_BG_FIRST_ADD_MS (0.5 s, was 4 s) and written again.
+#     The prewarm tail is paused by dm_gfx_suspend(1) before (engine-patches/0415), so the write is not beside its compiles.
+#   * M3: the descriptors added since the last good write are put back at the front of the waiting list when a write fails (they were lost for the run); a run whose last write
+#     failed is counted in <archive>.fail (removed by a good write), and after DVA_FAIL_SESSIONS (2) such runs in a row the next start deletes the archive and begins empty.
+#   * L1: DM_PSO_ARCHIVE_MB, _SECS (1..86400), _COUNT, _GUARD_MB are bounded whole numbers (one log line for a bad value): no shift or multiplication overflows.
+#   MEASURED (this Mac): t_pso_binary_archive 21 sessions (processes), 0 failed: the 11 of revision 1, plus the count cap (3 kept of 5, the .hdr says 3, a reopen takes the 3, a cap of
+#   2 deletes the file unopened), the memory guard (a test hook: 1000 MB before the open, 700 after -> off, file deleted), the background save (one task begun and ended, two writes:
+#   the 2 added first, then the 3 waiting), M1 (a lookup waits through a 10 ms add and hits, gives up after ~30 ms on a 200 ms one, misses at once during a write), M3 (the pipeline
+#   added since a failed write is queued again and found once re-added; two runs ending on failed writes, then the third starts empty). NOT VERIFIED on an iPhone: the footprint of an
+#   open there, the background task's time, whether the "missing 'vertex' stage" failure comes back.
+# RISKS: every MTLDevice pipeline (the host's own blits and kernels too, as with 0009) is looked up first; a write holds new compiles back for its length (ser_begin, as 0009's did);
+#   a small cap keeps fewer pipelines (400 of this game's ~8,300: the ones built first, i.e. drawn first; raise DM_PSO_ARCHIVE_COUNT / _MB only after measuring the open on the phone). A later revision of paches/0009 that hooks elsewhere than dev_rps / dev_cps could run beside this one: check its pa_on.
+# Roll back: DM_PSO_BINARY_ARCHIVE=0 turns it off (no archive at all, 0009's included); removing this file brings 0009's archive back.
+
+# REVISION 3 (2026-11-21, review L2, engine-patches/0414 only): g_dva_state is an _Atomic int, written with release and read with acquire (DVA_ST / DVA_ST_SET). The double-checked
+#   init published state 1 after the queue, the waiting list and the archive with a plain int: on ARM64 another thread could see 1 before them (one window, once per process).
+#   Test: t_pso_binary_archive session --race (8 threads start the archive together: each that gets 1 sees every object; a compile-time check that the type stays atomic). 22 sessions now.
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -157,6 +157,390 @@
+ static id<MTLLibrary> dev_lib(NSString *source, NSError **out) {
+     plain_compile_begin(); NSError *e = nil; id lib = [g_dev newLibraryWithSource:source options:nil error:&e]; return compile_done(lib, e, out);
+ }
++// ---- engine-patches/0414: the pipeline archive of the MTLDevice path, in the engine (DM_PSO_BINARY_ARCHIVE) ----
++// On iOS the render, compute and mesh pipelines are built through the MTLDevice (pso4_on() is 0 there: no Metal 4 bases, so no arch_* archive, no compaction, no sweep) and were compiled
++// again at every start but for the per-game MTLBinaryArchive iOSBuilder's paches/0009 adds to a copy of this file. That archive kept almost nothing on the phone: Ocarina of Time, iPhone
++// 15 Pro, 2026-11-20 (the device log): the first session (ended by SIGTERM: the graceful exit ends with _exit, which skips 0009's only write at the end, an atexit handler) left no file, so
++// the second one started "(new)"; there 451 of the 472 pipelines built were "dropped (queue full or too hot)" (0009 drops every batch at thermal Serious, and the session ran at Serious for
++// its first 1,150 s, and drops beyond 48 waiting), then a write failed ("Failed to generate machO ... missing 'vertex' stage in pipeline no. '32'") and 0009 turned itself off for the run;
++// mesh pipelines (dev_mps) were never archived; 930 s of the session's frames went to compiles on the submit thread, 580 s of them pipelines. This keeps the same file
++// (<game folder>/pipelines-<chain>-<gpu>.mtlarchive, the folder of DM_SAVE or DM_PSO_BINARY_DIR, a .hdr beside it naming the host build, chain, OS build and GPU) with these changes:
++//  * adds are never dropped for heat: at thermal Serious at most DVA_HOT_BATCH a tick (2 s), at Critical or below 400 MiB available none, the descriptors wait (up to DVA_PENDING_MAX;
++//    an add is one more compile, which the system's cache usually makes cheap); one add per write-lock hold, so a lookup misses for at most one add;
++//  * mesh pipelines too (addMeshRenderPipelineFunctionsWithDescriptor, iOS 18 / macOS 15);
++//  * written when something was added and DM_PSO_ARCHIVE_SECS (60) passed, then at most every size / 512 KB/s seconds (a 100 MB file: every 200 s, not every 60); and at every end the
++//    host controls, through mtl_arch_save: going to the background (dm_gfx_suspend(1), app patch 0030), the graceful exit (dm_gfx_quit_begin, then dm_gfx_quit waits up to
++//    DM_QUIT_ARCH_MS) and atexit, adding what waits first within half of that time;
++//  * a failed write does not turn it off: the archive goes on from its last written file (what was added since is built again when drawn); off after DVA_FAIL_MAX failures in a run.
++// The three device wrappers below take the place of dev_rps / dev_cps / dev_mps for every caller after this point (the #defines): paches/0009's code above stays compiled but is never
++// reached (its pa_on is called only from its own dev_rps / dev_cps), so the two never write the same file. DM_PSO_BINARY_ARCHIVE=0 (or off) turns this one off, as it did 0009's.
++// It is a cache, never a condition of drawing: a lookup that misses (or finds the archive busy) is the compile made before, and any failure but a write turns it off for the run.
++enum { DVA_PENDING_MAX = 512, DVA_TICK_MS = 2000, DVA_HOT_BATCH = 8, DVA_FAIL_MAX = 3, DVA_BG_ADD_MS = 4000 };
++static int pso4_on(void);
++static int ser_begin(void); static void ser_end(void);
++static uint64_t bp_now(void);
++static _Atomic int g_dva_state;   // 0 not tried, 1 on, 2 off
++// Read with acquire, written with release (review L2): a thread that sees 1 sees the queue, the waiting list and the archive that were made before it. Plain reads are seq_cst loads too; the named
++// accessors say what is meant and keep a later plain int from creeping back in (t_pso_binary_archive asserts the type)
++#define DVA_ST() atomic_load_explicit(&g_dva_state, memory_order_acquire)
++#define DVA_ST_SET(v) atomic_store_explicit(&g_dva_state, (v), memory_order_release)
++static os_unfair_lock g_dva_init_lk = OS_UNFAIR_LOCK_INIT, g_dva_lk = OS_UNFAIR_LOCK_INIT;   // g_dva_lk: the waiting list and its flags
++static pthread_rwlock_t g_dva_rw = PTHREAD_RWLOCK_INITIALIZER;   // lookups try-read (a miss while an add or the write holds it: the compile that follows is today's); adds, the write and a reopen take it
++static id<MTLBinaryArchive> g_dva_ar; static NSString *g_dva_path, *g_dva_hdr_path, *g_dva_hdr; static dispatch_queue_t g_dva_q; static dispatch_group_t g_dva_saves;   // g_dva_saves: dva_save's blocks
++static NSMutableArray<NSArray *> *g_dva_pend; static int g_dva_tick_set, g_dva_dirty, g_dva_capped, g_dva_fails; static uint64_t g_dva_cap, g_dva_last_ser_ns, g_dva_secs;
++static _Atomic uint64_t g_dva_hits, g_dva_miss, g_dva_added, g_dva_dropped, g_dva_wr, g_dva_size, g_dva_held;
++static int (*g_dva_thermal)(void);   // the thermal state (NSProcessInfoThermalState's values); tests set it, NULL: the system's
++static uint64_t (*g_dva_avail)(void);   // available memory in bytes; tests set it, NULL: os_proc_available_memory on iOS, unlimited on the Mac
++static int g_dva_fail_next;   // tests: the next write fails as a failed serialization would
++static int g_dva_manual;   // tests: no timer ticks (dva_tick runs only when the test calls it)
++// Revision 2 of 0414 (the read-only review of 2026-11-21, target/agent-work/review-eng/REVIEW.txt H1, M1-M3, L1):
++//  * H1: opening an MTLBinaryArchive costs a footprint that grows with the SQUARE of its size and is not given back when it is released (this Mac: a 68.6 MB file of 1,200 pipelines
++//    +367 MB at the open, 103 MB / 1,800 pipelines +843 MB; 22.8 MB / 400 +46 MB). So the archive is bounded by DM_PSO_ARCHIVE_MB (now 24 by default, 1..4096) AND by
++//    DM_PSO_ARCHIVE_COUNT pipelines (400 by default, 1..100000, kept in the .hdr's "pipelines=" line); it never grows past either (dva_add stops adding before), a file past either is
++//    deleted unopened, and the open is measured: os_proc_available_memory() before and after (logged on iOS); a drop past DM_PSO_ARCHIVE_GUARD_MB (150 by default, 0 = no guard) turns
++//    the archive off for the run and deletes the file: a cache must never cost the game;
++//  * M1: a lookup that finds an ADD holding the lock waits for it, up to DVA_LOOKUP_WAIT_US (a compile costs far more); one that finds a WRITE misses at once, as before; adds are spaced
++//    by DVA_ADD_GAP_US so lookups get in between;
++//  * M2: going to the background writes what is already added FIRST, then adds what waits within DVA_BG_FIRST_ADD_MS (0.5 s) and writes again, inside a UIApplication background task
++//    (beginBackgroundTaskWithName / endBackgroundTask, found at run time; the tail of the prewarm is paused by dm_gfx_suspend before, engine-patches/0415);
++//  * M3: what was added since the last good write is put back in the waiting list when a write fails; a run whose last write failed is counted in <archive>.fail, and after
++//    DVA_FAIL_SESSIONS such runs in a row the next start begins with an empty archive;
++//  * L1: DM_PSO_ARCHIVE_MB and DM_PSO_ARCHIVE_SECS (1..86400) are bounded, so no shift or multiplication overflows.
++enum { DVA_LOOKUP_WAIT_US = 30000, DVA_ADD_GAP_US = 1000, DVA_BG_FIRST_ADD_MS = 500, DVA_FAIL_SESSIONS = 2, DVA_MB_DEFAULT = 24, DVA_COUNT_DEFAULT = 400, DVA_GUARD_MB_DEFAULT = 150 };
++static uint64_t g_dva_count_cap, g_dva_guard;   // DM_PSO_ARCHIVE_COUNT (pipelines), DM_PSO_ARCHIVE_GUARD_MB (bytes; 0: no guard)
++static _Atomic uint64_t g_dva_count, g_dva_since_write;   // pipelines in the archive (the file's, from its .hdr, + those added in this run); added since the last good write
++static _Atomic int g_dva_writing;   // dva_write holds or wants g_dva_rw: a lookup misses at once
++static _Atomic uint64_t g_dva_waited, g_dva_busy;   // lookups that waited for an add and then looked; lookups that missed because the archive was being written or the wait ran out
++static NSMutableArray<NSArray *> *g_dva_since;   // the descriptors added since the last good write (g_dva_lk): back to the waiting list when a write fails (M3)
++static int g_dva_fail_runs, g_dva_fail_noted;   // runs that ended on a failed write before this one (<archive>.fail); this run's failure is counted there
++static NSUInteger (*g_dva_bg_begin)(void); static void (*g_dva_bg_end)(NSUInteger);   // tests: stand-ins for the background task (NULL: UIApplication's, on iOS)
++static uint64_t dva_env_u(const char *name, uint64_t dflt, uint64_t lo, uint64_t hi) {   // a whole number in [lo, hi], else the default (one line says so)
++    const char *e = getenv(name); if (!e || !*e) return dflt;
++    char *end = NULL; unsigned long long v = strtoull(e, &end, 10);
++    if (end == e || *end || v < lo || v > hi) { MLOG("%s=%s is not a whole number from %llu to %llu: %llu is used", name, e, (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)dflt); return dflt; }
++    return v;
++}
++#if TARGET_OS_IPHONE
++static NSUInteger dva_bg_begin_ui(void) {   // a UIApplication background task, so iOS lets the write finish before it suspends the process; 0: none
++    Class c = NSClassFromString(@"UIApplication"); if (!c || ![c respondsToSelector:@selector(sharedApplication)]) return 0;
++    id app = ((id (*)(id, SEL))objc_msgSend)(c, @selector(sharedApplication)); SEL b = NSSelectorFromString(@"beginBackgroundTaskWithName:expirationHandler:");
++    if (!app || ![app respondsToSelector:b]) return 0;
++    __block NSUInteger tid = 0; __block _Atomic int ended = 0;
++    tid = ((NSUInteger (*)(id, SEL, NSString *, void (^)(void)))objc_msgSend)(app, b, @"dm.nvn.pipeline-archive", ^{   // the time ran out: end it (the .tmp of a cut write is left, removed at the next start)
++        if (!atomic_exchange(&ended, 1)) ((void (*)(id, SEL, NSUInteger))objc_msgSend)(app, NSSelectorFromString(@"endBackgroundTask:"), tid); });
++    return tid;
++}
++static void dva_bg_end_ui(NSUInteger tid) {
++    if (!tid) return; Class c = NSClassFromString(@"UIApplication"); id app = c ? ((id (*)(id, SEL))objc_msgSend)(c, @selector(sharedApplication)) : nil;
++    if (app) ((void (*)(id, SEL, NSUInteger))objc_msgSend)(app, NSSelectorFromString(@"endBackgroundTask:"), tid);
++}
++#endif
++static NSUInteger dva_bg_begin(void) {
++    if (g_dva_bg_begin) return g_dva_bg_begin();
++#if TARGET_OS_IPHONE
++    return dva_bg_begin_ui();
++#else
++    return 0;
++#endif
++}
++static void dva_bg_end(NSUInteger tid) {
++    if (g_dva_bg_end) { g_dva_bg_end(tid); return; }
++#if TARGET_OS_IPHONE
++    dva_bg_end_ui(tid);
++#else
++    (void)tid;
++#endif
++}
++static int dva_thermal(void) { return g_dva_thermal ? g_dva_thermal() : (int)NSProcessInfo.processInfo.thermalState; }
++static uint64_t dva_avail(void) {
++    if (g_dva_avail) return g_dva_avail();
++#if TARGET_OS_IPHONE
++    return (uint64_t)os_proc_available_memory();
++#else
++    return UINT64_MAX;
++#endif
++}
++static void dva_off(const char *why) { if (DVA_ST() != 2) { DVA_ST_SET(2); MLOG("[RED] pipeline binary archive: off for this run (%s); pipelines are built as without it", why); } }
++static NSString *dva_header(NSString *gpu) {   // what the binaries are valid for: another host build, chain, OS build or GPU makes Metal refuse or ignore them
++    char b[64] = ""; size_t n = sizeof b; sysctlbyname("kern.osversion", b, &n, NULL, 0);
++    return [NSString stringWithFormat:@"iBuilderPSO2\nhost=%s %s\nchain=%s\nos=%@ (%s)\ngpu=%@\n", __DATE__, __TIME__, DMSH_CHAIN, NSProcessInfo.processInfo.operatingSystemVersionString, b, gpu];
++}
++static uint64_t dva_file_size(NSString *p) { struct stat st; return p && !stat(p.fileSystemRepresentation, &st) ? (uint64_t)st.st_size : 0; }
++static NSString *dva_hdr_text(void) { return [g_dva_hdr stringByAppendingFormat:@"pipelines=%llu\n", (unsigned long long)atomic_load(&g_dva_count)]; }   // the identity, then the pipeline count
++static int dva_hdr_read(NSString *have, uint64_t *count) {   // 1 when the .hdr's identity is this run's; *count: its pipelines= line (0 without one)
++    if (!have) return 0; NSMutableString *id_ = [NSMutableString string]; *count = 0;
++    for (NSString *l in [have componentsSeparatedByString:@"\n"]) { if (!l.length) continue; if ([l hasPrefix:@"pipelines="]) *count = strtoull([l substringFromIndex:10].UTF8String, NULL, 10); else [id_ appendFormat:@"%@\n", l]; }
++    return [id_ isEqualToString:g_dva_hdr];
++}
++static NSString *dva_fail_path(void) { return [g_dva_path stringByAppendingString:@".fail"]; }
++static void dva_drop_files(void) { NSFileManager *fm = NSFileManager.defaultManager; [fm removeItemAtPath:g_dva_path error:nil]; [fm removeItemAtPath:g_dva_hdr_path error:nil]; [fm removeItemAtPath:dva_fail_path() error:nil]; }
++static void dva_tick(void); static void dva_write(int now);
++static void dva_schedule(uint64_t ms) {   // g_dva_lk held
++    if (g_dva_tick_set || g_dva_manual) return; g_dva_tick_set = 1;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms * NSEC_PER_MSEC)), g_dva_q, ^{ @autoreleasepool { dva_tick(); } });
++}
++static void dva_save(int wait_ms, int ending);
++static id<MTLBinaryArchive> dva_open_file(NSString *path, NSError **err) {   // the archive in path, or a new empty one (path nil or absent)
++    MTLBinaryArchiveDescriptor *bd = [MTLBinaryArchiveDescriptor new];
++    if (path && [NSFileManager.defaultManager fileExistsAtPath:path]) bd.url = [NSURL fileURLWithPath:path];
++    return [g_dev newBinaryArchiveWithDescriptor:bd error:err];
++}
++static int dva_on(void) {
++    { int s0 = DVA_ST(); if (s0) return s0 == 1; }
++    os_unfair_lock_lock(&g_dva_init_lk);
++    if (!DVA_ST()) @autoreleasepool {
++        const char *e = getenv("DM_PSO_BINARY_ARCHIVE");
++        if (e && (!strcmp(e, "0") || !strcmp(e, "off"))) { DVA_ST_SET(2); MLOG("pipeline binary archive (DM_PSO_BINARY_ARCHIVE): off"); }
++        else if (pso4_on()) DVA_ST_SET(2);   // the Metal 4 pipeline archive keeps the pipelines (arch_*)
++        else if (!g_dev || ![g_dev respondsToSelector:@selector(newBinaryArchiveWithDescriptor:error:)]) dva_off("this device makes no MTLBinaryArchive");
++        else {
++            const char *d = getenv("DM_PSO_BINARY_DIR"), *save = getenv("DM_SAVE");
++            NSString *dir = d && *d ? @(d) : save && *save ? [@(save) stringByDeletingLastPathComponent] : nil;
++            if (!dir) { DVA_ST_SET(2); MLOG("pipeline binary archive: no game folder (neither DM_PSO_BINARY_DIR nor DM_SAVE is set): not used"); }
++            else {
++                g_dva_cap = dva_env_u("DM_PSO_ARCHIVE_MB", DVA_MB_DEFAULT, 1, 4096) << 20;   // bounded (L1): no shift overflows
++                g_dva_secs = dva_env_u("DM_PSO_ARCHIVE_SECS", 60, 1, 86400);
++                g_dva_count_cap = dva_env_u("DM_PSO_ARCHIVE_COUNT", DVA_COUNT_DEFAULT, 1, 100000);
++                g_dva_guard = dva_env_u("DM_PSO_ARCHIVE_GUARD_MB", DVA_GUARD_MB_DEFAULT, 0, 65536) << 20;
++                NSMutableString *gpu = [NSMutableString string];
++                NSString *an = nil; if (@available(iOS 14.0, macOS 11.0, *)) an = g_dev.architecture.name;
++                NSString *w = an ?: g_dev.name; for (NSUInteger i = 0; i < w.length && gpu.length < 24; i++) { unichar c = [w characterAtIndex:i]; if (isalnum(c)) [gpu appendFormat:@"%C", c]; }
++                NSString *name = [NSString stringWithFormat:@"pipelines-%s-%@.mtlarchive", DMSH_CHAIN, gpu];
++                g_dva_path = [dir stringByAppendingPathComponent:name]; g_dva_hdr_path = [g_dva_path stringByAppendingString:@".hdr"]; g_dva_hdr = dva_header(gpu);
++                NSFileManager *fm = NSFileManager.defaultManager;
++                for (NSString *f in [fm contentsOfDirectoryAtPath:dir error:nil] ?: @[])   // another chain's or GPU's archive in the game's folder is dead weight
++                    if ([f hasPrefix:@"pipelines-"] && ([f hasSuffix:@".mtlarchive"] || [f hasSuffix:@".mtlarchive.hdr"] || [f hasSuffix:@".mtlarchive.tmp"]) && ![f hasPrefix:name])
++                        [fm removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil];
++                [fm removeItemAtPath:[g_dva_path stringByAppendingString:@".tmp"] error:nil];
++                NSString *have = [NSString stringWithContentsOfFile:g_dva_hdr_path encoding:NSUTF8StringEncoding error:nil]; uint64_t had = 0;
++                g_dva_fail_runs = [[NSString stringWithContentsOfFile:dva_fail_path() encoding:NSUTF8StringEncoding error:nil] intValue];
++                if ([fm fileExistsAtPath:g_dva_path] && !dva_hdr_read(have, &had)) {
++                    MLOG("pipeline binary archive: %s was made for another host build, shader chain, OS build or GPU: dropped", name.UTF8String);
++                    dva_drop_files(); had = 0; g_dva_fail_runs = 0;
++                } else if ([fm fileExistsAtPath:g_dva_path] && g_dva_fail_runs >= DVA_FAIL_SESSIONS) {   // M3: it keeps failing to be written
++                    MLOG("[RED] pipeline binary archive: the last %d runs ended on a failed write of %s: it starts again empty", g_dva_fail_runs, name.UTF8String);
++                    dva_drop_files(); had = 0; g_dva_fail_runs = 0;
++                } else if ([fm fileExistsAtPath:g_dva_path] && (dva_file_size(g_dva_path) > g_dva_cap || had > g_dva_count_cap || !had)) {   // H1: never open one past the caps
++                    MLOG("pipeline binary archive: %s holds %llu pipelines in %.1f MB, past the caps (%llu pipelines, %.0f MB) or of unknown count: deleted unopened (opening it would cost memory "
++                         "that grows with the square of its size)", name.UTF8String, (unsigned long long)had, dva_file_size(g_dva_path) / 1048576.0, (unsigned long long)g_dva_count_cap, g_dva_cap / 1048576.0);
++                    dva_drop_files(); had = 0; g_dva_fail_runs = 0;
++                }
++                int existed = [fm fileExistsAtPath:g_dva_path]; NSError *err = nil;
++                uint64_t av0 = dva_avail(), ot0 = bp_now();
++                g_dva_ar = dva_open_file(g_dva_path, &err);
++                uint64_t av1 = dva_avail(), cost = av0 != UINT64_MAX && av1 < av0 ? av0 - av1 : 0;
++                if (existed && av0 != UINT64_MAX) MLOG("pipeline binary archive: opened %s (%llu pipelines, %.1f MB) in %.0f ms: available memory %.0f MB before, %.0f MB after", name.UTF8String,
++                                                       (unsigned long long)had, dva_file_size(g_dva_path) / 1048576.0, (bp_now() - ot0) / 1e6, av0 / 1048576.0, av1 / 1048576.0);
++                if (g_dva_ar && existed && g_dva_guard && cost > g_dva_guard) {   // H1's guard: a cache must not cost the game
++                    g_dva_ar = nil; dva_drop_files();
++                    char why[200]; snprintf(why, sizeof why, "opening it took %.0f MB of available memory, over DM_PSO_ARCHIVE_GUARD_MB %.0f: the file is deleted", cost / 1048576.0, g_dva_guard / 1048576.0);
++                    dva_off(why); os_unfair_lock_unlock(&g_dva_init_lk); return 0;
++                }
++                atomic_store(&g_dva_count, existed ? had : 0);
++                if (!g_dva_ar && existed) {   // unreadable: started again
++                    MLOG("pipeline binary archive: %s cannot be opened (%s): started again", name.UTF8String, err.localizedDescription.UTF8String);
++                    [fm removeItemAtPath:g_dva_path error:nil]; [fm removeItemAtPath:g_dva_hdr_path error:nil]; existed = 0; err = nil;
++                    g_dva_ar = dva_open_file(nil, &err);
++                }
++                if (!g_dva_ar) dva_off(err ? err.localizedDescription.UTF8String : "no archive made");
++                else {
++                    g_dva_pend = [NSMutableArray array]; g_dva_since = [NSMutableArray array]; g_dva_saves = dispatch_group_create();
++                    g_dva_q = dispatch_queue_create("dm.nvn.pso-binary-archive", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
++                    g_dva_size = dva_file_size(g_dva_path); g_dva_capped = g_dva_size >= g_dva_cap || atomic_load(&g_dva_count) >= g_dva_count_cap; g_dva_last_ser_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++                    DVA_ST_SET(1);
++                    MLOG("pipeline binary archive (engine-patches/0414): %s, %.1f MB of the %.0f MB cap, %llu of the %llu pipelines cap%s; written %llu s after the first pipeline added, then at most "
++                         "every size / 512 KB/s, and at every background or end; render, compute and mesh pipelines, none dropped for heat", name.UTF8String, g_dva_size / 1048576.0, g_dva_cap / 1048576.0,
++                         (unsigned long long)atomic_load(&g_dva_count), (unsigned long long)g_dva_count_cap, g_dva_capped ? " (full: nothing more is added)" : existed ? "" : " (new)", (unsigned long long)g_dva_secs);
++#if TARGET_OS_IPHONE
++                    [[NSNotificationCenter defaultCenter] addObserverForName:@"UIApplicationDidEnterBackgroundNotification" object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; dva_save(0, 0); }];
++#endif
++                    atexit_b(^{ dva_save(MTL_QUIT_ARCH_MS, 1); });   // ⌘Q, exit(): the graceful exit's _exit skips this, and dm_gfx_quit writes it there
++                }
++            }
++        }
++    }
++    os_unfair_lock_unlock(&g_dva_init_lk);
++    return DVA_ST() == 1;
++}
++static uint64_t dva_interval_ns(void) {   // DM_PSO_ARCHIVE_SECS, or the file's size at 512 KB/s when that is longer: every write rewrites the whole file
++    uint64_t s = g_dva_secs, by_size = atomic_load(&g_dva_size) / (512u << 10);
++    return (by_size > s ? by_size : s) * 1000000000ull;
++}
++// Writes the archive when something was added since the last write: now (now != 0), else once dva_interval_ns() passed since the last. On g_dva_q
++static void dva_write(int now) {
++    if (DVA_ST() != 1) return;
++    os_unfair_lock_lock(&g_dva_lk); int dirty = g_dva_dirty; os_unfair_lock_unlock(&g_dva_lk);
++    if (!dirty) return;
++    uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), iv = dva_interval_ns();
++    if (!now && t - g_dva_last_ser_ns < iv) { os_unfair_lock_lock(&g_dva_lk); dva_schedule((iv - (t - g_dva_last_ser_ns)) / 1000000ull + 50); os_unfair_lock_unlock(&g_dva_lk); return; }
++    NSString *tmp = [g_dva_path stringByAppendingString:@".tmp"]; NSError *err = nil; BOOL ok;
++    uint64_t t0 = bp_now();
++    atomic_store(&g_dva_writing, 1);   // lookups miss at once from here (M1)
++    pthread_rwlock_wrlock(&g_dva_rw);
++    ser_begin();   // not beside a compile: the host's serialization gate (Metal frees entries a compile reads while an archive is written)
++    @autoreleasepool { ok = !g_dva_fail_next && [g_dva_ar serializeToURL:[NSURL fileURLWithPath:tmp] error:&err]; }
++    if (g_dva_fail_next) { g_dva_fail_next = 0; err = [NSError errorWithDomain:@"dm" code:1 userInfo:@{NSLocalizedDescriptionKey: @"a test's failed write"}]; }
++    ser_end();
++    if (ok && !rename(tmp.fileSystemRepresentation, g_dva_path.fileSystemRepresentation)) {
++        pthread_rwlock_unlock(&g_dva_rw); atomic_store(&g_dva_writing, 0);
++        [dva_hdr_text() writeToFile:g_dva_hdr_path atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        os_unfair_lock_lock(&g_dva_lk); [g_dva_since removeAllObjects]; atomic_store(&g_dva_since_write, 0); os_unfair_lock_unlock(&g_dva_lk);
++        if (g_dva_fail_noted) { [NSFileManager.defaultManager removeItemAtPath:dva_fail_path() error:nil]; g_dva_fail_noted = 0; }   // this run does not end on a failed write
++        else if (g_dva_fail_runs) { [NSFileManager.defaultManager removeItemAtPath:dva_fail_path() error:nil]; g_dva_fail_runs = 0; }
++        uint64_t sz = dva_file_size(g_dva_path); g_dva_size = sz; g_dva_last_ser_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); atomic_fetch_add(&g_dva_wr, 1);
++        os_unfair_lock_lock(&g_dva_lk); g_dva_dirty = 0; unsigned waiting = (unsigned)g_dva_pend.count;
++        if (sz >= g_dva_cap && !g_dva_capped) { g_dva_capped = 1; atomic_fetch_add(&g_dva_dropped, g_dva_pend.count); [g_dva_pend removeAllObjects]; MLOG("pipeline binary archive: %.1f MB reached the %.0f MB cap: nothing more is added, the archive stays in use", sz / 1048576.0, g_dva_cap / 1048576.0); }
++        os_unfair_lock_unlock(&g_dva_lk);
++        MLOG("pipeline binary archive: written, %.1f MB in %.0f ms: %llu pipelines taken from it, %llu built, %llu added, %u waiting, %llu dropped (queue full), %llu adds held back for heat or memory",
++             sz / 1048576.0, (bp_now() - t0) / 1e6, (unsigned long long)g_dva_hits, (unsigned long long)g_dva_miss, (unsigned long long)g_dva_added, waiting, (unsigned long long)g_dva_dropped, (unsigned long long)g_dva_held);
++        return;
++    }
++    remove(tmp.fileSystemRepresentation); atomic_store(&g_dva_writing, 0);
++    // The write failed (on an iPhone 15 Pro: "Failed to generate machO ... missing 'vertex' stage in pipeline no. '32'", a file of 40 pipelines written fine 60 s before): the archive goes
++    // on from its last written file; what was added since is lost (built again when drawn, offered again at the next start)
++    const char *why = err ? err.localizedDescription.UTF8String : "the write failed";
++    if (++g_dva_fails >= DVA_FAIL_MAX) { pthread_rwlock_unlock(&g_dva_rw); dva_off(why); return; }
++    NSError *oe = nil; id<MTLBinaryArchive> a = dva_open_file(g_dva_path, &oe);
++    if (!a) { pthread_rwlock_unlock(&g_dva_rw); dva_off(oe ? oe.localizedDescription.UTF8String : why); return; }
++    g_dva_ar = a; pthread_rwlock_unlock(&g_dva_rw);
++    // M3: what was added since the last good write goes back to the front of the waiting list (it is no longer in the archive); the run is counted as one ending on a failed write
++    os_unfair_lock_lock(&g_dva_lk); g_dva_dirty = 0; NSUInteger back = g_dva_since.count;
++    atomic_fetch_sub(&g_dva_count, MIN((uint64_t)back, atomic_load(&g_dva_count))); atomic_store(&g_dva_since_write, 0);
++    NSRange keep = NSMakeRange(0, MIN(back, (NSUInteger)DVA_PENDING_MAX)); [g_dva_pend insertObjects:[g_dva_since subarrayWithRange:keep] atIndexes:[NSIndexSet indexSetWithIndexesInRange:keep]];
++    while (g_dva_pend.count > DVA_PENDING_MAX) { [g_dva_pend removeLastObject]; atomic_fetch_add(&g_dva_dropped, 1); }
++    [g_dva_since removeAllObjects]; if (g_dva_pend.count) dva_schedule(DVA_TICK_MS); os_unfair_lock_unlock(&g_dva_lk);
++    if (!g_dva_fail_noted) { g_dva_fail_noted = 1; [[NSString stringWithFormat:@"%d\n", g_dva_fail_runs + 1] writeToFile:dva_fail_path() atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
++    MLOG("[RED] pipeline binary archive: the write failed (%s); it goes on from its last written file (%.1f MB), the %lu pipelines added since are queued to be added again (%d of %d failures "
++         "allowed in a run; %d earlier runs ended on a failed write, %d start again empty)", why, dva_file_size(g_dva_path) / 1048576.0, (unsigned long)back, g_dva_fails, DVA_FAIL_MAX, g_dva_fail_runs, DVA_FAIL_SESSIONS);
++}
++// Whether one more pipeline fits under the caps (H1): the count cap, and the size cap at the file's bytes a pipeline so far (an empty file: 64 KB a pipeline). g_dva_lk held
++static int dva_fits(void) {
++    uint64_t n = atomic_load(&g_dva_count), since = atomic_load(&g_dva_since_write), sz = atomic_load(&g_dva_size), per = n > since && sz ? sz / (n - since) : 64u << 10;
++    return n < g_dva_count_cap && sz + per * (since + 1) <= g_dva_cap;
++}
++static void dva_cap_reached(void) {   // g_dva_lk held: nothing more is added, the archive stays in use
++    if (g_dva_capped) return; g_dva_capped = 1; atomic_fetch_add(&g_dva_dropped, g_dva_pend.count); [g_dva_pend removeAllObjects];
++    MLOG("pipeline binary archive: the cap is reached (%llu of %llu pipelines, %.1f MB written of %.0f MB): nothing more is added, the archive stays in use",
++         (unsigned long long)atomic_load(&g_dva_count), (unsigned long long)g_dva_count_cap, atomic_load(&g_dva_size) / 1048576.0, g_dva_cap / 1048576.0);
++}
++static int dva_add(NSArray *it) {   // one descriptor into the archive, under the write lock; 1 when added
++    os_unfair_lock_lock(&g_dva_lk); int fits = !g_dva_capped && dva_fits(); if (!fits) dva_cap_reached(); os_unfair_lock_unlock(&g_dva_lk);
++    if (!fits) return 0;
++    pthread_rwlock_wrlock(&g_dva_rw);
++    if (DVA_ST() != 1) { pthread_rwlock_unlock(&g_dva_rw); return 0; }
++    ser_compile_begin(); NSError *err = nil; BOOL ok = NO; int kind = [it[0] intValue];
++    @autoreleasepool {
++        if (kind == 0) ok = [g_dva_ar addRenderPipelineFunctionsWithDescriptor:it[1] error:&err];
++        else if (kind == 1) ok = [g_dva_ar addComputePipelineFunctionsWithDescriptor:it[1] error:&err];
++        else if (@available(iOS 18.0, macOS 15.0, *)) ok = [g_dva_ar addMeshRenderPipelineFunctionsWithDescriptor:it[1] error:&err];
++    }
++    ser_compile_end(); pthread_rwlock_unlock(&g_dva_rw);
++    if (ok) { atomic_fetch_add(&g_dva_added, 1); atomic_fetch_add(&g_dva_count, 1); atomic_fetch_add(&g_dva_since_write, 1);
++              os_unfair_lock_lock(&g_dva_lk); g_dva_dirty = 1; [g_dva_since addObject:it]; os_unfair_lock_unlock(&g_dva_lk); }
++    else { static _Atomic int told; if (!atomic_exchange(&told, 1)) MLOG("pipeline binary archive: a pipeline was not added (%s); the others go on", err.localizedDescription.UTF8String); }
++    return ok;
++}
++// A tick: what waits is added (all of it below thermal Serious, DVA_HOT_BATCH at Serious, none at Critical or below 400 MiB available: those wait for a later tick), then the write if due
++static void dva_tick(void) {
++    os_unfair_lock_lock(&g_dva_lk); g_dva_tick_set = 0; os_unfair_lock_unlock(&g_dva_lk);
++    if (DVA_ST() != 1) return;
++    int th = dva_thermal(); int low = dva_avail() < (400ull << 20);
++    unsigned allow = th >= 3 || low ? 0 : th == 2 ? DVA_HOT_BATCH : UINT_MAX, done = 0;
++    for (;;) {
++        os_unfair_lock_lock(&g_dva_lk);
++        NSArray *it = done < allow && g_dva_pend.count && !g_dva_capped ? g_dva_pend[0] : nil;
++        if (it) [g_dva_pend removeObjectAtIndex:0];
++        os_unfair_lock_unlock(&g_dva_lk);
++        if (!it) break;
++        if (done) usleep(DVA_ADD_GAP_US);   // M1: room for the lookups between two adds
++        dva_add(it); done++;
++    }
++    os_unfair_lock_lock(&g_dva_lk);
++    unsigned left = g_dva_capped ? 0 : (unsigned)g_dva_pend.count;
++    if (left) { if (!allow) atomic_fetch_add(&g_dva_held, 1); dva_schedule(allow ? DVA_TICK_MS : 5 * DVA_TICK_MS); }
++    os_unfair_lock_unlock(&g_dva_lk);
++    dva_write(0);
++}
++// A pipeline from the archive, or nil (the caller then builds it as before and offers it with dva_offer). kind 0 render, 1 compute, 2 mesh (d: its descriptor)
++static id dva_lookup(int kind, id d) {
++    if (!dva_on()) return nil;
++    int got = !atomic_load(&g_dva_writing) && !pthread_rwlock_tryrdlock(&g_dva_rw);
++    if (!got && !atomic_load(&g_dva_writing)) {   // M1: an add holds the lock: wait for it (up to DVA_LOOKUP_WAIT_US), a compile costs far more; a write: miss at once
++        uint64_t w0 = bp_now();
++        while (!got && !atomic_load(&g_dva_writing) && bp_now() - w0 < DVA_LOOKUP_WAIT_US * 1000ull) { usleep(200); got = !pthread_rwlock_tryrdlock(&g_dva_rw); }
++        if (got) atomic_fetch_add(&g_dva_waited, 1);
++    }
++    if (!got) { atomic_fetch_add(&g_dva_busy, 1); return nil; }
++    id ps = nil;
++    @autoreleasepool {
++        NSError *err = nil; id dd = [d copy];
++        if (kind == 0) { [(MTLRenderPipelineDescriptor *)dd setBinaryArchives:@[g_dva_ar]]; ps = [g_dev newRenderPipelineStateWithDescriptor:dd options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&err]; }
++        else if (kind == 1) { [(MTLComputePipelineDescriptor *)dd setBinaryArchives:@[g_dva_ar]]; ps = [g_dev newComputePipelineStateWithDescriptor:dd options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&err]; }
++        else if (@available(iOS 18.0, macOS 15.0, *)) { [(MTLMeshRenderPipelineDescriptor *)dd setBinaryArchives:@[g_dva_ar]]; ps = [g_dev newRenderPipelineStateWithMeshDescriptor:dd options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:&err]; }
++    }
++    pthread_rwlock_unlock(&g_dva_rw);
++    atomic_fetch_add(ps ? &g_dva_hits : &g_dva_miss, 1);
++    return ps;
++}
++static void dva_offer(int kind, id d) {
++    if (DVA_ST() != 1) return;
++    os_unfair_lock_lock(&g_dva_lk);
++    if (g_dva_capped) { os_unfair_lock_unlock(&g_dva_lk); return; }
++    if (atomic_load(&g_dva_count) + g_dva_pend.count >= g_dva_count_cap) atomic_fetch_add(&g_dva_dropped, 1);   // no room for it under the count cap
++    else if (g_dva_pend.count >= DVA_PENDING_MAX) atomic_fetch_add(&g_dva_dropped, 1);
++    else { [g_dva_pend addObject:@[@(kind), [d copy]]]; dva_schedule(DVA_TICK_MS); }
++    os_unfair_lock_unlock(&g_dva_lk);
++}
++// mtl_arch_save's part (going to the background, the graceful exit, atexit). Going to the background (wait_ms <= 0, nothing waits for it): inside a background task, what is already
++// added is written FIRST, then what waits is added within DVA_BG_FIRST_ADD_MS and written again (M2). An end (wait_ms > 0): what waits is added within half of wait_ms (whatever the
++// heat: an end is short), then the write, and the caller waits for it (the timer's ticks are not waited for)
++static void dva_save(int wait_ms, int ending) {
++    if (DVA_ST() != 1) return;
++    int bg = wait_ms <= 0;
++    uint64_t t0 = bp_now(), budget_ms = bg ? DVA_BG_FIRST_ADD_MS : (uint64_t)wait_ms / 2; int pend = 0;
++    os_unfair_lock_lock(&g_dva_lk); pend = (int)g_dva_pend.count; os_unfair_lock_unlock(&g_dva_lk);
++    NSUInteger task = bg ? dva_bg_begin() : 0;
++    dispatch_group_async(g_dva_saves, g_dva_q, ^{ @autoreleasepool {
++        if (bg) dva_write(1);   // what is in the archive already, before anything else
++        for (;;) {   // adds are compiles, usually from the system's cache
++            if ((bp_now() - t0) / 1000000ull >= budget_ms) break;
++            os_unfair_lock_lock(&g_dva_lk); NSArray *it = g_dva_pend.count && !g_dva_capped ? g_dva_pend[0] : nil; if (it) [g_dva_pend removeObjectAtIndex:0]; os_unfair_lock_unlock(&g_dva_lk);
++            if (!it) break;
++            dva_add(it);
++        }
++        dva_write(1);
++        dva_bg_end(task);
++    } });
++    if (wait_ms <= 0) return;
++    long late = dispatch_group_wait(g_dva_saves, dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait_ms * NSEC_PER_MSEC));
++    os_unfair_lock_lock(&g_dva_lk); int left = (int)g_dva_pend.count; os_unfair_lock_unlock(&g_dva_lk);
++    MLOG("pipeline binary archive at %s: %s in %.0f ms (%d were waiting to be added, %d still wait: built again at the next start; %llu pipelines in it, %llu lookups waited for an add, "
++         "%llu missed it busy)", ending ? "exit" : "a wait", late ? "not all written in time" : "written", (bp_now() - t0) / 1e6, pend, left, (unsigned long long)atomic_load(&g_dva_count),
++         (unsigned long long)atomic_load(&g_dva_waited), (unsigned long long)atomic_load(&g_dva_busy));
++}
++// The MTLDevice's pipeline builds, through the archive (paches/0009's dev_* above are not reached from here on)
++static id<MTLComputePipelineState> dva_cps(id<MTLFunction> f, NSError **out) {
++    plain_compile_begin(); NSError *e = nil;
++    MTLComputePipelineDescriptor *cd = nil; id ps = nil;
++    if (f && dva_on()) { cd = [MTLComputePipelineDescriptor new]; cd.computeFunction = f; ps = dva_lookup(1, cd); }
++    if (!ps) { ps = [g_dev newComputePipelineStateWithFunction:f error:&e]; if (ps && cd) dva_offer(1, cd); }
++    return compile_done(ps, e, out);
++}
++static id<MTLRenderPipelineState> dva_rps(MTLRenderPipelineDescriptor *d, NSError **out) {
++    plain_compile_begin(); NSError *e = nil; id ps = dva_on() ? dva_lookup(0, d) : nil;
++    if (!ps) { ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e]; if (ps && DVA_ST() == 1) dva_offer(0, d); }
++    return compile_done(ps, e, out);
++}
++static id<MTLRenderPipelineState> dva_mps(MTLMeshRenderPipelineDescriptor *d, NSError **out) {
++    plain_compile_begin(); NSError *e = nil; id ps = nil; int arch = 0;
++    if (@available(iOS 18.0, macOS 15.0, *)) arch = dva_on();
++    if (arch) ps = dva_lookup(2, d);
++    if (!ps) { ps = [g_dev newRenderPipelineStateWithMeshDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&e]; if (ps && arch) dva_offer(2, d); }
++    return compile_done(ps, e, out);
++}
++#define dev_cps(f, out) dva_cps(f, out)
++#define dev_rps(d, out) dva_rps(d, out)
++#define dev_mps(d, out) dva_mps(d, out)
+ // The shaders the host writes itself (built-in kernels, clears, copies, index conversions, geometry packing, the present: dm/gfx/msl), compiled when the host is built and loaded by
+ // name (host_msl_lib), so none is compiled at run time. The diagnostic overrides (DM_NVN_HILITE, DM_NVN_MAGSCAN, DM_NVN_TEXDUMP) still compile theirs from source
+ static id<MTLLibrary> host_lib_from(id<MTL4Compiler> compiler, const char *name, NSError **out) {
+@@ -10808,6 +11192,7 @@
+ // 4-9 s). A write the exit then cuts short is not a compaction that crashed Metal: its marker goes, and none is written from here on (arch_mark). A wait (wait_ms > 0) first lets the
+ // harvest queue capture what it holds (arch_harvest_wait), within the same time. Every end the host controls stops the prewarm first (mtl_warm_stop) and waits MTL_QUIT_ARCH_MS
+ void mtl_arch_save(int wait_ms, int ending) {
++    dva_save(wait_ms, ending);   // engine-patches/0414: the MTLDevice path's archive (iOS), written at the same moments
+     if (!g_arch_cap) return;
+     uint64_t t0 = bp_now(); dispatch_time_t until = dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait_ms * NSEC_PER_MSEC);
+     long late = wait_ms > 0 && arch_harvest_wait(until);
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -547,6 +547,12 @@
+ check_t_pso_user_first: t_pso_user_first
+ 	DM_PSO_MTL4=0 MTL_DEBUG_LAYER=1 ./t_pso_user_first
+ 	DM_PSO_MTL4=1 MTL_DEBUG_LAYER=1 ./t_pso_user_first
++# DM_PSO_BINARY_ARCHIVE (engine-patches/0414): the MTLDevice path's pipeline archive across processes (quit, SIGTERM, background + SIGKILL), heat and memory, failed writes
++t_pso_binary_archive: t_pso_binary_archive.m $(MTL_T_DEP) ../../host/hle_lifecycle.c
++	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_binary_archive.m $(MTL_T_SRC) ../../host/hle_lifecycle.c $(FW)
++.PHONY: check_t_pso_binary_archive
++check_t_pso_binary_archive: t_pso_binary_archive
++	MTL_DEBUG_LAYER=1 ./t_pso_binary_archive
+ t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_skey.m -framework Foundation
+ t_view_swizzle: t_view_swizzle.m $(MTL_T_DEP)
+--- /dev/null
++++ b/dm/gfx/tests/t_pso_binary_archive.m
+@@ -0,0 +1,379 @@
++// engine-patches/0414: the MTLDevice path's pipeline archive (DM_PSO_BINARY_ARCHIVE), on this Mac's GPU with DM_PSO_MTL4=0 (the path iOS takes) and pipelines from a library compiled from
++// source at run time. Each scenario is a process of its own (this binary run again), as a session on the phone is. What it shows:
++//  - a session that ends by quitting (mtl_arch_save's end, atexit's), by SIGTERM's graceful exit (which ends with _exit), or by going to the background (dm_gfx_suspend(1)) and then
++//    SIGKILL (jetsam, or iOS ending a suspended app) writes the archive, and the NEXT process takes every render, compute and mesh pipeline from it (FailOnBinaryArchiveMiss), and builds
++//    one it never saw;
++//  - heat holds adds back instead of dropping them: none at Critical or with little memory, DVA_HOT_BATCH a tick at Serious, the rest once cool; at most DVA_PENDING_MAX wait;
++//  - a failed write does not turn the archive off: it goes on from its last written file (what was added since is lost, what was written is still found), off after DVA_FAIL_MAX;
++//  - a file made for another host build / chain / OS / GPU is dropped, an unreadable one started again, and the Metal 4 path (DM_PSO_MTL4=1) does not use it.
++#include "../nvn/nvn_mtl.m"
++#include <fcntl.h>
++#include <signal.h>
++#include <spawn.h>
++#include <sys/wait.h>
++#include <unistd.h>
++extern char **environ;
++
++uint64_t g_t0_ns;
++int dm_guest_as_contains(uintptr_t address) { (void)address; return 0; }
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++void hlecount_flush(void) {} void dm_rec_finish(void) {} void dm_cheats_exit(void) {} void dm_audio_suspend(int on) { (void)on; }   // what the graceful exit (hle_lifecycle.c) calls besides graphics
++int dm_teardown_is_guest_thread(void) { return 0; } void dm_teardown_park_self(void) {} void dm_vsync_stop_all(void) {} void dm_audio_stop_all(void) {}
++void dm_threads_park_all(void) {} void dm_guest_memory_release(int unmap_as) { (void)unmap_as; } void dm_modules_teardown(void) {}
++
++static int checks, failed;
++#define EXPECT(name, want, got) do { long long w_ = (long long)(want), g_ = (long long)(got); checks++; \
++    if (w_ != g_) { printf("FAIL %s: expected %lld, got %lld (line %d)\n", name, w_, g_, __LINE__); failed++; } } while (0)
++#define EXPECT_LOG(name, log, needle) do { checks++; if ([(log) rangeOfString:@needle].location == NSNotFound) { printf("FAIL %s: the log has no \"%s\"\n--- log\n%s\n---\n", name, needle, [(log) UTF8String]); failed++; } } while (0)
++#define EXPECT_NOLOG(name, log, needle) do { checks++; if ([(log) rangeOfString:@needle].location != NSNotFound) { printf("FAIL %s: the log has \"%s\"\n", name, needle); failed++; } } while (0)
++
++static int g_logfd; static off_t g_logmark;
++static NSString *log_since(void) {
++    off_t end = lseek(g_logfd, 0, SEEK_END); NSString *s = @"";
++    if (end > g_logmark) {
++        NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)(end - g_logmark)]; ssize_t n = pread(g_logfd, d.mutableBytes, d.length, g_logmark);
++        if (n > 0) s = [[NSString alloc] initWithBytes:d.bytes length:(NSUInteger)n encoding:NSUTF8StringEncoding] ?: @"";
++    }
++    g_logmark = end; return s;
++}
++static void show(NSString *log) { for (NSString *l in [log componentsSeparatedByString:@"\n"]) if ([l containsString:@"binary archive"]) printf("   %s\n", [l stringByReplacingOccurrencesOfString:@"[dm] [nvn-mtl] " withString:@""].UTF8String); }
++
++static id<MTLLibrary> g_lib;
++static const char *k_src =
++    "#include <metal_stdlib>\nusing namespace metal;\n"
++    "struct V { float4 p [[position]]; };\n"
++    "vertex V vs(uint vid [[vertex_id]]) { V o; o.p = float4(float(vid & 1), float(vid >> 1), 0, 1); return o; }\n"
++    "vertex void vs_tf(uint vid [[vertex_id]], device float *out [[buffer(0)]]) { out[vid] = float(vid); }\n"
++    "fragment float4 fs(V i [[stage_in]]) { return float4(i.p.x, 0.25, 0.5, 1); }\n"
++    "kernel void cs(device float *b [[buffer(0)]], uint i [[thread_position_in_grid]]) { b[i] = b[i] * 2 + 1; }\n"
++    "struct MV { float4 p [[position]]; };\n"
++    "using M = mesh<MV, void, 3, 1, topology::triangle>;\n"
++    "[[mesh]] void ms(M m, uint t [[thread_index_in_threadgroup]]) { if (t == 0) { m.set_primitive_count(1); for (int i = 0; i < 3; i++) { MV v; v.p = float4(i, 0, 0, 1); m.set_vertex(i, v); m.set_index(i, i); } } }\n"
++    "fragment float4 mfs(MV i [[stage_in]]) { return float4(1, 0, 1, 1); }\n";
++static const MTLPixelFormat k_fmt[] = {MTLPixelFormatBGRA8Unorm, MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA8Unorm, MTLPixelFormatR8Unorm, MTLPixelFormatRG8Unorm, MTLPixelFormatRGBA8Unorm_sRGB,
++    MTLPixelFormatBGRA8Unorm_sRGB, MTLPixelFormatR16Float, MTLPixelFormatRG16Float, MTLPixelFormatR32Float, MTLPixelFormatRG32Float, MTLPixelFormatRGBA32Float, MTLPixelFormatR16Unorm,
++    MTLPixelFormatRG16Unorm, MTLPixelFormatRGBA16Unorm, MTLPixelFormatRGB10A2Unorm, MTLPixelFormatRG11B10Float, MTLPixelFormatR8Snorm, MTLPixelFormatRG8Snorm, MTLPixelFormatRGBA8Snorm};
++enum { NFMT = sizeof k_fmt / sizeof k_fmt[0] };
++static MTLRenderPipelineDescriptor *rdesc(int v) {   // variant v: a colour format and a write mask; distinct pipelines for v < NFMT * 4
++    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
++    d.vertexFunction = [g_lib newFunctionWithName:@"vs"]; d.fragmentFunction = [g_lib newFunctionWithName:@"fs"];
++    d.colorAttachments[0].pixelFormat = k_fmt[v % NFMT]; d.colorAttachments[0].writeMask = (MTLColorWriteMask[]){MTLColorWriteMaskAll, MTLColorWriteMaskRed, MTLColorWriteMaskGreen | MTLColorWriteMaskBlue, MTLColorWriteMaskAlpha}[(v / NFMT) % 4];
++    return d;
++}
++static MTLRenderPipelineDescriptor *tfdesc(void) { MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; d.vertexFunction = [g_lib newFunctionWithName:@"vs_tf"]; d.rasterizationEnabled = NO; return d; }
++static MTLMeshRenderPipelineDescriptor *mdesc(void) {
++    MTLMeshRenderPipelineDescriptor *d = [MTLMeshRenderPipelineDescriptor new];
++    d.meshFunction = [g_lib newFunctionWithName:@"ms"]; d.fragmentFunction = [g_lib newFunctionWithName:@"mfs"]; d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
++    return d;
++}
++static int setup(const char *dir, int mtl4) {
++    setenv("DM_PSO_MTL4", mtl4 ? "1" : "0", 1); setenv("DM_PSO_BINARY_DIR", dir, 1); setenv("DM_PSO_ARCHIVE", "off", 1); unsetenv("DM_PSO_BINARY_ARCHIVE"); unsetenv("DM_SAVE");
++    char lp[1100]; snprintf(lp, sizeof lp, "%s/engine-%d.log", dir, (int)getpid());
++    g_logfd = open(lp, O_RDWR | O_CREAT | O_TRUNC, 0600);
++    if (g_logfd < 0 || dup2(g_logfd, 2) < 0) return 0;
++    mtl_init();
++    NSError *e = nil; g_lib = [g_dev newLibraryWithSource:@(k_src) options:nil error:&e];
++    if (!g_lib) { printf("library: %s\n", e.localizedDescription.UTF8String); return 0; }
++    return 1;
++}
++// The session's five pipelines, built through the device path: two render, the rasterization-off one, a compute and a mesh pipeline. Returns how many were made
++static int build_five(void) {
++    NSError *e = nil; int n = 0;
++    n += dev_rps(rdesc(0), &e) != nil; n += dev_rps(rdesc(1), &e) != nil; n += dev_rps(tfdesc(), &e) != nil;
++    n += dev_cps([g_lib newFunctionWithName:@"cs"], &e) != nil; n += dev_mps(mdesc(), &e) != nil;
++    return n;
++}
++static int finish(const char *what) { printf("t_pso_binary_archive %s: %d checks, %d failed\n", what, checks, failed); fflush(stdout); return failed != 0; }
++static NSString *apath(const char *dir) { return [@(dir) stringByAppendingPathComponent:[NSString stringWithFormat:@"pipelines-%s-%@.mtlarchive", DMSH_CHAIN,
++    ^NSString *{ NSMutableString *g = [NSMutableString string]; NSString *w = g_dev.architecture.name ?: g_dev.name; for (NSUInteger i = 0; i < w.length && g.length < 24; i++) { unichar c = [w characterAtIndex:i]; if (isalnum(c)) [g appendFormat:@"%C", c]; } return g; }()]]; }
++
++// ---- the sessions (child processes)
++static int s_write(const char *dir, const char *end) {   // a first session: builds the five pipelines, then ends as `end` says
++    if (!setup(dir, 0)) return 1;
++    EXPECT("write: the archive is on with DM_PSO_MTL4=0", 1, dva_on());
++    EXPECT_LOG("write: a new file", log_since(), "(new)");
++    EXPECT("write: five pipelines built", 5, build_five());
++    EXPECT("write: none from the archive", 0, atomic_load(&g_dva_hits)); EXPECT("write: five looked up and missed", 5, atomic_load(&g_dva_miss));
++    os_unfair_lock_lock(&g_dva_lk); unsigned pend = (unsigned)g_dva_pend.count; os_unfair_lock_unlock(&g_dva_lk);
++    EXPECT("write: five offered", 5, pend);
++    if (!strcmp(end, "quit")) {   // ⌘Q / exit(): atexit's mtl_arch_save path (called here as the graceful exit's dm_gfx_quit does)
++        mtl_arch_save(MTL_QUIT_ARCH_MS, 1);
++        NSString *log = log_since(); show(log);
++        EXPECT("quit: five added", 5, atomic_load(&g_dva_added)); EXPECT("quit: written once", 1, atomic_load(&g_dva_wr));
++        EXPECT_LOG("quit: the write's line", log, "pipeline binary archive: written, ");
++        EXPECT_LOG("quit: the end's line", log, "pipeline binary archive at exit: written in ");
++        EXPECT("quit: the file is there", 1, [NSFileManager.defaultManager fileExistsAtPath:apath(dir)]);
++        EXPECT("quit: its header is there", 1, [NSFileManager.defaultManager fileExistsAtPath:[apath(dir) stringByAppendingString:@".hdr"]]);
++        // in the same run the archive serves them at once
++        NSError *e = nil; uint64_t h0 = atomic_load(&g_dva_hits);
++        EXPECT("quit: a render pipeline again", 1, dev_rps(rdesc(0), &e) != nil); EXPECT("quit: from the archive", h0 + 1, atomic_load(&g_dva_hits));
++        return finish("write+quit");
++    }
++    if (!strcmp(end, "term")) {   // SIGTERM: the graceful exit (hle_lifecycle.c) ends with _exit(0), so atexit does not run: dm_gfx_quit_begin / dm_gfx_quit write it
++        void dm_term_install(void); dm_term_install();
++        int r = finish("write+SIGTERM (before the exit)"); if (r) _exit(1);
++        kill(getpid(), SIGTERM);
++        for (;;) pause();
++    }
++    if (!strcmp(end, "suspend-kill")) {   // the app goes to the background (dm_gfx_suspend(1), app patch 0030), then the process is killed without a word
++        dm_gfx_suspend(1);
++        EXPECT("suspend: the write it started is done within 10 s", 0, dispatch_group_wait(g_dva_saves, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)));
++        show(log_since());
++        EXPECT("suspend: written", 1, atomic_load(&g_dva_wr));
++        int r = finish("write+suspend (before SIGKILL)"); if (r) _exit(1);
++        kill(getpid(), SIGKILL);
++        for (;;) pause();
++    }
++    return 1;
++}
++static int s_read(const char *dir, int expect_hits) {   // the next session: the same five pipelines, and one it never built
++    if (!setup(dir, 0)) return 1;
++    EXPECT("read: the archive is on", 1, dva_on());
++    NSString *log = log_since(); show(log);
++    if (expect_hits) EXPECT_NOLOG("read: not a new file", log, "(new)");
++    EXPECT("read: five pipelines built", 5, build_five());
++    EXPECT("read: all five taken from the archive (render, rasterization off, compute, mesh)", expect_hits ? 5 : 0, atomic_load(&g_dva_hits));
++    EXPECT("read: none compiled", expect_hits ? 0 : 5, atomic_load(&g_dva_miss));
++    NSError *e = nil; EXPECT("read: one it never saw is built", 1, dev_rps(rdesc(2), &e) != nil);
++    EXPECT("read: and that one missed", expect_hits ? 1 : 6, atomic_load(&g_dva_miss));
++    mtl_arch_save(MTL_QUIT_ARCH_MS, 1);
++    return finish(expect_hits ? "read (hits)" : "read (a new archive)");
++}
++static int set_counts(unsigned *pend) { os_unfair_lock_lock(&g_dva_lk); *pend = (unsigned)g_dva_pend.count; os_unfair_lock_unlock(&g_dva_lk); return (int)atomic_load(&g_dva_added); }
++static int th_value = 0; static int th_hook(void) { return th_value; }
++static uint64_t mem_value = UINT64_MAX; static uint64_t mem_hook(void) { return mem_value; }
++static void tick(void) { dispatch_sync(g_dva_q, ^{ @autoreleasepool { dva_tick(); } }); }
++static int s_policy(const char *dir) {   // heat, memory, the waiting list's cap, failed writes
++    setenv("DM_PSO_ARCHIVE_COUNT", "100000", 1); setenv("DM_PSO_ARCHIVE_MB", "4096", 1);   // the waiting list's own cap, not the archive's (s_caps)
++    if (!setup(dir, 0)) return 1;
++    g_dva_manual = 1; g_dva_thermal = th_hook; g_dva_avail = mem_hook;
++    EXPECT("policy: on", 1, dva_on()); (void)log_since();
++    NSError *e = nil; unsigned pend = 0; int v = 0;
++    th_value = 3;   // Critical: nothing is added, nothing dropped
++    for (int i = 0; i < 3; i++) EXPECT("policy: built", 1, dev_rps(rdesc(v++), &e) != nil);
++    tick(); EXPECT("critical: none added", 0, set_counts(&pend)); EXPECT("critical: all three wait", 3, pend); EXPECT("critical: none dropped", 0, atomic_load(&g_dva_dropped));
++    EXPECT("critical: held back counted", 1, atomic_load(&g_dva_held) >= 1);
++    th_value = 2;   // Serious: DVA_HOT_BATCH a tick
++    for (int i = 0; i < 17; i++) EXPECT("policy: built", 1, dev_rps(rdesc(v++), &e) != nil);
++    tick(); EXPECT("serious: DVA_HOT_BATCH added", DVA_HOT_BATCH, set_counts(&pend)); EXPECT("serious: the rest waits", 20 - DVA_HOT_BATCH, pend);
++    tick(); EXPECT("serious: DVA_HOT_BATCH more at the next tick", 2 * DVA_HOT_BATCH, set_counts(&pend));
++    th_value = 0; mem_value = 100ull << 20;   // cool, but little memory: none added
++    tick(); EXPECT("low memory: none added", 2 * DVA_HOT_BATCH, set_counts(&pend)); EXPECT("low memory: they wait", 20 - 2 * DVA_HOT_BATCH, pend);
++    mem_value = UINT64_MAX;
++    tick(); EXPECT("nominal: everything added", 20, set_counts(&pend)); EXPECT("nominal: nothing waits", 0, pend); EXPECT("policy: nothing dropped for heat", 0, atomic_load(&g_dva_dropped));
++    // the cap of the waiting list: DVA_PENDING_MAX wait, the others are dropped (they come again at a later start)
++    for (int i = 0; i < DVA_PENDING_MAX + 40; i++) dva_offer(0, rdesc(i % (NFMT * 4)));
++    set_counts(&pend); EXPECT("cap: DVA_PENDING_MAX wait", DVA_PENDING_MAX, pend); EXPECT("cap: the others dropped", 40, atomic_load(&g_dva_dropped));
++    os_unfair_lock_lock(&g_dva_lk); [g_dva_pend removeAllObjects]; os_unfair_lock_unlock(&g_dva_lk);
++    // a written file, then a write that fails: the archive goes on from that file
++    dispatch_sync(g_dva_q, ^{ dva_write(1); });
++    EXPECT("fail: the first write", 1, atomic_load(&g_dva_wr)); uint64_t size1 = dva_file_size(g_dva_path);
++    EXPECT("fail: a pipeline built after it", 1, dev_rps(rdesc(40), &e) != nil); tick(); EXPECT("fail: and added", 21, set_counts(&pend));
++    (void)log_since(); g_dva_fail_next = 1;
++    dispatch_sync(g_dva_q, ^{ dva_write(1); });
++    NSString *log = log_since(); show(log);
++    EXPECT_LOG("fail: the line", log, "[RED] pipeline binary archive: the write failed (a test's failed write); it goes on from its last written file");
++    set_counts(&pend); EXPECT("fail (M3): the pipeline added since is queued again", 1, pend);
++    EXPECT_LOG("fail (M3): said", log, "the 1 pipelines added since are queued to be added again");
++    EXPECT("fail (M3): the run is counted in .fail", 1, [[NSString stringWithContentsOfFile:dva_fail_path() encoding:NSUTF8StringEncoding error:nil] intValue]);
++    EXPECT("fail (M3): the count is the file's again", 20, atomic_load(&g_dva_count));
++    EXPECT("fail: still on", 1, g_dva_state); EXPECT("fail: the file is the last one written", size1, dva_file_size(g_dva_path));
++    uint64_t h0 = atomic_load(&g_dva_hits), m0 = atomic_load(&g_dva_miss);
++    EXPECT("fail: a pipeline written before is still taken from it", 1, dev_rps(rdesc(5), &e) != nil); EXPECT("fail: a hit", h0 + 1, atomic_load(&g_dva_hits));
++    EXPECT("fail: the one added since is not in the archive, built again", 1, dev_rps(rdesc(40), &e) != nil); EXPECT("fail: a miss", m0 + 1, atomic_load(&g_dva_miss));
++    tick(); h0 = atomic_load(&g_dva_hits);
++    EXPECT("fail (M3): once added again it is taken from the archive", 1, dva_lookup(0, rdesc(40)) != nil); EXPECT("fail (M3): a hit", h0 + 1, atomic_load(&g_dva_hits));
++    // M1: a lookup waits for an add that holds the lock (up to DVA_LOOKUP_WAIT_US), misses at once during a write, and gives up when the add outlasts the wait
++    {
++        dispatch_semaphore_t held = dispatch_semaphore_create(0); uint64_t w0 = atomic_load(&g_dva_waited), b0 = atomic_load(&g_dva_busy);
++        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ pthread_rwlock_wrlock(&g_dva_rw); dispatch_semaphore_signal(held); usleep(10000); pthread_rwlock_unlock(&g_dva_rw); });
++        dispatch_semaphore_wait(held, DISPATCH_TIME_FOREVER);
++        EXPECT("M1: a lookup during a 10 ms add waits and finds it", 1, dva_lookup(0, rdesc(5)) != nil); EXPECT("M1: counted as waited", w0 + 1, atomic_load(&g_dva_waited));
++        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ pthread_rwlock_wrlock(&g_dva_rw); dispatch_semaphore_signal(held); usleep(200000); pthread_rwlock_unlock(&g_dva_rw); });
++        dispatch_semaphore_wait(held, DISPATCH_TIME_FOREVER);
++        uint64_t t0 = bp_now(); id r = dva_lookup(0, rdesc(5)); double ms = (bp_now() - t0) / 1e6;
++        EXPECT("M1: an add longer than the wait: a miss", 1, r == nil); EXPECT("M1: after about DVA_LOOKUP_WAIT_US", 1, ms >= DVA_LOOKUP_WAIT_US / 1000 - 1 && ms < 150);
++        usleep(250000);
++        atomic_store(&g_dva_writing, 1); t0 = bp_now(); r = dva_lookup(0, rdesc(5)); ms = (bp_now() - t0) / 1e6; atomic_store(&g_dva_writing, 0);
++        EXPECT("M1: during a write a lookup misses at once", 1, r == nil && ms < 5); EXPECT("M1: both counted as busy", b0 + 2, atomic_load(&g_dva_busy));
++    }
++    tick();
++    for (int k = 2; k <= DVA_FAIL_MAX; k++) { EXPECT("fail: built", 1, dev_rps(rdesc(40 + k), &e) != nil); tick(); g_dva_fail_next = 1; dispatch_sync(g_dva_q, ^{ dva_write(1); }); }
++    log = log_since(); show(log);
++    EXPECT("fail: off after DVA_FAIL_MAX failed writes", 2, g_dva_state);
++    EXPECT_LOG("fail: the off line", log, "[RED] pipeline binary archive: off for this run (a test's failed write)");
++    EXPECT("fail: drawing goes on without it", 1, dev_rps(rdesc(60), &e) != nil);
++    return finish("policy");
++}
++static int s_caps(const char *dir, int count, int expect_open) {   // H1: the pipeline count cap (DM_PSO_ARCHIVE_COUNT): never past it; a file past it is deleted unopened
++    char c[16]; snprintf(c, sizeof c, "%d", count); setenv("DM_PSO_ARCHIVE_COUNT", c, 1);
++    if (!setup(dir, 0)) return 1;
++    EXPECT("caps: on", 1, dva_on()); NSString *log = log_since(); show(log);
++    if (expect_open == 2) {   // a file of 3 pipelines, a cap of 2: deleted unopened, a new archive
++        EXPECT_LOG("caps: the file past the cap is deleted unopened", log, "past the caps");
++        EXPECT_LOG("caps: then a new one", log, "(new)");
++        return finish("count cap below the file");
++    }
++    EXPECT("caps: five built", 5, build_five());
++    EXPECT("caps: hits", expect_open ? 3 : 0, atomic_load(&g_dva_hits));
++    mtl_arch_save(MTL_QUIT_ARCH_MS, 1); log = log_since(); show(log);
++    EXPECT("caps: never more than the cap in the archive", count, atomic_load(&g_dva_count));
++    NSString *h = [NSString stringWithContentsOfFile:g_dva_hdr_path encoding:NSUTF8StringEncoding error:nil];
++    NSString *want = [NSString stringWithFormat:@"pipelines=%d\n", count]; EXPECT("caps: the .hdr keeps the count", 1, [h containsString:want]);
++    if (!expect_open) EXPECT("caps: the two past the cap were not offered", 2, atomic_load(&g_dva_dropped));
++    // the size cap: a written file at its cap leaves no room (dva_fits)
++    os_unfair_lock_lock(&g_dva_lk); uint64_t cap0 = g_dva_cap; g_dva_cap = atomic_load(&g_dva_size); g_dva_count_cap = 100000; int fits = dva_fits(); g_dva_cap = cap0; os_unfair_lock_unlock(&g_dva_lk);
++    EXPECT("caps: a file at the size cap takes nothing more", 0, fits);
++    return finish(expect_open ? "count cap, reopened" : "count cap");
++}
++static int g_av_calls; static uint64_t av_drop_hook(void) { return g_av_calls++ ? 700ull << 20 : 1000ull << 20; }   // 1000 MB before the open, 700 MB after
++static int s_guard(const char *dir) {   // H1: an open that costs more than DM_PSO_ARCHIVE_GUARD_MB turns the archive off and deletes the file
++    if (!setup(dir, 0)) return 1;
++    g_dva_avail = av_drop_hook;
++    EXPECT("guard: off", 0, dva_on()); NSString *log = log_since(); show(log);
++    EXPECT_LOG("guard: the open is measured", log, "available memory 1000 MB before, 700 MB after");
++    EXPECT_LOG("guard: and turned off", log, "opening it took 300 MB of available memory, over DM_PSO_ARCHIVE_GUARD_MB 150: the file is deleted");
++    EXPECT("guard: the file is deleted", 0, [NSFileManager.defaultManager fileExistsAtPath:apath(dir)]);
++    NSError *e = nil; EXPECT("guard: drawing goes on", 1, dev_rps(rdesc(0), &e) != nil);
++    return finish("memory guard at the open");
++}
++static int g_bg_begins, g_bg_ends; static NSUInteger g_bg_last; static uint64_t g_bg_wr_at_begin;
++static NSUInteger bg_begin_hook(void) { g_bg_begins++; g_bg_wr_at_begin = atomic_load(&g_dva_wr); return 77; }
++static void bg_end_hook(NSUInteger t) { g_bg_ends++; g_bg_last = t; }
++static int s_background(const char *dir) {   // M2: going to the background: a background task, what is added is written first, then the waiting ones added and written
++    if (!setup(dir, 0)) return 1;
++    g_dva_manual = 1; g_dva_bg_begin = bg_begin_hook; g_dva_bg_end = bg_end_hook;
++    EXPECT("bg: on", 1, dva_on()); NSError *e = nil; unsigned pend = 0;
++    for (int i = 0; i < 2; i++) EXPECT("bg: built", 1, dev_rps(rdesc(i), &e) != nil);
++    tick(); EXPECT("bg: two added", 2, set_counts(&pend));
++    for (int i = 2; i < 5; i++) EXPECT("bg: built", 1, dev_rps(rdesc(i), &e) != nil);
++    set_counts(&pend); EXPECT("bg: three wait", 3, pend); (void)log_since();
++    mtl_arch_save(0, 0);   // dm_gfx_suspend(1)'s call
++    EXPECT("bg: the save is done", 0, dispatch_group_wait(g_dva_saves, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)));
++    show(log_since());
++    EXPECT("bg: one background task begun", 1, g_bg_begins); EXPECT("bg: and ended, the same", 1, g_bg_ends == 1 && g_bg_last == 77);
++    EXPECT("bg: two writes: what was added first, then the rest", 2, atomic_load(&g_dva_wr)); EXPECT("bg: all five in it", 5, atomic_load(&g_dva_count));
++    set_counts(&pend); EXPECT("bg: nothing waits", 0, pend);
++    return finish("background save");
++}
++static int s_failrun(const char *dir, int expect_fresh) {   // M3: runs that end on a failed write are counted; after DVA_FAIL_SESSIONS the next start begins empty
++    if (!setup(dir, 0)) return 1;
++    g_dva_manual = 1;
++    EXPECT("failrun: on", 1, dva_on()); NSString *log = log_since(); show(log);
++    if (expect_fresh) { EXPECT_LOG("failrun: started again empty", log, "runs ended on a failed write of"); EXPECT_LOG("failrun: new", log, "(new)"); return finish("after runs ending on failed writes"); }
++    NSError *e = nil; unsigned pend = 0; EXPECT("failrun: five built", 5, build_five()); tick(); set_counts(&pend);
++    if (!atomic_load(&g_dva_wr) && ![NSFileManager.defaultManager fileExistsAtPath:g_dva_path]) dispatch_sync(g_dva_q, ^{ dva_write(1); });   // a good file first
++    EXPECT("failrun: one more", 1, dev_rps(rdesc(9), &e) != nil); tick();
++    g_dva_fail_next = 1; dispatch_sync(g_dva_q, ^{ dva_write(1); }); show(log_since());
++    int runs = [[NSString stringWithContentsOfFile:dva_fail_path() encoding:NSUTF8StringEncoding error:nil] intValue];
++    printf("failrun: .fail says %d\n", runs);
++    int r = finish("a run ending on a failed write"); _exit(r);   // ends without a good write (jetsam-like)
++}
++static int s_mtl4(const char *dir) {
++    if (!setup(dir, 1)) return 1;
++    NSError *e = nil; EXPECT("Metal 4 path: built", 1, dev_rps(rdesc(0), &e) != nil);
++    EXPECT("Metal 4 path: the device archive is off", 0, dva_on()); EXPECT("Metal 4 path: nothing looked up", 0, atomic_load(&g_dva_miss) + atomic_load(&g_dva_hits));
++    mtl_arch_save(1000, 1);
++    EXPECT("Metal 4 path: no file", 0, [NSFileManager.defaultManager fileExistsAtPath:apath(dir)]);
++    return finish("Metal 4 path");
++}
++static int s_off(const char *dir) {
++    setenv("DM_PSO_BINARY_ARCHIVE", "0", 1);
++    if (!setup(dir, 0)) return 1;
++    setenv("DM_PSO_BINARY_ARCHIVE", "0", 1);
++    NSError *e = nil; EXPECT("off: built", 1, dev_rps(rdesc(0), &e) != nil); EXPECT("off: not used", 0, dva_on());
++    EXPECT_LOG("off: said", log_since(), "pipeline binary archive (DM_PSO_BINARY_ARCHIVE): off");
++    return finish("DM_PSO_BINARY_ARCHIVE=0");
++}
++// L2 (review): g_dva_state is published after the queue, the waiting list and the archive; a thread that reads 1 must see them. Eight threads start the archive at once; each one that gets 1
++// back checks what 1 promises (acquire / release), the type is asserted at compile time
++_Static_assert(__builtin_types_compatible_p(__typeof__(g_dva_state), _Atomic int), "g_dva_state must stay _Atomic (engine-patches/0414, review L2)");
++static _Atomic int g_race_ready, g_race_go, g_race_on, g_race_torn;
++static void *race_thread(void *p) {
++    (void)p; atomic_fetch_add(&g_race_ready, 1); while (!atomic_load(&g_race_go)) {}   // macOS has no pthread_barrier: a spin start
++    if (dva_on()) {
++        atomic_fetch_add(&g_race_on, 1);
++        if (!g_dva_q || !g_dva_pend || !g_dva_since || !g_dva_saves || !g_dva_ar || !g_dva_path || !g_dva_hdr_path || !g_dva_hdr || !g_dva_cap) atomic_fetch_add(&g_race_torn, 1);
++    }
++    return NULL;
++}
++static int s_race(const char *dir) {
++    if (!setup(dir, 0)) return 1;
++    enum { N = 8 }; pthread_t th[N];
++    for (int i = 0; i < N; i++) pthread_create(&th[i], NULL, race_thread, NULL);
++    while (atomic_load(&g_race_ready) < N) usleep(100);
++    atomic_store(&g_race_go, 1);
++    for (int i = 0; i < N; i++) pthread_join(th[i], NULL);
++    EXPECT("race: every thread got the archive", N, atomic_load(&g_race_on)); EXPECT("race: none saw the state before its objects", 0, atomic_load(&g_race_torn));
++    EXPECT("race: state 1", 1, DVA_ST()); EXPECT("race: opened once", 1, (int)[log_since() componentsSeparatedByString:@"pipeline binary archive (engine-patches/0414)"].count - 1);
++    return finish("the init race (L2)");
++}
++static int s_dropped(const char *dir, const char *needle) {   // a file the start must not use
++    if (!setup(dir, 0)) return 1;
++    EXPECT("drop: on", 1, dva_on()); NSString *log = log_since(); show(log);
++    checks++; if ([log rangeOfString:@(needle)].location == NSNotFound) { failed++; printf("FAIL drop: no \"%s\" in the log\n", needle); }
++    EXPECT("drop: pipelines built all the same", 5, build_five()); EXPECT("drop: none taken from it", 0, atomic_load(&g_dva_hits));
++    return finish("a file not for this host");
++}
++
++static int run(const char *exe, const char *const *args) {   // a session; 0 when it passed
++    char *argv[8] = {(char *)exe}; int n = 1; for (; args[n - 1] && n < 7; n++) argv[n] = (char *)args[n - 1]; argv[n] = NULL;
++    pid_t pid; if (posix_spawn(&pid, exe, NULL, NULL, argv, environ)) return -1;
++    int st = 0; waitpid(pid, &st, 0);
++    return st;
++}
++int main(int argc, char **argv) { @autoreleasepool {
++    setvbuf(stdout, NULL, _IOLBF, 0); alarm(300);
++    if (argc >= 3 && !strcmp(argv[1], "--write")) return s_write(argv[2], argc > 3 ? argv[3] : "quit");
++    if (argc == 3 && !strcmp(argv[1], "--read")) return s_read(argv[2], 1);
++    if (argc == 3 && !strcmp(argv[1], "--read-new")) return s_read(argv[2], 0);
++    if (argc == 3 && !strcmp(argv[1], "--policy")) return s_policy(argv[2]);
++    if (argc == 5 && !strcmp(argv[1], "--caps")) return s_caps(argv[2], atoi(argv[3]), atoi(argv[4]));
++    if (argc == 3 && !strcmp(argv[1], "--guard")) return s_guard(argv[2]);
++    if (argc == 3 && !strcmp(argv[1], "--background")) return s_background(argv[2]);
++    if (argc == 4 && !strcmp(argv[1], "--failrun")) return s_failrun(argv[2], atoi(argv[3]));
++    if (argc == 3 && !strcmp(argv[1], "--mtl4")) return s_mtl4(argv[2]);
++    if (argc == 3 && !strcmp(argv[1], "--off")) return s_off(argv[2]);
++    if (argc == 3 && !strcmp(argv[1], "--race")) return s_race(argv[2]);
++    if (argc == 4 && !strcmp(argv[1], "--dropped")) return s_dropped(argv[2], argv[3]);
++    char tmpl[1024]; snprintf(tmpl, sizeof tmpl, "%s/t_pso_binary_archive.XXXXXX", NSTemporaryDirectory().fileSystemRepresentation);
++    if (!mkdtemp(tmpl)) { perror("mkdtemp"); return 1; }
++    NSString *root = @(tmpl); NSFileManager *fm = NSFileManager.defaultManager; int bad = 0, runs = 0;
++    NSString *(^dir)(NSString *) = ^NSString *(NSString *n) { NSString *d = [root stringByAppendingPathComponent:n]; [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]; return d; };
++    #define RUN(want_exit0, ...) do { const char *a_[] = {__VA_ARGS__, NULL}; int st_ = run(argv[0], a_); runs++; \
++        int ok_ = want_exit0 ? (WIFEXITED(st_) && !WEXITSTATUS(st_)) : (WIFSIGNALED(st_) && WTERMSIG(st_) == SIGKILL); \
++        if (!ok_) { bad++; printf("FAIL session %s %s: status 0x%x\n", a_[0], a_[2] ? a_[2] : "", st_); } } while (0)
++    NSString *d1 = dir(@"quit"), *d2 = dir(@"term"), *d3 = dir(@"suspend"), *d4 = dir(@"policy"), *d5 = dir(@"mtl4"), *d6 = dir(@"off");
++    RUN(1, "--write", d1.UTF8String, "quit"); RUN(1, "--read", d1.UTF8String);                 // quit, then the next start takes them
++    RUN(1, "--write", d2.UTF8String, "term"); RUN(1, "--read", d2.UTF8String);                 // SIGTERM's graceful exit (_exit), then the next start
++    RUN(0, "--write", d3.UTF8String, "suspend-kill"); RUN(1, "--read", d3.UTF8String);         // background, then killed: the next start
++    // a header that names another host build: dropped, and the start makes a new one; an unreadable file with the right header: started again
++    NSString *hdr = nil; for (NSString *f in [fm contentsOfDirectoryAtPath:d1 error:nil]) if ([f hasSuffix:@".mtlarchive.hdr"]) hdr = [d1 stringByAppendingPathComponent:f];
++    EXPECT("orchestrator: the quit session left a header", 1, hdr != nil);
++    if (hdr) {
++        NSString *h = [NSString stringWithContentsOfFile:hdr encoding:NSUTF8StringEncoding error:nil];
++        [[h stringByReplacingOccurrencesOfString:@"host=" withString:@"host=another "] writeToFile:hdr atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        RUN(1, "--dropped", d1.UTF8String, "was made for another host build, shader chain, OS build or GPU: dropped");
++        NSString *arch = [hdr substringToIndex:hdr.length - 4];
++        [[NSData dataWithBytes:"not an archive, not an archive, not an archive" length:46] writeToFile:arch atomically:YES];
++        [h writeToFile:hdr atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        RUN(1, "--dropped", d1.UTF8String, "cannot be opened");
++    }
++    RUN(1, "--policy", d4.UTF8String);
++    NSString *d7 = dir(@"caps"), *d8 = dir(@"guard"), *d9 = dir(@"bg"), *d10 = dir(@"failrun");
++    RUN(1, "--caps", d7.UTF8String, "3", "0"); RUN(1, "--caps", d7.UTF8String, "3", "1"); RUN(1, "--caps", d7.UTF8String, "2", "2");   // H1: the count cap
++    RUN(1, "--write", d8.UTF8String, "quit"); RUN(1, "--guard", d8.UTF8String);                                                         // H1: the memory guard
++    RUN(1, "--background", d9.UTF8String);                                                                                               // M2
++    RUN(1, "--write", d10.UTF8String, "quit"); RUN(1, "--failrun", d10.UTF8String, "0"); RUN(1, "--failrun", d10.UTF8String, "0");        // M3: two runs end on failed writes,
++    RUN(1, "--failrun", d10.UTF8String, "1");                                                                                            //     the third starts empty
++    RUN(1, "--mtl4", d5.UTF8String);
++    RUN(1, "--off", d6.UTF8String);
++    RUN(1, "--race", dir(@"race").UTF8String);   // L2: the init race
++    [fm removeItemAtPath:root error:nil];
++    printf("t_pso_binary_archive: %d sessions, %d failed; orchestrator %d checks, %d failed\n", runs, bad, checks, failed);
++    return bad || failed;
++} }

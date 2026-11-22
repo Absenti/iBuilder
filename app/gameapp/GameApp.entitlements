@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- gameapp/GameApp.entitlements: the app's entitlements, applied to BOTH build shapes (gameapp/build_gameapp.sh).
+     (No double hyphen may appear inside this comment: the SDK's parser and plistlib refuse it. docs/DECISIONS.md trap 14.)
+
+     com.apple.developer.kernel.increased-memory-limit raises this process's per-process memory ceiling. The
+     rewrite peaks near 3.5 GiB resident in one process (docs/GAME-APP.md section 4), and jetsam is what decides
+     whether that survives on hardware, so the app asks for the raised limit.
+
+     WHERE IT HAS TO BE FOR IT TO TAKE EFFECT: the entitlement must be in the app's OWN signature (this file,
+     embedded at signing time) AND the provisioning profile the installer signs with must also carry it. iOS
+     honours the entitlement only when both agree. With a free Apple ID signed through SideStore or AltStore the
+     profile is a personal development profile and may not carry it at all, in which case the app runs with the
+     ordinary limit and this key changes nothing. The ONLY proof it was applied is os_proc_available_memory():
+     it rises on the same device, or the entitlement did not take. The app prints that number at launch and
+     around every heavy step (docs/PROFILE-DERIVED.md).
+
+     com.apple.developer.kernel.extended-virtual-addressing gives the process a much larger ADDRESS SPACE (not more
+     RAM). At a 3364 MiB ceiling the census before the dlopen found 0.25 GB of free addresses and the guest block had
+     to be squeezed (docs/STATE-GAMEAPP.md section 4); a Switch game reserves a large guest range. Same rule as above:
+     the installer's profile must carry it too, which a developer account's App ID with the capability does.
+
+     No secret, key or certificate lives here: entitlements are a plist, and the signing identity is the
+     installer's, read from the Keychain at run time (gameapp/gameapp_shim.c). -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>

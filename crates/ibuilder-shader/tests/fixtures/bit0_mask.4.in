@@ -1,0 +1,11 @@
+using namespace metal;
+struct main0_out
+{
+    float4 gl_Position [[position]];
+};
+
+void f()
+{
+    float4 _6 = float4(1.0, 2.0  , 3.0, 4.0);
+    uint _22 = (a ? b : c) & 1;
+  uint _27 = uint(

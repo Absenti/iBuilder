@@ -1,0 +1,13 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct main0_in
+{
+    float4 m_1 [[user(locn1)]];
+    float4 m_4 [[user(locn4)]];
+    float4 dm_pv3_0 [[user(locn73)]];
+  

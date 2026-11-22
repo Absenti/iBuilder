@@ -1,0 +1,38 @@
+[package]
+name = "ibuilder-shadersplit"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Rust port of the engine's gfx/tools/shader_split.py (+ shader_device.split, JobMemo): the game's shaders to pkg/*.bin and tables/*.tsv, byte-identical"
+
+[dependencies]
+ibuilder-nso = { path = "../ibuilder-nso" }
+# only `sys::qos::lower_worker_qos` (the split workers run at utility QoS on Apple targets)
+ibuilder-pipeline = { path = "../ibuilder-pipeline" }
+# only the Mac CLI (src/bin/shadersplit.rs) uses it: its global allocator, so that its memory numbers are the chain's (docs/chain/MEMORY-RUST.md)
+ibuilder-alloc = { path = "../ibuilder-alloc" }
+sha2 = { workspace = true }
+lz4_flex = { workspace = true }
+memchr = "2"
+serde_json = "1"
+# inflate / gzip, pure Rust backend (miniz_oxide): builds for aarch64-apple-ios
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# pure-Rust zstd decoder (dictionaries included): the default `Zstd` implementation
+ruzstd = { version = "0.8", default-features = false, features = ["std", "hash"] }
+# raw LZMA1 for Unity bundles
+lzma-rs = "0.3"
+# CRC-32 of zip members (the crate flate2 already uses)
+crc32fast = "1"
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+# the examples (memprofile): the allocation profiler
+ibuilder-alloc = { path = "../ibuilder-alloc", features = ["profile"] }
+
+[features]
+# measuring only (docs/chain/MEMORY-RUST.md): the `shadersplit` binary runs with the plain system allocator instead of `ibuilder-alloc`'s
+system-alloc = []
+
+[[bin]]
+name = "shadersplit"
+path = "src/bin/shadersplit.rs"

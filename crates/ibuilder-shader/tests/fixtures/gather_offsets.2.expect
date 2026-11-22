@@ -1,0 +1,38 @@
+OK
+{}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+template<typename T> static inline __attribute__((always_inline)) vec<T, 4> dm_gather4(T a, T b, T c, T d) { return vec<T, 4>(a, b, c, d); }
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+};
+constant spvUnsafeArray<int2, 4> _20 = spvUnsafeArray<int2, 4>({ int2(2, 2), int2(1, 1), int2(6, 1), int2(0, 2) });
+kernel void main0()
+{
+    float4 _30 = dm_gather4(d.t0.gather(spvDescriptorSet0.s0, in.uv, int2(2, 2), 1).w, d.t0.gather(spvDescriptorSet0.s0, in.uv, int2(1, 1), 1).w, d.t0.gather(spvDescriptorSet0.s0, in.uv, int2(6, 1), 1).w, d.t0.gather(spvDescriptorSet0.s0, in.uv, int2(0, 2), 1).w);
+}

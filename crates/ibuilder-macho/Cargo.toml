@@ -1,0 +1,34 @@
+[package]
+name = "ibuilder-macho"
+description = "Linker-less Mach-O framework assembler: Rust port of iOSBuilder's assemble.py / macho_write.py / fix_tlv.py / gen_embed.py"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# No third-party runtime dependencies: std only (positioned I/O through std::os::unix::fs::FileExt,
+# which iOS has). sha2 + ibuilder-testkit are used by the tests only.
+[dependencies]
+
+[dev-dependencies]
+sha2 = { workspace = true }
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+
+[lib]
+name = "ibuilder_macho"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ibuilder-assemble"
+path = "src/bin/ibuilder-assemble.rs"
+
+[[bin]]
+name = "ibuilder-macho-write"
+path = "src/bin/ibuilder-macho-write.rs"
+
+[[bin]]
+name = "ibuilder-fix-tlv"
+path = "src/bin/ibuilder-fix-tlv.rs"
+
+[[bin]]
+name = "ibuilder-gen-embed"
+path = "src/bin/ibuilder-gen-embed.rs"

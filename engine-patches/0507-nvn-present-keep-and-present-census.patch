@@ -1,0 +1,198 @@
+# (after 0506) nvn/present: a texture the game presents keeps its stores; every present classified (drawn / not written / never
+# written / Metal texture replaced) and counted
+#
+# Why: South Park: The Fractured But Whole (01008F2005154000) on an iPhone 15 Pro (A17 Pro): during loading the previous picture stays, then the screen alternates image /
+#   black for about 2 s (owner, 2026-11-21). The device log has loading frames presented with @draws=0 in which 4 loaded 1280x720 RGBA8 attachments (the window textures'
+#   size and format) were stored DontCare (@unwritten_dc_mb=14.06). On the console a texture is its memory, so presenting without drawing shows the old picture. Here a pass
+#   that loads an attachment and writes nothing stores DontCare (udc_on, DM_NVN_UNWRITTEN_DC), which Metal defines as undefined contents; the engine checked that rule on
+#   an A19 Pro and Macs, not on an A17 Pro.
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m, hle_nvn.c; a test):
+#   * sd_finish: a colour attachment whose texture the game has presented (the last 4 presented textures, by serial) keeps MTLStoreActionStore when it was loaded and not
+#     written. Every other attachment follows the DontCare rule as before, and the mandatory image-only rule is untouched. Cost: one window-texture store per such pass.
+#     DM_NVN_PRESENT_KEEP=0 restores the old behaviour.
+#   * ps_note_present (present_enqueue, submit thread). Each present is classified:
+#     - drawn, cleared or copied into since its previous present;
+#     - not written since (the console shows its old bytes);
+#     - never written since the host made it (the host shows zeros, the console its storage);
+#     - shown through another Metal texture than last time (content lost: "[RED] ... what was drawn into it before is gone").
+#     First cases and powers of two are logged, with a "presented textures up to present N" summary per window texture every 300 presents. That summary gives presents,
+#     drawn, not written, never written, replaced, in frames with no draw, and stores kept.
+#     mtl_present_unwritten() feeds the slow-frame row @pres_unwritten (weak reference in hle_nvn.c).
+#   * Writes counted: draws and clears into a colour attachment, OP_COPY_B2T / OP_COPY_T2T / OP_CLEAR_TEX into it. NOT counted: compute image stores, so a window texture
+#     written by a compute shader shows as "not written".
+# DEFAULT: keep on, census always on (a 4-entry table per pass end and per present).
+# What a device log then tells:
+#   - "not written" presents in frames with no draw and no more black: the DontCare loss was it (the keep is the fix);
+#   - "replaced" / "never written" lines at the flashes: the host lost the texture, not the store (a sharing-table / texture lifetime problem; DM_NVN_PRESENT_KEEP does not cure that);
+#   - every present "drawn" while black frames are seen: the game's own draws come out black (draws skipped: draft 0506's counts; or inputs read as dummies).
+# Shader chain: not touched (b24b25240cad).
+# Test: dm/gfx/tests/t_present_keep (10 checks with the keep on and 10 with DM_NVN_PRESENT_KEEP=0; make check_t_present_keep). Rebuilt with 0506 + 0507 on an M1 Pro:
+#   t_dead_targets 197/0, t_nvn 506/0, t_addr_known 14/0, t_pool_chunks 178/0, t_vbuf_clamp 15/0 + 13/0. NOT run on a device; no host dylib built.
+
+# Rebased 2026-11-22 onto the new 0506 (upstream c96c45e9 + 79555b67 + the pool-end fallback): context only, same behaviour.
+
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -2832,7 +2832,8 @@
+             trow(f, "@call_ms", (t0 - g_t0_ns) / 1e6);
+         }
+         trow(f, "@passes", (double)(ps - prev_pass)); trow(f, "@draws", (double)(dr - prev_draw));
+-        { extern uint64_t mtl_vbuf_skips(void) __attribute__((weak_import)); static uint64_t pvs; uint64_t vs = mtl_vbuf_skips ? mtl_vbuf_skips() : 0; trow(f, "@vbuf_skips", (double)(vs - pvs)); pvs = vs; }   // draws skipped for a vertex stream in no pool (nvn_mtl.m vbuf_skip_note)
++        { extern uint64_t mtl_vbuf_skips(void) __attribute__((weak_import)); static uint64_t pvs; uint64_t vs = mtl_vbuf_skips ? mtl_vbuf_skips() : 0; trow(f, "@vbuf_skips", (double)(vs - pvs)); pvs = vs; }
++        { extern uint64_t mtl_present_unwritten(void) __attribute__((weak_import)); static uint64_t ppu; uint64_t pu = mtl_present_unwritten ? mtl_present_unwritten() : 0; trow(f, "@pres_unwritten", (double)(pu - ppu)); ppu = pu; }   // presents of a texture not written since its previous one (nvn_mtl.m ps_note_present)   // draws skipped for a vertex stream in no pool (nvn_mtl.m vbuf_skip_note)
+         static uint64_t pl, pst, pf, pudc; uint64_t l, st, fu; mtl_bw(&l, &st, &fu);
+         trow(f, "@rt_load_mb", (l - pl) / 1048576.0); trow(f, "@rt_store_mb", (st - pst) / 1048576.0); trow(f, "@pass_full_rw", (double)(fu - pf));
+         uint64_t udc = mtl_udc_saved_bytes(); trow(f, "@unwritten_dc_mb", (udc - pudc) / 1048576.0);
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -6644,6 +6644,49 @@
+ }
+ 
+ static uint64_t g_sd_dead_bytes, g_sd_n_dead, g_sd_n_all;
++// ---------- Presented textures: what the screen gets when a frame drew nothing into them (draft for South Park: The Fractured But Whole, 01008F2005154000) ----------
++// On the console a texture is its memory: a window texture the game presents again without drawing into it shows what it held, so a loading screen that presents with no
++// draws keeps the last picture on screen. Here a pass that loads an attachment and writes nothing into it stores DontCare (udc_on, DM_NVN_UNWRITTEN_DC), whose contents Metal
++// leaves undefined; on the iPhone 15 Pro (A17 Pro, not among the GPUs that rule was checked on) South Park's loading frames presented 0 draws with 14 MB of such stores and the
++// owner saw the picture alternate image / black. A texture the game has presented keeps its store (DM_NVN_PRESENT_KEEP=0: as before): one store of a window texture per pass.
++// Each present is also classified, per presented texture: drawn or cleared or copied into since its previous present, not written since (the console shows its old bytes), never
++// written since the host made it (the console shows its storage; here it is zeros), or shown through another Metal texture than last time (what was drawn before is gone).
++// Logged: the first cases of each, then at powers of two; a summary every 300 presents; mtl_present_unwritten for the slow-frame row @pres_unwritten.
++// Writes counted: draws and clears into a colour attachment (sd_finish), buffer / texture copies and texture clears into it. Not counted: compute image stores (a texture a
++// shader writes shows as "not written"). Replay-thread state: sd_finish, the copies and present_enqueue all run on the submitting thread
++enum { PS_N = 4 };
++typedef struct { uint64_t ser, presents, written, unwritten, never, replaced, kept, zero_draw, since_w, last; const void *mt; int ever; } ps_ent;
++static ps_ent g_ps[PS_N]; static uint64_t g_ps_n, g_ps_bad;
++uint64_t mtl_present_unwritten(void) { return __atomic_load_n(&g_ps_bad, __ATOMIC_RELAXED); }
++static int present_keep_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PRESENT_KEEP"); v = !(e && !strcmp(e, "0")); } return v; }
++static ps_ent *ps_find(uint64_t ser) { if (!ser) return NULL; for (int i = 0; i < PS_N; i++) if (g_ps[i].ser == ser) return &g_ps[i]; return NULL; }
++static void ps_note_write(const tex_t *t) { ps_ent *e = t ? ps_find(t->serial) : NULL; if (e) { e->since_w++; e->ever = 1; } }
++static int ps_pow2(uint64_t n) { return n <= 4 || !(n & (n - 1)); }
++static void ps_note_present(const tex_t *t, const void *mt, uint64_t frame_draws) {
++    if (!t || !t->serial) return;
++    ps_ent *e = ps_find(t->serial);
++    if (!e && mt) for (int i = 0; i < PS_N && !e; i++) if (g_ps[i].mt == mt) { e = &g_ps[i]; e->ser = t->serial; }   // a new texture object the sharing table gave the same Metal texture: the same picture
++    if (!e) { e = &g_ps[0]; for (int i = 1; i < PS_N; i++) if (g_ps[i].last < e->last) e = &g_ps[i];   // the least recently presented slot
++              memset(e, 0, sizeof *e); e->ser = t->serial; }
++    uint64_t n = ++g_ps_n; e->last = n; e->presents++;
++    if (!frame_draws) e->zero_draw++;
++    if (e->mt && mt && e->mt != mt) { e->replaced++; g_ps_bad++; if (ps_pow2(e->replaced)) MLOG("[RED] present #%llu of ser=%llu %ux%u: shown through another Metal texture than its previous present: what was drawn into it before is gone (%llu times for it)",
++        (unsigned long long)n, (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned long long)e->replaced); }
++    if (!e->ever) { e->never++; g_ps_bad++; if (ps_pow2(e->never)) MLOG("present #%llu of ser=%llu %ux%u: nothing drew, cleared or copied into it since the host made it: the screen shows zeros, the console its storage (%llu times for it; frame draws %llu)",
++        (unsigned long long)n, (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned long long)e->never, (unsigned long long)frame_draws); }
++    else if (!e->since_w) { e->unwritten++; g_ps_bad++; if (ps_pow2(e->unwritten)) MLOG("present #%llu of ser=%llu %ux%u: not written since its previous present (frame draws %llu): it shows its old picture%s (%llu times for it)",
++        (unsigned long long)n, (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned long long)frame_draws, present_keep_on() ? ", its stores kept" : ", unless a DontCare store lost it (DM_NVN_PRESENT_KEEP=0)", (unsigned long long)e->unwritten); }
++    else e->written++;
++    e->since_w = 0; if (mt) e->mt = mt;
++    if (n % 300 == 0) {
++        char b[1024]; size_t o = 0;
++        for (int i = 0; i < PS_N && o < sizeof b - 200; i++) if (g_ps[i].ser) o += (size_t)snprintf(b + o, sizeof b - o, "%s ser=%llu: %llu presents, drawn %llu, not written %llu, never written %llu, texture replaced %llu, in frames with no draw %llu, stores kept %llu",
++            o ? ";" : "", (unsigned long long)g_ps[i].ser, (unsigned long long)g_ps[i].presents, (unsigned long long)g_ps[i].written, (unsigned long long)g_ps[i].unwritten, (unsigned long long)g_ps[i].never,
++            (unsigned long long)g_ps[i].replaced, (unsigned long long)g_ps[i].zero_draw, (unsigned long long)g_ps[i].kept);
++        MLOG("presented textures up to present %llu (DM_NVN_PRESENT_KEEP %s):%s", (unsigned long long)n, present_keep_on() ? "on" : "off", o ? b : " none");
++    }
++}
++
+ static void sd_finish(void);
+ static int pf_is_float(MTLPixelFormat f) {   // Float color formats that can store NaN (sentinel choice for the load-elision probe; RGB9E5 cannot store NaN and does not count)
+     switch (f) { case MTLPixelFormatR16Float: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA16Float: case MTLPixelFormatR32Float:
+@@ -14940,6 +14983,9 @@
+     for (int i = 0; i < g_nsd; i++) sd_need(&g_sd[i], 6);   // Pass ended outside the list / index unavailable: always write back
+     for (int i = 0; i < g_nsd; i++) {
+         sd_att *t = &g_sd[i]; int udc_dead = udc_on() && t->load && !t->wrote;
++        ps_ent *pe = t->depth == 0 ? ps_find(t->ser) : NULL;   // a texture the game presents (draft 0507)
++        if (pe && t->wrote) { pe->since_w++; pe->ever = 1; }
++        if (pe && udc_dead && present_keep_on()) { udc_dead = 0; pe->kept++; }   // its old picture is what the console would show: kept, not DontCare
+         // A loaded color tile with no raster output or clear holds only the old memory contents. Storing it can overwrite image writes to the same texture
+         // (Dark Souls' image-only AO pass). This is required for correctness even when store optimizations are disabled; mixed tile/image writers retain their store.
+         int img_dead = t->depth == 0 && t->load && t->img && !t->rast;
+@@ -19202,11 +19248,11 @@
+                 state_op(h.op, a); tf_state_gpu(b); break; }
+             case OP_PRIM_RESTART: state_op(h.op, a); break;
+             case OP_RAST_DISCARD: PD("Y rasterizer discard %d", ((const p_rast_discard *)a)->on); state_op(h.op, a); break;
+-            case OP_COPY_B2T: copy_b2t(a, h.size); break;
++            case OP_COPY_B2T: copy_b2t(a, h.size); ps_note_write(((const p_copy_b2t *)a)->tex); break;
+             case OP_COPY_T2B: copy_t2b(a, h.size); break;
+-            case OP_COPY_T2T: copy_t2t(a); break;
++            case OP_COPY_T2T: copy_t2t(a); ps_note_write(((const p_copy_t2t *)a)->dst); break;
+             case OP_DRAW_TEX: draw_tex(a); break;
+-            case OP_CLEAR_TEX: clear_tex(a); break;
++            case OP_CLEAR_TEX: clear_tex(a); ps_note_write(((const p_clear_tex *)a)->tex); break;
+             case OP_DLSS: dlss_eval(a); break;
+             case OP_AS_BUILD: as_exec_build(a); break;
+             case OP_AS_COPY: as_exec_copy(a); break;
+@@ -21241,7 +21287,10 @@
+     // A texture first used by the present is resolved here too: its first use decides whether it is taken from its storage (tex_cpu_content), so tex_from_storage cannot tell before,
+     // and resolved on the present thread a window texture holding the CPU's data in a pool the CPU can write was uploaded there and aborted the host (t_nvn, whose window textures
+     // nothing draws into, since c06d1e79 stopped a sliver of another span from making them the GPU's)
+-    if (!ev_val && on_sub_thread()) { tex_mtl(t); if (tex_from_storage(t)) up_flush(); }
++    if (!ev_val && on_sub_thread()) {
++        id<MTLTexture> pmt = tex_mtl(t); if (tex_from_storage(t)) up_flush();
++        static uint64_t pdraw; uint64_t dn = g_stat_draw; ps_note_present(t, (__bridge const void *)pmt, dn - pdraw); pdraw = dn;   // draft 0507: what this present shows
++    }
+     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);
+     link_sync();
+     {   // Test switch DM_TEST_LINK_STALL=start seconds,duration seconds: counting from the first present, pause the display link at that point (imitating the display link not calling back while in the foreground) and release it when the duration is up. For verifying the fallback; not set in the product
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -263,6 +263,11 @@
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_addr_known.m $(MTL_T_SRC) $(FW)
+ t_vbuf_clamp: t_vbuf_clamp.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_vbuf_clamp.m $(MTL_T_SRC) $(FW)
++t_present_keep: t_present_keep.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_present_keep.m $(MTL_T_SRC) $(FW)
++.PHONY: check_t_present_keep
++check_t_present_keep: t_present_keep
++	./t_present_keep && DM_NVN_PRESENT_KEEP=0 ./t_present_keep
+ .PHONY: check_t_vbuf_clamp
+ check_t_vbuf_clamp: t_vbuf_clamp
+ 	./t_vbuf_clamp && DM_NVN_VBUF_CLAMP=0 ./t_vbuf_clamp && DM_NVN_VBUF_CLAMP=2 ./t_vbuf_clamp
+--- /dev/null
++++ b/dm/gfx/tests/t_present_keep.m
+@@ -0,0 +1,47 @@
++// Presented textures (nvn_mtl.m ps_note_present, draft 0507): each present is classified as drawn / not written since its previous present / never written / shown through
++// another Metal texture, and a pass that loads a presented texture and writes nothing into it keeps its store (DM_NVN_PRESENT_KEEP=0: DontCare as before; the check target
++// runs both). Draft for South Park: The Fractured But Whole (01008F2005154000)
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(label, c) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
++static void pass_on(uint64_t ser, int load, int wrote) {   // one colour attachment, then the pass's end (sd_finish; g_enc nil: the store action messages go nowhere)
++    g_nsd = 1; g_sd[0] = (sd_att){0}; g_sd[0].ser = ser; g_sd[0].bytes = 1280 * 720 * 4; g_sd[0].idx = 0; g_sd[0].load = (uint8_t)load; g_sd[0].wrote = (uint8_t)wrote; g_sd[0].rast = 1;
++    sd_finish();
++}
++int main(void) { @autoreleasepool {
++    const int keep = present_keep_on();
++    tex_t a = {0}, b = {0}; a.serial = 101; b.serial = 102; a.d.width = b.d.width = 1280; a.d.height = b.d.height = 720;
++    const void *ma = (const void *)0x1000, *mb = (const void *)0x2000, *mb2 = (const void *)0x3000;
++    uint64_t bad0 = mtl_present_unwritten();
++    ps_note_present(&a, ma, 0);   // the first present of a: nothing drew into it yet
++    CHECK("a texture presented before anything wrote it is 'never written'", ps_find(101) && ps_find(101)->never == 1);
++    pass_on(101, 0, 1);           // drawn
++    ps_note_present(&a, ma, 4);
++    CHECK("drawn since its previous present", ps_find(101)->written == 1);
++    ps_note_present(&b, mb, 4); pass_on(102, 1, 1); ps_note_present(&b, mb, 4);
++    CHECK("the second window texture has its own slot", ps_find(102) && ps_find(102)->written == 1 && ps_find(102)->never == 1);
++    uint64_t saved0 = g_udc_saved_bytes;
++    pass_on(101, 1, 0);           // a loading frame: the pass loads a and draws nothing
++    ps_note_present(&a, ma, 0);
++    CHECK("not written since its previous present", ps_find(101)->unwritten == 1 && ps_find(101)->zero_draw == 2);
++    if (keep) CHECK("its store is kept (no DontCare saving counted)", g_udc_saved_bytes == saved0 && ps_find(101)->kept == 1);
++    else CHECK("DM_NVN_PRESENT_KEEP=0: DontCare as before", g_udc_saved_bytes == saved0 + 1280 * 720 * 4 && ps_find(101)->kept == 0);
++    pass_on(555, 1, 0);           // a texture never presented: the DontCare rule is unchanged
++    CHECK("an unpresented texture still gets DontCare", g_udc_saved_bytes == saved0 + (uint64_t)(keep ? 1 : 2) * 1280 * 720 * 4);
++    ps_note_write(&b);            // a copy into b
++    ps_note_present(&b, mb2, 0);  // shown through another Metal texture
++    CHECK("a copy counts as a write", ps_find(102)->written == 2);
++    CHECK("another Metal texture is counted as replaced", ps_find(102)->replaced == 1);
++    tex_t a2 = a; a2.serial = 201;  // a new texture object the sharing table gave a's Metal texture
++    pass_on(101, 0, 1);
++    ps_note_present(&a2, ma, 4);
++    CHECK("a new serial over the same Metal texture takes its slot", ps_find(201) && !ps_find(101) && ps_find(201)->written == 2);
++    CHECK("the unwritten count for the slow-frame row", mtl_present_unwritten() == bad0 + 4);   // never a, never b, unwritten a, replaced b
++    printf("t_present_keep (keep %s): %d checks, %d failed\n", keep ? "on" : "off", checks, failed);
++    return failed != 0;
++} }

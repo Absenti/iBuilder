@@ -1,0 +1,485 @@
+# nvn/draw: every dropped draw counted by reason, the game's own draw records counted, stretches of frames that
+# encoded no draw logged with their causes; DM_METAL_HUD through the game layer's developerHUDProperties
+#
+# Why: South Park: The Fractured But Whole (01008F2005154000), iPhone 15 Pro, session pid 7174 of 2026-11-22 (~170 s). The picture held, flashed image / black, then jumped
+#   about 2 s ahead while the game and its audio ran on. Presents stayed at 30 Hz throughout. Slow-frame rows show frames with @draws=0 over 10 passes
+#   (@rt_load_mb 42, all unwritten) around t = 92.5, 101.9-103.7, 106.1-107.0, 108.3-108.4, 111.0, 113.9 and 205.0-206.5 s. Frame generation, snapshots and low latency
+#   changed nothing. Draws can be dropped silently by: a render condition evaluated false on the CPU, no pipeline (DM_LIVE_SHADERS=skip, a failed build), a vertex or index
+#   buffer the host finds in no pool, and others. Only one RED_ONCE line existed for any of them, and the game issuing no draw at all looked the same.
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m, hle_nvn.c; a test):
+#   * g_draw_ops counts every draw record the replay meets (OP_DRAW, OP_DRAW_IDX, OP_MULTI_DRAW, OP_DRAW_TEX).
+#   * drop_note counts each early return of the draw path by reason, 15 of them:
+#     render_condition_false, no_program, raster_discard, diagnostic_switch, culled, empty_scissor, render_pass_not_begun, no_pipeline, vertex_buffer_not_in_pool,
+#     arguments_ended_pass_twice, primitive_type, index_buffer_not_in_pool, past_multi_draw_count, mesh_or_wide_line_pipeline_missing, draw_texture_failed.
+#     Logged at the first 4 cases and at powers of two, with what each saw:
+#     - the pipeline's shader keys;
+#     - the render condition's mode, address, values, and whether both were read from memory;
+#     - the index range and the nearest pools, and whether a sparse pool holds an address that is in no pool (the vertex-stream line too).
+#     Reasons the console shares are logged without [RED]. Render-enable conditions are counted evaluated true / false / unknown.
+#   * stretch_note: 3 or more presents in a row whose frames encoded no draw give one "[RED] N presents in a row encoded no draw" line with the presents, the first frame, the
+#     duration, the draw records replayed ("the game issued none" when 0), the drops by reason and the render conditions. First 16, then powers of two; also at 150 still going.
+#     Every 300 presents: draw records, presents with no draw, drops by reason.
+#   * Slow-frame rows: @draw_ops, @drops, @drop_why (bit i = reason i, in the order above).
+#   * hud_layer: DM_METAL_HUD=1 sets the game layer's developerHUDProperties {mode: default, logging: default} once per layer, on the main thread, and logs it. Needed because
+#     MTL_HUD_ENABLED only acts on a process's first Metal device. In GameApp that device is the app's own, made long before the game, and nothing translated DM_METAL_HUD.
+#     Not with the Mac's front end, which has front_hud_env (g_hud_own).
+# DEFAULT: all on (counters, a handful of log lines). No behaviour change for draws: the same draws are dropped as before, now counted.
+# Reading the next log:
+#   - "the game issued none" in the stretch lines: the game itself stopped drawing. Then look at what it waits on (sync waits, queries).
+#   - "render_condition_false": the CPU-side render-condition evaluation (rc_value) is wrong for this game; its values and address are in the line.
+#   - "no_pipeline": a missing / failed pipeline. Retry with DM_LIVE_SHADERS=pause; the keys tell which shader.
+#   - "vertex_buffer_not_in_pool" / "index_buffer_not_in_pool": the nearest-pool distances tell a pool registered late or freed from a range overrun.
+# Shader chain: not touched (b24b25240cad).
+# Test: dm/gfx/tests/t_drop_reasons, 13 checks, 0 failed: the counters, a no-program draw through draw(), the stretch census, the HUD set once with mode default, and off with
+#   DM_METAL_HUD=0. Rebuilt with 0506 + 0507 + 0508 on an M1 Pro: t_nvn 506/0, t_dead_targets 197/0, t_present_keep 10/0 + 10/0, t_vbuf_clamp 15/0 + 13/0,
+#   t_addr_known 14/0, t_pool_chunks 178/0. NOT run on a device; no host dylib built.
+
+# Rebased 2026-11-22 onto the new 0506 (upstream c96c45e9 + 79555b67 + the pool-end fallback): context only, same behaviour.
+
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -2833,7 +2833,11 @@
+         }
+         trow(f, "@passes", (double)(ps - prev_pass)); trow(f, "@draws", (double)(dr - prev_draw));
+         { extern uint64_t mtl_vbuf_skips(void) __attribute__((weak_import)); static uint64_t pvs; uint64_t vs = mtl_vbuf_skips ? mtl_vbuf_skips() : 0; trow(f, "@vbuf_skips", (double)(vs - pvs)); pvs = vs; }
+-        { extern uint64_t mtl_present_unwritten(void) __attribute__((weak_import)); static uint64_t ppu; uint64_t pu = mtl_present_unwritten ? mtl_present_unwritten() : 0; trow(f, "@pres_unwritten", (double)(pu - ppu)); ppu = pu; }   // presents of a texture not written since its previous one (nvn_mtl.m ps_note_present)   // draws skipped for a vertex stream in no pool (nvn_mtl.m vbuf_skip_note)
++        { extern uint64_t mtl_present_unwritten(void) __attribute__((weak_import)); static uint64_t ppu; uint64_t pu = mtl_present_unwritten ? mtl_present_unwritten() : 0; trow(f, "@pres_unwritten", (double)(pu - ppu)); ppu = pu; }
++        { extern void mtl_drop_stats(uint64_t *, uint64_t *, int) __attribute__((weak_import)); static uint64_t pops, pby[16]; uint64_t ops = 0, by[16] = {0};   // draft 0508: draw records and drops by reason (nvn_mtl.m g_dr_name)
++          if (mtl_drop_stats) mtl_drop_stats(&ops, by, 16);
++          double sum = 0; uint32_t why = 0; for (int i = 0; i < 16; i++) { if (by[i] > pby[i]) { sum += (double)(by[i] - pby[i]); why |= 1u << i; } pby[i] = by[i]; }
++          trow(f, "@draw_ops", (double)(ops - pops)); trow(f, "@drops", sum); trow(f, "@drop_why", (double)why); pops = ops; }   // presents of a texture not written since its previous one (nvn_mtl.m ps_note_present)   // draws skipped for a vertex stream in no pool (nvn_mtl.m vbuf_skip_note)
+         static uint64_t pl, pst, pf, pudc; uint64_t l, st, fu; mtl_bw(&l, &st, &fu);
+         trow(f, "@rt_load_mb", (l - pl) / 1048576.0); trow(f, "@rt_store_mb", (st - pst) / 1048576.0); trow(f, "@pass_full_rw", (double)(fu - pf));
+         uint64_t udc = mtl_udc_saved_bytes(); trow(f, "@unwritten_dc_mb", (udc - pudc) / 1048576.0);
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -1850,7 +1850,38 @@
+     if (i >= 0) { pool_res(i); pc_put(i, addr); *buf = (__bridge void *)g_pools[i].buf; *off = addr - g_pools[i].base; *gpu = g_pools[i].gpu + *off; ok = 1; }
+     pthread_mutex_unlock(&g_mu);
+     return ok;
++}
++
++// ---------- Dropped draws, by reason (draft 0508, South Park: The Fractured But Whole, 01008F2005154000) ----------
++// The device log of 2026-11-22 had stretches of 1-2 s whose frames encoded no draw (@draws=0 over 10 passes, @rt_load_mb 42 left unwritten) while the game ran on and its audio
++// played: the picture held, flashed image / black, then jumped ahead. Only the slow frames had rows, and the one draw skip with a log line is a RED_ONCE, so whether the game
++// issued no draw or the host dropped them could not be told. Every draw record the replay meets is counted (g_draw_ops: OP_DRAW, OP_DRAW_IDX, OP_MULTI_DRAW, OP_DRAW_TEX), and
++// every way the draw path returns without encoding it is counted by reason (g_dr), each reason logged at its first cases and at powers of two with what it saw.
++// Reasons the console shares (the draw draws nothing there either) are marked so in the log: past_count, culled, empty_scissor, raster_discard.
++// mtl_drop_stats feeds the slow-frame rows @draw_ops, @drops (all reasons) and @drop_why (a bit per reason, bit i = g_dr_name[i]); the presents keep a census of the
++// stretches of frames that encoded no draw (stretch_note). Replay-thread state, as the draw path's own.
++enum { DR_RC, DR_NOPROG, DR_RASTDISC, DR_DIAG, DR_CULL, DR_SCISSOR, DR_NOPASS, DR_PSO, DR_VBUF, DR_ARGS, DR_PRIM, DR_IBUF, DR_PAST, DR_MESH, DR_DRAWTEX, DR_N };
++static const char *const g_dr_name[DR_N] = {"render_condition_false", "no_program", "raster_discard (as on the console)", "diagnostic_switch", "culled (as on the console)",
++    "empty_scissor (as on the console)", "render_pass_not_begun", "no_pipeline", "vertex_buffer_not_in_pool", "arguments_ended_pass_twice", "primitive_type", "index_buffer_not_in_pool",
++    "past_multi_draw_count (as on the console)", "mesh_or_wide_line_pipeline_missing", "draw_texture_failed"};
++static uint64_t g_dr[DR_N], g_draw_ops, g_rc_eval[3];   // g_rc_eval: render-enable conditions evaluated true / false / unknown (drawn)
++static uint64_t g_rc_last_addr, g_rc_last_x, g_rc_last_y; static int g_rc_last_mode, g_rc_last_known;
++void mtl_drop_stats(uint64_t *ops, uint64_t *by, int n) { *ops = g_draw_ops; for (int i = 0; i < n && i < DR_N; i++) by[i] = g_dr[i]; }
++static uint64_t mtl_frame_now(void);
++static uint64_t g_stat_pass_now(void);
++static void drop_note(int r, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
++static void drop_note(int r, const char *fmt, ...) {
++    uint64_t n = ++g_dr[r];
++    if (n > 4 && (n & (n - 1))) return;
++    char d[400] = ""; if (fmt) { va_list ap; va_start(ap, fmt); vsnprintf(d, sizeof d, fmt, ap); va_end(ap); }
++    MLOG("%sdraw dropped: %s (%llu so far, frame %llu, pass %llu)%s%s", r == DR_PAST || r == DR_CULL || r == DR_SCISSOR || r == DR_RASTDISC ? "" : "[RED] ", g_dr_name[r], (unsigned long long)n,
++         (unsigned long long)mtl_frame_now(), (unsigned long long)g_stat_pass_now(), *d ? ": " : "", d);
+ }
++static void rc_note_drop(const char *what) {
++    drop_note(DR_RC, "%s inside a render-enable block evaluated false: %s at %#llx, values %llu / %llu%s", what,
++              g_rc_last_mode >= 2 ? "SetRenderEnable(false)" : g_rc_last_mode ? "draw if not equal" : "draw if equal", (unsigned long long)g_rc_last_addr,
++              (unsigned long long)g_rc_last_x, (unsigned long long)g_rc_last_y, g_rc_last_mode >= 2 ? "" : g_rc_last_known ? " (both read from memory)" : "");
++}
+ 
+ // Vertex streams, iBuilder's safety net beside upstream's proof (bind_vbufs, pull_layout_fill; engine-patches/0506). NVN binds a vertex buffer as an address and a size, and the
+ // GPU fetches only the vertices a draw reads. Snowdrop (South Park: The Fractured But Whole, 01008F2005154000) binds from offsets inside a buffer with the whole buffer's size, so the
+@@ -1889,15 +1920,23 @@
+     pthread_mutex_lock(&g_mu); uint64_t room = pool_tail(addr); pthread_mutex_unlock(&g_mu);
+     return room && room < size ? room : 0;
+ }
++static void ibuf_drop(uint64_t addr, uint64_t len) {   // draft 0508: an indexed draw whose index range is in no pool (counted after g_stat_draw: @draws includes these)
++    uint64_t room, be, al; pthread_mutex_lock(&g_mu); room = pool_tail(addr); pool_near(addr, &be, &al); pthread_mutex_unlock(&g_mu);
++    char vp[200] = ""; if (!room) { void nvn_vpool_note(uint64_t, char *, size_t); nvn_vpool_note(addr, vp, sizeof vp); }
++    drop_note(DR_IBUF, "indices at %#llx, %llu bytes: %s; nearest pool below ends %#llx bytes before, above starts %#llx bytes after%s", (unsigned long long)addr, (unsigned long long)len,
++              room ? "the range runs past its pool's end" : "the start is in no pool", (unsigned long long)(be ? addr - be : 0), (unsigned long long)(al != ~0ull ? al - addr : 0), vp);
++}
+ static void vbuf_skip_note(int s, uint64_t addr, uint64_t size) {   // a draw skipped for vertex stream s (the callers' former RED_ONCE 158)
++    g_dr[DR_VBUF]++;   // draft 0508: counted with the other reasons (logged here, with the pools around it)
+     uint64_t n = __atomic_add_fetch(&g_vbuf_skips, 1, __ATOMIC_RELAXED);
+     if (n & (n - 1)) return;
+     uint64_t room, be, al; pthread_mutex_lock(&g_mu); room = pool_tail(addr); pool_near(addr, &be, &al); pthread_mutex_unlock(&g_mu);
+     char near[160] = "";
+     if (!room) snprintf(near, sizeof near, "; the nearest pool below ends %s%#llx bytes before it, the nearest above starts %s%#llx bytes after it",
+                         be ? "" : "(none) ", (unsigned long long)(be ? addr - be : 0), al != ~0ull ? "" : "(none) ", (unsigned long long)(al != ~0ull ? al - addr : 0));
+-    MLOG("[RED] vertex stream %d's buffer %#llx (%llu bytes) %s; draw skipped (%llu draws skipped so far%s)", s, (unsigned long long)addr, (unsigned long long)size,
+-         room ? "runs past its memory pool's end" : "is in no memory pool", (unsigned long long)n, near);
++    char vp[200] = ""; if (!room) { void nvn_vpool_note(uint64_t, char *, size_t); nvn_vpool_note(addr, vp, sizeof vp); }   // draft 0508: whether a sparse pool holds it
++    MLOG("[RED] vertex stream %d's buffer %#llx (%llu bytes) %s; draw skipped (%llu draws skipped so far%s%s, frame %llu)", s, (unsigned long long)addr, (unsigned long long)size,
++         room ? "runs past its memory pool's end" : "is in no memory pool", (unsigned long long)n, near, vp, (unsigned long long)mtl_frame_now());
+ }
+ 
+ // ---------- Submission ----------
+@@ -6684,7 +6723,43 @@
+             o ? ";" : "", (unsigned long long)g_ps[i].ser, (unsigned long long)g_ps[i].presents, (unsigned long long)g_ps[i].written, (unsigned long long)g_ps[i].unwritten, (unsigned long long)g_ps[i].never,
+             (unsigned long long)g_ps[i].replaced, (unsigned long long)g_ps[i].zero_draw, (unsigned long long)g_ps[i].kept);
+         MLOG("presented textures up to present %llu (DM_NVN_PRESENT_KEEP %s):%s", (unsigned long long)n, present_keep_on() ? "on" : "off", o ? b : " none");
++    }
++}
++// Draft 0508: stretches of presents whose frames encoded no draw (draws replayed since the previous present = 0), with what the replay met in them: the draw records (none: the
++// game issued no draw) and the drops by reason. A stretch of 3 presents or more is logged when it ends (the first 16, then at powers of two), and one still going at 150 presents
++// is logged then too. Every 300 presents: frames with no draw encoded among them, and the drop totals
++static void drop_line(char *b, size_t n, const uint64_t *d) {   // "reason N, ..." of the non-zero counts in d
++    size_t o = 0; b[0] = 0;
++    for (int i = 0; i < DR_N && o + 80 < n; i++) if (d[i]) o += (size_t)snprintf(b + o, n - o, "%s%s %llu", o ? ", " : "", g_dr_name[i], (unsigned long long)d[i]);
++    if (!o) snprintf(b, n, "none");
++}
++static uint64_t g_st_n;   // stretches logged-or-counted so far (t_drop_reasons reads it)
++static void stretch_note(uint64_t frame_draws) {
++    static uint64_t prev_ops, prev_dr[DR_N], prev_rc[3], np, run, run_ops, run_dr[DR_N], run_rc[3], run_first, run_frame0, win_zero, win_ops0, win_dr0[DR_N];
++    static double run_t0;
++    uint64_t ops = g_draw_ops - prev_ops, d[DR_N]; prev_ops = g_draw_ops;
++    for (int i = 0; i < DR_N; i++) { d[i] = g_dr[i] - prev_dr[i]; prev_dr[i] = g_dr[i]; }
++    uint64_t rc[3]; for (int i = 0; i < 3; i++) { rc[i] = g_rc_eval[i] - prev_rc[i]; prev_rc[i] = g_rc_eval[i]; }
++    np++;
++    if (!frame_draws) {
++        if (!run) { run_first = np; run_frame0 = mtl_frame_now(); run_t0 = CACurrentMediaTime(); run_ops = 0; memset(run_dr, 0, sizeof run_dr); memset(run_rc, 0, sizeof run_rc); }
++        run++; run_ops += ops; for (int i = 0; i < DR_N; i++) run_dr[i] += d[i]; for (int i = 0; i < 3; i++) run_rc[i] += rc[i];
++        win_zero++;
+     }
++    if (run && (frame_draws || run == 150)) {
++        if (run >= 3) { uint64_t k = ++g_st_n;
++            if (k <= 16 || !(k & (k - 1)) || run == 150) { char b[700]; drop_line(b, sizeof b, run_dr);
++                MLOG("[RED] %s%llu presents in a row encoded no draw (presents %llu-%llu, frames from %llu, %.2f s): draw records replayed in them %llu%s; dropped by reason: %s; render conditions true %llu / false %llu / unknown %llu (stretch #%llu)",
++                     run == 150 && !frame_draws ? "still going: " : "", (unsigned long long)run, (unsigned long long)run_first, (unsigned long long)(run_first + run - 1), (unsigned long long)run_frame0,
++                     CACurrentMediaTime() - run_t0, (unsigned long long)run_ops, run_ops ? "" : " (the game issued none)", b, (unsigned long long)run_rc[0], (unsigned long long)run_rc[1],
++                     (unsigned long long)run_rc[2], (unsigned long long)k); } }
++        if (frame_draws) run = 0;
++    }
++    if (np % 300 == 0) { uint64_t w[DR_N]; for (int i = 0; i < DR_N; i++) { w[i] = g_dr[i] - win_dr0[i]; win_dr0[i] = g_dr[i]; }
++        char b[700]; drop_line(b, sizeof b, w);
++        MLOG("draws up to present %llu: draw records replayed %llu, presents whose frame encoded no draw %llu of 300; dropped in these 300 by reason: %s; render conditions true %llu / false %llu / unknown %llu so far",
++             (unsigned long long)np, (unsigned long long)(g_draw_ops - win_ops0), (unsigned long long)win_zero, b, (unsigned long long)g_rc_eval[0], (unsigned long long)g_rc_eval[1], (unsigned long long)g_rc_eval[2]);
++        win_zero = 0; win_ops0 = g_draw_ops; }
+ }
+ 
+ static void sd_finish(void);
+@@ -16253,7 +16328,7 @@
+         const wide_ent *w = wide_wanted(di) ? wide_find(di) : NULL; ty = MTLIndexTypeUInt16; il = (uint64_t)di->count * 2;
+         if (w && w->gpu) gpu = w->gpu;
+         else { void *mb; uint64_t mo; const uint8_t *src;
+-            if (!mtl_addr(di->ibuf, di->count, &mb, &mo) || !(src = [(__bridge id<MTLBuffer>)mb contents])) { RED_ONCE(22, "index buffer is in no memory pool"); return; }
++            if (!mtl_addr(di->ibuf, di->count, &mb, &mo) || !(src = [(__bridge id<MTLBuffer>)mb contents])) { RED_ONCE(22, "index buffer is in no memory pool"); ibuf_drop(di->ibuf, di->count); return; }
+             id<MTLBuffer> ab; size_t off = arena_alloc(((size_t)di->count * 2 + 15) & ~(size_t)15, &ab);
+             uint16_t *d = (uint16_t *)((uint8_t *)ab.contents + off); src += mo;
+             for (int32_t i = 0; i < di->count; i++) d[i] = src[i];
+@@ -17162,10 +17237,10 @@
+     if (g_enc && g_fsp_pass) rp_end();   // a face-split pass holds its one draw (fsp_plan)
+     if (g_enc && !g_geo_program && !g_geo_mesh.on) pass_split_try();
+     int mdx_on = (dw && dw->mdi_cnt) || (di && di->mdi_cnt) ? mdx_wanted(dw, di) : 0;   // an indirect-count multi-draw's record masked on the GPU (mdx_run), else read after a wait
+-    if (!mdx_on && ((di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i)) || (dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i)))) return;   // past the multi-draw's count
++    if (!mdx_on && ((di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i)) || (dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i)))) { drop_note(DR_PAST, NULL); return; }   // past the multi-draw's count
+     if (mdx_on && mdx_next(dw, di)) return;   // the next draw of a masked multi-draw: only the draw is encoded
+     g_mdxc.next = NULL;
+-    if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
++    if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); drop_note(DR_NOPROG, NULL); return; }
+     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
+     image_prepare(pr, 0x1f);
+     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
+@@ -17174,7 +17249,7 @@
+     if (!g_geo_program && S.tf_on && pr && pr->sh[0] && pr->sh[0]->tf_fn) tf_draw(pr, dw, di);
+     // Rasterizer discard suppresses fragments, not vertex execution or its storage and image writes (the build gives such a vertex shader main0_discard).
+     // Xenoblade Chronicles 3 uses vertex-only work before its skinned-model draws; Metroid Prime Remastered fills its fog volume with image stores from points.
+-    if (S.rast_discard && (!pr->sh[0] || !pr->sh[0]->discard_fn)) { PD("Z %llu draw skipped: rasterizer discard with no vertex storage or image writes vs=%s", g_stat_pass + !g_enc, pr->sh[0] ? pr->sh[0]->key : "-"); return; }
++    if (S.rast_discard && (!pr->sh[0] || !pr->sh[0]->discard_fn)) { PD("Z %llu draw skipped: rasterizer discard with no vertex storage or image writes vs=%s", g_stat_pass + !g_enc, pr->sh[0] ? pr->sh[0]->key : "-"); drop_note(DR_RASTDISC, NULL); return; }
+     if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
+     vertex_dump(pr->sh[0], dw, di);
+     if (g_nlc && !g_enc) lc_take(pr);   // waiting clears: this pass's load actions, or landed before it (see lc_take)
+@@ -17182,19 +17257,19 @@
+     uint64_t mdx = 0;   // the masked copy of the record (mdx_run); a draw it could not copy waits for the count instead
+     if (mdx_on) { uint64_t ind = dw ? dw->ind : di->ind, cnt = dw ? dw->mdi_cnt : di->mdi_cnt; int i = dw ? dw->mdi_i : di->mdi_i;
+         if (!mdx_find(ind, cnt, &mdx)) { mdx_run(dw, di); if (!mdx_find(ind, cnt, &mdx)) mdx = 0; }
+-        if (!mdx && !mdi_live(cnt, i)) return; }
++        if (!mdx && !mdi_live(cnt, i)) { drop_note(DR_PAST, NULL); return; } }
+     else if (!g_enc && g_exec_next) mdx_prescan();   // the pass this draw opens: its multi-draws copied first (see mdx_prescan)
+     if (di && !g_wl.on && wide_wanted(di) && !wide_find(di)) wide_run(di);   // 8-bit indices written earlier in this submission: widened on the GPU before the render pass (see wide_run)
+     // Draws that cannot draw anything (both faces culled, empty scissor) return before the render pass is opened: otherwise the render pass is already open and on TBDR the whole attachment is loaded and stored for nothing
+     // (Mac character select page: 3 render passes are opened only because of such draws, all loaded, zero draws)
+     // DM_NVN_SKIP_FS / DM_NVN_UB (skip_fs_draw)
+-    { if (skip_fs_draw(pr)) return;
+-      if (ms_draw(pr)) return; }
++    { if (skip_fs_draw(pr)) { drop_note(DR_DIAG, "DM_NVN_SKIP_FS / A-B phase"); return; }
++      if (ms_draw(pr)) { drop_note(DR_DIAG, "the particle A-B switch"); return; } }
+     // Similar diagnostic DM_NVN_SKIP_SMALL=<width>: drop all draws whose target width (by the attached level) is <= this value -- measures how much "dropping tiny render passes in bulk" is worth under the parallel pipeline (fixed per-pass overhead)
+     { static int small = -1; if (small < 0) { const char *e = getenv("DM_NVN_SKIP_SMALL"); small = e ? atoi(e) : 0; if (small) MLOG("DM_NVN_SKIP_SMALL: dropping draws whose target width is ≤ %d (diagnostic; the picture is wrong)", small); }
+       if (small > 0 && R.has_rt) { int k = R.rt.n && R.rt.color[0] ? 0 : R.rt.depth ? 8 : -1;
+-        if (k >= 0) { uint64_t s_; int lv, sl; rt_sub(&R.rt, k, &s_, &lv, &sl); const tex_t *t = k == 8 ? R.rt.depth : R.rt.color[0]; if ((int)MAX(t->d.width >> lv, 1u) <= small) return; } } }
+-    if (S.poly.cull == NVN_FACE_FRONT_AND_BACK && !S.rast_discard && !g_wl.on) { PD("Z %llu draw skipped (before the pass begins): both faces culled", g_stat_pass + !g_enc); return; }
++        if (k >= 0) { uint64_t s_; int lv, sl; rt_sub(&R.rt, k, &s_, &lv, &sl); const tex_t *t = k == 8 ? R.rt.depth : R.rt.color[0]; if ((int)MAX(t->d.width >> lv, 1u) <= small) { drop_note(DR_DIAG, "DM_NVN_SKIP_SMALL"); return; } } } }
++    if (S.poly.cull == NVN_FACE_FRONT_AND_BACK && !S.rast_discard && !g_wl.on) { PD("Z %llu draw skipped (before the pass begins): both faces culled", g_stat_pass + !g_enc); drop_note(DR_CULL, NULL); return; }
+     g_samples_fb_left = 1;
+     int rt_sampled = g_rt_merged && draw_samples_rt(pr); g_samples_fb_left = 0;
+     if (rt_sampled) { static int once; if (!once++) MLOG("same-target continuation: a draw in the continued pass samples an attachment; split here (first case pass %llu)", g_stat_pass);
+@@ -17207,7 +17282,7 @@
+         NSUInteger tw0 = 0, th0 = 0; rt_dims(&tw0, &th0);
+         long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y < 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
+         if (x1 > (long)tw0) x1 = tw0; if (y1 > (long)th0) y1 = th0;
+-        if (x1 <= x0 || y1 <= y0) { PD("Z %llu draw skipped (before the pass begins): empty scissor (%d,%d %dx%d, target %lux%lu)", g_stat_pass + 1, R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long)tw0, (unsigned long)th0); return; }
++        if (x1 <= x0 || y1 <= y0) { PD("Z %llu draw skipped (before the pass begins): empty scissor (%d,%d %dx%d, target %lux%lu)", g_stat_pass + 1, R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long)tw0, (unsigned long)th0); drop_note(DR_SCISSOR, NULL); return; }
+     }
+     if (!g_enc && !g_geo_program && cshoist_on() && !g_split_resume) cs_hoist_try(pr, dw, di);   // see DM_NVN_CS_HOIST
+     g_split_resume = 0;
+@@ -17221,12 +17296,13 @@
+     vbuf_prepare(pr->sh[0] ? &pr->sh[0]->rf : NULL, dw, di);   // an unaligned GPU-written stream, or one the draw reads past, needs its ordered copy before the render encoder
+     id<MTLRenderCommandEncoder> en = rp_begin_ex(0);
+     g_rp_layered = 0; g_sm_plan.on = 0; g_fsp_plan.on = 0;
+-    if (!en) { PD("Z %llu draw skipped: the render pass did not begin vs=%.16s fs=%.16s", g_stat_pass, pr && pr->sh[0] ? pr->sh[0]->key : "-", pr && pr->sh[1] ? pr->sh[1]->key : "-"); return; }   // Z lines: why a draw was dropped at these early returns
++    if (!en) { PD("Z %llu draw skipped: the render pass did not begin vs=%.16s fs=%.16s", g_stat_pass, pr && pr->sh[0] ? pr->sh[0]->key : "-", pr && pr->sh[1] ? pr->sh[1]->key : "-");
++               drop_note(DR_NOPASS, "vertex %s fragment %s", pr && pr->sh[0] ? pr->sh[0]->key : "-", pr && pr->sh[1] ? pr->sh[1]->key : "-"); return; }   // Z lines: why a draw was dropped at these early returns
+     if ((g_fb_early_seq == g_draw_seq || g_fb_learn_seq == g_draw_seq) && !fb_early_after()) {   // planned a tile read for another pass than the one that opened: its snapshot, then the pass again
+         rp_end(); g_fb_noearly = 1; fb_prepare(pr); g_fb_noearly = 0;
+         g_rp_layered = pr->sh[0] && pr->sh[0]->layer_out;
+         vbuf_prepare(pr->sh[0] ? &pr->sh[0]->rf : NULL, dw, di); en = rp_begin_ex(0); g_rp_layered = 0;
+-        if (!en) return;
++        if (!en) { drop_note(DR_NOPASS, "after a tile-read snapshot"); return; }
+     }
+     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
+     // … and on whether a sampler the draw binds has a border colour twin (pso_key.border), which follows the bindings: binding a sampler, or a handle a uniform buffer holds,
+@@ -17234,20 +17310,21 @@
+     static int cur_border; int border = prog_border(pr);
+     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass; static int cur_pull;   // cur_pull: a hybrid (pulling) pipeline, asked for again at the next draw
+     if (g_fb_tseq == g_draw_seq && g_fb_tfn) { g_pso_lmap = g_fb_tlmap; g_pso_fsfn = g_fb_tfn; g_pso_fz = g_fb_tdesc; g_pso_dirty = 1; }   // same-pass feedback read from the tile (fb_tile_plan)
+-    if (g_mtk.on) { cur_ps = mtk_pso(pr); cur_pull = 0; cur_pr = nil; if (!cur_ps) { g_mtk.miss = 1; return; } }   // a task / mesh draw (mesh_tasks_draw)
+-    else if (g_geo_mesh.on) { cur_ps = geo_mesh_pso(pr); cur_pull = 1; cur_pr = nil; if (!cur_ps) { g_geo_mesh.miss = 1; return; } }   // a mesh draw (geo_mesh_draw): pulls its streams; the next draw fetches its own pipeline; none yet: the compute path draws
+-    else if (g_wl.on) { cur_ps = wl_pso(pr); cur_pull = 1; cur_pr = nil; if (!cur_ps) { g_wl.miss = 1; return; } }   // a wide line drawn as quads (nvn_wline.inc): pulls its streams; the next draw fetches its own pipeline
++    if (g_mtk.on) { cur_ps = mtk_pso(pr); cur_pull = 0; cur_pr = nil; if (!cur_ps) { g_mtk.miss = 1; drop_note(DR_MESH, "task / mesh"); return; } }   // a task / mesh draw (mesh_tasks_draw)
++    else if (g_geo_mesh.on) { cur_ps = geo_mesh_pso(pr); cur_pull = 1; cur_pr = nil; if (!cur_ps) { g_geo_mesh.miss = 1; drop_note(DR_MESH, "geometry as mesh"); return; } }   // a mesh draw (geo_mesh_draw): pulls its streams; the next draw fetches its own pipeline; none yet: the compute path draws
++    else if (g_wl.on) { cur_ps = wl_pso(pr); cur_pull = 1; cur_pr = nil; if (!cur_ps) { g_wl.miss = 1; drop_note(DR_MESH, "wide line"); return; } }   // a wide line drawn as quads (nvn_wline.inc): pulls its streams; the next draw fetches its own pipeline
+     else if (g_fsp_pass) { cur_ps = nil; for (int i = 0; i < g_fsp_n && !cur_ps; i++) cur_ps = g_fsp_ps[i]; cur_pull = 0; cur_pr = nil; g_pso_dirty = 1; }   // a face-split draw: its pipelines (fsp_encode); the next draw fetches its own
+     else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || border != cur_border) { g_pso_amp = g_sm_pass; cur_ps = pso_get(pr, nil); g_pso_amp = 0; cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; cur_border = border; g_pso_dirty = !cur_ps || cur_pull; }
+     if (!cur_ps && g_sm_pass) {   // a draw whose amplified pipeline is not built yet (sm_amp_get queued it): the slice-merged pass ends and the draw opens a pass of its own
+         g_sm_nwait++; PD("M %llu slice-merged pass: no amplified pipeline yet for vertex %s fragment %s; split here", g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-");
+-        rp_end(); en = rp_begin_ex(0); if (!en) return;
++        rp_end(); en = rp_begin_ex(0); if (!en) { drop_note(DR_NOPASS, "slice-merged split"); return; }
+         cur_ps = pso_get(pr, nil); cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; cur_border = border; g_pso_dirty = !cur_ps || cur_pull; }
+     uint32_t raster_mask = draw_color_writes(pr);   // Capture the physical mapping before resetting the merged pipeline state.
+     uint8_t lm_copy[8]; const uint8_t *draw_lmap = g_pso_lmap ? memcpy(lm_copy, g_pso_lmap, sizeof lm_copy) : NULL;   // the same for the blend words (bz_bind, below)
+     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
+     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
+-    if (!ps) { PD("Z %llu draw skipped: no render pipeline (vertex %s fragment %s)", g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-"); return; }
++    if (!ps) { PD("Z %llu draw skipped: no render pipeline (vertex %s fragment %s)", g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-");
++               drop_note(DR_PSO, "vertex %s fragment %s (a shader missing from the library with DM_LIVE_SHADERS=skip, a failed build, or DM_PSO_NOWAIT)", pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-"); return; }
+     if (ps != g_enc_pso) { enc_r_pso(en, ps); g_enc_pso = ps; }
+     if (g_sm_pass && g_sm_applied != g_sm_cur) {   // the layer this draw goes to (see g_sm_plan)
+         MTLVertexAmplificationViewMapping vm = {0, (uint32_t)(g_sm_cur - g_sm_lo)}; [(id<MTL4RenderCommandEncoder>)en setVertexAmplificationCount:1 viewMappings:&vm]; g_sm_applied = g_sm_cur; }
+@@ -17278,11 +17355,11 @@
+     if (R.has_sc && !S.rast_discard) {   // raster state cannot suppress vertex storage writes
+         long x0 = R.sc.x < 0 ? 0 : R.sc.x, y0 = R.sc.y <= 0 ? 0 : R.sc.y, x1 = (long)R.sc.x + R.sc.w, y1 = (long)R.sc.y + R.sc.h;
+         if (x1 > (long)tw) x1 = tw; if (y1 > (long)th) y1 = th;
+-        if (x1 <= x0 || y1 <= y0) { PD("Z %llu draw skipped: empty scissor (%d,%d %dx%d, target %lux%lu)", g_stat_pass, R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long)tw, (unsigned long)th); return; }
++        if (x1 <= x0 || y1 <= y0) { PD("Z %llu draw skipped: empty scissor (%d,%d %dx%d, target %lux%lu)", g_stat_pass, R.sc.x, R.sc.y, R.sc.w, R.sc.h, (unsigned long)tw, (unsigned long)th); drop_note(DR_SCISSOR, NULL); return; }
+         sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
+     }
+     if (!(g_ed.ok & ED_SC) || memcmp(&g_ed.sc, &sc, sizeof sc)) { enc_r_scissor(en, sc); g_ed.sc = sc; g_ed.ok |= ED_SC; }
+-    if (S.poly.cull == NVN_FACE_FRONT_AND_BACK && !S.rast_discard && !g_wl.on) { PD("Z %llu draw skipped: both faces culled", g_stat_pass); return; }
++    if (S.poly.cull == NVN_FACE_FRONT_AND_BACK && !S.rast_discard && !g_wl.on) { PD("Z %llu draw skipped: both faces culled", g_stat_pass); drop_note(DR_CULL, NULL); return; }
+     { int cu = g_wl.on ? MTLCullModeNone : S.poly.cull == NVN_FACE_FRONT ? MTLCullModeFront : S.poly.cull == NVN_FACE_BACK ? MTLCullModeBack : MTLCullModeNone;   // a line has no faces: its quads are never culled
+       int wi = (S.poly.front == NVN_FRONT_FACE_CCW) != g_queue_origin_ll ? MTLWindingCounterClockwise : MTLWindingClockwise;   // NVN's raster flip is captured when the queue is initialized, rather than when the device origin changes.
+       int fi = S.poly.mode == NVN_POLYGON_MODE_LINE && !g_wl.on ? MTLTriangleFillModeLines : MTLTriangleFillModeFill, cl = !S.depth_clamp;   // depth clip off = SetDepthClamp
+@@ -17321,7 +17398,7 @@
+     // which ends the render pass: en is then an ended encoder, and drawing on it crashed in the driver (AGX reads its released context: Need for Speed: Hot Pursuit Remastered,
+     // a 4096x1024 texture sampled through another format's view at its first loading screen). The texture is upgraded now, so the draw is encoded again in a new pass
+     if (g_enc != en) {
+-        static int again; if (again) { RED_ONCE(130, "binding a draw's arguments ended its render pass twice; draw skipped"); return; }
++        static int again; if (again) { RED_ONCE(130, "binding a draw's arguments ended its render pass twice; draw skipped"); drop_note(DR_ARGS, NULL); return; }
+         PD("M %llu binding the draw's arguments ended the render pass (texture upgrade); encoded again", g_stat_pass);
+         again = 1; draw(dw, di); again = 0; return;
+     }
+@@ -17341,7 +17418,7 @@
+         case 4: case 6: case 7: mp = MTLPrimitiveTypeTriangle; break; case 5: mp = MTLPrimitiveTypeTriangleStrip; break;   // 6 triangle fan, 7 quads: Metal has neither, expanded into triangle lists
+         default: { static int n; if (n++ < 8) MLOG("[RED] primitive type %d not implemented (vertex %s hull %s domain %s fragment %s; draw skipped)", prim, pr->sh[0] ? pr->sh[0]->key : "-",
+                                                     pr->sh[3] ? pr->sh[3]->key : "-", pr->sh[4] ? pr->sh[4]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-"); }
+-            PD("Z %llu draw skipped: primitive type %d", g_stat_pass, prim); return;
++            PD("Z %llu draw skipped: primitive type %d", g_stat_pass, prim); drop_note(DR_PRIM, "primitive %d", prim); return;
+     }
+     if (g_vis_counting && g_vis_need) {   // Occlusion query counting: a new slot for this render pass (also switch to a new slot after a report / reset)
+         if (!g_enc_has_vis) RED_ONCE(34, "occlusion query counting began in a pass without a visibility buffer (the first reset happened mid-pass); that pass's samples are not counted");
+@@ -17446,7 +17523,7 @@
+             uint32_t nt = prim == 7 ? (uint32_t)(di->count / 4) * 2 : di->count >= 3 ? (uint32_t)di->count - 2 : 0;
+             if (!nt) return;
+             void *mb; uint64_t mo; const uint8_t *src;
+-            if (!mtl_addr(di->ibuf, (uint64_t)di->count * isz, &mb, &mo) || !(src = [(__bridge id<MTLBuffer>)mb contents])) { RED_ONCE(22, "index buffer is in no memory pool"); return; }
++            if (!mtl_addr(di->ibuf, (uint64_t)di->count * isz, &mb, &mo) || !(src = [(__bridge id<MTLBuffer>)mb contents])) { RED_ONCE(22, "index buffer is in no memory pool"); ibuf_drop(di->ibuf, (uint64_t)di->count * isz); return; }
+             if (pend_hits(di->ibuf, (uint64_t)di->count * isz)) RED_ONCE(73, "triangle fan / quad index buffer has GPU-side writes in this submission: expanded from the current content");
+             src += mo;
+             id<MTLBuffer> ab; arena_at at = arena_take(((size_t)nt * 12 + 15) & ~(size_t)15, &ab);
+@@ -17467,7 +17544,7 @@
+                 return;
+             }
+             void *mb; uint64_t mo; const uint8_t *src;
+-            if (!mtl_addr(di->ibuf, di->count, &mb, &mo) || !(src = [(__bridge id<MTLBuffer>)mb contents])) { RED_ONCE(22, "index buffer is in no memory pool"); return; }
++            if (!mtl_addr(di->ibuf, di->count, &mb, &mo) || !(src = [(__bridge id<MTLBuffer>)mb contents])) { RED_ONCE(22, "index buffer is in no memory pool"); ibuf_drop(di->ibuf, di->count); return; }
+             if (pend_hits(di->ibuf, di->count)) RED_ONCE(48, "8-bit index buffer has GPU-side writes in this submission and the GPU expansion failed: expanded from the current content");
+             id<MTLBuffer> ab; arena_at at = arena_take(((size_t)di->count * 2 + 15) & ~(size_t)15, &ab);
+             uint16_t *d = (uint16_t *)(void *)at.cpu; src += mo;
+@@ -17477,7 +17554,7 @@
+         }
+         void *mb; uint64_t mo;
+         uint64_t gpu;
+-        if (!mtl_gpu_addr(di->ibuf, (uint64_t)di->count * (di->itype == 1 ? 2 : 4), &mb, &mo, &gpu)) { RED_ONCE(22, "index buffer is in no memory pool"); return; }
++        if (!mtl_gpu_addr(di->ibuf, (uint64_t)di->count * (di->itype == 1 ? 2 : 4), &mb, &mo, &gpu)) { RED_ONCE(22, "index buffer is in no memory pool"); ibuf_drop(di->ibuf, (uint64_t)di->count * (di->itype == 1 ? 2 : 4)); return; }
+         if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ((__bridge id<MTLBuffer>)mb).length - mo,
+                 di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
+     }
+@@ -19134,9 +19211,11 @@
+                 else mtl_sub_counter(ad, (uint32_t)t);
+                 break; }
+             case OP_RENDER_COND: { const p_render_cond *rc = a;   // SetRenderEnable / SetRenderEnableConditional (hle_nvn.c)
++                g_rc_last_mode = rc->mode; g_rc_last_addr = rc->addr;
+                 if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
+                 else { uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
+                     g_rc_skip = known && (rc->mode ? x == y : x != y);
++                    g_rc_last_x = x; g_rc_last_y = y; g_rc_last_known = known; g_rc_eval[!known ? 2 : g_rc_skip ? 1 : 0]++;
+                     PD("E %llu conditional render %s addr=%#llx values %llu / %llu%s%s", g_stat_pass, rc->mode ? "draw if not equal" : "draw if equal", (unsigned long long)rc->addr, (unsigned long long)x, (unsigned long long)y, known ? "" : " (unknown, drawn)", g_rc_skip ? " → not drawn" : ""); }
+                 break; }
+             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = 1;   // the fence value this submission (segment) commits with
+@@ -19220,12 +19299,12 @@
+             case OP_MULTI_DRAW:
+                 // A lookahead from outside the range stops at its boundary, including scans for inline writes to the arguments.
+                 g_mdx_epoch++; g_mdx_stop = NULL;
+-                if (!g_rc_skip) draw_multi(a);
++                g_draw_ops++; if (!g_rc_skip) draw_multi(a); else rc_note_drop("a multi-draw");
+                 g_mdx_epoch++;
+                 break;
+-            case OP_DRAW: { if (g_rc_skip) break; if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
++            case OP_DRAW: { g_draw_ops++; if (g_rc_skip) { rc_note_drop("a draw"); break; } if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
+                 p_draw t; g_exec_cur = p; g_exec_next = p + h.size; draw(draw_rec(a, h.size, &t), NULL); g_exec_next = NULL; break; }   // Lookahead start point
+-            case OP_DRAW_IDX: { if (g_rc_skip) break; if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
++            case OP_DRAW_IDX: { g_draw_ops++; if (g_rc_skip) { rc_note_drop("an indexed draw"); break; } if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
+                 p_draw_idx t; g_exec_cur = p; g_exec_next = p + h.size; draw(NULL, draw_idx_rec(a, h.size, &t)); g_exec_next = NULL; break; }
+             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
+             case OP_BIND_PROGRAM: { const p_bind_program *b = a; state_op(h.op,a);
+@@ -19251,7 +19330,7 @@
+             case OP_COPY_B2T: copy_b2t(a, h.size); ps_note_write(((const p_copy_b2t *)a)->tex); break;
+             case OP_COPY_T2B: copy_t2b(a, h.size); break;
+             case OP_COPY_T2T: copy_t2t(a); ps_note_write(((const p_copy_t2t *)a)->dst); break;
+-            case OP_DRAW_TEX: draw_tex(a); break;
++            case OP_DRAW_TEX: g_draw_ops++; if (g_rc_skip) rc_note_drop("a DrawTexture"); else if (g_draw_tex_failed) drop_note(DR_DRAWTEX, "its pipeline could not be made"); draw_tex(a); break;
+             case OP_CLEAR_TEX: clear_tex(a); ps_note_write(((const p_clear_tex *)a)->tex); break;
+             case OP_DLSS: dlss_eval(a); break;
+             case OP_AS_BUILD: as_exec_build(a); break;
+@@ -20149,6 +20228,23 @@
+ static uint64_t g_present_res_ns;   // present_now's residency commits (display link thread: the slow-callback line)
+ static int g_fg_owing;   // frame generation: present_now is showing a present's own picture after its generated frame (display link thread only; see g_fg_owe)
+ static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
++// Draft 0508: Apple's Metal performance HUD for DM_METAL_HUD=1 where the front end does not set it. Metal reads MTL_HUD_ENABLED when the process makes its first device; in an app
++// that hands the engine its own layer (GameApp: front_stub + front_pad, iOS) that device is made by the app long before the game, and nothing turned DM_METAL_HUD into
++// MTL_HUD_ENABLED, so the setting showed nothing and logged nothing. The layer's developerHUDProperties (iOS 16, macOS 13) turn the HUD on for that layer at any time: set once
++// per layer, on the main thread, and logged. Not with the Mac's own front end, whose front_hud_env sets MTL_HUD_ENABLED before the first device (mode=default would override its
++// Hide HUD menu): g_hud_own is 1 there. DM_METAL_HUD unset or 0: nothing
++static int g_hud_own = TARGET_OS_OSX;   // the front end turns the HUD on itself (front_mac.m); tests set it
++static int g_hud_set;   // layers given the HUD (t_drop_reasons)
++static void hud_layer(CAMetalLayer *layer) {
++    static void *done; if ((__bridge void *)layer == done) return; done = (__bridge void *)layer;
++    const char *e = getenv("DM_METAL_HUD"); if (!e || !atoi(e) || g_hud_own) return;
++    if (![layer respondsToSelector:@selector(setDeveloperHUDProperties:)]) { MLOG("[RED] DM_METAL_HUD: this system's CAMetalLayer has no developerHUDProperties: no HUD"); return; }
++    g_hud_set++;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        if (@available(iOS 16.0, macOS 13.0, *)) layer.developerHUDProperties = @{@"mode": @"default", @"logging": @"default"};
++        MLOG("Metal performance HUD on through the game layer's developerHUDProperties (DM_METAL_HUD=1)");
++    });
++}
+ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
+     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
+     g_present_n++;
+@@ -20213,6 +20309,7 @@
+     if (atomic_load(&g_gpu_lost)) return 0;   // the display command buffer would be ignored too: take no drawable from the screen the front end is about to close
+     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
+     if (!layer) return 0;
++    hud_layer(layer);   // draft 0508: DM_METAL_HUD through the layer (developerHUDProperties)
+ #if TARGET_OS_OSX
+     if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // Windowed mode follows the display's vsync to prevent tearing
+ #endif
+@@ -21289,7 +21386,7 @@
+     // nothing draws into, since c06d1e79 stopped a sliver of another span from making them the GPU's)
+     if (!ev_val && on_sub_thread()) {
+         id<MTLTexture> pmt = tex_mtl(t); if (tex_from_storage(t)) up_flush();
+-        static uint64_t pdraw; uint64_t dn = g_stat_draw; ps_note_present(t, (__bridge const void *)pmt, dn - pdraw); pdraw = dn;   // draft 0507: what this present shows
++        static uint64_t pdraw; uint64_t dn = g_stat_draw; ps_note_present(t, (__bridge const void *)pmt, dn - pdraw); stretch_note(dn - pdraw); pdraw = dn;   // draft 0507: what this present shows; 0508: stretches with no draw
+     }
+     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);
+     link_sync();
+@@ -21418,6 +21515,8 @@
+ // Wait until all queued presents have been processed (used by mtl_finish = nvnQueueFinish etc.): goes through mtl_present_wait, so there is still a fallback when the display link stops (real device: the game called QueueFinish once while the display link was stopped,
+ // and this used to wait here without a timeout; nobody took the 3 queued frames and the game stalled; those two runs on Mac did not hit this call)
+ void mtl_present_flush(void) { pthread_mutex_lock(&g_pq_mu); uint64_t h = g_pq_in; pthread_mutex_unlock(&g_pq_mu); mtl_present_wait(h); }
++static uint64_t mtl_frame_now(void) { return atomic_load(&g_cur_frame); }
++static uint64_t g_stat_pass_now(void) { return g_stat_pass; }
+ void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = g_stat_pass; *draws = g_stat_draw; cp_report(); }
+ void mtl_args_stats(uint64_t *enc, uint64_t *reuse, uint64_t *patch) { *enc = g_stat_args_enc; *reuse = g_stat_args_reuse; *patch = g_stat_args_patch; }
+ void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip, uint64_t *copies, uint64_t *copy_bytes) {
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -268,6 +268,8 @@
+ .PHONY: check_t_present_keep
+ check_t_present_keep: t_present_keep
+ 	./t_present_keep && DM_NVN_PRESENT_KEEP=0 ./t_present_keep
++t_drop_reasons: t_drop_reasons.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_drop_reasons.m $(MTL_T_SRC) $(FW)
+ .PHONY: check_t_vbuf_clamp
+ check_t_vbuf_clamp: t_vbuf_clamp
+ 	./t_vbuf_clamp && DM_NVN_VBUF_CLAMP=0 ./t_vbuf_clamp && DM_NVN_VBUF_CLAMP=2 ./t_vbuf_clamp
+--- /dev/null
++++ b/dm/gfx/tests/t_drop_reasons.m
+@@ -0,0 +1,53 @@
++// Dropped draws by reason (nvn_mtl.m drop_note, draft 0508): the counters mtl_drop_stats reports, the render-condition note, a draw with no program bound replayed through
++// draw() (no_program), the census of presents that encoded no draw (stretch_note), and DM_METAL_HUD through the layer's developerHUDProperties (hud_layer).
++// Draft for South Park: The Fractured But Whole (01008F2005154000)
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(label, c) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
++static uint64_t dr(int r) { uint64_t ops, by[DR_N]; mtl_drop_stats(&ops, by, DR_N); return by[r]; }
++int main(void) { @autoreleasepool {
++    mtl_init();
++    g_hud_own = 0;   // as GameApp's front end: the engine sets the HUD on the layer
++    CHECK("15 reasons, named", DR_N == 15 && g_dr_name[DR_N - 1] && g_dr_name[DR_RC]);
++    drop_note(DR_PSO, "vertex %s fragment %s", "aaaa", "bbbb");
++    drop_note(DR_PSO, NULL);
++    CHECK("a reason counts each drop", dr(DR_PSO) == 2);
++    g_rc_last_mode = 0; g_rc_last_addr = 0x1234; g_rc_last_x = 1; g_rc_last_y = 2; g_rc_last_known = 1;
++    rc_note_drop("a draw");
++    CHECK("a draw inside a false render condition counts as render_condition_false", dr(DR_RC) == 1);
++    vbuf_skip_note(0, 0x10, 64);
++    CHECK("a vertex-stream skip counts in its reason", dr(DR_VBUF) == 1);
++    // a draw replayed with no program bound: the draw path's own early return
++    memset(&S, 0, sizeof S); p_draw d = {0}; d.prim = 4; d.count = 3; d.instances = 1;
++    uint64_t np0 = dr(DR_NOPROG); draw(&d, NULL);
++    CHECK("a draw with no program bound counts as no_program", dr(DR_NOPROG) == np0 + 1);
++    // stretches: 5 presents with no draw encoded, the game's records dropped by a render condition, then one with draws
++    uint64_t st0 = g_st_n;
++    stretch_note(4);
++    for (int i = 0; i < 5; i++) { g_draw_ops += 2; rc_note_drop("a draw"); rc_note_drop("a draw"); stretch_note(0); }
++    CHECK("no stretch logged while it runs", g_st_n == st0);
++    stretch_note(3);
++    CHECK("a stretch of 5 presents is counted when draws come back", g_st_n == st0 + 1);
++    stretch_note(0); stretch_note(0); stretch_note(5);
++    CHECK("a run of 2 is not a stretch", g_st_n == st0 + 1);
++    uint64_t ops, by[DR_N]; mtl_drop_stats(&ops, by, DR_N);
++    CHECK("draw records counted", ops == 10);
++    CHECK("render-condition drops total", by[DR_RC] == 11);
++    // the Metal HUD through the layer
++    setenv("DM_METAL_HUD", "1", 1);
++    CAMetalLayer *l = [CAMetalLayer layer]; l.device = g_dev;
++    hud_layer(l); hud_layer(l);
++    CHECK("the HUD is set once per layer", g_hud_set == 1);
++    for (int i = 0; i < 20 && ![l.developerHUDProperties[@"mode"] isEqual:@"default"]; i++) [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
++    CHECK("the layer's developerHUDProperties say mode default", [l.developerHUDProperties[@"mode"] isEqual:@"default"]);
++    setenv("DM_METAL_HUD", "0", 1);
++    CAMetalLayer *l2 = [CAMetalLayer layer]; hud_layer(l2);
++    CHECK("DM_METAL_HUD=0: nothing", g_hud_set == 1 && !l2.developerHUDProperties);
++    printf("t_drop_reasons: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }

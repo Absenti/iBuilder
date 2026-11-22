@@ -1,0 +1,21 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/ps_data.bin": "ffdc033d51ac6e5717e6085b43f5fc3bbd6f4a6699850dab0ac1bee764994576",
+  "pkg/vs_data.bin": "5b8adeccb96cda765e2ae4808f65f990939576256c4e2dcb3de38249f04e3183",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f2ba7b14c9b0912d59d94603955272d90ab8f1b5b538d5f541340e5c62f089cb",
+  "tables/shader_map.tsv": "383753853f9acbaa6c207df697b47122a1e0f111a71839996999c97d01d87df8",
+  "tables/shader_pairs.tsv": "46f3c424e9fb3f5ad8b6f6f722ee692b2a3a3209e992cdd6a32ff668305fb7df"
+ },
+ "log": [
+  "[RED] Data/lz4len.kit: @ROMFS@/Data/lz4len.kit#0: LZ4 block is outside the KIT member (its shaders are left out)",
+  "[RED] Data/lz4zero.kit: @ROMFS@/Data/lz4zero.kit#0: LZ4 block is outside the KIT member (its shaders are left out)",
+  "[RED] Data/sha.kit: @ROMFS@/Data/sha.kit#0: KIT SHA1 mismatch (its shaders are left out)",
+  "[RED] 3 file(s) could not be read, their shaders are left out (first: Data/lz4len.kit: @ROMFS@/Data/lz4len.kit#0: LZ4 block is outside the KIT member)",
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (67afa1fa2e2f68d6)",
+  "shaders: 2 (pixel 1, vertex 1); sources data 2; compute shader answers 0 rows; variation pairs 1"
+ ],
+ "shaders": 2,
+ "updates": []
+}

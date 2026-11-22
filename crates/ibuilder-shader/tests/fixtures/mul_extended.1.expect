@@ -1,0 +1,20 @@
+OK
+{}
+#praga clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T, typename U, typename V>
+[[clang::optnone]] T spvMulExtended(V l, V r)
+{
+    return T{U(l * r), U(mulhi(l, r))};
+}
+template<typename T, typename U> static inline __attribute__((always_inline)) T spvMulExtended(uint l, uint r) { ulong p = ulong(l) * ulong(r); return T{U(p), U(p >> 32)}; }
+template<typename T, typename U> static inline __attribute__((always_inline)) T spvMulExtended(int l, int r) { long p = long(l) * long(r); return T{U(p), U(p >> 32)}; }
+
+kernel void main0()
+{
+
+}

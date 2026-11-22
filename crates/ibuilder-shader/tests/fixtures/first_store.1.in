@@ -1,0 +1,21 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <simd/simd.h>
+
+using namespace metal;
+
+kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]])
+{
+
+    float _158 = as_type<float>(gl_WorkGroupID.x);
+    float _163 = as_type<float>(gl_LocalInvocationID.x);
+    int _190 = as_type<int>(_158) << 2;
+    int _172 = ~as_type<int>(_163);
+    int _132 = _172 + 1;
+    bool _163 = _132 != _190;
+    if (!_163)
+    {
+        (*spvDescriptorSet0.cp_s2)._m0[1] = 1u;
+    }
+    float _99 = 1.0;
+}

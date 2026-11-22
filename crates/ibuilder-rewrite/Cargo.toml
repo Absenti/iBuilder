@@ -1,0 +1,22 @@
+[package]
+name = "ibuilder-rewrite"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Switch NSO rewriter (port of dm/tools/patch_nso.py)"
+
+[dependencies]
+ibuilder-nso = { path = "../ibuilder-nso" }
+ibuilder-a64 = { path = "../ibuilder-a64" }
+sha2 = { workspace = true }
+rayon = { workspace = true }
+memmap2 = { workspace = true }
+# regex: the jump-table / tail-call recognisers of patch_nso.py are written as Python `re` patterns over Capstone's
+# operand text; the same patterns are kept verbatim (ASCII mode, no unicode tables) so the port stays reviewable
+# line by line against the Python. Only used on the rare `br x18` / window paths, not in the hot scans.
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
+# memchr: `bytes.find` over 100 MB module images (already a transitive dependency of regex)
+memchr = "2"
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }

@@ -1,0 +1,13 @@
+OK
+{}
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+kernel void main0()
+{
+atomic_fetch_add_explicit((device atomic_float*)&a(b), fma(a, b, c), memory_order_relaxed);
+int _65 = _7 + 1;
+}

@@ -1,0 +1,600 @@
+# 0081-redesign-ipad-sidebar-hero-inspector.patch -- the iPad layout of the redesign (the owner's prototype target/agent-work/design/project/iPad.dc.html, 1180 x 820 landscape): a left
+# sidebar instead of the tab bar, the Library as a hero of the selected game above a 4-column grid, the game's page in a right INSPECTOR instead of the bottom sheet, Build and Settings in
+# two columns. A compact width keeps 0080's iPhone layout exactly.
+# Applies after 0080. UNTESTED ON AN IPAD, IN THE SIMULATOR AND ON A PHONE: compiled, and its pure part ran in the host harness (below). Kept apart from 0080 at the coordinator's suggestion.
+#
+# WHEN: PadLayout.Applies (GameAppPad.cs, pure): a REGULAR horizontal size class AND at least 820 pt of safe-area width (0062's WideFrom), never in an exported player. Decided in
+#   ApplyAdaptiveLayout after every layout (a rotation, Split View, Slide Over, a Stage Manager resize switch it); the change (SetPadWide) is made once per change. With it 0062's Settings split
+#   (Settings in a left column, its pages on the right) is not used: Settings has the whole width beside the sidebar and its pages open over it with their back button.
+# WHAT (GameAppPadUi.cs, new; small hooks in GameAppLibrary.cs, GameAppRedesignUi.cs, GameAppShelf.cs):
+#   * the sidebar (250 pt, #121217, a hairline edge): the iBuilder mark, Library / Build / Settings (44 pt rows, the lit one an ink capsule, with their counts: the games; "1 building · 2
+#     queued"; the log's errors), SOURCES (the cached cloud sources and their game files, each -> the Cloud page), a storage card at the bottom (0064's bar, the free space). The capsule tab bar
+#     is hidden and the pages reach the bottom (their constraint to the bar is swapped for one to the safe area); every page starts beside the sidebar.
+#   * Library: the hero (a 250 pt cover, the status pill, the title 34 pt, the meta line, the state's buttons of 0080 at 52 pt, the round settings button, the get-task-allow line) above "All games",
+#     a grid of 4 columns, 3 while the inspector is open; a tap on a card selects the hero's game (the hero's settings button or its cover opens the inspector); touch and hold is 0080's menu,
+#     anchored with the grid's real column count; the carousel and its toggle are not shown; the glow follows the hero's game.
+#   * the inspector (360 pt on the right): ShowGameSheet's own page (0080's sheet) as a child navigation controller instead of a presented sheet; its actions close it first (as the sheet closed
+#     itself), its Close button closes it; the library's page makes room for it.
+#   * Build: the "Now building" card on the left, the import card, the queue, the shader preparation, the filter and the game lists on the right. Settings: the four tiles in one row, then the
+#     build settings and the sources on the left, the storage card, the diagnostics and the footer on the right. On a phone both keep 0080's order (they are re-stacked on a change).
+#
+# VERIFIED (2026-11-21, M1 Pro)
+#   * scripts/check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree (diff -r).
+#   * Compile (the same device project, GameAppPad.cs and GameAppPadUi.cs added): `dotnet build gameapp.csproj -c Release -r ios-arm64 -t:Compile`: 0 errors / 40 warnings, the same per file and
+#     code as the 0079 and 0080 trees. "layout: iPad (sidebar, hero, inspector)" and "All games" are in the compiled GameApp.dll.
+#   * Host harness (target/agent-work/redesign/harness81: 0080's harness compiled with PAD81 and GameAppPad.cs over this tree): 131 of 131 checks (0080's 118 and 13 for this patch: when it
+#     applies, the columns, the sizes, the counts, the menu's anchoring in 4 columns, the wiring read from the UIKit files); 11 of 11 mutations of this patch are killed (mutate81.py).
+#
+# NOT VERIFIED: nothing ran on an iPad: the sidebar's and the inspector's look, the switch between the layouts on a rotation or a resize, a child navigation controller's pushed settings page in
+#   a 360 pt panel (its own "Done" button is a sheet's and does nothing there: its back button returns), the hero's sizes in a narrow regular window (820 pt), VoiceOver order. The prototype's
+#   certificate chip in the library header and the Build column's list of the + menu entries are not reproduced (the certificate is Settings' tile, the + menu is the Build header's).
+#
+# NEW UI STRINGS: "iBuilder" (the sidebar's mark), "All games", the counts " building", " queued", " error(s)"; log lines "layout: iPad (sidebar, hero, inspector)", "layout: compact (the iPhone's)".
+diff -ruN b/GameAppLibrary.cs c/GameAppLibrary.cs
+--- b/GameAppLibrary.cs	2026-11-21 19:46:12
++++ c/GameAppLibrary.cs	2026-11-21 19:59:05
+@@ -866,7 +866,9 @@
+             constraints.Add(page.TopAnchor.ConstraintEqualTo(guide.TopAnchor));
+             constraints.Add(pageLead[i]);
+             constraints.Add(pageTrail[i]);
+-            constraints.Add(page.BottomAnchor.ConstraintEqualTo(bar.TopAnchor, -6));
++            pageBottomBar[i] = page.BottomAnchor.ConstraintEqualTo(bar.TopAnchor, -6);
++            pageBottomWide[i] = page.BottomAnchor.ConstraintEqualTo(guide.BottomAnchor, -8);   // patch 0081: the iPad layout has no tab bar (its sidebar, GameAppPadUi.cs)
++            constraints.Add(pageBottomBar[i]);
+         }
+         // The Settings split (a wide iPad window): Settings keeps a column of its own on the left, its pages open on the right.
+         pageLeftWidth = pages[4].WidthAnchor.ConstraintEqualTo(380);
+@@ -878,6 +880,8 @@
+         constraints.Add(splitDivider.TopAnchor.ConstraintEqualTo(guide.TopAnchor, 14));
+         constraints.Add(splitDivider.BottomAnchor.ConstraintEqualTo(bar.TopAnchor, -14));
+         NSLayoutConstraint.ActivateConstraints(constraints.ToArray());
++        tabBarView = bar;
++        BuildSidebar();   // GameAppPadUi.cs (patch 0081): the iPad layout's sidebar and inspector, hidden until it applies
+     }
+ 
+     private readonly NSLayoutConstraint[] pageLead = new NSLayoutConstraint[8], pageTrail = new NSLayoutConstraint[8];
+@@ -895,7 +899,11 @@
+     {
+         if (GameExport.IsPlayer || pageLead[0] == null) return;
+         var width = View.SafeAreaLayoutGuide.LayoutFrame.Width;
+-        bool wide = width >= WideFrom;
++        // patch 0081: a regular width of an iPad (PadLayout.Applies) takes the iPad layout of the redesign (a sidebar, the library's hero and inspector, two columns); the Settings split of 0062
++        // is then not used (Settings has the whole width beside the sidebar, its pages open over it with their back button)
++        bool pad = PadLayout.Applies(TraitCollection.HorizontalSizeClass == UIUserInterfaceSizeClass.Regular, (double) width, GameExport.IsPlayer);
++        SetPadWide(pad);
++        bool wide = width >= WideFrom && !pad;
+         var side = (nfloat) Math.Max(340.0, Math.Min(420.0, (double) width * 0.34));
+         SetLibraryWide(wide, side, width - 18 - side - 24 - 18);
+         if (wide != splitMode)
+@@ -919,6 +927,7 @@
+         {
+             foreach (var i in new[] { 1, 2, 3, 5, 6 }) pageLead[i].Constant = 0;
+         }
++        if (!wide) for (int i = 0; i < pageLead.Length; i++) if (pageLead[i] != null) pageLead[i].Constant = PageOffset;   // patch 0081: beside the sidebar
+     }
+ 
+     /// The window is wide enough for the two-pane library and the Settings split: an iPad's full width, an iPad in a wide Stage Manager
+@@ -947,6 +956,7 @@
+         if (index == 5) RefreshAppsPage();
+         if (index == 6) RefreshQueuePage();
+         if (index == 7) RefreshBuildTab(GatherFacts());
++        RefreshSidebar();   // GameAppPadUi.cs (patch 0081): the lit entry and the counts
+     }
+ 
+     /// Where the log's back button goes when the build screen opened it: that screen again. Cleared once used, and by
+diff -ruN b/GameAppPad.cs c/GameAppPad.cs
+--- b/GameAppPad.cs	1970-01-01 01:00:00
++++ c/GameAppPad.cs	2026-11-21 19:58:49
+@@ -0,0 +1,26 @@
++// gameapp/GameAppPad.cs: the pure part of the iPad layout (app/patches/0081, the owner's iPad.dc.html): when the iPad layout applies, its sizes, the grid's columns, the sidebar's counts.
++// No UIKit: the host harness compiles it as it is. The views are GameAppPadUi.cs.
++
++using System;
++
++public static class PadLayout
++{
++    public const float SidebarWidth = 250, InspectorWidth = 360, HeroCover = 250;
++
++    /// The width from which the iPad layout is used (the app's WideFrom since 0062): an iPad's full screen or a wide Stage Manager window, never an iPhone, never Split View's halves.
++    public const double MinWidth = 820;
++
++    /// The iPad layout: a REGULAR horizontal size class and at least MinWidth points. A compact one (an iPhone, Slide Over, a narrow Split View) keeps the iPhone layout.
++    public static bool Applies(bool regularWidth, double width, bool player) => !player && regularWidth && width >= MinWidth;
++
++    /// The grid's columns: 2 on the phone layout; 4 in the iPad layout, 3 while its inspector is open.
++    public static int Columns(bool padWide, bool inspectorOpen) => !padWide ? 2 : inspectorOpen ? 3 : 4;
++
++    /// The count beside a sidebar entry: the games, what the Build tab is doing, the log's errors.
++    public static string NavCount(int entry, int games, int queued, bool building, int errors) => entry switch
++    {
++        0 => games > 0 ? games.ToString(System.Globalization.CultureInfo.InvariantCulture) : "",
++        1 => building ? "1 building" + (queued > 0 ? " · " + queued + " queued" : "") : queued > 0 ? queued + " queued" : "",
++        _ => errors > 0 ? errors + (errors == 1 ? " error" : " errors") : "",
++    };
++}
+diff -ruN b/GameAppPadUi.cs c/GameAppPadUi.cs
+--- b/GameAppPadUi.cs	1970-01-01 01:00:00
++++ c/GameAppPadUi.cs	2026-11-21 19:59:48
+@@ -0,0 +1,327 @@
++// gameapp/GameAppPadUi.cs: the iPad layout of the redesign (app/patches/0081, the owner's prototype target/agent-work/design/project/iPad.dc.html, 1180 x 820 landscape). On a REGULAR horizontal
++// size class at least 820 pt wide (an iPad's full screen, a wide Stage Manager window): a left sidebar (Library / Build / Settings with their counts, the sources, a storage bar) instead of the
++// capsule tab bar; the Library as a hero of the selected game (250 pt cover, pill, title, meta, the state's buttons, a round settings button, the get-task-allow line) above a grid of 4 columns
++// (3 while the inspector is open); the game's settings in a right INSPECTOR panel (360 pt: the game sheet's own page, GameAppShelf.cs ShowGameSheet) instead of the iPhone's bottom sheet;
++// Build and Settings in two columns (Settings' four tiles in one row). A compact width (an iPhone, an iPad in Split View or Slide Over) keeps the iPhone layout of 0080.
++// The pure part (PadLayout, GameAppRedesign.cs) runs in the host harness; nothing here was looked at on an iPad.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using CoreAnimation;
++using CoreGraphics;
++using Foundation;
++using UIKit;
++
++public sealed partial class GameAppViewController
++{
++    private bool padWide;
++    private UIView sidebar, inspector;
++    private UINavigationController inspectorNav;
++    private string inspectorGame;
++    private NSLayoutConstraint inspectorWidth;
++    private readonly NSLayoutConstraint[] pageBottomBar = new NSLayoutConstraint[8], pageBottomWide = new NSLayoutConstraint[8];
++    private readonly List<(UIButton Button, UILabel Count, int Page)> sideNav = new List<(UIButton, UILabel, int)>();
++    private UIStackView sideSources;
++    private readonly StorageBarView sideStorage = new StorageBarView();
++    private UILabel sideFree;
++    private UIView tabBarView;
++
++    // ---- the sidebar -----------------------------------------------------------------------------------------------
++
++    private void BuildSidebar()
++    {
++        sidebar = new UIView { BackgroundColor = Theme.Hex(0x121217), Hidden = true, TranslatesAutoresizingMaskIntoConstraints = false, AccessibilityIdentifier = "sidebar" };
++        var edge = new UIView { BackgroundColor = Look.Line, TranslatesAutoresizingMaskIntoConstraints = false };
++        sidebar.AddSubview(edge);
++        var logo = new UIView { BackgroundColor = Theme.Accent, TranslatesAutoresizingMaskIntoConstraints = false, IsAccessibilityElement = false };
++        logo.Layer.CornerRadius = 9;
++        var hammer = Theme.Symbol("hammer.fill", 17, UIColor.Black);
++        logo.AddSubview(hammer);
++        NSLayoutConstraint.ActivateConstraints(new[] { logo.WidthAnchor.ConstraintEqualTo(34), logo.HeightAnchor.ConstraintEqualTo(34), hammer.CenterXAnchor.ConstraintEqualTo(logo.CenterXAnchor), hammer.CenterYAnchor.ConstraintEqualTo(logo.CenterYAnchor) });
++        var name = Theme.Label("iBuilder", Theme.Font(20, UIFontWeight.Bold), Theme.Text);
++        name.AccessibilityTraits = UIAccessibilityTrait.Header;
++        var brand = Theme.Row(10, logo, name);
++        var column = Theme.Column(6, brand);
++        column.SetCustomSpacing(18, brand);
++        sideNav.Clear();
++        for (int i = 0; i < TabTitles.Length; i++)
++        {
++            int page = TabPages[i];
++            var b = new UIButton(UIButtonType.Custom) { AccessibilityIdentifier = "side-" + TabIds[i], AccessibilityLabel = TabTitles[i] };
++            b.Layer.CornerRadius = 12;
++            var icon = Theme.Symbol(TabIcons[i], 18, Theme.Text);
++            var label = Theme.Label(TabTitles[i], Theme.Font(15, UIFontWeight.Semibold), Theme.Text);
++            var count = Theme.Label("", Theme.Font(12, UIFontWeight.Medium), Theme.Muted);
++            var row = Theme.Row(12, icon, label, new UIView(), count);
++            row.UserInteractionEnabled = false;
++            row.TranslatesAutoresizingMaskIntoConstraints = false;
++            b.AddSubview(row);
++            NSLayoutConstraint.ActivateConstraints(new[] { row.LeadingAnchor.ConstraintEqualTo(b.LeadingAnchor, 12), row.TrailingAnchor.ConstraintEqualTo(b.TrailingAnchor, -12), row.CenterYAnchor.ConstraintEqualTo(b.CenterYAnchor), b.HeightAnchor.ConstraintEqualTo(44) });
++            b.TouchUpInside += (_, __) => { logsBack = null; ShowTab(page); };
++            column.AddArrangedSubview(b);
++            sideNav.Add((b, count, page));
++        }
++        var sources = Look.Section("Sources");
++        column.AddArrangedSubview(sources);
++        column.SetCustomSpacing(22, sideNav[^1].Button);
++        sideSources = Theme.Column(0);
++        column.AddArrangedSubview(sideSources);
++        sideFree = Theme.Label("", Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
++        sideFree.TextAlignment = UITextAlignment.Right;
++        var storage = Look.Card(Theme.Column(8, Theme.Row(8, Theme.Label("Storage", Theme.Font(12, UIFontWeight.Semibold), Theme.Text), new UIView(), sideFree), sideStorage), 12, 12);
++        storage.Layer.CornerRadius = 14;
++        column.TranslatesAutoresizingMaskIntoConstraints = false;
++        storage.TranslatesAutoresizingMaskIntoConstraints = false;
++        sidebar.AddSubview(column);
++        sidebar.AddSubview(storage);
++        View.AddSubview(sidebar);
++        var guide = View.SafeAreaLayoutGuide;
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            sidebar.TopAnchor.ConstraintEqualTo(View.TopAnchor), sidebar.BottomAnchor.ConstraintEqualTo(View.BottomAnchor),
++            sidebar.LeadingAnchor.ConstraintEqualTo(View.LeadingAnchor), sidebar.TrailingAnchor.ConstraintEqualTo(guide.LeadingAnchor, PadLayout.SidebarWidth),
++            edge.TopAnchor.ConstraintEqualTo(sidebar.TopAnchor), edge.BottomAnchor.ConstraintEqualTo(sidebar.BottomAnchor), edge.TrailingAnchor.ConstraintEqualTo(sidebar.TrailingAnchor), edge.WidthAnchor.ConstraintEqualTo(1),
++            column.TopAnchor.ConstraintEqualTo(guide.TopAnchor, 28), column.LeadingAnchor.ConstraintEqualTo(guide.LeadingAnchor, 16), column.TrailingAnchor.ConstraintEqualTo(sidebar.TrailingAnchor, -16),
++            storage.LeadingAnchor.ConstraintEqualTo(column.LeadingAnchor), storage.TrailingAnchor.ConstraintEqualTo(column.TrailingAnchor), storage.BottomAnchor.ConstraintEqualTo(guide.BottomAnchor, -20),
++        });
++
++        // the inspector: the game sheet's page, on the right
++        inspector = new UIView { BackgroundColor = Theme.Hex(0x121217), Hidden = true, TranslatesAutoresizingMaskIntoConstraints = false, AccessibilityIdentifier = "inspector" };
++        var iedge = new UIView { BackgroundColor = Look.Line, TranslatesAutoresizingMaskIntoConstraints = false };
++        inspector.AddSubview(iedge);
++        View.AddSubview(inspector);
++        inspectorWidth = inspector.WidthAnchor.ConstraintEqualTo(PadLayout.InspectorWidth);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            inspector.TopAnchor.ConstraintEqualTo(View.TopAnchor), inspector.BottomAnchor.ConstraintEqualTo(View.BottomAnchor), inspector.TrailingAnchor.ConstraintEqualTo(View.TrailingAnchor), inspectorWidth,
++            iedge.TopAnchor.ConstraintEqualTo(inspector.TopAnchor), iedge.BottomAnchor.ConstraintEqualTo(inspector.BottomAnchor), iedge.LeadingAnchor.ConstraintEqualTo(inspector.LeadingAnchor), iedge.WidthAnchor.ConstraintEqualTo(1),
++        });
++    }
++
++    private void RefreshSidebar()
++    {
++        if (sidebar == null || !padWide) return;
++        int lit = currentTab == 0 ? 0 : currentTab == 7 ? 1 : 2;
++        for (int i = 0; i < sideNav.Count; i++)
++        {
++            var (b, count, page) = sideNav[i];
++            bool on = i == lit;
++            b.BackgroundColor = on ? Theme.Text : UIColor.Clear;
++            foreach (var l in b.Subviews.SelectMany(s => s.Subviews)) { if (l is UILabel lab && lab != count) lab.TextColor = on ? UIColor.Black : Theme.Text; if (l is UIImageView img) img.TintColor = on ? UIColor.Black : Theme.Text; }
++            count.TextColor = on ? UIColor.FromWhiteAlpha(0f, 0.6f) : Theme.Muted;
++            count.Text = PadLayout.NavCount(i, libShown.Count, buildQueue.Items.Count, running && launchingGame == null, logErrors);
++            b.AccessibilityValue = count.Text;
++            b.AccessibilityTraits = on ? UIAccessibilityTrait.Button | UIAccessibilityTrait.Selected : UIAccessibilityTrait.Button;
++        }
++        foreach (var v in sideSources.ArrangedSubviews.ToArray()) { sideSources.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        foreach (var s in cloudSources)
++        {
++            var label = Theme.Label(s.Kind == CloudKind.Nas ? "NAS" : Cloud.ProviderName(s.Location), Theme.Font(14, UIFontWeight.Regular), UIColor.FromWhiteAlpha(1f, 0.8f));
++            var n = Theme.Label(cloudFiles.Count(f => f.SourceId == s.Id && Cloud.IsGameFile(f.Name)).ToString(), Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
++            var row = new UIButton(UIButtonType.Custom) { AccessibilityLabel = label.Text + ", " + n.Text + " game files" };
++            var r = Theme.Row(12, Theme.Symbol(s.Kind == CloudKind.Nas ? "server.rack" : "icloud", 16, Theme.Accent), label, new UIView(), n);
++            r.UserInteractionEnabled = false;
++            r.TranslatesAutoresizingMaskIntoConstraints = false;
++            row.AddSubview(r);
++            NSLayoutConstraint.ActivateConstraints(new[] { r.LeadingAnchor.ConstraintEqualTo(row.LeadingAnchor, 12), r.TrailingAnchor.ConstraintEqualTo(row.TrailingAnchor, -12), r.CenterYAnchor.ConstraintEqualTo(row.CenterYAnchor), row.HeightAnchor.ConstraintEqualTo(44) });
++            row.TouchUpInside += (_, __) => ShowTab(1);
++            sideSources.AddArrangedSubview(row);
++        }
++        sideStorage.Set(CurrentStorageSegments());
++        sideFree.Text = GameAppUi.SizeText(FreeBytes()) + " free";
++    }
++
++    // ---- the mode: decided after every layout (ApplyAdaptiveLayout) ----------------------------------------------------
++
++    private void SetPadWide(bool wide)
++    {
++        if (sidebar == null || wide == padWide) return;
++        padWide = wide;
++        sidebar.Hidden = !wide;
++        if (tabBarView != null) tabBarView.Hidden = wide;
++        for (int i = 0; i < pages.Length; i++)
++        {
++            if (pageBottomBar[i] == null) continue;
++            pageBottomBar[i].Active = !wide;
++            pageBottomWide[i].Active = wide;
++        }
++        if (!wide) CloseInspector();
++        ArrangeBuildTab(wide);
++        ArrangeSettings(wide);
++        Write(wide ? "layout: iPad (sidebar, hero, inspector)" : "layout: compact (the iPhone's)");
++        ShowTab(currentTab);
++        RefreshScreen();
++    }
++
++    /// The leading offset of every page: the sidebar's width in the iPad layout.
++    private nfloat PageOffset => padWide ? PadLayout.SidebarWidth : 0;
++
++    // ---- the Library: the hero, the grid's columns ----------------------------------------------------------------
++
++    private UIView heroBlock;
++    private FlowCell heroCover;
++    private UILabel heroTitle, heroMeta, heroNote, gridSection;
++    private UIView heroPill;
++    private UIStackView heroButtons, heroPillRow;
++
++    private UIView MakeHero()
++    {
++        heroCover = new FlowCell();
++        heroCover.UserInteractionEnabled = true;
++        heroCover.Activated = () => { var e = HeroEntry(); if (e != null) ShowGameSheet(e); };
++        heroCover.AddGestureRecognizer(new UITapGestureRecognizer(() => { var e = HeroEntry(); if (e != null) ShowGameSheet(e); }));
++        heroCover.TranslatesAutoresizingMaskIntoConstraints = false;
++        heroCover.WidthAnchor.ConstraintEqualTo(PadLayout.HeroCover).Active = true;
++        heroCover.HeightAnchor.ConstraintEqualTo(PadLayout.HeroCover).Active = true;
++        heroTitle = Theme.Label("", Theme.Font(34, UIFontWeight.Bold), Theme.Text, 2);
++        heroTitle.AccessibilityTraits = UIAccessibilityTrait.Header;
++        heroMeta = Theme.Label("", Theme.Font(14, UIFontWeight.Regular), UIColor.FromWhiteAlpha(1f, 0.66f), 2);
++        heroButtons = new UIStackView { Axis = UILayoutConstraintAxis.Horizontal, Spacing = 10, Alignment = UIStackViewAlignment.Center };
++        heroNote = Theme.Label(LibraryActions.NoGetTaskAllowNote, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
++        heroPillRow = new UIStackView { Axis = UILayoutConstraintAxis.Horizontal };
++        var text = Theme.Column(0, heroPillRow, heroTitle, heroMeta, Theme.Row(0, heroButtons, new UIView()), heroNote);
++        text.SetCustomSpacing(12, heroPillRow);
++        text.SetCustomSpacing(6, heroTitle);
++        text.SetCustomSpacing(20, heroMeta);
++        text.SetCustomSpacing(12, heroButtons.Superview ?? heroButtons);
++        var row = Theme.Row(28, heroCover, text);
++        heroBlock = row;
++        heroBlock.Hidden = true;
++        gridSection = Look.Section("All games");
++        gridSection.Hidden = true;
++        return Theme.Column(30, heroBlock, gridSection);
++    }
++
++    private LibraryEntry HeroEntry() => libShown.FirstOrDefault(e => e.Name == selected) ?? libShown.FirstOrDefault();
++
++    private void RefreshHero()
++    {
++        if (heroBlock == null) return;
++        heroBlock.Hidden = gridSection.Hidden = !padWide || libShown.Count == 0;
++        if (heroBlock.Hidden || libFacts == null) return;
++        var facts = libFacts;
++        var e = HeroEntry();
++        var state = LibStateOf(e, facts, out var fraction);
++        var status = StatusOf(e, state, fraction, facts);
++        bool grey = state == LibState.CloudOnly || state == LibState.Downloading;
++        bool canRun = CanRunHere(facts);
++        heroCover.Set(new FlowItem(e.Name, GameAppUi.DisplayName(e.Name), e.Icon, grey, grey, status.Text, status.Tone, state == LibState.Downloading || state == LibState.Building ? fraction : null));
++        heroPill?.RemoveFromSuperview();
++        heroPill = Look.Pill(status.Text, status.Tone, grey);
++        heroPillRow.AddArrangedSubview(heroPill);
++        heroTitle.Text = GameAppUi.DisplayName(e.Name);
++        long size = e.Cloud != null && grey ? e.Cloud.Size : 0;
++        heroMeta.Text = LibraryStatus.Meta(state, e.Name, size > 0 ? GameAppUi.SizeText(size) : ShelfMeta(e), CloudWords(e.Cloud).Long, canRun, GameAppUi.DeviceName);
++        foreach (var v in heroButtons.ArrangedSubviews.ToArray()) { heroButtons.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        var accent = Look.AccentOf(e.Icon, grey);
++        foreach (var b in LibraryActions.For(state, canRun))
++        {
++            var button = Look.Capsule(b.Label, b.Symbol, b.Primary, accent, 52, b.Primary ? 16 : 15);
++            button.AccessibilityIdentifier = "hero-" + b.Id;
++            button.Enabled = LibraryActions.Enabled(b.Act, facts.Running);
++            var act = b.Act;
++            button.TouchUpInside += (_, __) => RunLibAct(act, e);
++            heroButtons.AddArrangedSubview(button);
++        }
++        var settings = Look.RoundIcon("slider.horizontal.3", "Settings of this game", 52);
++        settings.AccessibilityIdentifier = "hero-settings";
++        settings.TouchUpInside += (_, __) => ShowGameSheet(e);
++        heroButtons.AddArrangedSubview(settings);
++        heroNote.Hidden = !LibraryActions.ShowsNote(state, canRun);
++        ambient.SetHue(e.Icon != null ? Look.HueOf(e.Icon) : -1, true);
++    }
++
++    /// The grid's columns: 2 on a phone, 4 in the iPad layout, 3 while its inspector is open.
++    private int GridColumns => PadLayout.Columns(padWide, inspectorGame != null);
++
++    // ---- the inspector ------------------------------------------------------------------------------------------------
++
++    /// The game sheet's page in the inspector (ShowGameSheet builds it the same way; `close` replaces the sheet's dismissal).
++    private void ShowInspector(UINavigationController nav, string game)
++    {
++        CloseInspector(refresh: false);
++        inspectorNav = nav;
++        inspectorGame = game;
++        AddChildViewController(nav);
++        nav.View.TranslatesAutoresizingMaskIntoConstraints = false;
++        inspector.AddSubview(nav.View);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            nav.View.TopAnchor.ConstraintEqualTo(inspector.TopAnchor), nav.View.BottomAnchor.ConstraintEqualTo(inspector.BottomAnchor),
++            nav.View.LeadingAnchor.ConstraintEqualTo(inspector.LeadingAnchor, 1), nav.View.TrailingAnchor.ConstraintEqualTo(inspector.TrailingAnchor),
++        });
++        nav.DidMoveToParentViewController(this);
++        inspector.Hidden = false;
++        View.BringSubviewToFront(inspector);
++        pageTrail[0].Constant = -PadLayout.InspectorWidth;   // the library makes room: its grid goes to 3 columns
++        inspector.Transform = CGAffineTransform.MakeTranslation(PadLayout.InspectorWidth, 0);
++        UIView.AnimateNotify(0.3, 0, 0.9f, 0.3f, UIViewAnimationOptions.AllowUserInteraction, () => { inspector.Transform = CGAffineTransform.MakeIdentity(); View.LayoutIfNeeded(); }, null);
++        UIAccessibility.PostNotification(UIAccessibilityPostNotification.ScreenChanged, inspector);
++        RefreshScreen();
++    }
++
++    private void CloseInspector(bool refresh = true)
++    {
++        if (inspectorNav == null) return;
++        sheetLaunchFill = null;
++        inspectorNav.WillMoveToParentViewController(null);
++        inspectorNav.View.RemoveFromSuperview();
++        inspectorNav.RemoveFromParentViewController();
++        inspectorNav = null;
++        inspectorGame = null;
++        inspector.Hidden = true;
++        if (pageTrail[0] != null) pageTrail[0].Constant = 0;
++        if (refresh) RefreshScreen();
++    }
++
++    // ---- Build and Settings in two columns -------------------------------------------------------------------------
++
++    private UIStackView buildBody, settingsBody;
++    private UIView[] buildLeft, buildRight, buildNarrow, settingsTop, settingsLeft, settingsRight;
++    private UIStackView tilesOuter;
++
++    private static void Restack(UIStackView body, bool wide, UIView[] left, UIView[] right, UIView[] narrowOrder, nfloat spacing)
++    {
++        foreach (var v in body.ArrangedSubviews.ToArray()) { body.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }   // the two columns (iPad) or the blocks themselves (phone)
++        foreach (var v in left.Concat(right)) v.RemoveFromSuperview();   // out of a column of before
++        if (wide)
++        {
++            body.Axis = UILayoutConstraintAxis.Horizontal;
++            body.Alignment = UIStackViewAlignment.Top;
++            body.Distribution = UIStackViewDistribution.FillEqually;
++            body.Spacing = 16;
++            foreach (var side in new[] { left, right })
++            {
++                var col = Theme.Column(spacing, side);
++                foreach (var v in side) if (!(v is UILabel)) col.SetCustomSpacing(spacing < 12 ? 20 : spacing, v);
++                body.AddArrangedSubview(col);
++            }
++        }
++        else
++        {
++            body.Axis = UILayoutConstraintAxis.Vertical;
++            body.Alignment = UIStackViewAlignment.Fill;
++            body.Distribution = UIStackViewDistribution.Fill;
++            body.Spacing = spacing;
++            foreach (var v in narrowOrder) { body.AddArrangedSubview(v); if (!(v is UILabel)) body.SetCustomSpacing(spacing < 12 ? 20 : spacing, v); }
++        }
++    }
++
++    private void ArrangeBuildTab(bool wide)
++    {
++        if (buildBody == null) return;
++        Restack(buildBody, wide, buildLeft, buildRight, buildNarrow, 18);
++    }
++
++    private void ArrangeSettings(bool wide)
++    {
++        if (settingsBody == null) return;
++        // the four tiles in one row on an iPad, two rows of two on a phone
++        if (tilesOuter != null) tilesOuter.Axis = wide ? UILayoutConstraintAxis.Horizontal : UILayoutConstraintAxis.Vertical;
++        if (tilesOuter != null) tilesOuter.Distribution = wide ? UIStackViewDistribution.FillEqually : UIStackViewDistribution.Fill;
++        if (tilesOuter != null) tilesOuter.Spacing = wide ? 14 : 12;
++        Restack(settingsBody, wide, settingsLeft, settingsRight, settingsTop, 8);
++    }
++}
+diff -ruN b/GameAppRedesignUi.cs c/GameAppRedesignUi.cs
+--- b/GameAppRedesignUi.cs	2026-11-21 19:54:33
++++ c/GameAppRedesignUi.cs	2026-11-21 19:59:48
+@@ -726,7 +726,8 @@
+         appsTitle = Look.Section("Exported apps");
+         shelfAppsCard = appsList;
+ 
+-        var column = Theme.Column(16, header, banner, carouselBlock, gridBlock, libEmpty, appsTitle, shelfAppsCard);
++        var hero = MakeHero();   // GameAppPadUi.cs (patch 0081): the iPad layout's hero and "All games", hidden on a phone
++        var column = Theme.Column(16, header, banner, hero, carouselBlock, gridBlock, libEmpty, appsTitle, shelfAppsCard);
+         column.SetCustomSpacing(8, appsTitle);
+         column.SetCustomSpacing(22, header);
+         // vertical only (the owner's correction): the content is exactly the page's width, no horizontal bounce, and a lifted card or its menu is a layer over the screen, never inside this scroll
+@@ -785,6 +786,8 @@
+         toggleConfig.Image = UIImage.GetSystemImage(grid ? "rectangle.stack" : "square.grid.2x2");
+         libToggle.Configuration = toggleConfig;
+         libToggle.AccessibilityValue = grid ? "Grid" : "Carousel";
++        if (padWide) grid = true;   // patch 0081: the iPad layout is the hero above the grid (no carousel, no toggle)
++        libToggle.Hidden = padWide;
+         bool any = libShown.Count > 0;
+         libEmpty.Hidden = any;
+         carouselBlock.Hidden = !any || grid;
+@@ -811,14 +814,18 @@
+         foreach (var v in gridRows.ArrangedSubviews.ToArray()) { gridRows.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+         if (grid)
+         {
++            int columns = GridColumns;   // 2 on a phone; 4 in the iPad layout, 3 with its inspector open (patch 0081)
+             var cells = libShown.Select((e, i) => GridCard(e, i, libShown.Count, facts)).ToList();
+-            for (int i = 0; i < cells.Count; i += 2)
++            for (int i = 0; i < cells.Count; i += columns)
+             {
+-                var pair = new UIStackView(new UIView[] { cells[i], i + 1 < cells.Count ? cells[i + 1] : new UIView() })
+-                    { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = 14, Alignment = UIStackViewAlignment.Top };
++                var rowCells = Enumerable.Range(i, columns).Select(k => k < cells.Count ? cells[k] : new UIView()).ToArray();
++                var pair = new UIStackView(rowCells)
++                    { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = padWide ? 16 : 14, Alignment = UIStackViewAlignment.Top };
+                 gridRows.AddArrangedSubview(pair);
+             }
+         }
++        RefreshHero();      // GameAppPadUi.cs (patch 0081)
++        RefreshSidebar();
+ 
+         int appCount = FillApps(appsList);
+         appsTitle.Hidden = shelfAppsCard.Hidden = appCount == 0;
+@@ -928,7 +935,7 @@
+             info.TopAnchor.ConstraintEqualTo(open.TopAnchor), info.BottomAnchor.ConstraintEqualTo(open.BottomAnchor),
+             info.LeadingAnchor.ConstraintEqualTo(open.LeadingAnchor), info.TrailingAnchor.ConstraintEqualTo(open.TrailingAnchor),
+         });
+-        open.TouchUpInside += (_, __) => ShowGameSheet(e);
++        open.TouchUpInside += (_, __) => { if (padWide) { selected = e.Name; RefreshScreen(); } else ShowGameSheet(e); };   // patch 0081: on an iPad a card selects the hero's game
+ 
+         var parts = new List<UIView> { open };
+         if (fraction != null && (state == LibState.Downloading || state == LibState.Building)) parts.Add(Look.Bar((float) fraction.Value, Theme.Accent, 4));
+@@ -962,7 +969,7 @@
+         var card = Look.Card(stack, 10, 10);
+         card.ClipsToBounds = true;
+ 
+-        var hold = new UILongPressGestureRecognizer(g => { if (g.State == UIGestureRecognizerState.Began) ShowHold(e, card, 16, index, count, 2); }) { MinimumPressDuration = 0.5 };
++        var hold = new UILongPressGestureRecognizer(g => { if (g.State == UIGestureRecognizerState.Began) ShowHold(e, card, 16, index, count, GridColumns); }) { MinimumPressDuration = 0.5 };
+         open.AddGestureRecognizer(hold);
+         // VoiceOver: the menu's entries are the card's own actions
+         open.AccessibilityCustomActions = HoldEntries(e, facts).Select(x => new UIAccessibilityCustomAction(x.Title, (Func<UIAccessibilityCustomAction, bool>) (a => { x.Run(); return true; }))).ToArray();
+@@ -1086,7 +1093,8 @@
+         tileAddress = Tile("Extended address", "settings-address", () => ShowTab(2));
+         navRows[2] = tileCert.Button;
+         UIStackView Pair(UIView a, UIView b) => new UIStackView(new[] { a, b }) { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Alignment = UIStackViewAlignment.Fill, Spacing = 12 };
+-        return Theme.Column(12, Pair(tileKeys.Button, tileCert.Button), Pair(tileMemory.Button, tileAddress.Button));
++        tilesOuter = Theme.Column(12, Pair(tileKeys.Button, tileCert.Button), Pair(tileMemory.Button, tileAddress.Button));   // patch 0081: one row of four on an iPad (ArrangeSettings)
++        return tilesOuter;
+     }
+ 
+     private static void ReadProvisionOnce()
+diff -ruN b/GameAppShelf.cs c/GameAppShelf.cs
+--- b/GameAppShelf.cs	2026-11-21 19:54:52
++++ c/GameAppShelf.cs	2026-11-21 19:59:48
+@@ -233,7 +233,15 @@
+         phoneSection = Theme.Column(8, Look.Section("On this " + GameAppUi.DeviceName), phoneCard);
+         cloudSection = Theme.Column(8, Look.Section("In the cloud"), cloudCard, cloudNote);
+ 
+-        var column = Theme.Column(18, header, MakeImportCard(), nowSection, buildQueueSection, WarmBuildTabSection(), buildFilter, phoneSection, cloudSection);   // WarmBuildTabSection: GameAppWarm.cs (patch 0076)   // MakeImportCard: the progress of "Add from a folder without copying"
++        // patch 0081: the blocks under the header are kept apart so that the iPad layout can put them in two columns (GameAppPadUi.cs ArrangeBuildTab); a phone has them one under the other, as in 0080
++        var importCard = MakeImportCard();
++        var warmSection = WarmBuildTabSection();
++        buildLeft = new[] { nowSection };
++        buildRight = new[] { importCard, buildQueueSection, warmSection, buildFilter, phoneSection, cloudSection };
++        buildNarrow = new[] { importCard, nowSection, buildQueueSection, warmSection, buildFilter, phoneSection, cloudSection };
++        buildBody = Theme.Column(18);
++        ArrangeBuildTab(padWide);
++        var column = Theme.Column(18, header, buildBody);   // WarmBuildTabSection: GameAppWarm.cs (patch 0076)   // MakeImportCard: the progress of "Add from a folder without copying"
+         var scroll = new UIScrollView { AlwaysBounceVertical = true, AlwaysBounceHorizontal = false, ShowsVerticalScrollIndicator = false };
+         column.TranslatesAutoresizingMaskIntoConstraints = false;
+         scroll.AddSubview(column);
+@@ -600,17 +608,16 @@
+         var diagCard = Look.Group(device.Button, setLogs.Button, share.Button, hidden.Button, build.Button);
+         var footer = Theme.Label("Your own games and keys only. Nothing is included and nothing is sent anywhere.", Theme.Font(12, UIFontWeight.Regular), UIColor.FromWhiteAlpha(1f, 0.55f), 0);
+ 
+-        UIView[] column = {
+-            title, tiles, storageCard,
+-            Look.Section("Build"), buildCard,
+-            Look.Section("Sources"), sourcesCard,
+-            Look.Section("Diagnostics"), diagCard,
+-            footer,
+-        };
+-        var stack = Theme.Column(8, column);
++        // patch 0081: the blocks are kept apart for the iPad layout (two columns, the tiles in one row: GameAppPadUi.cs ArrangeSettings); a phone has them one under the other, as in 0080
++        UIView buildLabel = Look.Section("Build"), sourcesLabel = Look.Section("Sources"), diagLabel = Look.Section("Diagnostics");
++        settingsTop = new UIView[] { storageCard, buildLabel, buildCard, sourcesLabel, sourcesCard, diagLabel, diagCard, footer };
++        settingsLeft = new UIView[] { buildLabel, buildCard, sourcesLabel, sourcesCard };
++        settingsRight = new UIView[] { storageCard, diagLabel, diagCard, footer };
++        settingsBody = Theme.Column(8);
++        ArrangeSettings(padWide);
++        var stack = Theme.Column(8, title, tiles, settingsBody);
+         stack.SetCustomSpacing(16, title);
+-        foreach (var v in new UIView[] { tiles, storageCard, buildCard, sourcesCard, diagCard }) stack.SetCustomSpacing(20, v);
+-        stack.SetCustomSpacing(16, diagCard);
++        stack.SetCustomSpacing(20, tiles);
+         var scroll = new UIScrollView { AlwaysBounceVertical = true, AlwaysBounceHorizontal = false, ShowsVerticalScrollIndicator = false };
+         stack.TranslatesAutoresizingMaskIntoConstraints = false;
+         scroll.AddSubview(stack);
+@@ -710,7 +717,8 @@
+         vc.View.BackgroundColor = Theme.Hex(0x121217);
+         var nav = new UINavigationController(vc) { NavigationBarHidden = true };   // the game's settings are a page of this sheet, not another window
+         nav.View.BackgroundColor = vc.View.BackgroundColor;
+-        void Then(Action act) => nav.DismissViewController(true, () => act());
++        bool panel = padWide;   // patch 0081: in the iPad layout the same page is the right INSPECTOR, not a sheet
++        void Then(Action act) { if (panel) { CloseInspector(); act(); } else nav.DismissViewController(true, () => act()); }
+         GameAppSettingsViewController SettingsPage()
+         {
+             var page = SettingsFor(game, false);
+@@ -727,7 +735,7 @@
+ 
+         // ---- the header: the cover, the name, its id, kind and size
+         var head = new UIView { BackgroundColor = Look.Surface, ClipsToBounds = true };
+-        head.HeightAnchor.ConstraintEqualTo(200).Active = true;
++        head.HeightAnchor.ConstraintEqualTo(panel ? 190 : 200).Active = true;
+         if (e.Icon != null)
+         {
+             var art = new UIImageView(grey ? Look.Grey(e.Icon) : e.Icon) { ContentMode = UIViewContentMode.ScaleAspectFill, ClipsToBounds = true, TranslatesAutoresizingMaskIntoConstraints = false };
+@@ -740,7 +748,7 @@
+         head.AddSubview(shade);
+         var close = Look.RoundIcon("xmark", "Close", 44, UIColor.FromWhiteAlpha(0f, 0.45f));
+         close.AccessibilityIdentifier = "sheet-done";
+-        close.TouchUpInside += (_, __) => vc.DismissViewController(true, null);
++        close.TouchUpInside += (_, __) => { if (panel) CloseInspector(); else vc.DismissViewController(true, null); };
+         head.AddSubview(close);
+         var title = Theme.Label(name, Theme.Font(24, UIFontWeight.Bold), Theme.Text, 2);
+         title.AccessibilityTraits = UIAccessibilityTrait.Header;
+@@ -983,6 +991,7 @@
+             scroll.LeadingAnchor.ConstraintEqualTo(vc.View.LeadingAnchor), scroll.TrailingAnchor.ConstraintEqualTo(vc.View.TrailingAnchor),
+         });
+         if (openSettings) nav.SetViewControllers(new UIViewController[] { vc, SettingsPage() }, false);
++        if (panel) { ShowInspector(nav, game); return; }   // GameAppPadUi.cs
+         Theme.StyleSheet(nav);
+         var sheet = nav.SheetPresentationController;
+         if (sheet != null && !Theme.IsPad) { sheet.Detents = new[] { UISheetPresentationControllerDetent.CreateLargeDetent() }; sheet.PrefersGrabberVisible = true; sheet.PreferredCornerRadius = 30; }

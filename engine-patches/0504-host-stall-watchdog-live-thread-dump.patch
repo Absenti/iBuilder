@@ -1,0 +1,409 @@
+# host/threads: a stall watchdog and a live thread dump (DM_STALL_DUMP, DM_THREAD_DUMP_AT), host frames of stuck threads, SDK 22 lock owners named and given priority lending
+#
+# Source:    https://github.com/cheemu21/kid-with-sword-remake  branch L, three commits put together here:
+#            6f8e49b3c ("L2 ...": svc_thread_dump_live, DM_THREAD_DUMP_AT; 2026-11-15, cheemu21),
+#            3282bd6a9 ("L4-L6 ...": the stall watchdog, DM_STALL_DUMP, in hle_nvn.c; 2026-11-16, cheemu21),
+#            304f10b2a ("L7.5: freeze reports show where a stuck thread sits; SDK 22 lock owners get priority lending"; 2026-11-19, patpat)
+# Authors:   cheemu21, patpat (the commits' names)
+# Licence:   MIT, Copyright (c) 2026 seedds and contributors (nxnative LICENSE; the fork is MIT too); the attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES
+#   dm/host/hle_thread.c:
+#     * svc_thread_dump_live(): the existing state dump (svc_thread_dump) run under G (tried for 200 ms) with NO thread suspended (g_dump_live): each guest thread's wait, the object it waits
+#       on, the guest stack of a thread in an SVC; a guest thread in NO guest wait also gets its scheduler flags and its host frames (host_frames: suspended only while its registers and
+#       frame-pointer chain are copied, resumed before anything is printed); the host's own threads are listed the same way. (The old dump suspends threads for their backtraces; a thread
+#       stopped while it holds the log's or the allocator's lock would stop the dump itself, which is why a live one is needed while the game is stuck.)
+#     * a lock wait names its owner: by handle, or (SDK 22, Ocarina of Time's 22.2.8) by kernel ID, with its name.
+#     * DM_THREAD_DUMP_AT=<seconds> (diagnostic, default unset): the live dump that many seconds after start.
+#     * DM_QOS_MAP priority lending (the lock wait in svc_thread_impl): the owner is also looked up by kernel ID; before only by handle, which found none on SDK 22 games, so a user-
+#       interactive main thread waiting for a lock whose owner ran at a lower QoS lent it nothing. THIS ONE IS A BEHAVIOUR CHANGE (only with g_qos_map, i.e. DM_QOS_MAP; the app's
+#       default for it was not checked).
+#   dm/gfx/nvn/hle_nvn.c:
+#     * stall_watch(): a thread started at load. Once the game has presented 300 frames, a frame count unchanged for 5 s while graphics are not suspended logs
+#       "[RED] stall: no frame for 5 s at frame N ..." and the live dump, once per stall, at most 4 times. DM_STALL_DUMP=0 turns it off. Default ON (reads one counter a second).
+# What the fork's "5 s picture stop" report is: exactly this. It does not fix a freeze; it says which thread holds what (their L7.4 log: a game lock whose owner sat in host code with no CPU
+#   for 28 s).
+# Left out: the fork's front_ios.m part (the dump when the app goes to the background, and the 25 s background task for the pipeline archive's writes): front_ios.m is not in our host build
+#   (load/front_*.m); the archive's writes at the end are engine-patches/0414's. The fork's t_dump_live test was not ported (it includes ../hle_thread.c with its own stubs).
+# Shader chain: not touched. Checked: patch -p1 --forward --dry-run, no fuzz, on the tree + 0401..0415 + 0500, 0503; hle_thread.c and hle_nvn.c pass clang -fsyntax-only (the host's
+#   include paths, profile 010015100B514000). NOT run, NOT run on a device.
+# Use: nothing to set (watchdog on). DM_STALL_DUMP=0 to turn it off; DM_THREAD_DUMP_AT=120 for a dump 2 minutes in.
+
+# REVISION 2 (2026-11-21, review L7): DM_STALL_DUMP is read by dm/host/dm_envflag.h (engine-patches/0415, needed before this patch): off / 0 / false / no turn the watchdog off
+#   (was "0" only); anything else not on / off is logged and keeps it on. The review's L6 (long compiles on the submit thread, the focus, the counter's reset, a handle taken for an ID) is dealt with in revision 3 below.
+
+# REVISION 3 (2026-11-21, review L6 and the frame counter of L8; DM_STALL_DUMP's default is unchanged: on):
+#   * the watchdog's decision is dm/gfx/nvn/nvn_stall_watch.h (pure C, nvn_stall_step): seconds with a pipeline / library compile on the SUBMIT path (a thread inside a graphics API call, i.e.
+#     dm_host_work > 0, or the encode thread: nvn_mtl.m counts them in ser_compile_enter / leave, mtl_submit_compiling()) are not counted, so a 161 s compile (an iPhone log, frame 4342) no
+#     longer uses up the 4 captures; seconds with the app not in front (dm_focus_now() != 1, as the display-link watchdog already does) are not counted either; the wait starts over when the
+#     compile ends; a stall already reported stays reported until frames come back;
+#   * nvn_hle_teardown() sets the frame counter back to 0, and a counter that goes back starts the count of dumps again (a second game in the same process);
+#   * the dump names a lock word's owner both ways (dm/host/dm_lockowner.h): a handle of one thread and the kernel ID of another are both printed, not one of them guessed (the review's "a handle
+#     taken for an ID"). The DM_QOS_MAP lending (svc_thread_impl) is unchanged: handle first, then the ID.
+#   Still as it was: the dump holds G (tried for 200 ms, never waited for longer) while it walks the guest threads; nothing runs in a signal handler.
+#   Tests (no GPU, no game): t_stall_watch (26 checks: the 5 s rule, a 400 s compile, focus, suspend, start-up, 4 per game, a second game, the counter's reset, the owner table) and
+#   t_submit_compile (11 checks: the counter over nested compiles, a host thread's compile, a real library build).
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -10,6 +10,7 @@
+ // Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
+ #include "../../host/hle.h"
+ #include "../../host/dm_envflag.h"   // engine-patches/0415: one reading of on / off switches (0503, 0504)
++#include "nvn_stall_watch.h"   // engine-patches/0504: the stall watchdog's decision (pure C; dm/gfx/tests/t_stall_watch.c)
+ #include "nvn_protos.h"
+ #include "nvn_count.h"
+ #include "nvn_tex.h"
+@@ -1862,6 +1863,37 @@
+     if (on) { dm_vk_drain(); dm_gl_drain(); mtl_drain(); mtl_arch_save(0, 0); LOG("[nvn] graphics suspended: in-flight GPU work drained"); } else LOG("[nvn] graphics resumed");   // the Vulkan and GL queues first: presents on the NVN queue wait for their frames;
+     // the pipeline archive starts writing what it holds: a process in the background may be ended without a word (iOS), and a prewarm's captures wait for a full period
+ }
++// Stall watchdog (kid-with-sword-remake L6.1): once the game has presented 300 frames, a frame count that stays the same for 5 s while graphics are not suspended (the app on the screen)
++// logs every guest thread's wait as it stands (hle_thread.c svc_thread_dump_live, no thread suspended), once per stall; the next stall after frames came back logs again, up to 4 times.
++// An iPhone log ended on a picture that stayed stuck with nothing said, so what the game was waiting for was lost. DM_STALL_DUMP=0 turns this off (default on: it reads a counter once a second)
++static _Atomic uint64_t g_frame;   // (defined below with the frame stats)
++// the host's own (hle_thread.c) wins at link time; a program that links the graphics code alone (the engine's gfx tests) gets this one, which logs nothing
++__attribute__((weak)) void svc_thread_dump_live(void) { }
++// nvn_mtl.m: 1 while a pipeline / library compile runs on the submit path (a thread inside a graphics API call, or the encode thread); the weak stand-in serves where it is not linked
++#ifndef DM_MTL_SUBMIT_COMPILING
++__attribute__((weak)) int mtl_submit_compiling(void) { return 0; }
++#endif
++int dm_focus_now(void);   // hle_oe.c (nvn_mtl.m has a weak one for the graphics tests): 1 when the app is the front one
++static void *stall_watch(void *p) {
++    (void)p;
++    nvn_stall_t st = {0};
++    for (;;) {
++        sleep(1);
++        uint64_t f = atomic_load_explicit(&g_frame, memory_order_relaxed);
++        pthread_mutex_lock(&g_susp_mu); int susp = g_susp; pthread_mutex_unlock(&g_susp_mu);
++        // not a stall: graphics suspended, the app not in front (focus), or the submit thread inside a compile (review L6; nvn_stall_watch.h)
++        if (nvn_stall_step(&st, f, susp, dm_focus_now() != 1, mtl_submit_compiling())) {
++            LOG("[nvn] [RED] stall: no frame for %d s at frame %llu with graphics running: the game's threads as they stand (DM_STALL_DUMP=0 turns this off)", st.still, (unsigned long long)f);
++            svc_thread_dump_live();
++        }
++    }
++    return NULL;
++}
++__attribute__((constructor)) static void stall_watch_start(void) {
++    int bad = 0; if (!dm_env_flag("DM_STALL_DUMP", 1, &bad)) return;   // dm_envflag.h (engine-patches/0415): off / 0 / false / no; was "0" only
++    if (bad) LOG("[nvn] DM_STALL_DUMP=%s is not on / off: the stall watchdog runs (the default)", getenv("DM_STALL_DUMP"));
++    pthread_t th; if (!pthread_create(&th, NULL, stall_watch, NULL)) pthread_detach(th);
++}
+ void dm_gfx_quit(int wait_ms) { mtl_arch_save(wait_ms, 1); }
+ void dm_gfx_quit_begin(void) { mtl_warm_stop(); mtl_arch_save(0, 0); }   // the end's first step: no more prewarm compiles, and what the archive holds starts writing beside the drain (which can wait on a draw that compiles)
+ _Static_assert(DM_QUIT_ARCH_MS == MTL_QUIT_ARCH_MS, "a graceful exit gives the pipeline archive the time a quit does");
+@@ -4019,6 +4051,7 @@
+ }
+ 
+ void nvn_hle_teardown(void) {
++    atomic_store(&g_frame, 0);   // engine-patches/0504 (review L6, L8): the stall watchdog and the frame logs of a second game in this process start from frame 0
+     nq_teardown();
+     pthread_mutex_lock(&g_vp_mu);
+     for (int i = 0; i < g_nvp; i++) {
+--- a/dm/host/hle_thread.c
++++ b/dm/host/hle_thread.c
+@@ -11,6 +11,7 @@
+ // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
+ #include <unistd.h>
+ #include "dm.h"
++#include "dm_lockowner.h"   // engine-patches/0504: handle or kernel ID (review L6)
+ #include <errno.h>
+ #include <sched.h>
+ #include <signal.h>
+@@ -802,6 +803,39 @@
+     return ok;
+ }
+ // State dump (called from crash.c on watchdog / crash; read-only, takes no lock): what each guest thread is waiting on and where its most recent SVC was issued from
++// kid-with-sword-remake L7.5: the host frames of a thread for the live dumps (the stall watchdog, the app leaving the screen). Suspended only while its registers and frame-pointer chain
++// are copied into pcs (thread_get_state and vm_read_overwrite: system calls, no lock, no allocation), resumed before anything is printed or looked up, so a thread stopped while it holds the
++// log's, the allocator's or dyld's lock cannot stop the dump. A member's log (L7.4) froze at a world change: the main thread and three workers waited for a game lock whose owner
++// ('OptimizeChangeBanc') sat in host code with no CPU for 28 s, and the dump could not say where. Returns the frames copied (pc, lr, then the fp chain)
++static int host_frames(mach_port_t port, uint64_t *pcs, int max) {
++    if (!port || port == mach_thread_self() || thread_suspend(port) != KERN_SUCCESS) return 0;
++    int n = 0; arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
++    if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&st, &c) == KERN_SUCCESS) {
++        uint64_t fp = __darwin_arm_thread_state64_get_fp(st);
++        pcs[n++] = __darwin_arm_thread_state64_get_pc(st); if (n < max) pcs[n++] = __darwin_arm_thread_state64_get_lr(st);
++        while (n < max && fp) { uint64_t fr[2]; vm_size_t g = 0;
++            if (vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g) || g != 16 || fr[0] <= fp) break;
++            pcs[n++] = fr[1]; fp = fr[0]; }
++    }
++    thread_resume(port);
++    return n;
++}
++// Print frames copied by host_frames: a guest module as module+offset, host code as image+offset (atos -o <the app's binary> -l <load address> reads them; the image's own offset is
++// printed so the build's unstripped binary symbolizes it) with the nearest exported symbol when dladdr has one
++static void host_frames_print(const char *head, const uint64_t *pcs, int n) {
++    char line[1600]; int p = snprintf(line, sizeof line, "%s", head);
++    for (int k = 0; k < n && p < (int)sizeof line - 120; k++) {
++        uint64_t pc = pcs[k] & 0x0000007fffffffffull; Dl_info di; module_t *m = module_of((void *)pc);
++        if (m) p += snprintf(line + p, sizeof line - p, " %s+%#llx", m->name, pc - (uint64_t)m->base);
++        else if (dladdr((void *)pc, &di) && di.dli_fname) { const char *b = strrchr(di.dli_fname, '/'); b = b ? b + 1 : di.dli_fname;
++            p += snprintf(line + p, sizeof line - p, " %s+%#llx", b, pc - (uint64_t)di.dli_fbase);
++            if (di.dli_sname) p += snprintf(line + p, sizeof line - p, "(%s+%#lx)", di.dli_sname, (unsigned long)(pc - (uint64_t)di.dli_saddr)); }
++        else p += snprintf(line + p, sizeof line - p, " %#llx", pc);
++    }
++    fprintf(stderr, "%s\n", line);
++}
++static int g_dump_live;   // svc_thread_dump_live: no thread is left suspended (host_frames stops one only while it copies its frames)
++static int g_dump_host;   // a live dump that also lists the host's threads (the stall watchdog's)
+ // During a state dump, take the backtrace of other guest threads: suspend → read registers → walk the frame pointer chain (both guest code and gate blocks keep the x29 chain) → resume; only main / sdk frames are printed
+ static void thr_bt(thr_t *t) {
+     if (!t->mport || t->exited || t->mport == mach_thread_self()) return;
+@@ -851,8 +885,14 @@
+         if (t->mport && !t->exited) { thread_basic_info_data_t bi; mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+             if (thread_info(t->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &n) == KERN_SUCCESS)
+                 cpu = bi.user_time.seconds + bi.user_time.microseconds / 1e6 + bi.system_time.seconds + bi.system_time.microseconds / 1e6; }
+-        char own[96] = ""; if (t->wkind == 1 && t->waddr) { uint32_t w = 0; vm_size_t g2 = 0;   // 0x40000000 | Lock wait: lock word = owner handle | 0x40000000
+-            if (!vm_read_overwrite(mach_task_self(), t->waddr, 4, (vm_address_t)&w, &g2)) snprintf(own, sizeof own, " owner %#x", w & ~WAITERS_BIT); }
++        char own[200] = ""; if (t->wkind == 1 && t->waddr) { uint32_t w = 0; vm_size_t g2 = 0;   // 0x40000000 | Lock wait: lock word = owner handle | 0x40000000
++            if (!vm_read_overwrite(mach_task_self(), t->waddr, 4, (vm_address_t)&w, &g2)) { uint32_t ow = w & ~WAITERS_BIT; thr_t *oh = NULL, *oi = NULL; char onb[32], onb2[32];   // the owner by handle (SDK 21 and before), or by kernel ID (SDK 22)
++                for (thr_t *c = g_all; c; c = c->all) { if (!oh && c->handle == ow) oh = c; if (!oi && (uint32_t)c->id == ow) oi = c; }   // both are looked for: a handle equal to another thread's ID is said, not guessed (dm_lockowner.h)
++                switch (dm_owner_kind(oh != NULL, oi != NULL, oh == oi)) {
++                case DM_OWNER_HANDLE: snprintf(own, sizeof own, " owner %#x = %#x '%s'%s", ow, oh->handle, thr_name(oh, onb, sizeof onb), oh->exited ? " (exited)" : ""); break;
++                case DM_OWNER_ID: snprintf(own, sizeof own, " owner %#x = kernel ID of %#x '%s'%s", ow, oi->handle, thr_name(oi, onb, sizeof onb), oi->exited ? " (exited)" : ""); break;
++                case DM_OWNER_BOTH: snprintf(own, sizeof own, " owner %#x = the handle of %#x '%s' or the kernel ID of %#x '%s' (not told apart)", ow, oh->handle, thr_name(oh, onb, sizeof onb), oi->handle, thr_name(oi, onb2, sizeof onb2)); break;
++                default: snprintf(own, sizeof own, " owner %#x (no such thread)", ow); } } }
+         if (t->wkind == 2 && t->waddr) { uint32_t w = 0, k = 0; vm_size_t g2 = 0;              // Condition wait: current values of the associated lock word and the condition key (the deadlock dump lacked this item)
+             vm_read_overwrite(mach_task_self(), t->waddr, 4, (vm_address_t)&w, &g2); vm_read_overwrite(mach_task_self(), t->wkey, 4, (vm_address_t)&k, &g2);
+             snprintf(own, sizeof own, " lock word %#x condvar key %#llx=%#x wait #%llu", w, t->wkey, k, (unsigned long long)t->wseq); }   // wait #: the order the waiters arrived in, which SignalProcessWideKey wakes them in at equal priority
+@@ -880,11 +920,28 @@
+                     if (m2 && stk[i] - (uint64_t)m2->base < m2->text_end) { q += snprintf(sl + q, sizeof sl - q, " [%d]%s+%#llx", i * 8, m2->name, stk[i] - (uint64_t)m2->base); nfr++; } }
+                 q += snprintf(sl + q, sizeof sl - q, " | x19=%#llx x20=%#llx x21=%#llx x22=%#llx x23=%#llx x24=%#llx x25=%#llx x26=%#llx x27=%#llx x28=%#llx", sr[19], sr[20], sr[21], sr[22], sr[23], sr[24], sr[25], sr[26], sr[27], sr[28]);
+                 fprintf(stderr, "%s\n", sl); } }
+-        thr_bt(t);
++        if (!g_dump_live) thr_bt(t);
++        else if (!t->wkind && t->started && !t->exited && t->mport) {   // not in a guest wait: where in the host it is, and what the scheduler thinks of it
++            uint64_t pcs[24]; int nf = host_frames(t->mport, pcs, 24); char hd[200];
++            snprintf(hd, sizeof hd, "[dm]   %#x id %#llx not in a guest wait: sleeping %d native wait %d pause %d host work %d; host frames:", t->handle, (unsigned long long)t->id,
++                     (int)t->sleeping, t->native_wait, (int)t->pause_req, t->host_work ? (int)*t->host_work : -1);
++            host_frames_print(hd, pcs, nf);
++        }
+     }
++    if (g_dump_live && g_dump_host) {   // the host's own threads too (a lock a stuck guest thread waits for may be held by one), frames copied with no thread left suspended
++        thread_act_array_t hs; mach_msg_type_number_t nh2 = 0;
++        if (task_threads(mach_task_self(), &hs, &nh2) == KERN_SUCCESS) {
++            for (mach_msg_type_number_t i = 0; i < nh2; i++) {
++                int guest = 0; for (thr_t *t = g_all; t; t = t->all) if (t->mport == hs[i]) { guest = 1; break; }
++                if (!guest && hs[i] != mach_thread_self()) { uint64_t pcs[16]; int nf = host_frames(hs[i], pcs, 16); char hd[64]; snprintf(hd, sizeof hd, "[dm] host thread %#x:", hs[i]); if (nf) host_frames_print(hd, pcs, nf); }
++                mach_port_deallocate(mach_task_self(), hs[i]);
++            }
++            vm_deallocate(mach_task_self(), (vm_address_t)hs, nh2 * sizeof *hs);
++        }
++    }
+     // Threads created by the host itself (graphics present, audio, movie decoding, etc.): not in the guest thread table, enumerated as mach threads, the first 12 frames symbolized with dladdr
+     thread_act_array_t ths; mach_msg_type_number_t nth = 0;
+-    if (task_threads(mach_task_self(), &ths, &nth) == KERN_SUCCESS) {
++    if (!g_dump_live && task_threads(mach_task_self(), &ths, &nth) == KERN_SUCCESS) {
+         for (mach_msg_type_number_t i = 0; i < nth; i++) {
+             int guest = 0; for (thr_t *t = g_all; t; t = t->all) if (t->mport == ths[i]) { guest = 1; break; }
+             if (!guest && ths[i] != mach_thread_self() && thread_suspend(ths[i]) == KERN_SUCCESS) {
+@@ -909,7 +966,23 @@
+         }
+         vm_deallocate(mach_task_self(), (vm_address_t)ths, nth * sizeof *ths);
+     }
++}
++
++// The same dump while the game runs on (the stall watchdog in hle_nvn.c, DM_THREAD_DUMP_AT): under G, so no thread is freed during the walk, and with no thread left suspended (a thread
++// stopped while it holds the log's or the allocator's lock would stop this one too): each thread's wait, the object it waits on, in an SVC its guest stack, and for a thread in no guest
++// wait its host frames. G is tried for at most 200 ms: a guest thread holding it longer is skipped over, not waited for
++void svc_thread_dump_live(void) {
++    int got = 0; for (int i = 0; i < 200 && !(got = !pthread_mutex_trylock(&G)); i++) usleep(1000);
++    if (!got) { fprintf(stderr, "[dm] thread dump skipped: the thread table stayed busy for 200 ms\n"); return; }
++    g_dump_live = 1; g_dump_host = 1; svc_thread_dump(); g_dump_live = 0; g_dump_host = 0;
++    pthread_mutex_unlock(&G);
+ }
++// DM_THREAD_DUMP_AT=<s> (diagnostic): the live dump that many seconds after start, as the stall watchdog prints it
++static void *dump_at_main(void *p) { sleep((unsigned)(uintptr_t)p); fprintf(stderr, "[dm] DM_THREAD_DUMP_AT: the game's threads as they stand\n"); svc_thread_dump_live(); return NULL; }
++__attribute__((constructor)) static void dump_at_start(void) {
++    const char *e = getenv("DM_THREAD_DUMP_AT"); if (!e || atoi(e) <= 0) return;
++    pthread_t th; if (!pthread_create(&th, NULL, dump_at_main, (void *)(uintptr_t)atoi(e))) pthread_detach(th);
++}
+ 
+ // Same-core wake handoffs apply to every game. core_preempt additionally checks
+ // already-runnable peers after every thread SVC; DM_PREEMPT overrides that option.
+@@ -1301,7 +1374,9 @@
+         if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) { t->waddr = addr; t->wtag = (uint32_t)regs[2];
+             // Under DM_QOS_MAP the owner runs at least at this thread's class until the lock is handed over (the Horizon kernel lends the waiter's priority the same way): a user-interactive
+             // waiter is never held up by a utility-class owner on a slow core
++            // The lock word's owner is the thread's handle up to SDK 21 and its kernel ID from SDK 22: a handle lookup alone found no owner on SDK 22 games (Ocarina of Time, SDK 22.2.8)
+             thr_t *o = g_qos_map ? h_peek((uint32_t)regs[0], O_THREAD) : NULL;
++            if (g_qos_map && !o) for (thr_t *c = g_all; c; c = c->all) if (!c->exited && (uint32_t)c->id == (uint32_t)regs[0]) { o = c; break; }
+             pthread_override_t ov = o && o->pt && !o->exited && t->qos > o->qos ? pthread_override_qos_class_start_np(o->pt, (qos_class_t)t->qos, 0) : NULL;
+             r = block(t, 1, -1);
+             if (ov) pthread_override_qos_class_end_np(ov); }
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -10800,7 +10800,16 @@
+ static pthread_cond_t g_ser_cv = PTHREAD_COND_INITIALIZER;
+ static int g_ser_compiles, g_ser_plain, g_ser_want;   // compiles under way, those without a capture period, serializations waiting or under way
+ static _Atomic uint64_t g_ser_held_ns, g_ser_holds;   // compiles held back by a serialization: time in all, how many
++// Whether a compile runs on the SUBMIT path (engine-patches/0504, review L6): the stall watchdog does not count seconds in which one does. A compile is on that path when its thread is inside a
++// graphics API call (dm_host_work, set by gfx_enter) or is the encode thread; the prewarm head and tail, the archive's queue and the Metal 4 harvesters are not (their threads are not)
++static __thread unsigned t_fg_bits;   // one bit per nested compile of this thread, 1 when it was on the submit path
++static _Atomic int g_fg_compiles; static _Atomic uint64_t g_fg_compile_n;
++#define DM_MTL_SUBMIT_COMPILING 1   // hle_nvn.c's weak stand-in is left out when a test includes both files
++int mtl_submit_compiling(void) { return atomic_load_explicit(&g_fg_compiles, memory_order_relaxed) > 0; }
++static void fg_compile_enter(void) { int fg = atomic_load_explicit(&dm_host_work, memory_order_relaxed) > 0 || on_sub_thread(); t_fg_bits = (t_fg_bits << 1) | (unsigned)fg; if (fg) { atomic_fetch_add(&g_fg_compiles, 1); atomic_fetch_add(&g_fg_compile_n, 1); } }
++static void fg_compile_leave(void) { int fg = t_fg_bits & 1; t_fg_bits >>= 1; if (fg) atomic_fetch_sub(&g_fg_compiles, 1); }
+ static void ser_compile_enter(int plain) {
++    fg_compile_enter();   // counted from the call, so a wait behind a serialization (the gate below) is the submit path's compile too
+     pthread_mutex_lock(&g_ser_mu);
+     if (g_ser_want) {
+         uint64_t t0 = bp_now(); while (g_ser_want) pthread_cond_wait(&g_ser_cv, &g_ser_mu);
+@@ -10810,7 +10819,7 @@
+ }
+ static void ser_compile_begin(void) { ser_compile_enter(0); }
+ static void plain_compile_begin(void) { ser_compile_enter(1); }
+-static void ser_compile_leave(int plain) { pthread_mutex_lock(&g_ser_mu); g_ser_plain -= plain; if (!--g_ser_compiles && g_ser_want) pthread_cond_broadcast(&g_ser_cv); pthread_mutex_unlock(&g_ser_mu); }
++static void ser_compile_leave(int plain) { fg_compile_leave(); pthread_mutex_lock(&g_ser_mu); g_ser_plain -= plain; if (!--g_ser_compiles && g_ser_want) pthread_cond_broadcast(&g_ser_cv); pthread_mutex_unlock(&g_ser_mu); }
+ static void ser_compile_end(void) { ser_compile_leave(0); }
+ static void plain_compile_end(void) { ser_compile_leave(1); }
+ // A stuck capture must not stop every later compile behind a waiting write: after SER_WAIT_MS the write can proceed beside captures of other periods. An unresolved plain compile
+--- /dev/null
++++ b/dm/gfx/nvn/nvn_stall_watch.h
+@@ -0,0 +1,20 @@
++// The stall watchdog's decision (hle_nvn.c stall_watch, engine-patches/0504), pure C so dm/gfx/tests/t_stall_watch.c can run it with no GPU and no game.
++// Once a second the watchdog looks at the game's frame count; this says whether the live thread dump is due. A second that does not count as a stall:
++//  - the count moved, or fewer than NVN_STALL_FRAMES frames were ever presented (the start-up);
++//  - graphics are suspended (the app left the screen) or the app is not the front one (focus: a Control Center pull-down, a call, a system sheet stop the display link too);
++//  - the submit path is inside a pipeline / library compile (a compile on the submit thread can take minutes on a phone: an iPhone log has 161 s at one frame): the frames are not
++//    late for a reason a thread dump would explain, and each one used up one of the 4 captures. The wait restarts when the compile ends.
++// A count that goes BACK (graphics teardown reset it: a second game in the same process) starts the dumps' count again.
++#ifndef NVN_STALL_WATCH_H
++#define NVN_STALL_WATCH_H
++#include <stdint.h>
++enum { NVN_STALL_FRAMES = 300, NVN_STALL_SECS = 5, NVN_STALL_MAX = 4 };
++typedef struct { uint64_t last; int still, dumped, n; } nvn_stall_t;
++static inline int nvn_stall_step(nvn_stall_t *s, uint64_t frames, int suspended, int away, int compiling) {
++    if (frames < s->last) s->n = 0;
++    if (frames != s->last || suspended || away || frames < NVN_STALL_FRAMES) { s->last = frames; s->still = 0; s->dumped = 0; return 0; }
++    if (compiling) { s->still = 0; return 0; }   // a stall already reported stays reported until frames come back
++    if (++s->still >= NVN_STALL_SECS && !s->dumped && s->n < NVN_STALL_MAX) { s->dumped = 1; s->n++; return 1; }
++    return 0;
++}
++#endif
+--- /dev/null
++++ b/dm/host/dm_lockowner.h
+@@ -0,0 +1,14 @@
++// Who owns a lock word, for the thread dump (hle_thread.c, engine-patches/0504). The word holds the owner thread's HANDLE up to SDK 21 and its kernel ID from SDK 22 (Ocarina of Time's
++// 22.2.8). A lookup that matched either one found the wrong thread when one thread's handle equals another's ID (review L6): the dump now looks for both and says which it is.
++//   DM_OWNER_NONE   no thread has that handle or ID
++//   DM_OWNER_HANDLE only a handle matches, or the same thread matches both: the owner is that thread
++//   DM_OWNER_ID     only a kernel ID matches
++//   DM_OWNER_BOTH   a handle of one thread and the ID of another match: both are named, neither is picked
++#ifndef DM_LOCKOWNER_H
++#define DM_LOCKOWNER_H
++enum { DM_OWNER_NONE = 0, DM_OWNER_HANDLE, DM_OWNER_ID, DM_OWNER_BOTH };
++static inline int dm_owner_kind(int by_handle, int by_id, int same_thread) {
++    if (by_handle && by_id) return same_thread ? DM_OWNER_HANDLE : DM_OWNER_BOTH;
++    return by_handle ? DM_OWNER_HANDLE : by_id ? DM_OWNER_ID : DM_OWNER_NONE;
++}
++#endif
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -963,3 +963,8 @@
+ # engine-patches/0415 revision 3 (review L8): the learned list's state is set back at graphics teardown
+ t_session_reset: t_session_reset.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_session_reset.m $(MTL_T_SRC) $(FW)
++# engine-patches/0504 revision 3 (review L6, L8): the stall watchdog's decision (nvn_stall_watch.h), the frame counter's reset at teardown, dm_lockowner.h; no GPU work
++t_stall_watch: t_stall_watch.c ../nvn/hle_nvn.c ../nvn/nvn_stall_watch.h ../../host/dm_lockowner.h ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
++	clang $(CFLAGS) -DDM_TEST_NVN_SDK -fobjc-arc -o $@ t_stall_watch.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
++t_submit_compile: t_submit_compile.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_submit_compile.m $(MTL_T_SRC) $(FW)
+--- /dev/null
++++ b/dm/gfx/tests/t_stall_watch.c
+@@ -0,0 +1,57 @@
++// engine-patches/0504 revision 3 (the review's L6, L8): the stall watchdog's decision and the frame counter's reset at teardown, no GPU work and no game.
++//  - nvn_stall_step (nvn_stall_watch.h): the 5 s rule; seconds with the app out of focus, graphics suspended, or the submit thread inside a compile are not stalls; a long compile does not use up
++//    the 4 captures; a counter that goes back (teardown) starts the count of dumps again;
++//  - nvn_hle_teardown() sets the frame counter back to 0 (a second game in the same process);
++//  - dm_owner_kind (dm_lockowner.h): a lock word that is one thread's handle and another's kernel ID is named both ways, not guessed.
++#include "../nvn/hle_nvn.c"
++#include "../../host/dm_lockowner.h"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
++static int g_fail, g_n;
++#define EXPECT(name, want, got) do { long long w_ = (long long)(want), g_ = (long long)(got); g_n++; if (w_ != g_) { printf("FAIL %s: expected %lld, got %lld (line %d)\n", name, w_, g_, __LINE__); g_fail++; } } while (0)
++int main(void) {
++    // ---- the decision: nvn_stall_step(state, frames, suspended, away, compiling)
++    { nvn_stall_t s = {0}; int due = 0;
++      for (int sec = 0; sec < 5; sec++) due += nvn_stall_step(&s, 1000, 0, 0, 0);   // the first look takes the count; then 4 still seconds
++      EXPECT("5 looks: not yet", 0, due);
++      EXPECT("5th still second (the 6th look): the dump is due", 1, nvn_stall_step(&s, 1000, 0, 0, 0)); EXPECT("  ... that stall's still count", 5, s.still);
++      EXPECT("once per stall", 0, nvn_stall_step(&s, 1000, 0, 0, 0)); EXPECT("  ... and still", 0, nvn_stall_step(&s, 1000, 0, 0, 0));
++      EXPECT("frames come back: reset", 0, nvn_stall_step(&s, 1001, 0, 0, 0)); EXPECT("  ... dumped flag cleared", 0, s.dumped);
++    }
++    { nvn_stall_t s = {0}; int due = 0; nvn_stall_step(&s, 1000, 0, 0, 0);
++      for (int sec = 0; sec < 400; sec++) due += nvn_stall_step(&s, 1000, 0, 0, 1);   // a 400 s compile on the submit thread (an iPhone log had 161 s)
++      EXPECT("a long compile: no dump, none of the 4 captures used", 0, due); EXPECT("  ... captures left", 0, s.n);
++      EXPECT("the compile ends: the wait starts over, 4 s later nothing", 0, nvn_stall_step(&s, 1000, 0, 0, 0) + nvn_stall_step(&s, 1000, 0, 0, 0) + nvn_stall_step(&s, 1000, 0, 0, 0) + nvn_stall_step(&s, 1000, 0, 0, 0));
++      EXPECT("  ... the 5th second after it", 1, nvn_stall_step(&s, 1000, 0, 0, 0));
++    }
++    { nvn_stall_t s = {0}; int due = 0; nvn_stall_step(&s, 1000, 0, 0, 0);
++      for (int sec = 0; sec < 60; sec++) due += nvn_stall_step(&s, 1000, 0, 1, 0);   // the app is not in front: Control Center, a call, a sheet
++      EXPECT("out of focus: no dump", 0, due);
++      for (int sec = 0; sec < 60; sec++) due += nvn_stall_step(&s, 1000, 1, 0, 0);   // graphics suspended (the background)
++      EXPECT("suspended: no dump", 0, due);
++      EXPECT("in front again: 4 s nothing", 0, nvn_stall_step(&s, 1000, 0, 0, 0) + nvn_stall_step(&s, 1000, 0, 0, 0) + nvn_stall_step(&s, 1000, 0, 0, 0) + nvn_stall_step(&s, 1000, 0, 0, 0));
++      EXPECT("  ... the 5th", 1, nvn_stall_step(&s, 1000, 0, 0, 0));
++    }
++    { nvn_stall_t s = {0}; int due = 0; nvn_stall_step(&s, 299, 0, 0, 0);
++      for (int sec = 0; sec < 30; sec++) due += nvn_stall_step(&s, 299, 0, 0, 0);
++      EXPECT("before 300 frames (start-up): no dump", 0, due);
++    }
++    { nvn_stall_t s = {0}; int due = 0;   // at most 4 stalls per game, then none; a second game (the count goes back) gets 4 again
++      for (int stall = 0; stall < 6; stall++) { nvn_stall_step(&s, 1000 + stall, 0, 0, 0); for (int sec = 0; sec < 8; sec++) due += nvn_stall_step(&s, 1000 + stall, 0, 0, 0); }
++      EXPECT("6 stalls, 4 dumps", 4, due);
++      nvn_stall_step(&s, 0, 0, 0, 0); EXPECT("the count went back: dumps counted again", 0, s.n);
++      due = 0; for (int stall = 0; stall < 2; stall++) { nvn_stall_step(&s, 400 + stall, 0, 0, 0); for (int sec = 0; sec < 8; sec++) due += nvn_stall_step(&s, 400 + stall, 0, 0, 0); }
++      EXPECT("the second game: dumps again", 2, due);
++    }
++    // ---- the teardown resets the frame counter (L6, L8): the counter is moved the way the frame hook moves it
++    g_frame = 1234; EXPECT("the counter before", 1234, dm_nvn_frame_count());
++    nvn_hle_teardown(); EXPECT("the counter after teardown", 0, dm_nvn_frame_count());
++    // ---- who owns a lock word
++    EXPECT("handle only", DM_OWNER_HANDLE, dm_owner_kind(1, 0, 0)); EXPECT("kernel ID only", DM_OWNER_ID, dm_owner_kind(0, 1, 0)); EXPECT("neither", DM_OWNER_NONE, dm_owner_kind(0, 0, 0));
++    EXPECT("both, one thread: that thread", DM_OWNER_HANDLE, dm_owner_kind(1, 1, 1)); EXPECT("both, two threads: said, not guessed", DM_OWNER_BOTH, dm_owner_kind(1, 1, 0));
++    printf("t_stall_watch: %d checks, %d failed\n", g_n, g_fail);
++    return g_fail != 0;
++}
+--- /dev/null
++++ b/dm/gfx/tests/t_submit_compile.m
+@@ -0,0 +1,34 @@
++// engine-patches/0504 revision 3 (review L6): mtl_submit_compiling() is 1 exactly while a pipeline / library compile runs on the SUBMIT path (a thread inside a graphics API call, i.e.
++// dm_host_work > 0), which is what the stall watchdog does not count; a compile of the prewarm, the archive's queue or any other thread does not. No GPU work beyond mtl_init
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define EXPECT(name, want, got) do { long long w_ = (long long)(want), g_ = (long long)(got); checks++; if (w_ != g_) { printf("FAIL %s: expected %lld, got %lld (line %d)\n", name, w_, g_, __LINE__); failed++; } } while (0)
++static _Atomic int g_bg_in, g_bg_go, g_bg_seen = -1;
++static void *bg_compile(void *p) {   // a host thread (dm_host_work 0): the prewarm's, the archive's
++    (void)p; plain_compile_begin(); atomic_store(&g_bg_in, 1); while (!atomic_load(&g_bg_go)) usleep(100); plain_compile_end(); return NULL;
++}
++int main(void) { @autoreleasepool {
++    mtl_init();
++    EXPECT("idle", 0, mtl_submit_compiling());
++    dm_host_work++;   // what gfx_enter does on a guest thread
++    plain_compile_begin(); EXPECT("a compile inside a graphics call", 1, mtl_submit_compiling());
++    ser_compile_begin(); EXPECT("nested", 1, mtl_submit_compiling());
++    ser_compile_end(); EXPECT("the inner one ends: still inside the outer", 1, mtl_submit_compiling());
++    plain_compile_end(); EXPECT("both ended", 0, mtl_submit_compiling());
++    dm_host_work--;
++    plain_compile_begin(); EXPECT("a compile of a host thread (not in a graphics call)", 0, mtl_submit_compiling()); plain_compile_end();
++    pthread_t th; pthread_create(&th, NULL, bg_compile, NULL); while (!atomic_load(&g_bg_in)) usleep(100);
++    EXPECT("a prewarm thread's compile under way: not the submit path", 0, mtl_submit_compiling());
++    dm_host_work++; plain_compile_begin(); EXPECT("while the submit path compiles too", 1, mtl_submit_compiling()); plain_compile_end(); dm_host_work--;
++    atomic_store(&g_bg_go, 1); pthread_join(th, NULL);
++    NSError *e = nil; dm_host_work++; id lib = dev_lib(@"kernel void k(device int *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = 1; }", &e);   // a real library build on the submit path
++    dm_host_work--; EXPECT("a real library compile returned", 1, lib != nil); EXPECT("and the counter is back to 0", 0, mtl_submit_compiling());
++    EXPECT("the compiles on the submit path were counted", 4, (long long)atomic_load(&g_fg_compile_n));
++    printf("t_submit_compile: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }

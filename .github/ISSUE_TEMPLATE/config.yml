@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/Absenti/iBuilder/security/policy
+    about: "Never use a public issue for a vulnerability, and never post prod.keys, certificates, game files or unredacted logs."
+  - name: Documentation
+    url: https://github.com/Absenti/iBuilder/blob/main/docs/README.md
+    about: "The index of every document: how the app is built, what was verified, what the devices showed."

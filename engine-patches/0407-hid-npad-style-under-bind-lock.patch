@@ -1,0 +1,92 @@
+# host/hid: read Npad style under the bind lock (PR #2878)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/4b92e2322747ce8113ce34af63e1ad040e084c55  (PR #2878)
+# Author:    seedds, 2026-11-19 09:34:08 +0800
+# Co-authors:
+#   Co-authored-by: Oliver Ames
+#   Co-authored-by: kenCalx
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# Why it matters here: see docs/UPSTREAM-AUDIT.md (section 5).
+#
+# Source applies as is; the test file's one conflict (two test calls added at the same place) is resolved by keeping both.
+#
+# Apply with: patch -p1 (tools/patched_engine.sh) or git apply -p1, to the tree out-nx2apple/engine + paches/engine/0103..0301 (the tree out-stage/out-engine/engine
+# is made of), in the order of the numbers of this folder. Checked on a COPY of the needed files only (git apply --check, then applied in series, then
+# paches/0002 0004 0005 0006 0007 0008 0009 0012 0013 still apply on top); NOT compiled, NOT run on a device.
+# Left out of the upstream diff: docs/, dm/games/ notes, and test files that conflict.
+
+--- a/dm/host/hle_hid.c
++++ b/dm/host/hle_hid.c
+@@ -1769,8 +1769,11 @@
+ HLE_FORCE("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", "controller style update event: bound, signaled once for a connected controller and on connect / disconnect", void, h_hid_BindStyleEv,
+           const uint32_t *id, void *ev, int clear) {
+     hle_bind_system_event(ev, clear);
+-    int slot = style_slot(*id); uint32_t st = style_of(*id);
+-    if (slot >= 0) { pthread_mutex_lock(&g_style_lock); g_style_ev[slot] = ev; g_style_told[slot] = st; pthread_mutex_unlock(&g_style_lock); }
++    // The style is read under the lock: a controller that came between a read before it and the lock was reported by styles_sync to no bound event and told as seen, so
++    // the bind would have told the style from before it and signalled nothing (t_hid t_bind_gap)
++    int slot = style_slot(*id); uint32_t st;
++    if (slot >= 0) { pthread_mutex_lock(&g_style_lock); g_style_ev[slot] = ev; g_style_told[slot] = st = style_of(*id); pthread_mutex_unlock(&g_style_lock); }
++    else st = style_of(*id);
+     if (st) hle_signal_system_event(ev);
+ }
+ // The Switch's player LEDs by npad (No1 1, No2 1-2, No3 1-3, No4 1-4, No5 1+4, No6 1+3, No7 1+3+4, No8 2+3; bit 0 = LED 1); Handheld and Other light LED 1 as before
+--- a/dm/host/tests/t_hid.c
++++ b/dm/host/tests/t_hid.c
+@@ -3,13 +3,23 @@
+ #include <time.h>
+ #include <unistd.h>
+ #include <sched.h>
++#include <pthread.h>
+ static int hid_clock_gettime(clockid_t clock, struct timespec *ts);
+ static int hid_usleep(useconds_t usec);
++static int hid_mutex_lock(pthread_mutex_t *m);
+ #define clock_gettime hid_clock_gettime
+ #define usleep hid_usleep
++#define pthread_mutex_lock hid_mutex_lock
+ #include "../hle_hid.c"
+ #undef clock_gettime
+ #undef usleep
++#undef pthread_mutex_lock
++// Another thread's turn just before g_style_lock is taken (t_bind_gap): run once at the next lock of it, before the lock
++static void (*style_lock_turn)(void);
++static int hid_mutex_lock(pthread_mutex_t *m) {
++    if (m == &g_style_lock && style_lock_turn) { void (*f)(void) = style_lock_turn; style_lock_turn = NULL; f(); }
++    return pthread_mutex_lock(m);
++}
+ #include "../pad_slots.h"
+ void dm_oe_execute(int index, const void *param, size_t n) { (void)index; (void)param; (void)n; }   // DM_CTL "program", "webshot": not exercised here
+ void front_web_shot(const char *path) { (void)path; }
+@@ -1884,6 +1894,23 @@
+     uint64_t first = buttons_of(0, STYLE_FULLKEY), second = buttons_of(0, STYLE_FULLKEY);
+     CHECK(first == DM_BTN_A && second == 0, "applet peek does not consume the game's independent short-press latch");
+     dm_pad_players(0);
++}
++
++// A controller that arrives while the game binds its npad's style event: the front end's report (dm_pad_players → styles_sync) runs on its own thread, here just before the bind
++// takes g_style_lock. The report finds no event bound and signals nothing, so the bind must read the style under the lock and signal it; a style read before the lock was
++// the one before the controller came, and the game heard nothing of player 3 until some later change
++static void third_player_comes(void) { dm_pad_players(0x7); }
++static void t_bind_gap(void) {
++    g_mode = 1; ids((uint32_t[]){0, 1, 2, 3}, 4); h_hid_SetStyles(STYLE_FULLKEY); dm_pad_players(0x1);
++    static uint8_t ev2[0x40]; g_signals = 0; g_signalled = NULL;
++    style_lock_turn = third_player_comes;
++    h_hid_BindStyleEv(&(uint32_t){2}, ev2, 0);
++    CHECK(!style_lock_turn, "the report ran inside the bind");
++    CHECK(h_hid_GetStyle(&(uint32_t){2}) == STYLE_FULLKEY, "player 3 is on No3");
++    CHECK(g_signalled == ev2, "a controller that came during the bind: No3's style event signalled by the bind (after the report's signal of No2's)");
++    g_signals = 0; dm_hid_opmode_changed();
++    CHECK(g_signals == 0, "the bind told No3's style: a report with no change signals nothing");
++    dm_pad_players(0x1); g_signals = 0; g_signalled = NULL;
+ }
+ 
+ int main(void) {
+@@ -2015,6 +2042,7 @@
+         CHECK(pad_slot_take_lowest(&f, NULL, "pad") == -1, "press: no owner, no slot");
+     }
+     t_applet_input();
++    t_bind_gap();
+     printf("hid players: %d checks, %d failed\n", checks, fails);
+     return fails != 0;
+ }

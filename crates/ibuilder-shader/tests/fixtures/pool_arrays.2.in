@@ -1,0 +1,11 @@
+#include <simd/simd.h>
+
+#include <metal_stdlib>
+#pragma clang d  iagnostic ignored "-Wmissing-prototypes"
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    array<sampler, 2> fp_s2_cb0_40000000 [[id(0)]];
+ 

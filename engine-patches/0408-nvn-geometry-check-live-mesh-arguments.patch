@@ -1,0 +1,87 @@
+# nvn/geometry: check live mesh argument addresses (PR #2938)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/74d175353d1acfe1c86b4541adbb47ad90867bc0  (PR #2938)
+# Author:    seedds, 2026-11-19 08:27:47 +0800
+# Co-authors:
+#   Co-authored-by: Mathias
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# Why it matters here: see docs/UPSTREAM-AUDIT.md (section 5).
+#
+# Applies as is. Mesh-shader draws (Switch 2 titles) stop counting composed-mesh scratch slots as missing GPU addresses.
+#
+# Apply with: patch -p1 (tools/patched_engine.sh) or git apply -p1, to the tree out-nx2apple/engine + paches/engine/0103..0301 (the tree out-stage/out-engine/engine
+# is made of), in the order of the numbers of this folder. Checked on a COPY of the needed files only (git apply --check, then applied in series, then
+# paches/0002 0004 0005 0006 0007 0008 0009 0012 0013 still apply on top); NOT compiled, NOT run on a device.
+# Left out of the upstream diff: docs/, dm/games/ notes, and test files that conflict.
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -13597,6 +13597,15 @@
+                                       ZA_K(SAMPH) | ZA_K(BORDER) | ZA_K(PUSH) | ZA_K(GMEM) | ZA_K(GMEML) | ZA_K(CBSIZE) | ZA_K(SBUFQ) | ZA_K(TBIAS) | ZA_K(SBLEN) |
+                                       ZA_K(RT_PARAMETERS) | ZA_K(RT_ERRORS) | ZA_K(RT_INSTANCE_SBT) | ZA_K(RT_BANK0) | ZA_K(RT_BANK3);   // binding kinds whose slot holds a GPU address
+ #undef ZA_K
++static void args_check_addresses(const nvn_refl *rf, const uint64_t *slots, size_t arg_len, int nvn_stage) {
++    for (int i = 0; i < rf->nb; i++) { const nvn_rbind *b = &rf->b[i];
++        // The composed mesh uses the lean kernel's layout, but dmsh_mesh.compose replaces capture, output and topology accesses
++        // with threadgroup values, a local mask and identity indices. Only geometry reg 3 (vb_info) is still read through this block.
++        // Keep checking every helper in the compute path and every guest binding in both paths.
++        if (g_args_mesh && nvn_stage == 2 && b->kind == NVN_RB_GEOMETRY && (b->reg < 3 || b->reg == 4)) continue;
++        if ((ZA_ADDR_KINDS >> b->kind & 1) && (size_t)b->aid * 8 < arg_len && slots[b->aid] < ZA_LOW) { char w[64]; snprintf(w, sizeof w, "stage %d argument block (binding kind %d) slot", nvn_stage, b->kind); za_note(w, b->aid, slots[b->aid]); }
++    }
++}
+ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) { cbs_note(sh); za_shader((__bridge const void *)sh, sh->key[0] ? sh->key : sh->builtin ? sh->builtin : "?"); AP_B; int r = encode_args_(en, sh, nvn_stage, metal_vertex); AP_E(3); return r; }
+ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex, const rt_argument_values *rt) {
+     if ((unsigned)nvn_stage >= NVN_RESOURCE_STAGES) MDIE("argument encoding has unsupported resource stage %d", nvn_stage);
+@@ -13959,8 +13968,7 @@
+     }
+     #undef USE
+     os_unfair_lock_unlock(&g_rmu);
+-    for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i];   // the slots that hold an address, not a resource ID (za_check)
+-        if ((ZA_ADDR_KINDS >> b->kind & 1) && (size_t)b->aid * 8 < arg_len && slots[b->aid] < ZA_LOW) { char w[64]; snprintf(w, sizeof w, "stage %d argument block (binding kind %d) slot", nvn_stage, b->kind); za_note(w, b->aid, slots[b->aid]); } }
++    args_check_addresses(&sh->rf, slots, arg_len, nvn_stage);
+     id<MTLBuffer> ab; arena_at at = arena_take(arg_len, &ab); size_t off = at.off;
+     memcpy(at.cpu, slots, arg_len);
+     if (gmem_aid >= 0) gmem_slot_note((uint64_t *)(void *)at.cpu + gmem_aid, gml_taken ? (__bridge void *)g_gml_last : NULL);   // the arena's own CPU address (no contents message: see ubo_read)
+--- a/dm/gfx/tests/t_cbs_fault.m
++++ b/dm/gfx/tests/t_cbs_fault.m
+@@ -59,6 +59,20 @@
+     l = cbs_take(); CHECK(l && l->nz == 0, "the next command buffer starts with none"); free(l);
+     for (int i = 0; i < ZA_SHOW + 3; i++) za_check(0, "compute table slot", i);
+     l = cbs_take(); CHECK(l && l->nz == ZA_SHOW + 3 && strstr(l->z[ZA_SHOW - 1], "compute table slot 3 = 0"), "past ZA_SHOW they are counted, the first kept"); free(l);
++    {   // Mesh borrows compute reflection: only vb_info remains device-backed among the geometry helpers.
++        nvn_refl rf = {.nb = 6}; uint64_t slots[6] = {0};
++        for (int i = 0; i < 5; i++) rf.b[i] = (nvn_rbind){.kind = NVN_RB_GEOMETRY, .reg = i, .aid = i};
++        rf.b[5] = (nvn_rbind){.kind = NVN_RB_SBUFP, .aid = 5};
++        g_args_mesh = GEO_MESH_GS_SLOT; za0 = g_za_total;
++        args_check_addresses(&rf, slots, sizeof slots, 2); l = cbs_take();
++        CHECK(g_za_total == za0 + 2 && l && l->nz == 2 && strstr(l->z[0], "slot 3 = 0") && strstr(l->z[1], "slot 5 = 0"),
++              "mesh still reports missing vb_info and guest storage, not its local scratch"); free(l);
++        slots[3] = slots[5] = 0x10000060000ull; za0 = g_za_total;
++        args_check_addresses(&rf, slots, sizeof slots, 2);
++        CHECK(g_za_total == za0, "valid mesh bindings need no compute scratch addresses");
++        g_args_mesh = 0; args_check_addresses(&rf, slots, sizeof slots, 2);
++        CHECK(g_za_total == za0 + 4, "compute still reports every missing geometry scratch address"); free(cbs_take());
++    }
+     // DM_RES_CHECK: an object retired behind an earlier fence than a binding's goes while that binding is on the GPU
+     mtl_init(); g_res_check_on = 1;
+     id<MTLBuffer> early = [g_dev newBufferWithLength:4096 options:MTLResourceStorageModeShared], fine = [g_dev newBufferWithLength:4096 options:MTLResourceStorageModeShared]; res_add(early); res_add(fine);
+--- a/dm/gfx/tests/t_geometry_mesh.m
++++ b/dm/gfx/tests/t_geometry_mesh.m
+@@ -85,7 +85,7 @@
+     op_hdr end = {OP_END, 8}; memcpy(mem + used, &end, 8);
+     #undef EMIT
+     state_reset(); memset(&R, 0, sizeof R); S.ds.dt = 1; S.ds.dw = 1; S.ds.df = 2;   // LESS, written
+-    uint64_t runs0 = g_mrun_runs, rdraws0 = g_mrun_draws, mesh0 = g_geo_mesh_n;
++    uint64_t runs0 = g_mrun_runs, rdraws0 = g_mrun_draws, mesh0 = g_geo_mesh_n, za0 = g_za_total;
+     mtl_sub_begin(); mtl_exec(mem);
+     id<MTLBuffer> b = [g_dev newBufferWithLength:MR_W * MR_H * 4 options:MTLResourceStorageModeShared]; res_add(b);
+     [blit() copyFromTexture:tex_mtl(&depth) sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(MR_W, MR_H, 1) toBuffer:b destinationOffset:0 destinationBytesPerRow:MR_W * 4 destinationBytesPerImage:MR_W * MR_H * 4];
+@@ -93,6 +93,7 @@
+     int ready = g_geo_mesh_n - mesh0 == MR_DRAWS && (!geo_mesh_run_on() || g_mrun_draws - rdraws0 == MR_DRAWS);   // the pipelines are built in the background: earlier passes draw some other way
+     int bad = 0;
+     if (ready) {
++        EXPECT("mesh-local geometry scratch is not a missing GPU binding", 0, g_za_total - za0);
+         const float *px = b.contents; unsigned drawn = 0;
+         for (unsigned g = 0; g < MR_TRIS; g++) {
+             float want = 1;

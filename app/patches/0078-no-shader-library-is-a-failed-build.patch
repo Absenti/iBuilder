@@ -1,0 +1,168 @@
+# 0078-no-shader-library-is-a-failed-build.patch -- a build (or a Play) that leaves the game with NO shader library, or a build that leaves NO framework (the assembly or the signature
+# failed), is shown as what it is, a failed run with its reason, never "Ready" or "Built: ready to play." (review r4 §4.1 / §2.2: the chain reported `shaders=failed (no library: ...)`,
+# returned 0, and the app said "Ready" while the game would draw nothing; the same 0 for `assemble=failed`, with "Built: ready to play." for a game that is not there).
+# Applies after 0077. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled only, and its pure part ran in a host check (below).
+#
+# THE CONTRACT (crates/ibuilder-ffi/include/ibuilder.h, docs/chain/PIPELINE-RUST.md "Result codes"; decided in the Rust chain, the shim passes the code through unchanged and pins 4 and 5)
+#   * gameapp_run_chain() -> 4 (IBUILDER_RC_NO_SHADER_LIBRARY): the game has no shader library and would draw nothing.
+#       - a build: stage 3 had to make the library and could not (too little space, no translator, inputs missing, the split, the translation or the install failed). The chain still went on
+#         to the assembly (as before, as in Python), but it did NOT boot the game, did NOT write gameapp.boot-only, and wrote NO framework stamp (Documents/gameapp.framework): the existing
+#         rule (GameAppUi.ClassifyFramework / GameStatusOf) reads that framework as not built: "Needs setup", "Set up and play", never "Ready".
+#       - a Play (boot-only): its stage 3 could not make a missing library: the boot is refused and the request consumed (a later launch does not start it by itself); the framework stays
+#         this build's, so the game stays Ready and a later Play tries the library again.
+#   * gameapp_run_chain() -> 5 (IBUILDER_RC_NO_FRAMEWORK): no framework to play: stage 4 failed, the assembly or the signature (the signer's rc 10-14: a missing or unreadable certificate,
+#     ...). Nothing was stamped or booted (as before); it returned 0, as Python did. When stage 3 failed too, the chain returns 5 (the log says both).
+#   * `shaders=none (...)` (nothing to build: no chain in the config, shader_build=0, a game whose split finds no shader) keeps 0. Every other code keeps its meaning (0 1 2 3 75 130 131).
+#   * Without this patch the app already treats 4 and 5 as failed runs (StopMachine.ChainReturned: anything but 0, 130, 131 is Failed): the failure is not hidden, only worded generically
+#     ("Stopped at <the step it ended on>", which is the assembly's step). This patch gives them their words.
+#
+# WHAT IT DOES
+#   * GameAppStop.cs (no UIKit): ChainResult: NoShaderLibrary = 4, NoFramework = 5 and their texts: FailureText (the message), RunLine, QueueNote, LogLine ("[RED] " + the message: an
+#     error row); null for every other code (the generic texts stay).
+#   * GameAppMain.cs, BeginRun: lastChainRc = 0 when a run starts; when the chain returns, lastChainRc = rc (-1 when it threw), and a failed run whose code has words writes its LogLine
+#     right away, before Finish() draws the screen: it is the build screen's last error (its live rows) and where "See what stopped it" scrolls.
+#   * GameAppLibrary.cs: the run line under the game says "Shader library not built · <time>" / "Not assembled or signed · <time>" instead of "Stopped at <step>"; the "Notify me"
+#     notification says the message instead of "The build stopped: open iBuilder to see why."; the field lastChainRc.
+#   * GameAppQueueUi.cs: the build queue's note for that game is the code's note.
+#
+# NEW UI STRINGS (worth a marker in app/verify_ipa.sh, owned elsewhere)
+#   "The shader library could not be built: the game would draw nothing. Rebuild, or send the log."   (ChainResult.NoShaderLibraryText)
+#   "Shader library not built"                                                                         (ChainResult.NoShaderLibraryLine)
+#   "the shader library could not be built: see the log"                                               (ChainResult.NoShaderLibraryNote)
+#   "The game could not be assembled or signed: see the log."                                          (ChainResult.NoFrameworkText)
+#   "Not assembled or signed"                                                                          (ChainResult.NoFrameworkLine)
+#   "the game could not be assembled or signed: see the log"                                           (ChainResult.NoFrameworkNote)
+#
+# VERIFIED (2026-11-21, M1 Pro; the scratch of the first checks was wiped by a reboot, everything below was run again after it)
+#   * Compile: the app project generated as scripts/build-app.sh step 3 makes it (the patched GameApp*.cs, the engine's extractor and translator sources read from the read-only engine, the
+#     same csproj items), built with `dotnet build gameapp.csproj -c Release -r ios-arm64 -t:Compile`, the native references left out (the C# compile alone, no link; no .ipa): the tree with
+#     0077 rc 0, 0 errors, 40 warnings; with this patch rc 0, 0 errors, 40 warnings, the same warnings per file and code. The six texts above are in the compiled GameApp.dll (UTF-16).
+#     (Before the reboot, with 4 only: a full build of the earlier device project, 0 errors, 41 warnings with and without the patch, the same per file and code.)
+#   * Host harness (net11.0; the REAL GameAppStop.cs, GameAppNas.cs with NAS_LOGIC_ONLY, GameAppCloud.cs, GameAppUi.cs, GameAppCover.cs, GameAppQueue.cs, GameAppPerf.cs; the Rust and C texts
+#     read for what they share): 61 of 61 checks. For this patch: 4 and 5 are ibuilder.h's IBUILDER_RC_NO_SHADER_LIBRARY / IBUILDER_RC_NO_FRAMEWORK and the Rust RC_NO_SHADER_LIBRARY /
+#     RC_NO_FRAMEWORK, the header's nine codes are distinct; StopMachine: 4 and 5 are Failed (4 from a boot-only Play too), 0 Finished, 1 and 3 Failed, 131 Paused, 130 Cancelled; the texts of
+#     4 and of 5, none for 0 1 2 3 6 75 130 131 -1 -99; their log lines are error rows (GameAppUi.KindOfLine), and so are the chain's own "stage 5 NOT STARTED: [RED]" lines (no library,
+#     not assembled or signed) and "stage 5 boot-only REFUSED: [RED]" (read from chain.rs / boot.rs); a framework with no stamp is Needs setup with the Run action, a stamped one Ready
+#     (control), and assemble.rs stamps only when stage 3 did not fail; the wiring read from the UIKit files (reset at the start, kept and said before Finish(), the run line, the
+#     notification, the queue). 14 of 14 mutations of this patch (and of the Rust / C text it reads) are killed (code 5 for 4, code 6 for 5, no [RED], words for every failure, no words for 5,
+#     5 with 4's run line, the line not written, not reset, not kept, queue / notification not wired, the stamp written whatever stage 3 did, the header's codes moved).
+#   * The Rust side (cargo test -p ibuilder-pipeline -p ibuilder-ffi -p ibuilder-cli): a build whose stage 3 fails returns 4, boots nothing, writes no boot-only request and no stamp; a
+#     boot-only launch whose stage 3 fails refuses the boot, returns 4 and consumes the request; a build whose signature fails returns 5 (and 5 when stage 3 failed too), boots nothing;
+#     `none` keeps 0 and boots; the C ABI test sees 4, 5 and their status through the real header. check-patches-apply.sh: 34 patches, no fuzz, no offset.
+#
+# NOT VERIFIED
+#   * Nothing ran on an iPhone or in the simulator: the screen with these messages, the notification and the queue row are not looked at.
+#   * A build that fails at stage 3 or 4 in the app (a real translator failing, a full disk, a missing certificate) was not reproduced: the Rust tests reach the same code through stand-in
+#     workers (a failing translation, a huge shader_free_gib, a signer that returns 12).
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs	2026-11-21 17:40:07
++++ b/GameAppLibrary.cs	2026-11-21 17:40:07
+@@ -356,7 +356,7 @@
+                 progress.Hidden = true;
+                 return;
+             }
+-            runLine.Text = failedRun ? $"Stopped at {LowerFirst(at?.Name ?? "the start")} · {GameAppUi.FormatElapsed(lastRunEnd - startedAt)}"
++            runLine.Text = failedRun ? $"{ChainResult.RunLine(lastChainRc) ?? $"Stopped at {LowerFirst(at?.Name ?? "the start")}"} · {GameAppUi.FormatElapsed(lastRunEnd - startedAt)}"
+                                      : $"Built in {GameAppUi.FormatElapsed(lastRunEnd - startedAt)}";
+             runLine.TextColor = failedRun ? Theme.Warn : Theme.Ok;
+             progress.Hidden = true;
+@@ -1437,7 +1437,7 @@
+         var content = new UserNotifications.UNMutableNotificationContent
+         {
+             Title = selected != null ? GameAppUi.DisplayName(selected) : "iBuilder",
+-            Body = failedRun ? "The build stopped: open iBuilder to see why." : "Built: ready to play.",
++            Body = failedRun ? ChainResult.FailureText(lastChainRc) ?? "The build stopped: open iBuilder to see why." : "Built: ready to play.",
+             Sound = UserNotifications.UNNotificationSound.Default,
+         };
+         var request = UserNotifications.UNNotificationRequest.FromIdentifier("build-ended", content, null);
+@@ -1445,6 +1445,8 @@
+     }
+ 
+     private bool failedRun;
++    /// The code gameapp_run_chain returned in the last run (-1: it threw; 0 before it returned): what a failed run's words come from (ChainResult, patch 0078).
++    private int lastChainRc;
+     private string lastRunGame;   // the game the last build was for: its card stays under it once the build is over
+ 
+     private static long SafeLength(string path)
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs	2026-11-21 17:40:07
++++ b/GameAppMain.cs	2026-11-21 17:40:07
+@@ -2660,6 +2660,7 @@
+         lastRunGame = selected;
+         buildFinished = false;
+         failedRun = false;
++        lastChainRc = 0;   // patch 0078: the code of this run's chain, once it returns
+         if (!bootOnly) ShowBuildScreen();
+ 
+         var documents = GameAppMain.Documents;
+@@ -2806,6 +2807,10 @@
+                 Write($"chain returned {rc} after {Took(chainTook)}");
+                 if (askedBefore && outcome is StopOutcome.Finished or StopOutcome.Failed) Write("the stop came too late: the chain had already ended");
+                 failedRun = outcome == StopOutcome.Failed;
++                lastChainRc = chainError != null ? -1 : rc;
++                // patch 0078: a code that says why (4: no shader library, 5: no framework) is said, as an error line, before the screen is drawn: never "Ready" or "Built" for a game that
++                // would draw nothing or that is not there
++                if (failedRun && ChainResult.LogLine(lastChainRc) is string why) Write(why);
+                 // patch 0073: a .nup the chain was given (nup=) is extracted when the chain derived its profile in this run (that stage runs only once the package is read): its marker, then "Optimize storage".
+                 // Any outcome, except a cancel that frees the space (it deletes the extraction).
+                 var profilePath = Path.Combine(GameAppMain.Documents, "profile.tsv");
+diff -ruN a/GameAppQueueUi.cs b/GameAppQueueUi.cs
+--- a/GameAppQueueUi.cs	2026-11-21 17:40:07
++++ b/GameAppQueueUi.cs	2026-11-21 17:40:07
+@@ -220,7 +220,7 @@
+         if (runOutcome == StopOutcome.Paused || runOutcome == StopOutcome.Cancelled) return;   // the person stopped it: StopEnding() already moved the queue (QueuePaused / QueueCancelled)
+         if (queueGame != null)
+         {
+-            BuildQueue.Ended(buildQueue, queueGame, !failedRun, failedRun ? "the build stopped: see the log" : "");
++            BuildQueue.Ended(buildQueue, queueGame, !failedRun, failedRun ? ChainResult.QueueNote(lastChainRc) ?? "the build stopped: see the log" : "");
+             queueGame = null;
+             SaveBuildQueue();
+         }
+diff -ruN a/GameAppStop.cs b/GameAppStop.cs
+--- a/GameAppStop.cs	2026-11-21 17:40:07
++++ b/GameAppStop.cs	2026-11-21 17:40:07
+@@ -49,6 +49,44 @@
+     public static bool IsStop(int rc) => rc == Cancelled || rc == Paused;
+ }
+ 
++/// gameapp_run_chain's results that say WHY a run failed, so the screen tells the truth instead of "Ready" or "Built: ready to play." (patch 0078). The shim passes the library's code through unchanged
++/// (crates/ibuilder-ffi/include/ibuilder.h, docs/chain/PIPELINE-RUST.md). Any code but 0 is already a failed run (StopMachine.ChainReturned); these only give it its words.
++public static class ChainResult
++{
++    /// IBUILDER_RC_NO_SHADER_LIBRARY: the game has no shader library and would draw nothing. A build's stage 3 had to make it and could not: the chain still assembled the game but did not
++    /// boot it and wrote no framework stamp, so the game reads as not built (never "Ready"). A Play's stage 3 could not make a missing one: the boot was refused.
++    public const int NoShaderLibrary = 4;
++
++    /// What the person reads (the log's error line, the build screen, the notification).
++    public const string NoShaderLibraryText = "The shader library could not be built: the game would draw nothing. Rebuild, or send the log.";
++
++    /// The run line under the game (instead of "Stopped at <step>": the chain went on to the assembly, so the step it ended on is not the one that failed).
++    public const string NoShaderLibraryLine = "Shader library not built";
++
++    /// The build queue's note for that game.
++    public const string NoShaderLibraryNote = "the shader library could not be built: see the log";
++
++    /// IBUILDER_RC_NO_FRAMEWORK: no framework to play. Stage 4 failed, the assembly or the signature (a missing or unreadable certificate, ...): nothing was stamped or booted. It was 0, and
++    /// the screen said "Built: ready to play.". When stage 3 failed too the chain returns this one (the log says both).
++    public const int NoFramework = 5;
++
++    public const string NoFrameworkText = "The game could not be assembled or signed: see the log.";
++    public const string NoFrameworkLine = "Not assembled or signed";
++    public const string NoFrameworkNote = "the game could not be assembled or signed: see the log";
++
++    /// The reason a failed run of code `rc` has words for, or null (the generic "stopped" texts stay).
++    public static string FailureText(int rc) => rc == NoShaderLibrary ? NoShaderLibraryText : rc == NoFramework ? NoFrameworkText : null;
++
++    /// The run line's start for a failed run of code `rc`, or null ("Stopped at <step>").
++    public static string RunLine(int rc) => rc == NoShaderLibrary ? NoShaderLibraryLine : rc == NoFramework ? NoFrameworkLine : null;
++
++    /// The build queue's note for a failed run of code `rc`, or null ("the build stopped: see the log").
++    public static string QueueNote(int rc) => rc == NoShaderLibrary ? NoShaderLibraryNote : rc == NoFramework ? NoFrameworkNote : null;
++
++    /// The line the log gets for a failed run of code `rc` (an error line: "[RED]" makes it the build screen's last error, where "See what stopped it" scrolls), or null.
++    public static string LogLine(int rc) => FailureText(rc) is string t ? "[RED] " + t : null;
++}
++
+ /// The state of the build the user can stop. Thread-safe: the buttons are on the main thread, the chain's start and return are on the run's worker thread. Methods return what the caller must DO; they never
+ /// call the library themselves (so the harness can run every transition).
+ public sealed class StopMachine

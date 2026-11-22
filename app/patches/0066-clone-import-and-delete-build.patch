@@ -1,0 +1,934 @@
+# 0066-clone-import-and-delete-build.patch -- a game that is already on the phone is imported WITHOUT copying it (an APFS clone; the copy stays as the fallback); "Delete the build?" after a FULL .ipa export.
+# Applies after 0065 (the tree with 0010..0065 applied). UNTESTED ON DEVICE: compiled (dotnet build, ios-arm64, Release: rc 0, no error, the same 47 warnings as the 0065 tree: this patch adds none) and the pure classes run in a host
+# harness (a net console program built from the real source text of GameAppImport.cs, GameAppBuildCleanup.cs and the 0064 / 0065 classes they use: 178 checks, including the REAL clonefile syscall on this Mac's APFS and the cleanup
+# EXECUTED on real folder trees; 24 mutations of the classes, each caught by the checks that name them); no iPhone run. Measured and assumed are told apart below.
+#
+# WHY (the owner's requests, and the field facts of the 22,000-shader build on the iPhone): importing a 11-26 GB game that is already on the phone made iOS copy all of it (the + picker's Import mode copies it into tmp/ first, a
+#   Files-folder source's "Download" copies it file by file through an NSFileCoordinator read): minutes, and as much free space as the game. On the phone's one APFS volume a clone (clonefile) takes a millisecond and no space.
+#   Nothing here may block the main thread (0x8BADF00D, patch 0064): the clone, the copy, the size measurements and the deletes run on workers (Task.Run, DeleteFolderInBackground, the FolderSizes cache), a background task
+#   goes around the long ones, and every result comes back with BeginInvokeOnMainThread.
+#
+# FEATURE 1 -- NO COPY FOR A GAME THAT IS ALREADY ON THE PHONE
+#   * GameAppImport.cs (new; no UIKit, run by the harness): FileClone (clonefile(2) with the errno in words: EXDEV "the source is on another volume", ENOTSUP "this file system cannot clone", EPERM...), GameImport.Place(src, dest,
+#       clone, copy, log, freeBytes) -- the one decision, always through <dest>.part and ONE rename over any existing file: clone succeeds -> no copy; clone fails (or throws, or makes a file of the wrong length) -> the copy; the copy
+#       fails (or is short) -> the .part is removed and the previous dest is exactly as it was; dest exists -> it is replaced only by the final File.Move (rename(2)); the picked file already IS dest (the app's own Documents, under
+#       /var or /private/var) -> nothing is done; a copy that cannot fit (free < size + 256 MB) is refused BEFORE it starts (a clone needs no room); two Place of one dest at once are refused (one .part per name). It writes ONE
+#       log line per file: `import: cloned <name> (<size>) in <ms> ms` or `import: copied <name> (<size>) in <s> s (<why the clone was not used>)`. GameImport.CopyBytes is the copy loop CopyWithProgress had since 0040 (progress at most
+#       every 300 ms and once at the end). InPlaceImport: which picked names are taken (the games this app lists, .nsp .xci .nsz .nup in any case, and exactly prod.keys: the names the launch sweep of 0063 knows, so a .part
+#       left by a kill is removed at the next launch; the harness reads the sweep's real text to prove it; no change to the sweep was needed), the summary line and the alert text.
+#   * GameAppLibrary.cs: (a) CopyFromFolder (Files-folder sources: "Download", "Download and build"): inside the coordinated read it calls GameImport.Place (the clone first, else the copy with progress as before) and logs
+#       the one line per file; a file in an iCloud folder that is not downloaded is still downloaded first by the coordinator (then cloned). Download's up-front "Not enough space" now counts only what must be copied (the
+#       NAS files): a Files-folder file needs no room when it is cloned, and Place checks the room per file when the clone was refused. CopyWithProgress (also UploadTo, CopyContentIn) keeps its place and calls CopyBytes.
+#       Command-Shift-I (keyImportInPlace, "Add from Files without copying"), after the existing key commands.
+#   * GameAppShelf.cs: (b) the + button of the Build tab (accessibility id `import-file`, the same for the Library's "Add a game" tile, which opens the Build tab) is a MENU (UIMenu, ShowsMenuAsPrimaryAction): "Add a game file"
+#       (the old picker, UIDocumentPickerMode.Import, UNCHANGED: it works on this phone; Command-I, the main button's Import and "Update and DLC" still call it) and "Add from Files without copying". A progress card in the
+#       Build tab's column (MakeImportCard).
+#   * GameAppImportUi.cs (new): "Add from Files without copying" = UIDocumentPickerViewController(new[]{ UTTypes.Item }, asCopy: false), AllowsMultipleSelection (the non-obsolete initialiser, as 0065's cover picker). For each
+#       picked url, on a worker thread: StartAccessingSecurityScopedResource (stopped in a finally), an NSFileCoordinator read (a file only in iCloud is downloaded first), GameImport.Place into Documents/<the file's own name>
+#       (the naming CopyIn has; the title-id / update / DLC handling is the file name's, read by the refresh that follows: RefreshGames + RefreshScreen). A progress card ("Adding <name>", "Copying <name> · 37%", "2 of 3 ·"),
+#       a UIApplication background task (its expiration handler ends the TASK, not the app), the screen kept awake only if nothing else does. A pick that is not a game file / prod.keys is skipped with a reason in the log and
+#       an alert ("Nothing to add") when nothing is left. A picker's own copy in our tmp/ (if iOS makes one after all) is deleted after the clone. One import at a time ("Still adding").
+#       RISK HANDLED: a FILE picker in Open mode did NOT deliver the selection on iOS 27.0.1 in the exported player (the delegate never fired; the folder picker in Open mode did). The old Import stays the default and this is a
+#       second entry. The app logs `import: the picker is open (in place)` when it opens, `import: picked N file(s)` when it answers and `import: the picker was closed without a file` when it is cancelled; a watchdog
+#       (two property reads twice a second, at most 10 minutes) adds `import: the picker closed and the app got no answer from it (iOS may not deliver a pick made in Open mode: use "Add a game file")` when the picker is
+#       gone and the delegate was never called: that line is how the owner tells.
+#
+# FEATURE 2 -- "DELETE THE BUILD?" AFTER A TOTAL (FULL) EXPORT
+#   * GameAppBuildCleanup.cs (new; no UIKit, run by the harness): BuildCleanup.For(facts) is a WHITELIST, never a search: folders DmGameProbe.framework, extract, shaders/<id>, shaders/<id>.work; files gameapp.framework (the
+#       stamp), gameapp.boot-only, pipeline.boot, profile.tsv (what deleting a game removes with its build: GameAppUi.PlanDeletion's BuildToo) -- the id is profile.tsv's title id, 16 hex digits. It is EMPTY for a light
+#       export (the game files stay beside the .ipa as a clone of extract/RomFS.img: deleting the build frees nothing), while a build runs / is being stopped / is paused for this game, when another game's paused build
+#       holds extract/ (the 0065 cancel dialog's guard), when the framework stamp does not name this game's file or profile.tsv's title id is not this game's (the build on disk is another's), with no stamp, while a delete / an
+#       export / the shader warm-up is going. NeverDeleted (reuses CancelPlan.Forbidden of 0065 and adds Exports/, SaveBackups/, the certificate, any game file, the .nsz cache, pending shader packs, the app's settings, and
+#       everything the whitelist does not name) is checked against every plan before it is returned, and again by Execute for every path: the game file, shadercache/, games/<id>/ (settings, saves, cover, mods, icon, rewrite
+#       cache), Exports/, prod.keys, the certificate are never listed. Execute runs the plan: the four small files first (the stamp first: a cleanup cut by a kill never leaves a "Ready" build behind), the folders through
+#       the injected deleteFolder (the app passes DeleteFolderInBackground), `done(removed, failed)` once. BuildCleanupText: the words.
+#   * GameAppBuildCleanupUi.cs (new): GameAppMain.cs StartExport's completion calls OfferBuildCleanup right after its own "Export done" alert is presented, for a full export only. The size is measured OFF the main thread at
+#       that moment (the cached extract/ and framework sizes where known, a FolderWalk on a worker for this game's pack and .work), the question waits for it (20 s at most: then "at least" what the cache knew, or no number). It
+#       is NOT stacked on the export's alert or the share sheet: a timer waits until nothing is presented (two looks 0.6 s apart, so the gap between the alert going and the share sheet coming is not taken for "free"; 15 minutes
+#       at most) and presents it with PresentWhenFree. The guards are read again then and again when the button is pressed. "Delete the build (<N> GB)" (destructive) removes the stamp and boot files at once, the folders on
+#       DeleteFolderInBackground (patch 0064: a worker, one at a time, no folder size measured and BeginRun refused meanwhile), then RefreshScreen (the game is "Needs setup" / "Not built yet") and the sizes are measured
+#       again (DeleteFolderInBackground invalidates them). "Keep it" (the default, Cancel style) does nothing. Logs: `build cleanup: ...`.
+#
+# NEW STRINGS: "Add a game file", "Add from Files without copying", "Still adding", "Nothing to add", "Not all were added", "Adding", "Copying", "Delete the build?", "The exported app contains the whole build. iBuilder's copy takes
+#   <N> GB (the extracted game, the shaders, the framework). The game file, the shader cache, its settings, saves and cover stay; you can build again whenever you want." (also "takes at least <N> GB", and without the number),
+#   "Delete the build (<N> GB)" / "Delete the build (at least <N> GB)" / "Delete the build", "Keep it", "The build was not deleted". Log lines: `import: the picker is open (in place)`, `import: picked <N> file(s)`, `import: the picker was
+#   closed without a file`, `import: cloned <name> (<size>) in <ms> ms`, `import: copied <name> (<size>) in <s> s (<why>)`. ACCESSIBILITY IDS: import-file (the + button, now a menu), import-progress (the card); the menu's
+#   actions are import-add and import-in-place (UIAction identifiers); the cleanup alert has none (system buttons).
+#
+# MEASURED (host harness, .NET 11, Apple silicon Mac, APFS): 178 checks. The real clonefile: a 300 MB file cloned in 1.0 ms (0.38 ms through Place), the volume's free space 133,368.8 MB before and after (change 0.0 MB), the clone
+#   reads back identical (SHA-256), 1 MB written into the clone moves the free space by 1.0 MB and leaves the source's SHA-256 unchanged; the same file copied by CopyBytes: 94 ms on this Mac's SSD and 300.0 MB of free space (the
+#   phone is far slower: that is the 11-26 GB / minutes). Across volumes (a mounted APFS and a mounted HFS+ disk image): clonefile answers EXDEV, Place falls back to the copy and the line says why, a copy that cannot fit is refused up
+#   front, a copy that really runs out of space in the middle leaves the old file and no .part. Every branch of Place with injected delegates (clone ok / refused / throws / short; copy fails / short; the rename fails; dest exists:
+#   the old file is whole DURING the copy and replaced only at the end; stale .part; same file; missing source; a folder; two at once; awkward names). 64,512 generated fact layouts for the cleanup: the plan is empty exactly when a
+#   rule says so and never lists a protected path; 24 are offered. The cleanup EXECUTED on real trees (267 files: two games, Alpha built, Beta's shaders and .work, 60 shader cache files, saves, mods, covers, Exports, keys, a
+#   certificate, settings): exactly the build is gone (every file and folder of the whitelist, nothing else), every other file has the same SHA-256; run again it removes nothing; another game's build on disk: no plan, tree
+#   untouched; a light export: no plan; a forged plan naming shadercache, games, Exports, prod.keys, the game file, ../outside: every path refused, tree untouched; an extract/ that is a symlink: the link goes, its target stays.
+#   With 40,000 files under shaders/<id> and shaders/<id>.work, Execute returns to its caller after 0.6 ms (the 40,000 files take 2.9 s on the worker).
+# NOT EXERCISED / ASSUMED (no device run): everything UIKit (the menu, the picker, the progress card, the alert, the timer); that the Open-mode FILE picker delivers its selection on iOS 27.2.1 (it did not on 27.0.1: the old
+#   Import stays the default); that a coordinated read of a file in iCloud Drive / a third-party provider gives a path on the app's APFS volume (clonefile then works; when not, the copy runs as before and the line says why);
+#   that the sandbox lets clonefile read a security-scoped source (it can: an EPERM is a refusal, then the copy); the progress card while the app is in the background; the question after a "Send to the NAS" (it can appear
+#   while the upload runs: it does not touch Exports/); a kill in the middle of the cleanup (the stamp is gone first: the game is "Needs setup", the half-deleted folders are overwritten by the next build).
+# RISKS: a game picked from the app's own folder in Files is "already in the library" and nothing is done (the log says so); an iCloud file that is still being downloaded makes the coordinated read wait (the card says "Adding");
+#   the question's size is the build's, measured when the export ends (it may be a little old); between the stamp's removal and the end of the folder deletes a refresh can show the build as "Stale" for a moment; Command-Shift-I
+#   is a new hardware-keyboard shortcut (iPad).
+diff -ruN a/GameAppBuildCleanup.cs b/GameAppBuildCleanup.cs
+--- a/GameAppBuildCleanup.cs
++++ b/GameAppBuildCleanup.cs
+@@ -0,0 +1,161 @@
++// gameapp/GameAppBuildCleanup.cs -- "Delete the build?" after a FULL .ipa export: what it deletes, when it is offered, and its words, with no UIKit (patch 0066; the host harness compiles this file as it is).
++//
++// A full export embeds the whole game (RomFS included) in the .ipa; iBuilder's own copy (Documents/extract, the framework, the shader pack: 10 to 30 GB) is then only a second copy. The person is asked once, after the
++// export's own alert / share sheet is gone. The plan is a whitelist, never a search: this game's build (extract/, DmGameProbe.framework/, shaders/<id>/, shaders/<id>.work/, the stamp and the boot files), and nothing else.
++//
++// NEVER (CancelPlan.Forbidden, patch 0065, and more): the game file and its update / DLC, shadercache/, games/<id>/ (settings, saves, cover, mods, icon, rewrite cache), Exports/ (the .ipa just made, the light
++// exports' game files), prod.keys, the certificate (.p12), another game's shaders/<id> and its .work, a pending <id>.shaders.tar, SaveBackups/, the NAS and cloud settings.
++// Offered ONLY when the build on disk really is this game's: the framework stamp names this game's file, profile.tsv's title id is this game's, no build runs or is paused for it, no other game's paused build holds
++// extract/, nothing else is deleting / exporting / compiling shaders, and the export was a full one (a light export leaves the game files beside the .ipa as a clone of extract/RomFS.img: deleting the build frees nothing).
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Text.RegularExpressions;
++
++public enum CleanupWhy { Offer, LightExport, Busy, BuildRunning, PausedHere, OtherBuild, NoBuild, NoTitleId }
++
++/// What the decision depends on, read by the app right before it asks. `Game`: the exported game's file name. `FileTid`: its title id from the file name (null when it has none). `BuiltTid`: profile.tsv's title_id
++/// (the build on disk was made for it). `StampGame`: the game named by Documents/gameapp.framework. `BuildRunning`: a run is going or being stopped (the stop machine is busy). `PausedHere`: a paused build of this game
++/// is kept. `OtherHoldsExtract`: another game's paused build says extract/ holds it. `Busy`: something else is deleting, exporting, measuring for a delete, or compiling shaders.
++public sealed record CleanupFacts(string Game, string FileTid, string BuiltTid, string StampGame, bool Slim, bool BuildRunning, bool PausedHere, bool OtherHoldsExtract, bool Busy);
++
++/// Paths relative to Documents. `Tid`: the build's title id (the shader pack's name), null when nothing is to be deleted.
++public sealed record CleanupPlan(CleanupWhy Why, string Tid, IReadOnlyList<string> Folders, IReadOnlyList<string> Files)
++{
++    public bool IsEmpty => Folders.Count == 0 && Files.Count == 0;
++    public static CleanupPlan None(CleanupWhy why) => new CleanupPlan(why, null, Array.Empty<string>(), Array.Empty<string>());
++}
++
++public static class BuildCleanup
++{
++    public const string Extract = CancelPlan.Extract, Framework = CancelPlan.Framework;
++
++    /// The small files of a build (what deleting a game removes with it, GameAppUi.PlanDeletion): the stamp (without it the game is "Needs setup" at once), the boot request, the pipeline's boot marker, the profile.
++    public static readonly string[] BuildFiles = { CancelPlan.FrameworkStamp, "gameapp.boot-only", "pipeline.boot", "profile.tsv" };
++
++    private static readonly Regex TitleId = new Regex("^[0-9A-Fa-f]{16}$", RegexOptions.Compiled);
++
++    private static string Normal(string relative) => (relative ?? "").Replace('\\', '/').Trim('/');
++
++    /// What would be deleted for `f`, or an empty plan and the reason.
++    public static CleanupPlan For(CleanupFacts f)
++    {
++        if (f == null || string.IsNullOrEmpty(f.Game)) return CleanupPlan.None(CleanupWhy.NoBuild);
++        if (f.Slim) return CleanupPlan.None(CleanupWhy.LightExport);
++        if (f.BuildRunning) return CleanupPlan.None(CleanupWhy.BuildRunning);
++        if (f.PausedHere) return CleanupPlan.None(CleanupWhy.PausedHere);
++        if (f.OtherHoldsExtract) return CleanupPlan.None(CleanupWhy.OtherBuild);
++        if (f.Busy) return CleanupPlan.None(CleanupWhy.Busy);
++        if (string.IsNullOrEmpty(f.StampGame)) return CleanupPlan.None(CleanupWhy.NoBuild);                      // nobody's finished build is on disk
++        if (!string.Equals(f.StampGame, f.Game, StringComparison.Ordinal)) return CleanupPlan.None(CleanupWhy.OtherBuild);   // the framework is another game's
++        if (string.IsNullOrEmpty(f.BuiltTid) || !TitleId.IsMatch(f.BuiltTid)) return CleanupPlan.None(CleanupWhy.NoTitleId);
++        if (!string.IsNullOrEmpty(f.FileTid) && !string.Equals(f.FileTid, f.BuiltTid, StringComparison.OrdinalIgnoreCase)) return CleanupPlan.None(CleanupWhy.OtherBuild);   // profile.tsv is another game's
++        var tid = f.BuiltTid.ToUpperInvariant();
++        var folders = new List<string> { Framework, Extract, "shaders/" + tid, StopFiles.WorkFolder(tid) };   // the framework first: without it the game is not bootable at once
++        var files = BuildFiles.ToList();
++        // the plan is checked against the never-list before it is returned: a path on it would be a bug here, not something to delete
++        foreach (var rel in folders.Concat(files))
++            if (!Allowed(rel, tid) || NeverDeleted(rel, f.Game, tid)) throw new InvalidOperationException("the build cleanup plan lists a protected path: " + rel);
++        return new CleanupPlan(CleanupWhy.Offer, tid, folders, files);
++    }
++
++    /// The only paths a cleanup of the build of `tid` may remove (relative to Documents).
++    public static bool Allowed(string relative, string tid)
++    {
++        if (string.IsNullOrEmpty(tid) || !TitleId.IsMatch(tid)) return false;
++        var p = Normal(relative);
++        return p == Extract || p == Framework || BuildFiles.Contains(p, StringComparer.Ordinal)
++            || string.Equals(p, "shaders/" + tid, StringComparison.OrdinalIgnoreCase) || string.Equals(p, StopFiles.WorkFolder(tid), StringComparison.OrdinalIgnoreCase);
++    }
++
++    /// The paths that must never be in a cleanup (the tests check every plan against it, and Execute refuses them again). Two layers: the explicit ones, which are CancelPlan.Forbidden (the shader cache, games/, the game file,
++    /// prod.keys, the packs; patch 0065) and what only a cleanup could reach (Exports, SaveBackups, the certificate, a game file of any name, the converted .nsz cache, the pending shader packs, the app's and the NAS's settings,
++    /// the root and anything outside Documents); and then EVERYTHING the whitelist (Allowed) does not name: another game's shaders/<id> and its .work, any other top-level file or folder. The one thing a cleanup removes that
++    /// a cancel keeps is THIS build's finished pack, shaders/<tid>: not forbidden for `ownTid`, forbidden for any other.
++    public static bool NeverDeleted(string relative, string gameFile, string ownTid)
++    {
++        if (string.IsNullOrEmpty(relative)) return true;
++        var p = Normal(relative);
++        if (p.Length == 0 || relative.StartsWith("/", StringComparison.Ordinal) || relative.StartsWith("\\", StringComparison.Ordinal) || p.Contains("..")) return true;
++        bool ownPack = !string.IsNullOrEmpty(ownTid) && TitleId.IsMatch(ownTid) && string.Equals(p, "shaders/" + ownTid, StringComparison.OrdinalIgnoreCase);
++        if (!ownPack && CancelPlan.Forbidden(relative, gameFile)) return true;
++        var first = p.Split('/')[0];
++        if (first == "Exports" || first == "SaveBackups" || first == ".nsz" || first == "games" || first == "shadercache" || first == "profile-derived") return true;
++        if (gameFile != null && p == gameFile) return true;
++        if (!p.Contains('/'))
++        {
++            var ext = Path.GetExtension(p);
++            if (new[] { ".nsp", ".xci", ".nsz", ".nup", ".xcz", ".p12", ".pfx", ".tar", ".ipa", ".keys" }.Contains(ext, StringComparer.OrdinalIgnoreCase)) return true;
++            if (p.StartsWith("gameapp.", StringComparison.Ordinal) && !BuildFiles.Contains(p, StringComparer.Ordinal)) return true;   // gameapp.settings.tsv, gameapp.nas..., gameapp.paused.tsv, gameapp.killed: not the build's
++        }
++        return !Allowed(relative, ownTid);   // and whatever is not this build's own set
++    }
++
++    /// Runs `plan` under `documents`. The small files go at once (a stat and an unlink each: the same as ApplyCancel's plan.Files), the stamp first, so the game is "Needs setup" even if the app dies in the middle of the
++    /// folders; the folders go through `deleteFolder(path, done)` (the app passes DeleteFolderInBackground: a worker thread, one at a time; `done(error)` on the main thread, error null when it went well). `note` gets a line for each
++    /// thing that was refused or failed; `done(removed, failed)` is called once, when everything is over (at once when there is nothing to remove). A path the whitelist does not allow is refused here too.
++    public static void Execute(CleanupPlan plan, string documents, string gameFile, Action<string, Action<string>> deleteFolder, Action<string> note, Action<int, int> done)
++    {
++        int removed = 0, failed = 0;
++        foreach (var rel in plan.Files)
++        {
++            if (!Allowed(rel, plan.Tid) || NeverDeleted(rel, gameFile, plan.Tid)) { failed++; note?.Invoke($"build cleanup: {rel} is not on the list of what a cleanup removes: left alone"); continue; }
++            var path = Path.Combine(documents, rel);
++            try { if (File.Exists(path)) { File.Delete(path); removed++; } }
++            catch (Exception error) { failed++; note?.Invoke($"build cleanup: {rel} not removed ({error.Message})"); }
++        }
++        var folders = new List<string>();
++        foreach (var rel in plan.Folders)
++        {
++            if (!Allowed(rel, plan.Tid) || NeverDeleted(rel, gameFile, plan.Tid)) { failed++; note?.Invoke($"build cleanup: {rel}/ is not on the list of what a cleanup removes: left alone"); continue; }
++            if (Directory.Exists(Path.Combine(documents, rel))) folders.Add(rel);
++        }
++        int left = folders.Count;
++        if (left == 0) { done(removed, failed); return; }
++        foreach (var rel in folders)
++            deleteFolder(Path.Combine(documents, rel), error =>
++            {
++                if (error != null) { failed++; note?.Invoke($"build cleanup: {rel}/ not removed ({error})"); }
++                else removed++;
++                if (--left == 0) done(removed, failed);
++            });
++    }
++}
++
++/// The words of the question.
++public static class BuildCleanupText
++{
++    public const string Title = "Delete the build?";
++    public const string Keep = "Keep it";
++
++    /// "18.4 GB", "at least 18.4 GB" when a part of it was not known, null when nothing is known (or nothing is there).
++    public static string Amount(long bytes, bool exact) => bytes <= 0 ? null : (exact ? "" : "at least ") + GameAppUi.SizeText(bytes);
++
++    public static string Message(long bytes, bool exact)
++    {
++        var amount = Amount(bytes, exact);
++        return "The exported app contains the whole build. iBuilder's copy "
++               + (amount != null ? "takes " + amount + " (the extracted game, the shaders, the framework)" : "(the extracted game, the shaders, the framework) is still here")
++               + ". The game file, the shader cache, its settings, saves and cover stay; you can build again whenever you want.";
++    }
++
++    public static string DeleteButton(long bytes, bool exact)
++    {
++        var amount = Amount(bytes, exact);
++        return amount != null ? $"Delete the build ({amount})" : "Delete the build";
++    }
++
++    /// The log line when it is not offered.
++    public static string WhyNot(CleanupWhy why) => why switch
++    {
++        CleanupWhy.LightExport => "a light export keeps the game files beside the .ipa: the build holds the same blocks",
++        CleanupWhy.BuildRunning => "a build is running, being stopped or being resumed",
++        CleanupWhy.PausedHere => "a build of this game is paused: Resume continues from the files kept",
++        CleanupWhy.OtherBuild => "the build on disk is another game's, or another game's paused build holds extract/",
++        CleanupWhy.Busy => "something else is going on (a delete, an export, the shaders being prepared)",
++        CleanupWhy.NoBuild => "no finished build of this game is on disk",
++        CleanupWhy.NoTitleId => "the build's title id is not known (profile.tsv)",
++        _ => "offered",
++    };
++}
+diff -ruN a/GameAppBuildCleanupUi.cs b/GameAppBuildCleanupUi.cs
+--- a/GameAppBuildCleanupUi.cs
++++ b/GameAppBuildCleanupUi.cs
+@@ -0,0 +1,117 @@
++// gameapp/GameAppBuildCleanupUi.cs -- "Delete the build?" after a FULL .ipa export: the question, its timing and the deletion (patch 0066). What is deleted, when it is offered and the words are in GameAppBuildCleanup.cs
++// (no UIKit, run by the host harness).
++//
++//   * Offered once, by StartExport's completion, only for a full export. The size in the question is measured off the main thread when the export ends (the cached extract/ and framework sizes where they are known, a walk on a
++//     worker for this game's shader pack and work folder: never a walk on the main thread), and the question waits for it (20 s at most: then "at least" what the cache knew, or no number).
++//   * It is NOT stacked on the export's own "Export done" alert or the share sheet: it waits until nothing is presented (two looks 0.6 s apart, so the gap between the alert going and the share sheet coming is not taken for
++//     "free"), for 15 minutes at most, and is shown with PresentWhenFree. The guards are read again then, and again when "Delete the build" is pressed (a build may have started meanwhile).
++//   * "Delete the build (N GB)": the stamp and the boot files go at once (the game is "Needs setup", the refresh follows), the folders through DeleteFolderInBackground (patch 0064: a worker thread, one at a time, no folder
++//     size measured meanwhile, BeginRun refuses meanwhile), then the sizes are measured again. "Keep it" does nothing.
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Threading.Tasks;
++
++using Foundation;
++using UIKit;
++
++public sealed partial class GameAppViewController
++{
++    private sealed class CleanupAsk
++    {
++        public string Game;
++        public CleanupPlan Plan;
++        public long Bytes = -1;
++        public bool Exact, Measured;
++        public DateTime Since = DateTime.UtcNow;
++        public int Quiet;
++    }
++
++    private CleanupAsk cleanupAsk;
++
++    /// What the decision needs, read now: the framework stamp and profile.tsv (two small files), the paused records, the flags of what else is going on.
++    private CleanupFacts CleanupFactsFor(string game, bool slim)
++    {
++        string stampGame = null;
++        try { stampGame = GameAppUi.ParseFrameworkStamp(File.Exists(FrameworkStampPath) ? File.ReadAllText(FrameworkStampPath) : null)?.Game; }
++        catch (Exception) { }
++        return new CleanupFacts(game, GameAppUi.BaseTitleIdOf(game), BuiltTitleId(), stampGame, slim,
++                                BuildRunning: running || stop.Busy,
++                                PausedHere: pausedBuilds.Any(r => r.Game == game),
++                                OtherHoldsExtract: pausedBuilds.Any(r => r.Game != game && r.Extracted),
++                                Busy: exporting || exportSizing || deleteSizing || deletes.Busy || GameWarm.Active);
++    }
++
++    /// StartExport's completion calls this after its own alert is up. Nothing is asked here: the plan is made, the size is measured on a worker, and a timer waits for the screen to be free.
++    private void OfferBuildCleanup(string game, bool slim)
++    {
++        if (GameExport.IsPlayer) return;
++        var plan = BuildCleanup.For(CleanupFactsFor(game, slim));
++        if (plan.IsEmpty) { Write($"build cleanup: not offered: {BuildCleanupText.WhyNot(plan.Why)}"); return; }
++        var ask = new CleanupAsk { Game = game, Plan = plan };
++        // what the cache knows already (read here, on the main thread): the extraction and the framework
++        long cachedExtract = sizes.Get(FolderSizes.Extract), cachedFramework = sizes.Get(FolderSizes.Framework);
++        ask.Bytes = Math.Max(0, cachedExtract) + Math.Max(0, cachedFramework);
++        if (cachedExtract < 0 && cachedFramework < 0) ask.Bytes = -1;
++        cleanupAsk = ask;
++        var documents = GameAppMain.Documents;
++        Task.Run(() =>
++        {
++            long total = 0;
++            foreach (var rel in plan.Folders)
++            {
++                long cached = rel == BuildCleanup.Extract ? cachedExtract : rel == BuildCleanup.Framework ? cachedFramework : -1;
++                total += cached >= 0 ? cached : FolderWalk.Bytes(Path.Combine(documents, rel));
++            }
++            BeginInvokeOnMainThread(() => { ask.Bytes = total; ask.Exact = true; ask.Measured = true; });
++        });
++        NSTimer.CreateScheduledTimer(1.2, _ => CleanupTick(ask));
++    }
++
++    private void CleanupTick(CleanupAsk ask)
++    {
++        if (cleanupAsk != ask) return;   // another export replaced it
++        var waited = DateTime.UtcNow - ask.Since;
++        if (waited > TimeSpan.FromMinutes(15)) { cleanupAsk = null; Write("build cleanup: not asked (the screen was never free)"); return; }
++        bool measuring = !ask.Measured && waited < TimeSpan.FromSeconds(20);
++        bool free = PresentedViewController == null && !measuring;
++        ask.Quiet = free ? ask.Quiet + 1 : 0;
++        if (ask.Quiet < 2) { NSTimer.CreateScheduledTimer(0.6, _ => CleanupTick(ask)); return; }
++        cleanupAsk = null;
++        ShowBuildCleanupAlert(ask);
++    }
++
++    private void ShowBuildCleanupAlert(CleanupAsk ask)
++    {
++        var plan = BuildCleanup.For(CleanupFactsFor(ask.Game, false));   // a build may have started since: asked again
++        if (plan.IsEmpty) { Write($"build cleanup: not asked: {BuildCleanupText.WhyNot(plan.Why)}"); return; }
++        var name = GameAppUi.DisplayName(ask.Game);
++        Write($"build cleanup: asked after the full export of {name}" + (ask.Bytes > 0 ? $" (the build takes {BuildCleanupText.Amount(ask.Bytes, ask.Exact)})" : ""));
++        var alert = UIAlertController.Create(BuildCleanupText.Title, BuildCleanupText.Message(ask.Bytes, ask.Exact), UIAlertControllerStyle.Alert);
++        alert.AddAction(UIAlertAction.Create(BuildCleanupText.DeleteButton(ask.Bytes, ask.Exact), UIAlertActionStyle.Destructive, _ => DeleteTheBuild(ask)));
++        alert.AddAction(UIAlertAction.Create(BuildCleanupText.Keep, UIAlertActionStyle.Cancel, _ => Write($"build cleanup: kept the build of {name}")));   // Cancel style: bold, the default
++        PresentWhenFree(alert);
++    }
++
++    private void DeleteTheBuild(CleanupAsk ask)
++    {
++        var plan = BuildCleanup.For(CleanupFactsFor(ask.Game, false));
++        var name = GameAppUi.DisplayName(ask.Game);
++        if (plan.IsEmpty)
++        {
++            Write($"build cleanup: not done: {BuildCleanupText.WhyNot(plan.Why)}");
++            var no = UIAlertController.Create("The build was not deleted", "Something started meanwhile: " + BuildCleanupText.WhyNot(plan.Why) + ". Nothing was deleted.", UIAlertControllerStyle.Alert);
++            no.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++            PresentWhenFree(no);
++            return;
++        }
++        Write($"build cleanup: deleting the build of {name} in the background: {string.Join(", ", plan.Folders)} (the game file, the shader cache, games/<id>/, Exports/ and prod.keys stay)");
++        BuildCleanup.Execute(plan, GameAppMain.Documents, ask.Game, DeleteFolderInBackground, text => Write(text), (removed, failed) =>
++        {
++            Write($"build cleanup: done, {removed} item(s) removed" + (failed > 0 ? $", {failed} could not be removed" : "") + (ask.Bytes > 0 && failed == 0 ? $" (about {BuildCleanupText.Amount(ask.Bytes, ask.Exact)} freed)" : "") + "; build it again from the Build tab");
++            RefreshScreen();
++        });
++        RefreshScreen();   // the stamp is gone: the game is "Needs setup" now, the folders follow
++    }
++}
+diff -ruN a/GameAppImport.cs b/GameAppImport.cs
+--- a/GameAppImport.cs
++++ b/GameAppImport.cs
+@@ -0,0 +1,242 @@
++// gameapp/GameAppImport.cs -- a game that is already on the phone is brought into the library WITHOUT copying it: the decisions, with no UIKit (patch 0066; the host harness compiles this file as it is).
++//
++// Why: the + button's picker (UIDocumentPickerMode.Import) makes iOS copy the whole game (11 to 26 GB: minutes, and as much free space as the game) into tmp/ before the app sees it, and a Files-folder source's "Download" copies file by
++// file through an NSFileCoordinator read. On the phone's one APFS volume a CLONE (clonefile: the same blocks, shared until one side is written) takes a few milliseconds and no space at all.
++//
++//   FileClone    clonefile(2), and the reason in words when it refuses (another volume, a file system without clones, no permission...).
++//   GameImport   Place(src, dest, clone, copy, log): the one decision, always through <dest>.part and one rename over any existing file:
++//                  clone succeeds -> no copy;  clone fails -> the copy;  the copy fails -> the .part is removed and the previous dest is as it was;  dest exists -> replaced only by the final rename.
++//                CopyBytes: the copy with progress (the loop CopyWithProgress had since patch 0040).
++//   InPlaceImport  which picked names are added ("Add from Files without copying") and the sentence that says what happened.
++// The delegates are injected so the harness can run every branch; the app passes FileClone.Try and GameImport.CopyBytes.
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using System.Runtime.InteropServices;
++using System.Text;
++
++/// The APFS clone: `dst` becomes a file of its own that shares `src`'s blocks (copy on write). dst must not exist.
++public static class FileClone
++{
++    [DllImport("libc", EntryPoint = "clonefile", SetLastError = true)]
++    private static extern int clonefile(string src, string dst, uint flags);
++
++    /// null when `dst` is now a clone of `src`; else the reason, in words (it goes into the log line and says why the copy was used).
++    public static string Try(string src, string dst)
++    {
++        try
++        {
++            if (clonefile(src, dst, 0) == 0) return null;
++            return Why(Marshal.GetLastPInvokeError());
++        }
++        catch (DllNotFoundException) { return "clonefile is not available here"; }
++        catch (EntryPointNotFoundException) { return "clonefile is not available here"; }
++    }
++
++    /// errno (the Darwin numbers) in words.
++    public static string Why(int errno) => errno switch
++    {
++        1 => "not allowed (EPERM)",
++        2 => "the source is not there (ENOENT)",
++        13 => "no permission (EACCES)",
++        17 => "the destination exists (EEXIST)",
++        18 => "the source is on another volume (EXDEV)",
++        20 => "not a folder in the path (ENOTDIR)",
++        21 => "the source is a folder (EISDIR)",
++        22 => "refused (EINVAL)",
++        28 => "no space left (ENOSPC)",
++        45 => "this file system cannot clone (ENOTSUP)",
++        63 => "the name is too long (ENAMETOOLONG)",
++        _ => string.Create(CultureInfo.InvariantCulture, $"clonefile failed (errno {errno})"),
++    };
++}
++
++public enum PlacedHow { Cloned, Copied, AlreadyThere }
++
++/// What Place did. Why: for a copy, why the clone was not used; for AlreadyThere, what it saw.
++public sealed record Placed(PlacedHow How, long Bytes, TimeSpan Took, string Why);
++
++public static class GameImport
++{
++    /// A copy needs room for the whole file beside the old one (the old one stays until the rename) and some air.
++    public const long CopyMargin = 256L << 20;
++    public const string PartSuffix = ".part";
++
++    private static readonly object gate = new object();
++    private static readonly HashSet<string> going = new HashSet<string>(StringComparer.Ordinal);
++
++    private static string Inv(FormattableString text) => text.ToString(CultureInfo.InvariantCulture);
++
++    public static string ClonedLine(string name, long bytes, long milliseconds) => Inv($"import: cloned {name} ({GameAppUi.SizeText(bytes)}) in {milliseconds} ms");
++
++    public static string CopiedLine(string name, long bytes, double seconds, string why) => Inv($"import: copied {name} ({GameAppUi.SizeText(bytes)}) in {seconds:0.0} s ({why})");
++
++    /// The path as the file system sees it for a comparison: absolute, and without the /private prefix iOS and macOS put on /var and /tmp.
++    internal static string Normal(string path)
++    {
++        var full = Path.GetFullPath(path);
++        return full.StartsWith("/private/", StringComparison.Ordinal) ? full.Substring("/private".Length) : full;
++    }
++
++    /// The same file under two spellings (the picker's /private/var/... and the container's /var/...): nothing to do.
++    public static bool SamePath(string a, string b) => string.Equals(Normal(a), Normal(b), StringComparison.Ordinal);
++
++    private static long LengthOf(string path)
++    {
++        try { return new FileInfo(path).Length; } catch (Exception) { return -1; }
++    }
++
++    private static void Quietly(string path)
++    {
++        try { if (File.Exists(path)) File.Delete(path); } catch (Exception) { }
++    }
++
++    /// Puts `src` at `dest`. `clone(src, part)` returns null when it made the clone, else why not (it may also throw); `copy(src, part)` writes the copy (it throws on failure). Both write to `<dest>.part`, never to
++    /// `dest`: the one change to `dest` is the last line, a rename over it (File.Move: rename(2), atomic), so a failure anywhere leaves the previous `dest` exactly as it was and no `.part` behind. A clone or a copy
++    /// whose length is not the source's is not accepted (the clone is then followed by the copy; a short copy is an error). `freeBytes` (optional; <= 0 = unknown): the copy is refused up front when the volume cannot
++    /// hold it, so it does not run for minutes and fail. `log` gets exactly one line: `import: cloned <name> (<size>) in <ms> ms` or `import: copied <name> (<size>) in <s> s (<why the clone was not used>)`.
++    /// A second Place of the same dest while one is going is refused (the .part would be shared).
++    public static Placed Place(string src, string dest, Func<string, string, string> clone, Action<string, string> copy, Action<string> log = null, Func<long> freeBytes = null)
++    {
++        if (string.IsNullOrEmpty(src) || string.IsNullOrEmpty(dest)) throw new ArgumentException("a file to add and where it goes are needed");
++        var name = Path.GetFileName(dest);
++        if (SamePath(src, dest))
++        {
++            long own = LengthOf(src);
++            log?.Invoke($"import: {name} is already in the library (the picked file is this app's own copy): nothing to do");
++            return new Placed(PlacedHow.AlreadyThere, Math.Max(0, own), TimeSpan.Zero, "the same file");
++        }
++        var info = new FileInfo(src);
++        if (!info.Exists) throw new FileNotFoundException(Directory.Exists(src) ? $"{Path.GetFileName(src)} is a folder, not a file" : $"{Path.GetFileName(src)} cannot be read: it is not there");
++        long size = info.Length;
++        var part = dest + PartSuffix;
++        lock (gate)
++            if (!going.Add(dest)) throw new IOException($"{name} is already being added: wait for it to end");
++        try
++        {
++            var clock = Stopwatch.StartNew();
++            Quietly(part);   // a .part an earlier cut run left: this run owns the name now
++            string why = null;
++            bool cloned = false;
++            if (clone == null) why = "no clone was tried";
++            else
++            {
++                try { why = clone(src, part); }
++                catch (Exception e) { why = $"{e.GetType().Name}: {e.Message}"; }
++                if (why == null)
++                {
++                    long got = LengthOf(part);
++                    if (got == size) cloned = true;
++                    else why = Inv($"the clone has {got} bytes, the file {size}");
++                }
++                if (!cloned) Quietly(part);
++            }
++            if (!cloned)
++            {
++                long free = freeBytes?.Invoke() ?? 0;
++                if (free > 0 && free < size + CopyMargin)
++                    throw new IOException($"not enough space to copy {name}: {GameAppUi.SizeText(size)} needed ({why}), {GameAppUi.SizeText(free)} free");
++                try
++                {
++                    copy(src, part);
++                    long got = LengthOf(part);
++                    if (got != size) throw new IOException(Inv($"{name}: the copy has {got} bytes, the file {size}"));
++                }
++                catch { Quietly(part); throw; }
++            }
++            try { File.Move(part, dest, true); }   // the only change to dest: one rename over the old file (it is not deleted first)
++            catch { Quietly(part); throw; }
++            clock.Stop();
++            if (cloned) log?.Invoke(ClonedLine(name, size, clock.ElapsedMilliseconds));
++            else log?.Invoke(CopiedLine(name, size, clock.Elapsed.TotalSeconds, why));
++            return new Placed(cloned ? PlacedHow.Cloned : PlacedHow.Copied, size, clock.Elapsed, cloned ? null : why);
++        }
++        finally { lock (gate) going.Remove(dest); }
++    }
++
++    /// The copy, with progress (`progress(done, total)` at most every 300 ms, and once at the end). Writes `to` and nothing else; the caller owns the .part and the rename.
++    public static void CopyBytes(string from, string to, Action<long, long> progress, int bufferBytes = 4 << 20)
++    {
++        long total = new FileInfo(from).Length, done = 0;
++        var buffer = new byte[bufferBytes];
++        using (var input = File.OpenRead(from))
++        using (var output = File.Create(to))
++        {
++            int n;
++            var last = DateTime.MinValue;
++            while ((n = input.Read(buffer, 0, buffer.Length)) > 0)
++            {
++                output.Write(buffer, 0, n);
++                done += n;
++                if ((DateTime.Now - last).TotalMilliseconds > 300) { progress?.Invoke(done, total); last = DateTime.Now; }
++            }
++        }
++        progress?.Invoke(done, total);
++    }
++}
++
++/// One picked file's end: `Placed` when it is in the library, else `Error`.
++public sealed record ImportOutcome(string Name, Placed Placed, string Error);
++
++/// Which of the picked files "Add from Files without copying" takes, by index in the picked list.
++public sealed record InPlacePlan(IReadOnlyList<int> Accepted, IReadOnlyList<(int Index, string Why)> Skipped);
++
++public static class InPlaceImport
++{
++    public static readonly string[] GameExtensions = { ".nsp", ".xci", ".nsz", ".nup" };
++    public const string Keys = "prod.keys";
++
++    /// The names the launch sweep of leftover .part files knows (GameAppMain.OurPartExtensions and prod.keys.part): a name outside them would leave a .part for good if the app is killed mid-copy. They are the games this app
++    /// lists (Dumps()) and the keys. Anything else is left to "Add a game file".
++    public static bool Accepts(string name)
++    {
++        if (!SafeName(name)) return false;
++        if (string.Equals(name, Keys, StringComparison.Ordinal)) return true;
++        var extension = Path.GetExtension(name);
++        return name.Length > extension.Length && GameExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase);
++    }
++
++    /// A single file name for Documents: not empty, not . or .., no path separator, no NUL, and room for ".part" under the 255 bytes a name can have.
++    public static bool SafeName(string name) =>
++        !string.IsNullOrEmpty(name) && name != "." && name != ".." && name.IndexOf('/') < 0 && name.IndexOf('\0') < 0
++        && Encoding.UTF8.GetByteCount(name) + GameImport.PartSuffix.Length <= 255;
++
++    public static InPlacePlan Plan(IReadOnlyList<string> names)
++    {
++        var accepted = new List<int>();
++        var skipped = new List<(int, string)>();
++        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // Documents is on a case-insensitive file system: two picks of one name are one file
++        for (int i = 0; i < names.Count; i++)
++        {
++            var name = names[i];
++            if (!SafeName(name)) skipped.Add((i, "its name cannot be used"));
++            else if (!Accepts(name)) skipped.Add((i, "not a game file (.nsp, .xci, .nsz, .nup) or prod.keys: use \"Add a game file\" for it"));
++            else if (!seen.Add(name)) skipped.Add((i, "picked twice"));
++            else accepted.Add(i);
++        }
++        return new InPlacePlan(accepted, skipped);
++    }
++
++    /// The line the log gets when every file has been dealt with: what was added (and how), what was not (and why).
++    public static string Summary(IReadOnlyList<ImportOutcome> outcomes)
++    {
++        var added = outcomes.Where(o => o.Placed != null).ToList();
++        var failed = outcomes.Where(o => o.Placed == null).ToList();
++        var parts = new List<string>();
++        if (added.Count > 0)
++            parts.Add("imported: " + string.Join(", ", added.Select(o => o.Name + (o.Placed.How == PlacedHow.Cloned ? " (cloned)" : o.Placed.How == PlacedHow.Copied ? " (copied)" : " (already there)"))));
++        if (failed.Count > 0)
++            parts.Add("import failed: " + string.Join("; ", failed.Select(o => $"{o.Name}: {o.Error}")));
++        return string.Join(" · ", parts);
++    }
++
++    /// The alert's text for files that were not added, or null when all went well.
++    public static string Failures(IReadOnlyList<ImportOutcome> outcomes)
++    {
++        var failed = outcomes.Where(o => o.Placed == null).ToList();
++        return failed.Count == 0 ? null : string.Join("\n", failed.Select(o => $"{o.Name}: {o.Error}")) + "\n\nThe files that were already in the library are as they were.";
++    }
++}
+diff -ruN a/GameAppImportUi.cs b/GameAppImportUi.cs
+--- a/GameAppImportUi.cs
++++ b/GameAppImportUi.cs
+@@ -0,0 +1,192 @@
++// gameapp/GameAppImportUi.cs -- "Add from Files without copying": the + button's menu, the open-in-place picker, the import itself, the progress card on the Build tab (patch 0066). The decisions (clone or copy, the
++// .part and the rename, which names are taken, the words of the log) are in GameAppImport.cs (no UIKit, run by the host harness).
++//
++//   * The + button of the Build tab (accessibility id `import-file`, also the Library's "Add a game" tile and Command-I) is a menu: "Add a game file" (the picker that has been the way in all along: UIDocumentPickerMode.Import,
++//     iOS makes the copy in tmp/ and CopyIn moves it into Documents; it works on this phone and is NOT changed) and "Add from Files without copying" (this file). Command-Shift-I opens the second one.
++//   * "Add from Files without copying": the picker in OPEN mode (UIDocumentPickerViewController(types, asCopy: false), several files): iOS hands over the files where they are, no copy. For each picked file, on a worker
++//     thread, inside an NSFileCoordinator read (a file only in iCloud is downloaded first) and a security scope: an APFS clone into Documents, else (another volume, no clones) the copy with progress; always through
++//     <name>.part and one rename. A progress card on the Build tab, a background task, the screen kept awake while it copies. The main thread does a few property reads and nothing else.
++//   * A FILE picker in Open mode did not deliver its selection on iOS 27.0.1 in the exported player (the delegate never fired; the folder picker in Open mode did). The app logs `import: the picker is open (in place)` when
++//     it opens and `import: picked N file(s)` when it answers, `import: the picker was closed without a file` when it is cancelled; a watchdog adds one line when the picker is gone and nothing was answered.
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Threading.Tasks;
++
++using Foundation;
++using UIKit;
++using UniformTypeIdentifiers;
++
++public sealed partial class GameAppViewController
++{
++    private bool importBusy;
++    private NSObject importPickerDelegate;   // alive while a picker is up
++    private UILabel importLine;
++    private UIProgressView importBar;
++    private UIView importCard;
++
++    /// The menu of the + button: the old picker first, the new way second.
++    private UIMenu ImportMenu() => UIMenu.Create(new UIMenuElement[]
++    {
++        UIAction.Create("Add a game file", UIImage.GetSystemImage("doc.badge.plus"), "import-add", _ => Import()),
++        UIAction.Create("Add from Files without copying", UIImage.GetSystemImage("folder.badge.plus"), "import-in-place", _ => ImportInPlace()),
++    });
++
++    /// The progress card of the Build tab's column: hidden until an in-place import is going.
++    private UIView MakeImportCard()
++    {
++        importLine = Theme.Label("", Theme.Font(13, UIFontWeight.Semibold), Theme.Text, 0);
++        importBar = new UIProgressView(UIProgressViewStyle.Default) { ProgressTintColor = Theme.Accent, TrackTintColor = UIColor.FromWhiteAlpha(1f, 0.14f) };
++        importCard = Theme.Wrap(Theme.Column(8, importLine, importBar), 20, 14);
++        importCard.AccessibilityIdentifier = "import-progress";
++        importCard.Hidden = true;
++        return importCard;
++    }
++
++    private void ShowImportProgress(int index, int count, string name, double fraction, string what)
++    {
++        if (importCard == null) return;
++        importLine.Text = (count > 1 ? $"{index + 1} of {count} · " : "") + what + " " + name + (fraction > 0 ? $" · {Math.Round(fraction * 100):0}%" : "");
++        importBar.Progress = (float) Math.Max(0.02, Math.Min(1, fraction));
++        importCard.Hidden = false;
++    }
++
++    // ---- the picker ----------------------------------------------------------------------------------------------------------
++
++    private void ImportInPlace()
++    {
++        if (GameExport.IsPlayer) return;
++        if (importBusy)
++        {
++            Write("import: a file is still being added: wait for it to end");
++            var busy = UIAlertController.Create("Still adding", "A file is still being added from Files. Wait for it to end (the Build tab shows how far it is).", UIAlertControllerStyle.Alert);
++            busy.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++            PresentWhenFree(busy);
++            return;
++        }
++        var picker = new UIDocumentPickerViewController(new[] { UTTypes.Item }, false);   // asCopy: false = open the file where it is (the non-obsolete initialiser, as the cover picker's)
++        picker.AllowsMultipleSelection = true;                                           // a game with its update and DLC in one go
++        var answer = new InPlacePickerDelegate(this);
++        importPickerDelegate = answer;
++        picker.Delegate = answer;
++        Write("import: the picker is open (in place)");
++        PresentWhenFree(picker);
++        WatchPicker(picker, answer);
++    }
++
++    /// Only a line in the log: the picker is gone and the app was told nothing (the iOS 27.0.1 behaviour that made the old Open-mode file picker useless). Reads two properties twice a second, at most 10 minutes.
++    private void WatchPicker(UIDocumentPickerViewController picker, InPlacePickerDelegate answer)
++    {
++        int ticks = 0, gone = 0;
++        bool shown = false;
++        void Tick()
++        {
++            if (answer.Answered || ++ticks > 1200) return;
++            bool on = picker.IsViewLoaded && picker.View?.Window != null;
++            if (on) { shown = true; gone = 0; }
++            else if (shown && ++gone >= 6)
++            {
++                Write("import: the picker closed and the app got no answer from it (iOS may not deliver a pick made in Open mode: use \"Add a game file\")");
++                return;
++            }
++            NSTimer.CreateScheduledTimer(0.5, _ => Tick());
++        }
++        NSTimer.CreateScheduledTimer(0.5, _ => Tick());
++    }
++
++    private sealed class InPlacePickerDelegate : NSObject, IUIDocumentPickerDelegate
++    {
++        private readonly GameAppViewController owner;
++        private volatile bool answered;
++        public InPlacePickerDelegate(GameAppViewController owner) => this.owner = owner;
++        public bool Answered => answered;
++        public void DidPickDocument(UIDocumentPickerViewController controller, NSUrl url) { answered = true; owner.ImportPickedInPlace(new[] { url }); }
++        public void DidPickDocumentAtUrls(UIDocumentPickerViewController controller, NSUrl[] urls) { answered = true; owner.ImportPickedInPlace(urls); }
++        [Export("documentPickerWasCancelled:")]
++        public void WasCancelled(UIDocumentPickerViewController controller) { answered = true; owner.Write("import: the picker was closed without a file"); }
++    }
++
++    // ---- the import ----------------------------------------------------------------------------------------------------------
++
++    /// What the picker handed over: each file where it is, under a security scope. Main thread: it only plans; the work is on a worker.
++    private void ImportPickedInPlace(NSUrl[] urls)
++    {
++        var picked = (urls ?? Array.Empty<NSUrl>()).Where(u => u != null && !string.IsNullOrEmpty(u.LastPathComponent)).ToList();
++        if (picked.Count == 0) { Write("import: the picker returned no file"); return; }
++        Write($"import: picked {picked.Count} file(s)");
++        var names = picked.Select(u => Cloud.RealName(u.LastPathComponent)).ToList();   // an iCloud placeholder's real name
++        var plan = InPlaceImport.Plan(names);
++        foreach (var (index, why) in plan.Skipped) Write($"import: {names[index]} skipped: {why}");
++        if (plan.Accepted.Count == 0)
++        {
++            var none = UIAlertController.Create("Nothing to add", string.Join("\n", plan.Skipped.Select(s => $"{names[s.Index]}: {s.Why}")), UIAlertControllerStyle.Alert);
++            none.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++            PresentWhenFree(none);
++            return;
++        }
++        if (importBusy) { Write("import: a file is still being added: this pick is ignored"); return; }
++        importBusy = true;
++        var jobs = plan.Accepted.Select(i => (Url: picked[i], Name: names[i])).ToList();
++        bool awake = !UIApplication.SharedApplication.IdleTimerDisabled;   // not undone when a build already keeps the screen awake
++        if (awake) UIApplication.SharedApplication.IdleTimerDisabled = true;
++        // The background task keeps the copy going when the app is left (a clone is over before that matters). When the system's time for it runs out the task is ended, not the app: the copy goes on when the app is back.
++        nint task = UIApplication.BackgroundTaskInvalid;
++        void EndTask() { var t = task; task = UIApplication.BackgroundTaskInvalid; if (t != UIApplication.BackgroundTaskInvalid) UIApplication.SharedApplication.EndBackgroundTask(t); }
++        task = UIApplication.SharedApplication.BeginBackgroundTask("import", EndTask);   // the handler runs on the main thread and must end the task before it returns
++        ShowImportProgress(0, jobs.Count, jobs[0].Name, 0, "Adding");
++        var documents = GameAppMain.Documents;
++        Action<string> log = line => BeginInvokeOnMainThread(() => Write(line));
++        Task.Run(() =>
++        {
++            var outcomes = new List<ImportOutcome>();
++            for (int k = 0; k < jobs.Count; k++)
++            {
++                int index = k;
++                var (url, name) = jobs[k];
++                BeginInvokeOnMainThread(() => ShowImportProgress(index, jobs.Count, name, 0, "Adding"));
++                Placed placed = null;
++                string error = null;
++                bool scoped = url.StartAccessingSecurityScopedResource();
++                try
++                {
++                    new NSFileCoordinator().CoordinateRead(url, (NSFileCoordinatorReadingOptions) 0, out NSError coordination, readable =>
++                    {
++                        try
++                        {
++                            var path = readable.Path;
++                            placed = GameImport.Place(path, Path.Combine(documents, name), FileClone.Try,
++                                (from, part) => GameImport.CopyBytes(from, part, (done, total) =>
++                                    BeginInvokeOnMainThread(() => ShowImportProgress(index, jobs.Count, name, total > 0 ? done / (double) total : 0, "Copying"))),
++                                log, FreeBytes);
++                            if (placed.How != PlacedHow.AlreadyThere && IsPickerCopy(path)) try { File.Delete(path); } catch (Exception) { }   // the picker made a copy in our container after all: it is ours to remove
++                        }
++                        catch (Exception e) { error = e.Message; }
++                    });
++                    if (placed == null && error == null) error = coordination?.LocalizedDescription ?? "the file could not be read";
++                }
++                catch (Exception e) { error ??= e.Message; }
++                finally { if (scoped) url.StopAccessingSecurityScopedResource(); }
++                if (error != null) log($"import: {name} could not be added: {error}");
++                outcomes.Add(new ImportOutcome(name, placed, error));
++            }
++            BeginInvokeOnMainThread(() =>
++            {
++                importBusy = false;
++                if (importCard != null) importCard.Hidden = true;
++                if (awake) UIApplication.SharedApplication.IdleTimerDisabled = false;
++                EndTask();
++                Write(InPlaceImport.Summary(outcomes));
++                RefreshGames();
++                RefreshScreen();
++                var failures = InPlaceImport.Failures(outcomes);
++                if (failures != null)
++                {
++                    var a = UIAlertController.Create("Not all were added", failures, UIAlertControllerStyle.Alert);
++                    a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++                    PresentWhenFree(a);
++                }
++            });
++        });
++    }
++}
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -791,7 +791,7 @@
+ 
+     // ---- the keyboard (an iPad with a hardware keyboard) -------------------------------------------------------------
+ 
+-    /// Command-R refreshes the cloud, Command-I imports, Command-1 and Command-2 are the tabs, Command-comma is Settings, Return and
++    /// Command-R refreshes the cloud, Command-I imports, Command-Shift-I adds from Files without copying (patch 0066), Command-1 and Command-2 are the tabs, Command-comma is Settings, Return and
+     /// Space press the selected game's main button. Held down, Command shows the first five in the system's list. They act on the
+     /// library's screen only: a sheet or an alert on top has its own keys.
+     private void AddKeyCommands()
+@@ -809,12 +809,14 @@
+         Add(",", UIKeyModifierFlags.Command, "keySettingsTab", null);   // the system's own shortcut for an app's settings
+         Add("\r", 0, "keyPrimary", "Play or build the selected game");
+         Add(" ", 0, "keyPrimary", null);
++        Add("i", UIKeyModifierFlags.Command | UIKeyModifierFlags.Shift, "keyImportInPlace", "Add from Files without copying");
+     }
+ 
+     private bool KeysAreFree => PresentedViewController == null && !GameExport.IsPlayer;
+ 
+     [Export("keyRefresh")] private void KeyRefresh() { if (KeysAreFree) RefreshCloud(null); }
+     [Export("keyImport")] private void KeyImport() { if (KeysAreFree && !running) Import(); }
++    [Export("keyImportInPlace")] private void KeyImportInPlace() { if (KeysAreFree && !running) ImportInPlace(); }   // GameAppImportUi.cs
+     [Export("keyLibrary")] private void KeyLibrary() { if (KeysAreFree) { logsBack = null; ShowTab(0); } }
+     [Export("keySettingsTab")] private void KeySettingsTab() { if (KeysAreFree) { logsBack = null; ShowTab(4); } }
+     [Export("keyPrimary")] private void KeyPrimary() { if (KeysAreFree && currentTab == 0 && action.Enabled) PrimaryTapped(); }
+@@ -2040,9 +2042,12 @@
+     {
+         if (files.Count == 0) return;
+         long need = files.Sum(f => f.Size);
+-        if (need > 0 && FreeBytes() > 0 && need + (1L << 30) > FreeBytes())
++        var sources = cloudSources;
++        // A NAS file is always copied: its space is needed up front. A file of a Files folder is cloned when the volume allows (no space at all): the room for a COPY is checked file by file, only when the clone was refused (GameImport.Place).
++        long copyNeed = files.Where(f => sources.FirstOrDefault(s => s.Id == f.SourceId)?.Kind != CloudKind.Folder).Sum(f => f.Size);
++        if (copyNeed > 0 && FreeBytes() > 0 && copyNeed + (1L << 30) > FreeBytes())
+         {
+-            var a = UIAlertController.Create("Not enough space", $"{GameAppUi.SizeText(need)} to download, {GameAppUi.SizeText(FreeBytes())} free. Free some space first.", UIAlertControllerStyle.Alert);
++            var a = UIAlertController.Create("Not enough space", $"{GameAppUi.SizeText(copyNeed)} to download, {GameAppUi.SizeText(FreeBytes())} free. Free some space first.", UIAlertControllerStyle.Alert);
+             a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
+             PresentWhenFree(a);
+             return;
+@@ -2053,7 +2058,6 @@
+         StartDownloadTicker();
+         var nas = LoadNas();
+         var password = NasPassword();
+-        var sources = cloudSources;
+         Write($"\n=== download {key}" + (files.Count > 1 ? $" (+{files.Count - 1}: its update and DLC)" : "") + (need > 0 ? $", {GameAppUi.SizeText(need)}" : ""));
+         nint task = UIApplication.SharedApplication.BeginBackgroundTask("download", null);
+         UIApplication.SharedApplication.IdleTimerDisabled = true;
+@@ -2078,7 +2082,7 @@
+                     if (source.Kind == CloudKind.Nas)
+                         Nas.Download(nas, Nas.Password(nas.User, password), f.Remote, dest, progress, null);
+                     else
+-                        CopyFromFolder(source, f, dest, progress);
++                        CopyFromFolder(source, f, dest, progress, line => BeginInvokeOnMainThread(() => Write(line)));
+                     before += f.Size;
+                 }
+             }
+@@ -2104,7 +2108,7 @@
+ 
+     /// A file of a Files folder, copied here. The coordinated read makes the provider (iCloud Drive, Google Drive,
+     /// OneDrive...) download it first when it is only in the cloud.
+-    private static void CopyFromFolder(CloudSource source, CloudFile f, string dest, Action<long, long> progress)
++    private static void CopyFromFolder(CloudSource source, CloudFile f, string dest, Action<long, long> progress, Action<string> log = null)
+     {
+         var folder = ResolveFolder(source, out var why);
+         if (folder == null) throw new InvalidOperationException(why);
+@@ -2116,7 +2120,8 @@
+             var coordinator = new NSFileCoordinator();
+             coordinator.CoordinateRead(url, (NSFileCoordinatorReadingOptions) 0, out NSError error, readable =>
+             {
+-                try { CopyWithProgress(readable.Path, dest, progress); }
++                // An APFS clone first (the file is on this volume: instant, no space), else the copy with progress, both through <name>.part and one rename (GameAppImport.cs); one log line per file
++                try { GameImport.Place(readable.Path, dest, FileClone.Try, (from, part) => GameImport.CopyBytes(from, part, progress), log, FreeBytes); }
+                 catch (Exception e) { failure = e; }
+             });
+             if (error != null) throw new InvalidOperationException(error.LocalizedDescription);
+@@ -2130,20 +2135,7 @@
+         var part = dest + ".part";
+         try
+         {
+-            long total = new FileInfo(from).Length, done = 0;
+-            var buffer = new byte[4 << 20];
+-            using (var input = File.OpenRead(from))
+-            using (var output = File.Create(part))
+-            {
+-                int n;
+-                var last = DateTime.MinValue;
+-                while ((n = input.Read(buffer, 0, buffer.Length)) > 0)
+-                {
+-                    output.Write(buffer, 0, n);
+-                    done += n;
+-                    if ((DateTime.Now - last).TotalMilliseconds > 300) { progress?.Invoke(done, total); last = DateTime.Now; }
+-                }
+-            }
++            GameImport.CopyBytes(from, part, progress);   // the copy loop (GameAppImport.cs; it was here until patch 0066)
+             File.Move(part, dest, true);   // one rename over the old file (none deleted first); the .part is never left behind by a failure
+         }
+         catch
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -2170,6 +2170,7 @@
+                     PresentWhenFree(share);
+                 }));
+                 PresentWhenFree(done);
++                if (!slim) OfferBuildCleanup(game, slim);   // a FULL export holds the whole build: "Delete the build?", asked once this alert and the share sheet are gone (GameAppBuildCleanupUi.cs)
+             });
+         });
+     }
+diff -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs
++++ b/GameAppShelf.cs
+@@ -499,7 +499,8 @@
+         refresh.TouchUpInside += (_, __) => RefreshCloud(null);
+         var plus = Theme.Round("plus", "Add a game file");
+         plus.AccessibilityIdentifier = "import-file";
+-        plus.TouchUpInside += (_, __) => Import();
++        plus.Menu = ImportMenu();   // GameAppImportUi.cs: "Add a game file" (the picker that copies: unchanged) and "Add from Files without copying" (open in place, an APFS clone)
++        plus.ShowsMenuAsPrimaryAction = true;
+         var header = Theme.Row(8, Theme.Column(4, title, buildSub), new UIView(), refresh, plus);
+         header.Alignment = UIStackViewAlignment.Top;
+ 
+@@ -530,7 +531,7 @@
+         phoneSection = Theme.Column(8, SectionLabel("ON THIS " + GameAppUi.DeviceName.ToUpperInvariant()), phoneCard);
+         cloudSection = Theme.Column(8, SectionLabel("IN THE CLOUD"), cloudCard, cloudNote);
+ 
+-        var column = Theme.Column(18, header, buildFilter, buildNowCard, buildQueueSection, phoneSection, cloudSection);
++        var column = Theme.Column(18, header, buildFilter, buildNowCard, MakeImportCard(), buildQueueSection, phoneSection, cloudSection);   // MakeImportCard: the progress of "Add from Files without copying"
+         var scroll = new UIScrollView { AlwaysBounceVertical = true, ShowsVerticalScrollIndicator = false };
+         column.TranslatesAutoresizingMaskIntoConstraints = false;
+         scroll.AddSubview(column);

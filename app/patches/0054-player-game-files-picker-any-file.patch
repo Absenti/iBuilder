@@ -1,0 +1,22 @@
+# The exported player's "Find the game files" picker offered only dev.nxpocket.ibuilder.romfs: on an iPhone 15 Pro (iOS 27.0.1) the .romfs file showed as an enabled item and a tap did nothing (the delegate was never called; device test 2026-11-19).
+# Any file is offered now (like the certificate and import pickers); UsePickedRomfs checks name, size and digest. The steps are logged (opened / picked). Applies after 0053.
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -681,10 +681,14 @@
+     /// Files, filtered to game files (.romfs, declared in Info.plist): the player picks its game's, opened in place.
+     private void FindGameFiles()
+     {
+-        var picker = new UIDocumentPickerViewController(new[] { "dev.nxpocket.ibuilder.romfs" }, UIDocumentPickerMode.Open);
++        // The custom type alone was not enough: on an iPhone 15 Pro (iOS 27.0.1) the picker showed the .romfs file as a normal, enabled item and a tap did nothing (the delegate was never called; device test
++        // 2026-11-19). Any file is offered, like the other pickers of this app (the certificate, the import): GameExport.UsePickedRomfs checks the name, the size and the content digest anyway.
++        var picker = new UIDocumentPickerViewController(new[] { "dev.nxpocket.ibuilder.romfs", "public.data", "public.item" }, UIDocumentPickerMode.Open);
++        Write("game files: the picker is open (any file; the manifest decides)");
+         gameFilesPicker = new FolderPickerDelegate(url =>
+         {
+-            if (url == null) return;
++            if (url == null) { Write("game files: the picker closed without a file"); return; }
++            Write($"game files: picked {url.LastPathComponent}, checking it");
+             var why = GameExport.UsePickedRomfs(url);
+             Write(why == null ? $"game files: {url.LastPathComponent}, read in place from now on" : $"game files refused: {why}");
+             if (why != null)

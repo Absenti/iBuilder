@@ -1,0 +1,13 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+
+using namespace metal;
+
+template<typename T, typename U, typename V>	[[clang::optnone]] T spvMulExtended(V l, V r)	{	   return T{U(l * r), U(mulhi(l, r))};
+}
+
+kernel void main0()
+{
+
+}

@@ -1,0 +1,33 @@
+# game: Ocarina of Time increases the alias region to 8 GiB (profile data, DECISION NEEDED: not for a default build)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/f7ae8a3a4c2c71dd3aa09ed2bc458dad5e6ac4a3  (fixes #3103)
+# Author:    seedds, 2026-11-21 17:15:55 +0800
+# Co-authors:
+#   Co-authored-by: dag294-alt
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES FOR THE PHONE
+#   dm/games/0400486024DEC000/game.tsv: mem_reserve 0x320000000 (12.5 GiB) -> 0x420000000 (16.5 GiB), mem_alias 0x100000000 (4 GiB) -> 0x200000000 (8 GiB). Upstream: at the Chamber of
+#   Sages transition SDK 22.2.8 finds no aligned gap for a 50.03 MiB request in the 4 GiB alias region and returns 0x1803; the game then shows a solid white frame for ever. At 8 GiB the same
+#   save passes; reported fixed on an iPhone 18 Pro. It is a VIRTUAL reservation, but upstream states start-up with the 16.5 GiB reservation on earlier iPhones is NOT verified (an A17 Pro may
+#   refuse it or hit the VA / task-map limit of upstream issue #2965). Take it ONLY when a player has to get past the Chamber of Sages. Profile data: no host rebuild, a profile / pack rebuild.
+# Left out: README.md and the display-version line of game.tsv (separate upstream change).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine (independent of the other patches).
+
+diff --git a/dm/games/0400486024DEC000/game.tsv b/dm/games/0400486024DEC000/game.tsv
+index 63905872..5fe097d9 100644
+--- a/dm/games/0400486024DEC000/game.tsv
++++ b/dm/games/0400486024DEC000/game.tsv
+@@ -24,9 +24,9 @@ zip_store	.zs:.bwav:.webm:.metallib
+ 
+ # ---- Memory ----
+ # The Switch 2 leaves games 9 GB of its 12 GB (Donkey Kong Bananza's figure). The NPDM declares 48 MB of system resource, so virtual address memory is on.
+-# nninitStartup asks SetHeapSize 0x18ce00000 (6.2 GB) with the 9 GB pool, as Mario Kart World. 256 MB in front + 4 GB alias region + 256 MB stack region + 8 GB heap region: a starting split, to be measured
+-mem_reserve	0x320000000
+-mem_alias	0x100000000
++# 256 MiB in front + 8 GiB heap + 256 MiB stacks + 8 GiB alias region. At 4 GiB the Chamber of Sages transition runs out of room for a 50.03 MiB address region (#3103).
++mem_reserve	0x420000000
++mem_alias	0x200000000
+ mem_map_limit	on
+ mem_stack	0x10000000
+ app_pool	0x240000000

@@ -1,0 +1,17 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    texture2d_array<uint, access::read_write>	a_rg32ui [[id(0)]];
+};
+
+kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])
+{
+    uint _9 = a.b.a_rg32ui.atomic_fetch_min(x, uint(_3));
+    uint _9 = a.b.a_rg32ui.atomic_fetch_min(x, _13);
+}

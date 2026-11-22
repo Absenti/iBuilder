@@ -1,0 +1,16 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    texture3d<uint, access::read_write> a_rg32ui [[id(0)]];
+};
+
+
+kernel void main0(half spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])
+{
+    uint _9 = spvDescriptorSet0.a_rg32ui.atomic_fetch_max(x, _12).y;

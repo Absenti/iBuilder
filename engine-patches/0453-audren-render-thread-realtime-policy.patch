@@ -1,0 +1,196 @@
+# host/audren: give the audio producer a real-time deadline (time-constraint policy for the render thread)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/2edad1828de247aaf46c53cb288357cb65e84be0  (fixes #3059)
+# Author:    seedds, 2026-11-20 19:57:44 +0800
+# Co-authors:
+#   Co-authored-by: nichq50
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES FOR THE PHONE
+#   The in-process audio renderer's thread (render_main) asked for interactive QoS only. A QoS class is a priority, not a deadline: under load or a thermal clamp (the Ocarina log had
+#   thermal state 2) the 5 ms refill can wake late and drain the output although mixing takes 0.07 ms (upstream #3059). After the output is set up the thread now declares
+#   THREAD_TIME_CONSTRAINT_POLICY (period 5 ms, computation 1 ms, constraint 5 ms, preemptible) and restores the standard policy before the output is closed. A rejected request is logged
+#   ("[RED] audren: render thread time-constraint policy ... failed to set") and playback goes on as before; 0401's 4.5 ms pacing is kept. Success line:
+#   "audren: render thread time-constraint policy (requested period 5 ms, computation 1 ms) set (0)". Default ON; DM_AUDREN_RT=0 (game env.txt) keeps the default policy (A/B test).
+#   Upstream states iOS runtime and power are NOT verified: the first device run must show whether iOS grants the policy to this thread.
+#
+# HAND-MERGED: one hunk (NX2Apple 0048 rewrote the end of render_main; the reset goes just after the render loop, before that teardown).
+# RISK: low-medium. NOT run on a device. Shader chain id untouched.
+#
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0415 (0401 precedes it in hle_audren.c) and the candidates numbered below this one.
+
+# REVISION 2 (2026-11-21, review L7): DM_AUDREN_RT is read by dm/host/dm_envflag.h (added by engine-patches/0415, which this patch now needs before it): 0 / off / false / no keep
+#   the default policy, 1 / on / true / yes (and unset) set it; before, atoi() made "on" or "yes" turn it OFF. A value that is neither is logged and the policy is set.
+#   t_audren_layout checks "Off" (opt-out) and "on" (policy set) besides "0".
+--- a/dm/host/hle_audren.c
++++ b/dm/host/hle_audren.c
+@@ -14,6 +14,10 @@
+ // Command list format (SDK 16): header +0x04 command count, +0x08 mix buffer address, +0x10 buffer count, +0x14 samples per frame, +0x18 sample rate, commands from +0x20;
+ //   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
+ #include "hle.h"
++#include "dm_envflag.h"   // engine-patches/0415: one reading of on / off switches
++#include <mach/mach.h>
++#include <mach/mach_time.h>
++#include <mach/thread_policy.h>
+ #include <math.h>
+ #include <stdatomic.h>
+ #include <time.h>
+@@ -134,6 +138,31 @@
+     return found;
+ }
+ 
++// QoS alone does not give this 5 ms producer a deadline: late wakeups drain the output even when mixing takes only 0.07 ms (#3059).
++// The computation is a scheduling budget, not busy time. Keep output setup/teardown outside real-time policy and preserve burst-refill pacing.
++static int render_rt(void) {
++    int bad = 0;   // dm_envflag.h (engine-patches/0415): 0 / off / false / no keep the default policy; "on" and "yes" no longer do (atoi gave 0)
++    if (!dm_env_flag("DM_AUDREN_RT", 1, &bad)) { LOG("audren: render thread keeps its default policy (DM_AUDREN_RT=%s)", getenv("DM_AUDREN_RT")); return 0; }
++    if (bad) LOG("audren: DM_AUDREN_RT=%s is not on / off: the render thread gets its time-constraint policy (the default)", getenv("DM_AUDREN_RT"));
++    mach_timebase_info_data_t tb;
++    kern_return_t kr = mach_timebase_info(&tb);
++    if (kr == KERN_SUCCESS) {
++        thread_time_constraint_policy_data_t p = {
++            .period = (uint32_t)(5000000ull * tb.denom / tb.numer),
++            .computation = (uint32_t)(1000000ull * tb.denom / tb.numer),
++            .constraint = (uint32_t)(5000000ull * tb.denom / tb.numer), .preemptible = TRUE
++        };
++        kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
++    }
++    LOG("%saudren: render thread time-constraint policy (requested period 5 ms, computation 1 ms) %s (%d)", kr == KERN_SUCCESS ? "" : "[RED] ",
++        kr == KERN_SUCCESS ? "set" : "failed to set; keeping default policy", (int)kr);
++    return kr == KERN_SUCCESS;
++}
++static void render_rt_end(void) {
++    kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_STANDARD_POLICY, NULL, THREAD_STANDARD_POLICY_COUNT);
++    if (kr != KERN_SUCCESS) LOG("[RED] audren: cannot restore render thread default policy (%d)", (int)kr);
++}
++
+ static void render_main(void *arg) {
+     ar_t *a = arg; t_ar = a;
+     void (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
+@@ -148,6 +177,7 @@
+     LOG("audren: render thread %d started (%d buffers in flight, paced by the output)", ar_index(a), NBUF);
+     uint64_t next_exec = 0;
+     int prefill = NBUF;
++    int rt = render_rt();
+     while (atomic_load(&a->open)) {
+         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card, one every 5 ms); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
+             if (!atomic_load(&a->open)) break;
+@@ -190,6 +220,7 @@
+         if (!atomic_load(&a->open) || !dm_pcmout_append(out, b)) free_list[nfree++] = b;
+         else if (prefill) prefill--;
+     }
++    if (rt) render_rt_end();   // the standard policy again before the output is closed (nxnative 2edad182)
+     pthread_mutex_lock(&a->cq_mu);
+     void *owned_out = a->pcmout;
+     a->pcmout = NULL;
+--- a/dm/host/tests/t_audren_layout.c
++++ b/dm/host/tests/t_audren_layout.c
+@@ -5,13 +5,34 @@
+ #include "../hle.h"
+ #include <assert.h>
+ #include <errno.h>
++#include <mach/mach.h>
++#include <mach/thread_policy.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+ static int wait_for_render(pthread_cond_t *, pthread_mutex_t *, const struct timespec *);
++static kern_return_t render_policy_set(thread_t, thread_policy_flavor_t, thread_policy_t, mach_msg_type_number_t);
+ #define pthread_cond_timedwait_relative_np wait_for_render
++#define thread_policy_set render_policy_set
+ #include "../hle_audren.c"
++#undef thread_policy_set
+ #undef pthread_cond_timedwait_relative_np
+ 
++// Synthetic render loops must not promote the test runner. One short-lived pthread below exercises the real Mach boundary.
++static struct { int live, started, active, fail, sets, resets; } policy;
++static kern_return_t render_policy_set(thread_t thread, thread_policy_flavor_t flavor, thread_policy_t p, mach_msg_type_number_t n) {
++    if (policy.live) return thread_policy_set(thread, flavor, p, n);
++    assert(policy.started);
++    if (flavor == THREAD_TIME_CONSTRAINT_POLICY) {
++        assert(!policy.active); policy.sets++;
++        if (policy.fail) return KERN_FAILURE;
++        policy.active = 1;
++    } else {
++        assert(flavor == THREAD_STANDARD_POLICY && policy.active);
++        policy.active = 0; policy.resets++;
++    }
++    return KERN_SUCCESS;
++}
++
+ enum { SAMPLES = 240, NMIX = 8, NCMD = 6 };
+ enum { PACE_BLOCKS = 2000 };
+ static struct {
+@@ -42,8 +63,8 @@
+ void *dm_pcmout_open_sink(void) { return NULL; }
+ int dm_audio_output_channels(void) { return 2; }   // the stereo route; the six-channel resampler is checked directly below
+ int dm_audio_route(void) { return 2; }
+-void dm_pcmout_close(void *k) { (void)k; }
+-void dm_pcmout_start(void *k) { (void)k; }
++void dm_pcmout_close(void *k) { (void)k; assert(!policy.active); policy.started = 0; }
++void dm_pcmout_start(void *k) { (void)k; assert(!policy.active); policy.started = 1; }
+ int dm_pcmout_append(void *k, void *b) {
+     (void)k;
+     if (pace.rate) {
+@@ -321,6 +342,7 @@
+     t_ar->frame_n = SAMPLES;
+ }
+ static void test_renderer_blocks(void) {
++    memset(blocks_n, 0, sizeof blocks_n);
+     blocks_on = 1;
+     for (int r = 0; r < 2; r++) {
+         ar_t *a = &g_ar[r];
+@@ -338,7 +360,45 @@
+         }
+     }
+     memset(g_ar, 0, sizeof g_ar);
++}
++
++static void *policy_thread(void *unused) {
++    (void)unused;
++    assert(!pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0));
++    assert(render_rt());
++    thread_time_constraint_policy_data_t p = {0};
++    mach_msg_type_number_t n = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t def = FALSE;
++    thread_t self = pthread_mach_thread_np(pthread_self());
++    assert(thread_policy_get(self, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, &n, &def) == KERN_SUCCESS && !def);
++    mach_timebase_info_data_t tb; assert(mach_timebase_info(&tb) == KERN_SUCCESS);
++    fprintf(stderr, "Mach audio policy readback: period %u computation %u constraint %u, timebase %u/%u\n", p.period, p.computation, p.constraint, tb.numer, tb.denom);
++    assert((uint64_t)p.period * tb.numer / tb.denom == 5000000);
++    // XNU may raise computation to half the constraint; the accepted budget is not guaranteed to equal the request.
++    assert((uint64_t)p.computation * tb.numer / tb.denom >= 1000000 && p.computation <= p.constraint);
++    assert(p.constraint == p.period && p.preemptible);
++    render_rt_end();
++    thread_extended_policy_data_t extended = {0}; n = THREAD_EXTENDED_POLICY_COUNT; def = FALSE;
++    assert(thread_policy_get(self, THREAD_EXTENDED_POLICY, (thread_policy_t)&extended, &n, &def) == KERN_SUCCESS && !def && extended.timeshare);
++    return NULL;
+ }
++static void test_render_policy(void) {
++    // Failure and the diagnostic opt-out must still publish every renderer's PCM, without an unmatched policy reset.
++    unsetenv("DM_AUDREN_RT");
++    test_renderer_blocks(); assert(policy.sets == 2 && policy.resets == 2);
++    policy.fail = 1;
++    test_renderer_blocks(); assert(policy.sets == 4 && policy.resets == 2);
++    setenv("DM_AUDREN_RT", "0", 1);
++    test_renderer_blocks(); assert(policy.sets == 4 && policy.resets == 2);
++    setenv("DM_AUDREN_RT", "Off", 1);   // engine-patches/0415's dm_envflag.h: the words too
++    test_renderer_blocks(); assert(policy.sets == 4 && policy.resets == 2);
++    setenv("DM_AUDREN_RT", "on", 1);   // before, atoi("on") == 0 turned the policy OFF
++    test_renderer_blocks(); assert(policy.sets == 6 && policy.resets == 2);
++    unsetenv("DM_AUDREN_RT"); policy.fail = 0;
++    policy.live = 1;
++    pthread_t thread; assert(!pthread_create(&thread, NULL, policy_thread, NULL));
++    assert(!pthread_join(thread, NULL)); policy.live = 0;
++    puts("audren scheduling: real worker policy set/read/reset; setup/teardown outside real-time; PCM preserved on rejection and opt-out");
++}
+ 
+ // The update lock is read off Update, else off UpdateImpl; a miss keeps the caller's offset and is a red line. Built from prologues of the forms the SDKs have (`bl` into a PLT stub or straight to the function)
+ enum { F_UPDATE, F_IMPL = 16, F_STUB = 32, F_TICK = 36, F_SDK_LOCK, F_OS_LOCK, F_CODE };
+@@ -476,7 +536,7 @@
+     }
+     test_update_lock();
+     test_two_renderers();
+-    test_renderer_blocks();
++    test_render_policy();
+     if (argc == 2 && !strcmp(argv[1], "--histogram")) { test_histogram(); return 0; }
+     if (argc == 2 && !strcmp(argv[1], "--malformed")) { test_malformed(16, 0); return 0; }
+     test_headers();

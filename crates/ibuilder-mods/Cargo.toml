@@ -1,0 +1,28 @@
+[package]
+name = "ibuilder-mods"
+description = "Atmosphere-style mods and cheats for the build chain (port of gameapp/mods.py): IPS / IPS32 / pchtxt exefs patches applied to NSO modules before stage 2, RomFS overlay, cheats. No process spawning, iOS-buildable."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ibuilder_mods"
+path = "src/lib.rs"
+
+# The differential driver against gameapp/mods.py (a Mac tool, not part of the library): cargo build --release -p ibuilder-mods --features diff --bin mods_diff
+[[bin]]
+name = "mods_diff"
+path = "src/bin/mods_diff.rs"
+required-features = ["diff"]
+
+[features]
+default = []
+diff = ["dep:serde_json"]
+
+[dependencies]
+sha2 = { workspace = true }
+# the ZBIC decoder (NSO flag bit 7) of the toolchain; also what the tests load the patched NSO with
+ibuilder-nso = { path = "../ibuilder-nso" }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]

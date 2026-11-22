@@ -1,0 +1,17 @@
+OK
+{}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct main0_in
+{
+    float4 m_0 [[user(locn0)]];
+    float4 m_1 [[user(locn1)]];
+    vertex_value<float4> dm_pv4 [[user(locn4)]];
+};
+
+struct

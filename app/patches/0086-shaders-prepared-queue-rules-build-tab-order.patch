@@ -1,0 +1,311 @@
+# 0086-shaders-prepared-queue-rules-build-tab-order.patch -- three more of the owner's points after 0085: the shader preparation that never ended, the queue that rebuilt a built game, the
+# Build tab's order. Applies after 0085. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# M. "Preparing the shaders · South Park … · 5,009 of 5,009", the bar full, "Pause the preparation · Preparing" for ever, and the preparation started again at every open (0076's run of every
+#    library, GameAppWarm.cs GameWarm.Run): a worker that had nothing left to take still WAITED first: its turn (numbered at or above the allowed count: in the background one worker of up to
+#    four, in the foreground Auto two), the heat (Serious: none) or the memory (below 700 MiB), looking again every 2-3 s for ever. The run joins its workers, so it never returned: no
+#    prepared.tsv, Active stayed true (the sheet's "Preparing" and Pause, the strip, the continued-processing task), and the next launch's sync owed the game again ("you came back to
+#    iBuilder: …: all 5,009 libraries"). NOW a worker leaves as soon as nothing is left to take (WarmWorkers.NothingLeft, checked before every wait): the run ends, prepared.tsv is written,
+#    GameWarm.Ended removes the game from the queue and ends its task, the log says "shader warm-up: done, 5,009 libraries in 412 s", and the sheet's SHADERS row is "Shaders prepared · 5,009
+#    prepared" (prepared.tsv's "all" row; no action, no Pause, no bar). A finished game is not prepared again unless its pack changes (prepared.tsv is per app build and shader chain).
+# N. "Add to the build queue" on a BUILT game rebuilt it from scratch (the queue runs SetUpAndPlay): QueuePlan: a game not built (or paused) -> "Add to the build queue" (also while another
+#    builds, 0085); built and up to date -> NO queue entry; built but out of date (an update or DLC added since, the code mods changed: GameMods.ExefsChangedSinceBuild) -> "Queue a rebuild"
+#    (its own label and icon) with a question ("…its build is replaced by a new one… The shaders already translated come from the cache."); the same rule in the menu, the game sheet (so the
+#    iPad inspector) and the queue rows ("Next · Build" / "Next · Rebuild"). A game built by an older app version is "Needs setup", that is not built: Add. The queue texts no longer send the
+#    person to "Settings › Build queue" (the queue is in the Build tab).
+# O. The Build tab's order (BuildOrder): Now building (only while a build runs or is paused: an empty one shows nothing, no idle row) -> Queue (only with at least one item: no header, card,
+#    note or Start button when empty) -> the shader preparation while it runs -> Ready to build / In the cloud -> the shader preparation when it does not run; re-stacked only when the order
+#    changes; the iPad keeps Now building on the left, the rest in this order on the right.
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile (-t:Compile):
+#   0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness86: … P85;P86): 248 of 248 checks (11 new, among them a simulation of the worker loop: with the
+#   exit first every worker ends, without it the waiting ones never do); 8 of 8 mutations killed; the 0080-0085 trees still pass theirs.
+# NOT VERIFIED: nothing ran on a device: the end of a real 5,009-library run, its task's end on the lock screen, the new rows' look.
+# NEW UI STRINGS: "Shaders prepared", " prepared", "Queue a rebuild", "Queue a rebuild…", "Queue a rebuild?", "Queue the rebuild", the QueuePlan.RebuildNote text, " · Build", " · Rebuild",
+#   "Nothing queued: touch and hold a game that is not built: Add to the build queue."; log line "shader warm-up: done, ".
+diff -ruN g/GameAppField.cs h/GameAppField.cs
+--- g/GameAppField.cs	2026-11-21 23:39:09
++++ h/GameAppField.cs	2026-11-21 23:47:04
+@@ -229,6 +229,52 @@
+         running ? (true, true, true) : canCancel ? (true, false, true) : (false, false, false);
+ }
+ 
++/// Patch 0086 (the owner: "Preparing the shaders · 5,009 of 5,009" never became "prepared", and the preparation started again at every open): a worker that had nothing left to take still
++/// WAITED first (a worker numbered above the allowed count, at Serious heat, in the background with one worker, or below 700 MiB) and looked again every 2-3 s for ever; the run joined its
++/// workers, so it never ended: no prepared.tsv, the bar full, "Preparing", Pause, and the next launch's sync owed the game again. A worker now leaves as soon as nothing is left to take.
++public static class WarmWorkers
++{
++    /// `nextTaken`: the run's index of the last library taken (-1 before the first), `total`: its libraries.
++    public static bool NothingLeft(int nextTaken, int total) => nextTaken + 1 >= total;
++}
++
++/// The finished preparation, as the game's sheet says it: prepared.tsv's "all<TAB><count><TAB><time>" row.
++public static class WarmDone
++{
++    public static int Count(string preparedText)
++    {
++        foreach (var raw in (preparedText ?? "").Split('\n'))
++        {
++            var c = raw.TrimEnd('\r').Split('\t');
++            if (c.Length >= 2 && c[0] == "all" && int.TryParse(c[1], NumberStyles.None, CultureInfo.InvariantCulture, out var n)) return n;
++        }
++        return -1;
++    }
++
++    public static string Label(int count) => count > 0 ? count.ToString("N0", CultureInfo.InvariantCulture) + " prepared" : "Prepared";
++
++    /// The log line of a completed run: "shader warm-up: done, 5,009 libraries in 412 s".
++    public static string Line(int libraries, double seconds) => $"shader warm-up: done, {libraries.ToString("N0", CultureInfo.InvariantCulture)} libraries in {seconds.ToString("0", CultureInfo.InvariantCulture)} s";
++}
++
++/// Patch 0086 (the owner): the Build tab's order: Now building (only while a build runs or is paused) → Queue (only with at least one item: no header, card, note or Start button when
++/// empty) → the shader preparation while it RUNS → Ready to build / In the cloud → the shader preparation when it does not run. The import card leads (it shows only while files are added).
++public static class BuildOrder
++{
++    public const string Import = "import", Now = "now", Queue = "queue", Shaders = "shaders", Games = "games";
++
++    public static List<string> Of(bool nowShown, int queueItems, bool shadersRunning)
++    {
++        var order = new List<string> { Import };
++        if (nowShown) order.Add(Now);
++        if (queueItems > 0) order.Add(Queue);
++        if (shadersRunning) order.Add(Shaders);
++        order.Add(Games);
++        if (!shadersRunning) order.Add(Shaders);
++        return order;
++    }
++}
++
+ /// A value kept for a while (the facts the screen reads every second that cannot change that fast: the signing identity, the entitlements, the address space): computed again only after `ttl`.
+ public sealed class TtlCache<T>
+ {
+diff -ruN g/GameAppQueueUi.cs h/GameAppQueueUi.cs
+--- g/GameAppQueueUi.cs	2026-11-21 23:37:59
++++ h/GameAppQueueUi.cs	2026-11-21 23:46:42
+@@ -1,6 +1,6 @@
+ // The build queue, the heat check and the thermal file: the screens and the steps around GameAppQueue.cs's logic.
+ //
+-//   Queue    Library ··· › "Add to the build queue"; Settings › Build queue lists, removes and starts. Documents/build_queue.tsv
++//   Queue    a game's menu › "Add to the build queue" (or "Queue a rebuild" for a built game out of date, patch 0086); the Build tab's QUEUE lists, removes and starts. Documents/build_queue.tsv
+ //            keeps it across launches. iOS runs a build's Python once per process, so after each build the app asks to
+ //            close and the NEXT game builds at the next launch (a notification reminds); each build goes on in the background (GameAppBackground.cs)
+ //            but the next game needs the app opened, and the screen stays awake while it is open.
+@@ -120,7 +120,7 @@
+             string sub = item.State == BuildQueue.Running ? "Building now"
+                        : item.State == BuildQueue.Paused ? (string.IsNullOrEmpty(item.Note) ? "Paused" : item.Note) + " · Resume it in the Build tab"
+                        : item.State == BuildQueue.Failed ? "Stopped: " + (string.IsNullOrEmpty(item.Note) ? "see the log" : item.Note)
+-                       : first ? "Next" : "Waiting";
++                       : (first ? "Next" : "Waiting") + " · " + QueuePlan.RowWord(facts != null && GameAppUi.GameStatusOf(game, facts) == GameAppUi.GameStatus.Ready);   // patch 0086: Build or Rebuild
+             if (item.State == BuildQueue.Queued) first = false;
+             var row = new GameRowView(CoverOf(game, facts), GameAppUi.DisplayName(game), sub, false, false, null,
+                                       item.State == BuildQueue.Running ? null : "xmark", false, null);
+@@ -140,7 +140,7 @@
+         c.Image = UIImage.GetSystemImage(queueWanted ? "stop.fill" : "play.fill");
+         queueStart.Configuration = c;
+         queueStart.Enabled = queueWanted || BuildQueue.Next(buildQueue) != null || QueueStartPlan.For(buildQueue).PausedFirst != null;
+-        queueStatus.Text = buildQueue.Items.Count == 0 ? "Nothing queued: a game's ··· menu in the library has Add to the build queue."
++        queueStatus.Text = buildQueue.Items.Count == 0 ? "Nothing queued: touch and hold a game that is not built: Add to the build queue."
+                          : coolWaiter != null ? $"Waiting for the {GameAppUi.DeviceName} to cool down: the next build starts by itself."
+                          : queueWanted && running ? "Building. The next game starts after this one."
+                          : QueueStartPlan.For(buildQueue).PausedFirst is QueueItem pausedItem ? $"{GameAppUi.DisplayName(pausedItem.Game)} is paused: the queue asks before it starts anything."
+diff -ruN g/GameAppRedesign.cs h/GameAppRedesign.cs
+--- g/GameAppRedesign.cs	2026-11-21 23:37:59
++++ h/GameAppRedesign.cs	2026-11-21 23:46:42
+@@ -187,9 +187,9 @@
+ /// Play with a development certificate), Export IPA for a built game, Settings, Choose a cover… (not for a game only in the cloud), then the long-press menu's items of the patches before
+ /// where they apply (Update, 0076 the shader preparation's Pause / Resume and "Prepare the shaders now", 0065 the paused build's Cancel, the queue, the uploads, Remove download), and last
+ /// Delete… (a game on this iPhone) or Hide from the library (a game only in the cloud).
+-public enum HoldItem { Primary, Settings, ChooseCover, Export, Update, WarmToggle, WarmNow, CancelPaused, AddToQueue, Upload, RemoveDownload, Delete, Hide, AddContent, Mods }
++public enum HoldItem { Primary, Settings, ChooseCover, Export, Update, WarmToggle, WarmNow, CancelPaused, AddToQueue, Upload, RemoveDownload, Delete, Hide, AddContent, Mods, QueueRebuild }
+ 
+-public sealed record HoldFacts(LibState State, bool CanRunHere, bool Update, bool LocalFile, bool Busy, bool WarmShown, bool WarmQueued, int UploadTargets, bool HasCloudCopy, bool CanAttach = false, bool HasTitle = false);
++public sealed record HoldFacts(LibState State, bool CanRunHere, bool Update, bool LocalFile, bool Busy, bool WarmShown, bool WarmQueued, int UploadTargets, bool HasCloudCopy, bool CanAttach = false, bool HasTitle = false, bool ModsChanged = false);
+ 
+ public static class HoldMenuPlan
+ {
+@@ -209,7 +209,11 @@
+         if (built && !f.Busy && f.WarmShown) items.Add(HoldItem.WarmToggle);
+         else if (built && !f.Busy && f.WarmQueued) items.Add(HoldItem.WarmNow);
+         if (f.State == LibState.Paused) items.Add(HoldItem.CancelPaused);
+-        if (f.LocalFile && f.State != LibState.Building) items.Add(HoldItem.AddToQueue);
++        // patch 0086 (the owner: "Add to the build queue" on a BUILT game rebuilt it from scratch, why?): the queue builds; a game that is not built is added, a built one only when its build is
++        // out of date (an update or DLC added since, the code mods changed), as "Queue a rebuild" with a question; a built, up-to-date game has no queue entry at all
++        var queue = QueuePlan.For(f.State, f.Update || f.ModsChanged);
++        if (f.LocalFile && queue == QueuePlan.Entry.Add) items.Add(HoldItem.AddToQueue);
++        else if (f.LocalFile && queue == QueuePlan.Entry.Rebuild) items.Add(HoldItem.QueueRebuild);
+         if (f.LocalFile && f.UploadTargets > 0) items.Add(HoldItem.Upload);
+         if (f.LocalFile && f.HasCloudCopy) items.Add(HoldItem.RemoveDownload);
+         if (f.LocalFile && !f.Busy) items.Add(HoldItem.Delete);
+@@ -504,6 +508,28 @@
+         ("Frame rate", new[] { "Game", "30", "60" }, new[] { "auto", "30", "60" }),
+         ("Picture", new[] { "Fit", "Fill" }, new[] { "fit", "fill" }),
+     };
++}
++
++/// Patch 0086: what the build queue offers a game: Add (not built yet, or paused: the queue builds it), Rebuild (built but out of date: the queue replaces its build when it reaches it), None
++/// (built and up to date, or being built: nothing to queue).
++public static class QueuePlan
++{
++    public enum Entry { None, Add, Rebuild }
++
++    public static Entry For(LibState state, bool outdated) => state switch
++    {
++        LibState.NotBuilt or LibState.Paused => Entry.Add,
++        LibState.Built => outdated ? Entry.Rebuild : Entry.None,
++        _ => Entry.None,
++    };
++
++    public const string RebuildTitle = "Queue a rebuild?";
++
++    public static string RebuildNote(string game) =>
++        $"{game} is built. When the queue reaches it, its build is replaced by a new one (with the update, DLC or mods added since). The shaders already translated come from the cache.";
++
++    /// The queue row's words: "Build" for a game that is not built, "Rebuild" for one that is.
++    public static string RowWord(bool built) => built ? "Rebuild" : "Build";
+ }
+ 
+ /// Patch 0082 (the owner): a game's settings (its sheet or iPad inspector: frame rate, upscaler, memory saver, mods, saves, logs, export) exist ONLY for a BUILT game. A game on this iPhone that
+diff -ruN g/GameAppRedesignUi.cs h/GameAppRedesignUi.cs
+--- g/GameAppRedesignUi.cs	2026-11-21 23:39:52
++++ h/GameAppRedesignUi.cs	2026-11-21 23:47:04
+@@ -1090,6 +1090,15 @@
+         return card;
+     }
+ 
++    /// Patch 0086: a built game whose build is out of date: a rebuild queued only after the question (its working build is replaced when the queue reaches it).
++    private void AskQueueRebuild(string game)
++    {
++        var a = UIAlertController.Create(QueuePlan.RebuildTitle, QueuePlan.RebuildNote(GameAppUi.DisplayName(game)), UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
++        a.AddAction(UIAlertAction.Create("Queue the rebuild", UIAlertActionStyle.Default, _ => AddToBuildQueue(game)));
++        PresentWhenFree(a);
++    }
++
+     /// The entries of the touch-and-hold menu (HoldMenuPlan), each an existing action of the app.
+     private List<HoldOverlay.Entry> HoldEntries(LibraryEntry e, UiFacts facts)
+     {
+@@ -1106,7 +1115,8 @@
+         // patch 0082 (review L7): "Remove download" only for the file the app brought from that source (or of its size)
+         bool downloaded = local && e.Cloud != null && DownloadPairing.SameFile(SafeLength(path), e.Cloud, ImportLedger.Find(libLedger ?? ImportLedger.Load(GameAppMain.Documents), name));
+         bool canAttach = GameAppUi.ContentKindOf(name) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(name);   // patch 0084
+-        var plan = HoldMenuPlan.Items(new HoldFacts(state, canRun, update, local, facts.Running, warmShown, warmQueued, targets.Count, downloaded, canAttach, tid != null));
++        bool modsChanged = state == LibState.Built && tid != null && GameMods.ExefsChangedSinceBuild(GameAppMain.Documents, tid);   // patch 0086: a code mod changed since the build
++        var plan = HoldMenuPlan.Items(new HoldFacts(state, canRun, update, local, facts.Running, warmShown, warmQueued, targets.Count, downloaded, canAttach, tid != null, modsChanged));
+         var list = new List<HoldOverlay.Entry>();
+         var primary = LibraryActions.For(state, canRun)[0];
+         foreach (var item in plan)
+@@ -1132,6 +1142,7 @@
+                 case HoldItem.Delete: list.Add(new HoldOverlay.Entry("Delete…", "trash", true, () => ConfirmDelete(name), "hold-delete")); break;
+                 case HoldItem.Hide: list.Add(new HoldOverlay.Entry("Hide from the library", "eye.slash", true, () => HideFromLibrary(name), "hold-hide")); break;
+                 case HoldItem.AddContent: list.Add(new HoldOverlay.Entry("Add an update or DLC…", "plus.square.on.square", false, () => ShowContentChooser(name, null), "hold-add-content")); break;
++                case HoldItem.QueueRebuild: list.Add(new HoldOverlay.Entry("Queue a rebuild", "arrow.clockwise", false, () => AskQueueRebuild(name), "hold-queue-rebuild")); break;
+                 case HoldItem.Mods: list.Add(new HoldOverlay.Entry("Mods and cheats…", "puzzlepiece.extension", false, () => ShowMods(name, false), "hold-mods")); break;
+             }
+         }
+@@ -1368,7 +1379,8 @@
+     {
+         if (nowName == null || buildNowCard == null) return;
+         bool shown = !buildNowCard.Hidden;
+-        if (buildIdleRow != null) buildIdleRow.Hidden = shown;
++        if (buildIdleRow != null) buildIdleRow.Hidden = true;          // patch 0086 (the owner): an empty "Now building" is not shown at all
++        if (buildNowSection != null) buildNowSection.Hidden = !shown;
+         if (!shown) return;
+         string game; string stageLine; bool live = running;
+         PausedBuild paused = null;
+diff -ruN g/GameAppShelf.cs h/GameAppShelf.cs
+--- g/GameAppShelf.cs	2026-11-21 23:41:17
++++ h/GameAppShelf.cs	2026-11-21 23:47:04
+@@ -204,9 +204,9 @@
+         // patch 0081: the blocks under the header are kept apart so that the iPad layout can put them in two columns (GameAppPadUi.cs ArrangeBuildTab); a phone has them one under the other, as in 0080
+         var importCard = MakeImportCard();
+         var warmSection = WarmBuildTabSection();
+-        buildLeft = new[] { nowSection };
+-        buildRight = new[] { importCard, buildSections, buildQueueSection, warmSection };
+-        buildNarrow = new[] { importCard, nowSection, buildSections, buildQueueSection, warmSection };
++        buildNowSection = nowSection;
++        buildBlocks = new Dictionary<string, UIView> { [BuildOrder.Import] = importCard, [BuildOrder.Now] = nowSection, [BuildOrder.Queue] = buildQueueSection, [BuildOrder.Shaders] = warmSection, [BuildOrder.Games] = buildSections };
++        ApplyBuildOrder(BuildOrder.Of(false, buildQueue.Items.Count, GameWarm.Active), arrange: false);
+         buildBody = Theme.Column(18);
+         ArrangeBuildTab(padWide);
+         var column = Theme.Column(18, header, buildBody);   // WarmBuildTabSection: GameAppWarm.cs (patch 0076)   // MakeImportCard: the progress of "Add from a folder without copying"
+@@ -217,6 +217,24 @@
+         Fill(pages[7], scroll, 18);
+     }
+ 
++    private UIView buildNowSection;
++    private Dictionary<string, UIView> buildBlocks;
++    private string buildOrderKey;
++
++    /// Patch 0086: the blocks in BuildOrder's order (the phone's column, the iPad's right column; the iPad keeps Now building on the left), re-stacked only when the order changes.
++    private void ApplyBuildOrder(List<string> order, bool arrange)
++    {
++        if (buildBlocks == null) return;
++        var key = string.Join(",", order);
++        if (key == buildOrderKey) return;
++        buildOrderKey = key;
++        var all = order.Concat(new[] { BuildOrder.Import, BuildOrder.Now, BuildOrder.Queue, BuildOrder.Shaders, BuildOrder.Games }).Distinct().ToList();   // a block not in the order stays (hidden) at the end
++        buildNarrow = all.Select(k => buildBlocks[k]).ToArray();
++        buildLeft = new[] { buildBlocks[BuildOrder.Now] };
++        buildRight = all.Where(k => k != BuildOrder.Now).Select(k => buildBlocks[k]).ToArray();
++        if (arrange) ArrangeBuildTab(padWide);
++    }
++
+     /// The + menu: the import entries of GameAppImportUi.cs with the prototype's notes, and "From NAS or Cloud" (the Cloud page, where the sources are).
+     private UIMenu AddMenu()
+     {
+@@ -282,7 +300,8 @@
+         // Now: the build that is running (Pause, Cancel), being stopped, or paused (Resume, Cancel): GameAppStopUi.cs
+         UpdateNowCard(facts);
+         UpdateNowCardLook(facts);   // GameAppRedesignUi.cs: the card's words, pill, stages and times
+-        buildQueueSection.Hidden = buildQueue.Items.Count == 0 && !queueWanted;
++        buildQueueSection.Hidden = buildQueue.Items.Count == 0;   // patch 0086: an empty queue shows nothing at all
++        ApplyBuildOrder(BuildOrder.Of(buildNowCard != null && !buildNowCard.Hidden, buildQueue.Items.Count, GameWarm.Active), arrange: true);
+         UpdateWarmBuildSection();   // GameAppWarm.cs (patch 0076)
+ 
+         // review M3: the rows are built again only when their key changes (a download's percentage is updated in place: its Cancel is not lost under the finger)
+@@ -960,7 +979,9 @@
+         if (ready && GameAppUi.ContentChangedSinceBuild(game, names, facts)) more.Add(SettingsRow("Update (build again with the update or DLC)", () => Then(() => DoUpdate(game)), true, false).Button);
+         if (local) more.Add(SettingsRow("Show in Files", () => ShowInFiles(Path.Combine(docs, game)), true, false).Button);
+         if (PausedOf(game, facts) != null) more.Add(SettingsRow("Cancel the paused build…", () => Then(() => AskCancel(game)), false, false, -1, "sheet-cancel-build").Button);
+-        if (local) more.Add(SettingsRow("Add to the build queue", () => Then(() => AddToBuildQueue(game)), true, false).Button);
++        // patch 0086: a built game is queued only when its build is out of date, as a rebuild with a question (QueuePlan); up to date: no queue entry
++        if (local && QueuePlan.For(state, GameAppUi.ContentChangedSinceBuild(game, names, facts) || (tid != null && GameMods.ExefsChangedSinceBuild(docs, tid))) == QueuePlan.Entry.Rebuild)
++            more.Add(SettingsRow("Queue a rebuild…", () => Then(() => AskQueueRebuild(game)), true, false).Button);
+         if (local && DownloadPairing.SameFile(SafeLength(Path.Combine(docs, game)), e.Cloud, ImportLedger.Find(ImportLedger.Load(docs), game)))   // patch 0082 (review L7)
+             more.Add(SettingsRow("Remove download (stays in the cloud)", () => Then(() => RemoveGameDownload(game)), true, false).Button);
+         bool canRebuild = !GameExport.IsPlayer && GameAppUi.ShowRebuild(facts) && ready;
+@@ -971,8 +992,13 @@
+         {
+             // patch 0076: in the main app the row is "Prepare now" (this game first in the queue, the queue resumed; Pause when this game is the one being prepared)
+             bool thisOne = GameWarm.Active && string.Equals(tid, GameWarm.ActiveGame, StringComparison.OrdinalIgnoreCase);
+-            var prepare = SettingsRow(GameExport.IsPlayer ? "Prepare the shaders…" : thisOne ? "Pause the preparation" : "Prepare now", () => Then(() => PrepareShadersFor(game)), true, false);
++            // patch 0086: a finished preparation says so ("Shaders prepared", "5,009 prepared"), with no Pause and no bar (prepared.tsv's "all" row of this app build and chain)
++            string preparedText = null;
++            try { var mk = Path.Combine(docs, "games", (tid ?? "").ToUpperInvariant(), "prepared.tsv"); if (tid != null && File.Exists(mk)) preparedText = File.ReadAllText(mk); } catch (Exception) { }
++            bool prepared = !GameExport.IsPlayer && !thisOne && preparedText != null && GameWarmLogic.PreparedDone(preparedText, GameWarmLogic.Header(GameAppBuild.Id, GameAppBuild.ShaderChain), true);
++            var prepare = SettingsRow(GameExport.IsPlayer ? "Prepare the shaders…" : prepared ? "Shaders prepared" : thisOne ? "Pause the preparation" : "Prepare now", prepared ? null : () => Then(() => PrepareShadersFor(game)), !prepared, false);
+             prepare.Value.Text = GameExport.IsPlayer ? (GameWarm.Active ? "Running" : "")
++                               : prepared ? WarmDone.Label(WarmDone.Count(preparedText))
+                                : thisOne ? "Preparing" : tid != null && warmQueue.Titles.Contains(tid) ? (warmQueue.Paused ? "Paused" : "In the queue") : "";
+             var shaderViews = new List<UIView> { Look.Section("Shaders"), Look.Group(prepare.Button) };
+             warmSheetViews.Clear();
+diff -ruN g/GameAppWarm.cs h/GameAppWarm.cs
+--- g/GameAppWarm.cs	2026-11-21 23:33:02
++++ h/GameAppWarm.cs	2026-11-21 23:46:00
+@@ -775,6 +775,8 @@
+                     else NSThread.Current.QualityOfService = firstStart ? NSQualityOfService.UserInitiated : NSQualityOfService.Utility;
+                     while (Current(mine))
+                     {
++                        // patch 0086: nothing left to take: this worker is done NOW (it used to wait for its turn, the heat or the memory first, for ever: the run never ended)
++                        if (WarmWorkers.NothingLeft(Volatile.Read(ref next), total)) return;
+                         var thermal = NSProcessInfo.ProcessInfo.ThermalState;
+                         // Memory: the ceiling iOS grants is shared with a build or a game; stay out of the way below 700 MiB (a simulator answers none)
+                         bool lowMemory = GameAppMain.AvailableMiBValue() is long left && left > 0 && left < 700;
+@@ -862,6 +864,7 @@
+             try { File.WriteAllText(Path.Combine(gameDir, "prepared.tsv"), GameWarmLogic.PreparedText(header, everything, total, Stamp())); }
+             catch (Exception error) { complete = false; Log($"shader warm-up: [ORANGE] prepared.tsv could not be written ({error.Message}): the next start goes over the libraries again (as hits)"); }
+         }
++        if (complete) Log(WarmDone.Line(finished, sw.Elapsed.TotalSeconds));   // patch 0086
+         if (Current(mine))
+             Log($"shader warm-up: {titleId} done, {compiled} compiled in {sw.Elapsed.TotalSeconds:F0} s ({compileMs / 1000.0:F0} s of compile time summed over {workers} thread(s)), {skipped} already warm or shared a source, {failed} did not compile ({finished} of {total})");
+         else

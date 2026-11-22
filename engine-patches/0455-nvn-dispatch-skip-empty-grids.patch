@@ -1,0 +1,71 @@
+# nvn/dispatch: skip empty direct grids (PR #1696)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/a3e25ed40f4f200c311c639b29fc755c417cbeeb  (PR #1696)
+# Author:    seedds, 2026-11-20 18:46:28 +0800
+# Co-authors:
+#   Co-authored-by: ZZG
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES FOR THE PHONE
+#   A guest dispatch with an empty direct grid (x, y or z = 0) used to advance the write epochs, resolve the program and reach Metal, which rejects an empty grid. dispatch_ now returns before
+#   changing any replay state. Indirect dispatches (counts on the GPU) are untouched. A guard, no switch; no phone log shows it being hit (not checked). Prerequisite of 0456.
+# Left out of the upstream part: its Makefile hunk (it conflicts; revision 2 below adds a rule of ours); the test file is included.
+# RISK: low. NOT run on a device. Shader chain id untouched.
+#
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0415 and the candidates numbered below this one, in the order of the numbers of this folder.
+
+# REVISION 2 (2026-11-21, engine-patches review follow-up): the Makefile hunk the first revision left out (it conflicted upstream) is back as a rule of our own, with -fobjc-arc: without it
+#   t_dispatch_zero did not compile. `make -C dm/gfx/tests GAME=<profile> check_t_dispatch_zero` builds and runs it (four zero-dimensional grids leave the replay state alone).
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 386241a2..765243b5 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -17396,6 +17396,9 @@
+     return cs->loop_gpu;
+ }
+ static void dispatch_(const p_dispatch *dp) {
++    // An empty direct grid invokes no shader and changes no resources. Metal
++    // rejects it; indirect counts belong to the GPU and are left untouched.
++    if (!dp->ind && (!dp->x || !dp->y || !dp->z)) return;
+     g_wr_epoch++; g_mdx_epoch++;
+     if (!S.cprog) { RED_ONCE(27, "no program bound before the dispatch"); return; }
+     // DispatchComputeIndirect: the group counts {x, y, z} at ind (MTLDispatchThreadgroupsIndirectArguments) are usually written by the GPU earlier in the frame; Metal reads them when the dispatch runs
+--- /dev/null
++++ b/dm/gfx/tests/t_dispatch_zero.m
+@@ -0,0 +1,23 @@
++// A direct grid with any zero dimension does no work, even with no program bound.
++// It must leave pending clears, write epochs and encoders alone. An indirect
++// argument address is not a direct zero grid: its dimensions belong to the GPU.
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++int main(void) { @autoreleasepool {
++    mtl_init();
++    uint64_t writes = g_wr_epoch, indices = g_mdx_epoch;
++    const uint32_t dims[][3] = {{0, 8, 1}, {8, 0, 1}, {8, 8, 0}, {0, 0, 1}};
++    for (unsigned i = 0; i < sizeof dims / sizeof *dims; i++) {
++        p_dispatch d = {0}; d.x = dims[i][0]; d.y = dims[i][1]; d.z = dims[i][2];
++        dispatch(&d);
++        if (g_wr_epoch != writes || g_mdx_epoch != indices || g_cb || g_enc || g_blit) {
++            fprintf(stderr, "FAIL: empty grid changed replay state\n"); return 1;
++        }
++    }
++    puts("t_dispatch_zero: four zero-dimensional grids leave replay state untouched");
++    return 0;
++} }
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -347,6 +347,9 @@
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_gpuprof.m $(MTL_T_SRC) $(FW)
+ t_sub_overlap: t_sub_overlap.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_sub_overlap.m $(MTL_T_SRC) $(FW)
++# engine-patches/0455 (revision 2): the test needs -fobjc-arc like every other one here (no rule: the default rule compiled it without, and it did not build)
++t_dispatch_zero: t_dispatch_zero.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_zero.m $(MTL_T_SRC) $(FW)
+ t_dispatch_own: t_dispatch_own.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_own.m $(MTL_T_SRC) $(FW)
+ .PHONY: check_t_dispatch_own

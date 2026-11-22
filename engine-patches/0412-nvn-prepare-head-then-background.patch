@@ -1,0 +1,833 @@
+# nvn/pso: build only the head of the prewarm lists before the first frame, the tail in the background (DM_PSO_PREPARE_PERCENT)
+#
+# Origin:  written in this repository for the owner's decision "compile half of the prewarm lists before the first frame" (Ocarina of Time, Switch 2, 0400486024DEC000). No upstream
+#          commit: nvn_mtl.m's prepare step (warm_start -> warm_prepare) builds EVERY line of the lists before the first frame, on hw.activecpu workers (about 25k libraries and pipelines
+#          for this game on a first start). Applies after 0411 (patch -p1 --forward, no fuzz, no offset), to the tree out-stage/out-engine/engine + engine-patches/0401..0411.
+# Licence: the licence of the tree it patches (the engine's MIT licence, Copyright (c) 2026 seedds and contributors).
+#
+# WHAT IT ADDS
+#   DM_PSO_PREPARE_PERCENT=<1..100>   default 100 (unset, empty, or anything that is not a whole number from 1 to 100: ignored with one log line, i.e. 100).
+#       With p < 100 the prepare step builds the first ceil(n * p / 100) of the lists' n TASKS (the lists' order: the profile's pso_manifest.tsv, then this device's pso_user.tsv; a render
+#       task is the pipelines of one shader pair, so lines >= tasks) before the first frame, with the progress screen counting the head's lines, and does NOT build the rest (the tail) there.
+#   DM_PSO_PREPARE_TAIL=0             default on. On: the tail is built after the prepare step (the pipelines' prebuild included) by ONE serial worker at QOS_CLASS_UTILITY while the
+#       game runs. Off: the tail is not built at all, and a draw that needs one of its pipelines builds it on demand, as for any pipeline the lists do not hold.
+#   A draw that needs a tail pipeline before the worker reached it takes today's on-demand path (the app sets DM_PSO_NOWAIT=0: the draw waits for its compile). warm_claim keeps the first
+#   pipeline in the cache and drops the later duplicate, as it already did for the prefetch and the background prewarm.
+#   New: dm/gfx/nvn/nvn_warm_head.h (pure C: warm_head_count, warm_percent_parse, warm_claim_index), tests dm/gfx/tests/t_warm_head.c (no GPU) and t_pso_head.m (the real warm_start on the
+#   Mac's GPU with synthetic shaders), Makefile rules for both.
+#   Log lines (MLOG): "pipeline prepare: DM_PSO_PREPARE_PERCENT=p: head H lines (the first k of n tasks) before the first frame, tail T lines (m tasks) afterwards in the background |
+#   SKIPPED (DM_PSO_PREPARE_TAIL=0)...", "pipeline prepare: head D of H lines done in S s", "pipeline prewarm head done: ...", "pipeline prewarm tail: started ... / N of M tasks done (each
+#   60 s) / finished, in S s / stopped after N of M tasks", then the usual "pipeline prewarm done: ..." at the tail's end. With p = 100 none of these is printed.
+#
+# THE DEFAULT IS TODAY'S BEHAVIOUR (read the diff): prepare_percent() is 100 -> warm_head_count(n, 100) == n -> head == n, head_lines == lines, split == 0, tail == 0 -> warm_prepare gets
+#   head == tasks.count (its loop takes the same indexes: warm_claim_index(&next, n) is atomic_fetch_add + "i >= n" as it was), warm_finish_ex(1, 0) is the old warm_finish (same sweep,
+#   same text "pipeline prewarm done: ...", dictionary released, running cleared, arch_flush, pso_prebuild_bg; warm_finish() is kept as that call, t_pso_warm calls it), then
+#   prepare_prebuild() as before, warm_tail_start() is not reached. The background branch (DM_PSO_PREPARE=0, no window) is not touched. t_pso_head runs this path (unset, 100, 99 of 40
+#   tasks, invalid values) and checks lines, libraries, pipelines, dictionary, sweep, log; the Mac's t_pso_warm (123 checks, both compilers) still passes.
+#
+# CAREFUL POINT (a): WHAT RUNS AFTER THE HEAD AND WHAT ONLY AFTER THE TAIL
+#   After the head (warm_finish_ex(0, tail)): the log, g_warm_running = 0, arch_flush() (the head's captured bases are written now, as before the first frame today), NOT the archive
+#     sweep, and the shader dictionary and load table (g_warm_dict / g_warm_loads) are KEPT when a tail follows, released when none does. Then prepare_prebuild(), exactly as today, with
+#     g_warm_running = 0 (it relies on arch_flush() handing the period over and on the prebuilt.tsv stamp it writes afterwards: with the flag still 1 both would be held back).
+#   Then, only if a tail follows, warm_tail_start(): g_warm_bg = 1 and g_warm_running = 1 again (for the tail the prewarm is what it is in the app without a prepare step: running beside
+#     the game; the archive's timer flush then follows arch_warm_flush_due, 60 s then 120 s, ..., and not one file every 10 s), and one block on bg_group at utility QoS.
+#   Only after the tail (warm_finish, on the tail's thread): g_sweep_warm = 1 and arch_sweep(), the "done" line, release of the dictionary, g_warm_running = 0, arch_flush().
+#   Why the sweep waits: arch_sweep removes the archive files none of whose pipelines a lookup took in this run, on the premise that the lists asked for every pipeline (g_sweep_warm).
+#   After a head alone that is false: a file that holds only tail pipelines would go and be compiled again. So the sweep runs when every line was asked for (p = 100, or at the tail's end)
+#   and never with DM_PSO_PREPARE_TAIL=0 or after a stop. A start that compacts the archive (g_compact_enabled, more than 8 files in a tier) ignores the percentage and builds everything
+#   before the first frame: compaction recaptures what the prewarm finds in the old files and closes (deleting them) at the prewarm's end, so it has to see the whole prewarm, and the
+#   head's end, with g_warm_running = 0, would close it early (arch_hand_over).
+#   Threads: the head's workers (user-initiated QoS, all joined when warm_prepare returns: dispatch_group_wait) call warm_task concurrently as today: g_warm_dict / g_warm_loads under
+#   g_warm_dict_lock (never held across a library load: warm_shader waits on the load's dispatch group outside it), g_warm_items under g_warm_lock, g_warm_shaders / rps / cps / mps /
+#   skip_* / done atomics. From the head's end on ONE thread calls warm_task, the tail's worker (serial queue, its block starts after the head's workers joined and after the prebuild),
+#   and warm_shader is reached only from warm_task (grep: no other caller): the tail is the only user of g_warm_dict and g_warm_loads, so nothing races with them and nothing can use
+#   them after release. They are released by exactly one of: the tail's own end or stop branch (its last act, on its thread), the head's end when no tail follows (no tail thread exists),
+#   or dm_gfx_teardown AFTER its dispatch_group_wait(bg_group()), which has joined the tail (bg_async puts the tail on bg_group; teardown sets g_gfx_teardown first, a block not yet
+#   started returns at once, one under way ends at its next loop test). The game's own builds do not touch them (shader_get, pso_get_, the prefetch: other paths). The tail's results
+#   reach the game only through warm_enqueue / warm_claim (g_warm_lock; g_warm_ready release/acquire), exactly as the background prewarm's do. The one object a tail task and a draw can build
+#   at once, the same library or pipeline, is built twice at worst: warm_claim keeps the one already in g_shcache / g_pso.
+#   Verified on the Mac (t_pso_head): ThreadSanitizer 0 reports and AddressSanitizer 0 errors in both compiler modes, with the game's thread claiming and loading on demand beside the tail.
+# CAREFUL POINT (b): PROGRESS. warm_prepare takes the head's task count and the head's lines (the sum of the head tasks' lines): front_progress and the "pipeline prepare:" lines count
+#   g_warm_done (lines done) against the head's lines, so the screen reaches 100 % at the head's end. g_warm_done goes on counting in the tail (mtl_warm_stop's message prints it).
+# CAREFUL POINT (c): STOP, TEARDOWN, BACKGROUND. The tail honours g_gfx_teardown and g_warm_stop between two tasks (a render task also tests g_warm_stop between its pipelines, as today);
+#   either ends it without warm_finish ("stopped after N of M tasks", dictionary released, running cleared, no sweep): what is left is built at the next start or on demand. A start that
+#   finds the process or the graphics ending does not start the tail. dm_gfx_teardown waits for the task under way, no more. The head's own teardown handling is as it was.
+#   Going to the background (dm_gfx_suspend): not hooked, as for the background prewarm: the tail goes on until iOS suspends the process, and the archive writes the period under way
+#   (mtl_arch_save any_time) each time, which adds a small file per background while the tail runs. Pipeline compiles are not GPU command buffers, but nothing here was run on a phone.
+# CAREFUL POINT (d): prepare_prebuild (the pulling base of every pair of shader_pairs.tsv and pso_pairs.tsv, before the first frame, "Preparing pipelines", once per chain / depth mode /
+#   pair list: prebuilt.tsv) is LEFT AS IT IS and still builds every pair before the first frame whatever the percentage. It is also large for this game: pso_pairs.tsv has 6,472 rows and
+#   the engine tree's profile also has shader_pairs.tsv (28,179 lines; the prebuild reads both): the engine's own note measured 34,649 pairs, 493 s on an M4 Pro with 14 workers for
+#   the prebuild tool. So the head setting shortens only the lists' part of the first Play; on a cold start the prebuild may then be most of what is left (DM_PSO_PREBUILD=0, an existing
+#   switch, skips it and leaves the bases to the draws). It may also make the tail cheaper (the pulling bases of the tail's render pairs are then already built or archived): not measured.
+#
+# MEASURED on this Mac (M1 Pro): t_warm_head 455,404 checks 0 failed (also under UBSan+integer and TSan); t_pso_head 348 checks 0 failed with DM_PSO_MTL4=0 and =1 (also under TSan and
+#   ASan); a mutation (head end releasing the dictionary and allowing the sweep) makes 8 of its checks fail. NOT VERIFIED: anything on an iPhone (head or tail time, frame time while the
+#   tail runs, memory, the progress screen, a background / foreground), the app's way of setting the two variables, the pack's own manifest (14,753 rows). For the engine tree's profile
+#   manifest of this game (25,163 rows: a Python emulation of warm_parse without its shader-map test finds 23,191 tasks, 16,818 S, 5,166 R pairs with 7,138 pipelines, 1,043 C, 164 M),
+#   whose first fifth is almost only library loads (31 of its pipelines): at 50 % the head holds 51.9 % of the lines but 47.6 % of the render pipelines and 36.5 % of the compute ones.
+# RISKS: head-by-file-order is only meaningful if the manifest was recorded chronologically (it interleaves S runs and R/C rows: consistent with a recording order, not proven);
+#   background compiles cost frame time (the engine's own note: an iPhone 17 Pro Max's GPU frame went from about 13 ms to 15-18 ms in Breath of the Wild with background builds at
+#   user-initiated QoS; one utility worker should cost less, not measured); a draw that reaches a tail pipeline early hitches once; a killed process loses the tail's captures not yet
+#   written (the period under way, up to 60 s old at the start, then 120 s ...); many small archive files (a quit or a background during the tail writes one) can make a later start a
+#   compaction, which builds everything before the first frame.
+# Roll back: remove this file from engine-patches/ and run scripts/build-host.sh again (docs/ENGINE-UPDATE.md, section 10); the two variables do nothing without it.
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -41,6 +41,7 @@
+ #include "nvn_link_latch.h"
+ #include "nvn_timestamp.h"
+ #include "nvn_rt_recycle.h"
++#include "nvn_warm_head.h"   // DM_PSO_PREPARE_PERCENT: the head of the prewarm lists built before the first frame (pure C, dm/gfx/tests/t_warm_head.c)
+ #include "msl_image.h"
+ #include "../msl_mount.h"
+ #include "dmsh_chain.h"   // DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree, one for every game (beside this file, tools/dmsh_chain.py --header)
+@@ -11927,10 +11928,13 @@
+         }
+     }
+ }
+-static void warm_finish(void) {
+-    if (g_warm_rps + g_warm_cps + g_warm_mps) { atomic_store(&g_sweep_warm, 1); arch_sweep(); }   // the lists asked for their pipelines: the files none was taken from go
+-    MLOG("pipeline prewarm done: shaders %llu / render pipelines %llu (specialized fragment skipped %llu) / compute pipelines %llu, background time %.1f ms; shader keys not in the shader map (another game version) %llu",
+-         (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_skip_fz, (unsigned long long)g_warm_cps, (bp_now() - g_warm_t0) / 1e6, (unsigned long long)g_warm_skip_stale);
++// The end of a prewarm. walked_all: every line of the lists was asked for (warm_finish: the prewarm that ran whole, before the first frame, in the background, or as the tail of a split one),
++// and only then may the archive's sweep run: with DM_PSO_PREPARE_PERCENT the head alone is not "the lists' pipelines were asked for", and a file only a tail pipeline lives in would go.
++// keep_dict: the head of a split prewarm ends here and its tail goes on with warm_shader, whose dictionary and load table must stay until the tail has joined (the tail's own end drops them)
++static void warm_finish_ex(int walked_all, int keep_dict) {
++    if (walked_all && g_warm_rps + g_warm_cps + g_warm_mps) { atomic_store(&g_sweep_warm, 1); arch_sweep(); }   // the lists asked for their pipelines: the files none was taken from go
++    MLOG("pipeline prewarm %s: shaders %llu / render pipelines %llu (specialized fragment skipped %llu) / compute pipelines %llu, background time %.1f ms; shader keys not in the shader map (another game version) %llu",
++         walked_all ? "done" : "head done", (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_skip_fz, (unsigned long long)g_warm_cps, (bp_now() - g_warm_t0) / 1e6, (unsigned long long)g_warm_skip_stale);
+     if (g_warm_mps) MLOG("pipeline prewarm: %llu native task / mesh pipelines; so far %llu taken from the pipeline archive, %llu built and captured for it, %llu built without it",
+                          (unsigned long long)g_warm_mps, (unsigned long long)g_mtk_arch, (unsigned long long)g_mtk_built, (unsigned long long)g_mtk_dev);
+     char again[96] = "";   // only a compacting start captures bases again
+@@ -11942,11 +11946,12 @@
+                                          (unsigned long long)g_cps_arch, (unsigned long long)g_cps_run, (unsigned long long)g_cps_built, g_cps_look_ns / 1e6, g_cps_build_ns / 1e6);
+     // All warm tasks have joined. WarmItems retain published shaders until the submit thread claims them.
+     // Drop negative results too: demand loading keeps its existing retry behavior, independent of the warm dictionary.
+-    g_warm_dict = nil; g_warm_loads = nil;
++    if (!keep_dict) { g_warm_dict = nil; g_warm_loads = nil; }
+     atomic_store(&g_warm_running, 0);
+     arch_flush();   // the period of the recaptured bases (compaction finishes once it is written), after the prewarm stops recapturing them; recaptures still queued close it (arch_harvest)
+     @autoreleasepool { pso_prebuild_bg(); }   // then, once, the bases every shader pair's hybrid draws need
+ }
++static void warm_finish(void) { warm_finish_ex(1, 0); }
+ // The process is ending (dm_gfx_quit_begin, atexit): the prewarm and the pairs' prebuild take nothing more, so the archive's write does not share the compiler with them and no
+ // capture joins a period after the exit handed it over; what they had not built is built at the next start. The compiles under way finish (the period's write waits for them)
+ void mtl_warm_stop(void) {
+@@ -11969,6 +11974,11 @@
+ // Each start runs it: when everything is in the Metal shader cache and the pipeline archive it takes well under a second, and only past 0.5 s (with 0.3 s or more still to go) does the front end show its screen
+ // ("Preparing shaders", a bar and a count: front_progress). A stamp that says the step ran would skip it exactly when the system dropped the Metal cache (an OS update, storage
+ // pressure on iOS), which is when it is needed. DM_PSO_PREPARE=0: the prewarm runs in the background as before (as it does without a window); DM_PSO_PREPARE_THREADS=<n> sets the workers
++// DM_PSO_PREPARE_PERCENT=<1..100> (default 100: every line, as above): the step builds only the first ceil(n * p / 100) of the lists' n tasks before the first frame (the lists' order: the
++// profile's pso_manifest.tsv, then this device's pso_user.tsv), with the screen counting the head's lines. The rest, the tail, is built after the prepare step (the pipelines' prebuild
++// included) by ONE serial worker at utility QoS, in the background while the game runs (warm_tail_start), unless DM_PSO_PREPARE_TAIL=0: then it is not built at all and a draw that needs
++// one of its pipelines builds it on demand, as for any pipeline the lists do not hold. A start that compacts the pipeline archive (g_compact_enabled) builds everything before the first
++// frame whatever the percentage: a compaction has to see the whole prewarm
+ void front_progress(const char *title, long done, long total);
+ __attribute__((weak)) void front_progress(const char *title, long done, long total) { (void)title; (void)done; (void)total; }   // the front ends' (front.h); none in the unit tests
+ static int prepare_on(void) {
+@@ -11983,13 +11993,25 @@
+     if (n <= 0) { size_t sz = sizeof n; if (sysctlbyname("hw.activecpu", &n, &sz, NULL, 0) || n < 2) n = 2; }
+     return n;
+ }
+-static void warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
+-    int workers = prepare_workers(); long n = (long)tasks.count;
++// DM_PSO_PREPARE_PERCENT: 100 (every line) when it is unset or is not a whole number from 1 to 100; DM_PSO_PREPARE_TAIL: on unless it is "0"
++static int prepare_percent(void) {
++    const char *e = getenv("DM_PSO_PREPARE_PERCENT");
++    if (!e || !*e) return 100;
++    int p = warm_percent_parse(e);
++    if (!p) { MLOG("DM_PSO_PREPARE_PERCENT=%s is not a whole number from 1 to 100: ignored, every line of the prewarm lists is built before the first frame", e); return 100; }
++    return p;
++}
++static int prepare_tail_on(void) { const char *e = getenv("DM_PSO_PREPARE_TAIL"); return !(e && !strcmp(e, "0")); }
++// The lines a task stands for: a render task is one line per pipeline of its pair (every one is counted into g_warm_done), any other task one line
++static long warm_task_lines(const WarmTask *t) { return t->kind == 1 ? (long)t->rs.count : 1; }
++// head: how many of the tasks, from the first, this step builds (all of them unless DM_PSO_PREPARE_PERCENT split the list); lines: the lines those tasks stand for, the screen's total
++static void warm_prepare(NSArray<WarmTask *> *tasks, long head, long lines) {
++    int workers = prepare_workers(); long n = head;
+     uint64_t t0 = bp_now(), built0 = g_pb_built, arch0 = g_pb_archived, reused0 = g_pb_reused, spec0 = g_pb_spec;
+     __block _Atomic long next = 0;
+     dispatch_group_t g = dispatch_group_create();
+     for (int w = 0; w < workers; w++) dispatch_group_async(g, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+-        for (;;) { if (atomic_load(&g_gfx_teardown) || atomic_load(&g_warm_stop)) break; long i = atomic_fetch_add(&next, 1); if (i >= n) break; warm_task(tasks[(NSUInteger)i]); }
++        for (;;) { if (atomic_load(&g_gfx_teardown) || atomic_load(&g_warm_stop)) break; long i = warm_claim_index(&next, n); if (i < 0) break; warm_task(tasks[(NSUInteger)i]); }
+     });
+     int shown = 0;
+     while (dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 50 * (int64_t)NSEC_PER_MSEC))) {
+@@ -12133,6 +12155,42 @@
+     if (!g_comp4 || !g_arch_cap) { MLOG("[RED] pipeline prebuild: no Metal 4 compiler or pipeline serializer: nothing for the app"); return 2; }
+     return pre_bundle_out(g_pre_out, lines);
+ }
++// The tail of a split prewarm (DM_PSO_PREPARE_PERCENT): the tasks [from, n) of the list, built after the prepare step by ONE serial worker at utility QoS while the game runs. It is the prewarm
++// of the app without a prepare step (the queue in warm_start below) at a lower priority, and every rule of that one holds:
++//  - it runs on bg_group: dm_gfx_teardown sets g_gfx_teardown, then waits for the group, so the task under way finishes and no later one starts, and what teardown frees after that wait
++//    (g_warm_dict, g_warm_loads, g_warm_items) has no user left. mtl_warm_stop (g_warm_stop) ends it between two tasks. Neither runs warm_finish: the lines left are built at the next start
++//  - the head's workers have all joined (warm_prepare waited for their group) before this starts, so this one thread is the only caller of warm_task from here on: it owns g_warm_dict and
++//    g_warm_loads, which warm_finish_ex(.., keep_dict) left to it, and drops them at its end. The game's own builds never touch them (they go through shader_get and pso_get_)
++//  - g_warm_running is set again and so is g_warm_bg: for the tail the prewarm is what it is in the app without a prepare step, running beside the game. The archive's timer flushes then
++//    follow arch_warm_flush_due (a period handed over once it is 60 s old, then 120 s, ...) and not one file every 10 s, and its sweep waits for warm_finish below: the one that
++//    says every line was asked for. The head's end cleared g_warm_running, so the prebuild that follows it ran as it always did
++// A draw that comes before the worker reached its pipeline builds it on demand, as for any pipeline the lists do not hold: the pipeline the worker builds later is claimed only if no
++// one is there yet (warm_claim)
++static void warm_tail_start(NSArray<WarmTask *> *tasks, long from, int percent, long head_lines, long total_lines) {
++    long n = (long)tasks.count, tail_lines = total_lines - head_lines;
++    if (atomic_load(&g_gfx_teardown) || atomic_load(&g_warm_stop)) return;   // the process or the graphics are ending: the tail is built at the next start
++    dispatch_queue_t q = dispatch_queue_create("dm.nvn.pso-warm-tail", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
++    atomic_store(&g_warm_bg, 1); atomic_store(&g_warm_running, 1);
++    uint64_t t0 = bp_now();
++    MLOG("pipeline prewarm tail: started in the background, %ld tasks (%ld lines), one worker at utility QoS, %.1f s after the prewarm began (DM_PSO_PREPARE_PERCENT=%d)", n - from, tail_lines, (t0 - g_warm_t0) / 1e9, percent);
++    bg_async(q, ^{ @autoreleasepool {
++        _Atomic long next = from; long ran = 0; uint64_t last = t0;
++        for (;;) {
++            if (atomic_load(&g_gfx_teardown) || atomic_load(&g_warm_stop)) break;
++            long i = warm_claim_index(&next, n); if (i < 0) break;
++            warm_task(tasks[(NSUInteger)i]); ran++;
++            uint64_t now = bp_now();
++            if (now - last >= 60 * NSEC_PER_SEC) { last = now; MLOG("pipeline prewarm tail: %ld of %ld tasks done, %ld of %ld lines, after %.0f s", ran, n - from, (long)atomic_load(&g_warm_done) - head_lines, tail_lines, (now - t0) / 1e9); }
++        }
++        if (!atomic_load(&g_gfx_teardown) && !atomic_load(&g_warm_stop)) {
++            MLOG("pipeline prewarm tail: finished, %ld tasks (%ld lines) in %.1f s", ran, tail_lines, (bp_now() - t0) / 1e9);
++            warm_finish();
++        } else {
++            MLOG("pipeline prewarm tail: stopped after %ld of %ld tasks, %.1f s (the process or the graphics are ending): the rest is built at the next start or on demand", ran, n - from, (bp_now() - t0) / 1e9);
++            g_warm_dict = nil; g_warm_loads = nil; atomic_store(&g_warm_running, 0);
++        }
++    } });
++}
+ static void warm_start(void) {
+     if (g_warm_started++) return;
+     NSArray<NSString *> *paths = warm_paths(getenv("DM_PSO_MANIFEST"));
+@@ -12143,11 +12201,22 @@
+     atomic_store(&g_warm_running, 1);
+     if (prepare_on()) {
+         long lines = 0; NSArray<WarmTask *> *tasks = warm_parse(paths, &lines);
+-        if (lines) warm_prepare(tasks, lines);
++        // DM_PSO_PREPARE_PERCENT: the head is the first warm_head_count(n, p) tasks, the tail the rest. 100 (the default) leaves head = n: nothing below differs from a start without the variable
++        long n = (long)tasks.count, head = n, head_lines = lines; int pct = prepare_percent();
++        if (pct < 100 && g_compact_enabled) { MLOG("DM_PSO_PREPARE_PERCENT=%d: this start compacts the pipeline archive, and a compaction has to see the whole prewarm: every line is built before the first frame", pct); pct = 100; }
++        if (pct < 100) { head = warm_head_count(n, pct); head_lines = 0; for (long i = 0; i < head; i++) head_lines += warm_task_lines(tasks[(NSUInteger)i]); }
++        int split = head < n, tail = split && prepare_tail_on();
++        if (split) MLOG("pipeline prepare: DM_PSO_PREPARE_PERCENT=%d: head %ld lines (the first %ld of %ld tasks) before the first frame, tail %ld lines (%ld tasks) %s", pct, head_lines, head, n,
++                        lines - head_lines, n - head, tail ? "afterwards in the background" : "SKIPPED (DM_PSO_PREPARE_TAIL=0): not built, a draw that needs one builds it on demand");
++        uint64_t th0 = bp_now();
++        if (lines) warm_prepare(tasks, head, head_lines);
+         else MLOG("pipeline prepare: the prewarm lists hold nothing to build");
+         if (atomic_load(&g_warm_stop)) return;   // the process is ending: what is left is built at the next start
+-        warm_finish();
++        if (split) MLOG("pipeline prepare: head %ld of %ld lines done in %.2f s (DM_PSO_PREPARE_PERCENT=%d); tail %ld lines: %s", (long)atomic_load(&g_warm_done), head_lines, (bp_now() - th0) / 1e9, pct,
++                        lines - head_lines, tail ? "starts after the prebuild" : "skipped");
++        warm_finish_ex(!split, tail);   // a split prewarm has not asked for every line: no archive sweep, and the tail keeps the shader dictionary
+         @autoreleasepool { prepare_prebuild(); }   // then the bases every shader pair's hybrid draws need, before the first frame too (once)
++        if (tail) warm_tail_start(tasks, head, pct, head_lines, lines);
+         return;
+     }
+     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);   // Not optional background work: it decides whether the pipelines are ready before the player enters a run
+--- /dev/null
++++ b/dm/gfx/nvn/nvn_warm_head.h
+@@ -0,0 +1,39 @@
++// How much of the prewarm lists the prepare step builds before the game's first frame (DM_PSO_PREPARE_PERCENT), and how the workers take tasks from the list. Pure C: no Metal, no
++// Objective-C, no state of its own, so dm/gfx/tests/t_warm_head.c runs it on any machine and nvn_mtl.m calls the very same functions.
++#ifndef NVN_WARM_HEAD_H
++#define NVN_WARM_HEAD_H
++#include <stdatomic.h>
++#include <stdlib.h>
++
++// The head of a list of n tasks: the first ceil(n * percent / 100) of them. percent >= 100 is all of them (the default: the prepare step builds every line, as it always did), a
++// percent under 1 counts as 1 (the env parser below never hands one over), n <= 0 is 0. Written as q * p + ceil(r * p / 100) for n = 100 q + r, which is the same number and cannot
++// overflow however large n is: r * p is at most 99 * 99, and q * p is at most n
++static inline long warm_head_count(long n, int percent) {
++    if (n <= 0) return 0;
++    if (percent >= 100) return n;
++    if (percent < 1) percent = 1;
++    long q = n / 100, r = n % 100;
++    return q * percent + (r * percent + 99) / 100;
++}
++
++// The text of DM_PSO_PREPARE_PERCENT: the whole number 1..100 (surrounding blanks and a line end are allowed: the value may come from a line of env.txt), or 0 when it is unset, empty, not
++// a whole number or out of range. The caller then builds every line before the first frame, which is what a start without the variable does
++static inline int warm_percent_parse(const char *s) {
++    if (!s) return 0;
++    while (*s == ' ' || *s == '\t') s++;
++    if (!*s) return 0;
++    char *end = NULL; long v = strtol(s, &end, 10);
++    if (end == s) return 0;
++    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
++    if (*end || v < 1 || v > 100) return 0;
++    return (int)v;
++}
++
++// The next task index of [.., end) a worker takes from the shared counter *next, or -1 once the counter is past end. Every index below end comes out exactly once whatever the number of
++// workers, and the counter only grows: the head's workers share one counter that starts at 0 and ends at the head's size, the tail's worker has its own that starts there and ends at n,
++// so the two ranges are [0, head) and [head, n): the whole list, nothing twice
++static inline long warm_claim_index(_Atomic long *next, long end) {
++    long i = atomic_fetch_add(next, 1);
++    return i < end ? i : -1;
++}
++#endif
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -530,6 +530,16 @@
+ check_t_pso_warm: t_pso_warm
+ 	DM_PSO_MTL4=0 MTL_DEBUG_LAYER=1 ./t_pso_warm
+ 	DM_PSO_MTL4=1 MTL_DEBUG_LAYER=1 ./t_pso_warm
++# DM_PSO_PREPARE_PERCENT / DM_PSO_PREPARE_TAIL (engine-patches/0412): the head/tail split of the prepare step. t_warm_head is the pure part (nvn_warm_head.h: the head's size, the variable's text,
++# the workers' claiming of task indexes), no GPU; t_pso_head runs the real warm_start on this Mac's GPU with synthetic shader libraries (as t_pso_warm), with and without the split
++t_warm_head: t_warm_head.c ../nvn/nvn_warm_head.h
++	clang -O1 -Wall -Wextra -Werror -pthread -o $@ t_warm_head.c
++t_pso_head: t_pso_head.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_head.m $(MTL_T_SRC) $(FW)
++.PHONY: check_t_pso_head
++check_t_pso_head: t_pso_head
++	DM_PSO_MTL4=0 MTL_DEBUG_LAYER=1 ./t_pso_head
++	DM_PSO_MTL4=1 MTL_DEBUG_LAYER=1 ./t_pso_head
+ t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_skey.m -framework Foundation
+ t_view_swizzle: t_view_swizzle.m $(MTL_T_DEP)
+--- /dev/null
++++ b/dm/gfx/tests/t_pso_head.m
+@@ -0,0 +1,382 @@
++// DM_PSO_PREPARE_PERCENT and DM_PSO_PREPARE_TAIL (engine-patches/0412), on the real prepare step: warm_start with synthetic shader libraries and manifests, no game files, on this Mac's GPU
++// (the fixtures are compiled with the Metal toolchain, as t_pso_warm's are). What it shows:
++//  - without the variable (or with 100, or with a value that is no whole number from 1 to 100) the step is what it was: every line built before warm_start returns, the shader dictionary
++//    released, the archive's sweep allowed, no tail, none of the new log lines;
++//  - with PERCENT=p and the tail on: the first ceil(n * p / 100) tasks are built when warm_start returns (counted exactly: lines, libraries, pipelines, which tasks), the tail is held
++//    back by a gate on the device's library loads and shows as not started; once released it builds the REST, in the manifest's order, nothing twice, nothing lost, on one worker at
++//    utility QoS, and only then is the sweep allowed and the dictionary released;
++//  - with DM_PSO_PREPARE_TAIL=0 the tail is never built, nothing runs after warm_start returns, the dictionary is released and the sweep is not allowed;
++//  - mtl_warm_stop's flag (g_warm_stop) and dm_gfx_teardown, met while the tail runs, end it between two tasks with no deadlock and no use of the released dictionary;
++//  - a start that compacts the pipeline archive ignores the percentage.
++#include "../nvn/nvn_mtl.m"
++#include <fcntl.h>
++#include <unistd.h>
++
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++
++static int checks, failed;
++#define EXPECT(name, want, got) do { long long w_ = (long long)(want), g_ = (long long)(got); checks++; \
++    if (w_ != g_) { printf("FAIL %s: expected %lld, got %lld (line %d)\n", name, w_, g_, __LINE__); failed++; } } while (0)
++#define EXPECT_LOG(name, log, needle) do { checks++; if ([(log) rangeOfString:@needle].location == NSNotFound) { printf("FAIL %s: the log has no \"%s\"\n--- log\n%s\n---\n", name, needle, [(log) UTF8String]); failed++; } } while (0)
++#define EXPECT_NOLOG(name, log, needle) do { checks++; if ([(log) rangeOfString:@needle].location != NSNotFound) { printf("FAIL %s: the log has \"%s\"\n--- log\n%s\n---\n", name, needle, [(log) UTF8String]); failed++; } } while (0)
++
++enum { NT = 40 };   // tasks: every 4th is a shader load (S, one line), the others a pair of two pipelines (R, two lines): 10 + 30 tasks, 10 + 60 = 70 lines, 70 libraries, 60 pipelines
++static NSString *g_dir, *g_manifest;
++static int g_logfd; static off_t g_logmark;
++
++static NSString *log_since(void) {   // what the engine printed to stderr since the last call
++    off_t end = lseek(g_logfd, 0, SEEK_END); NSString *s = @"";
++    if (end > g_logmark) {
++        NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)(end - g_logmark)]; ssize_t n = pread(g_logfd, d.mutableBytes, d.length, g_logmark);
++        if (n > 0) s = [[NSString alloc] initWithBytes:d.bytes length:(NSUInteger)n encoding:NSUTF8StringEncoding] ?: @"";
++    }
++    g_logmark = end; return s;
++}
++static void show_log(const char *scenario, NSString *log) {   // the lines about the prepare step and the prewarm, for the record
++    printf("-- %s\n", scenario);
++    for (NSString *l in [log componentsSeparatedByString:@"\n"])
++        if ([l containsString:@"pipeline prepare"] || [l containsString:@"pipeline prewarm"] || [l containsString:@"DM_PSO_PREPARE"]) printf("   %s\n", [l stringByReplacingOccurrencesOfString:@"[dm] [nvn-mtl] " withString:@""].UTF8String);
++}
++
++// The device the loads go through: counts the library loads, can hold the N-th one until released (the tail's first), slows each load (a head long enough for the progress screen), and
++// records how many loads run at once and the QoS class of the thread that makes the first one and the one that is held
++@interface HeadGateDevice : NSObject {
++@public id<MTLDevice> device; dispatch_semaphore_t entered, release; _Atomic unsigned calls, inflight, max_inflight; unsigned block_at; useconds_t delay_us; _Atomic int qos_first, qos_block;
++}
++@end
++@implementation HeadGateDevice
++- (id)forwardingTargetForSelector:(SEL)selector { return device; }
++- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
++    unsigned n = atomic_fetch_add(&calls, 1) + 1, in = atomic_fetch_add(&inflight, 1) + 1;
++    for (unsigned m = atomic_load(&max_inflight); in > m && !atomic_compare_exchange_weak(&max_inflight, &m, in);) {}
++    if (n == 1) atomic_store(&qos_first, (int)qos_class_self());
++    if (block_at && n == block_at) { atomic_store(&qos_block, (int)qos_class_self()); dispatch_semaphore_signal(entered); dispatch_semaphore_wait(release, DISPATCH_TIME_FOREVER); }
++    if (delay_us) usleep(delay_us);
++    id<MTLLibrary> lib = [device newLibraryWithData:data error:error];
++    atomic_fetch_sub(&inflight, 1);
++    return lib;
++}
++@end
++static HeadGateDevice *g_gate;
++
++static int build_fixtures(NSString *dir) {
++    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
++        "vertex float4 vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); return float4(uv * 2 - 1, 0, 1); }\n"
++        "fragment float4 fs() { return float4(0.5, 0.25, 1, 0.5); }\n";
++    NSString *metal = [dir stringByAppendingPathComponent:@"fixture.metal"], *library = [dir stringByAppendingPathComponent:@"fixture.metallib"];
++    if (![source writeToFile:metal atomically:YES encoding:NSUTF8StringEncoding error:nil]) return 0;
++    NSTask *compiler = [NSTask new]; compiler.executableURL = [NSURL fileURLWithPath:@"/usr/bin/xcrun"];
++    compiler.arguments = @[@"-sdk", @"macosx", @"metal", metal, @"-o", library];
++    NSError *error = nil;
++    if (![compiler launchAndReturnError:&error]) { printf("fixture compiler: %s\n", error.localizedDescription.UTF8String); return 0; }
++    [compiler waitUntilExit]; if (compiler.terminationStatus) return 0;
++    NSFileManager *fm = NSFileManager.defaultManager;
++    NSMutableDictionary *map = [NSMutableDictionary dictionary];
++    for (int t = 0; t < NT; t++) {
++        NSArray<NSArray *> *libs = t % 4 == 0 ? @[@[[NSString stringWithFormat:@"hs%d", t], @"vs", @"vertex"]]
++                                              : @[@[[NSString stringWithFormat:@"hv%d", t], @"vs", @"vertex"], @[[NSString stringWithFormat:@"hf%d", t], @"fs", @"pixel"]];
++        for (NSArray *l in libs) {
++            NSDictionary *reflection = @{@"chain": @DMSH_CHAIN, @"route": @"B", @"entry": l[1], @"entry_z": l[1], @"bindings": @[], @"vertex_inputs": @[]};
++            NSData *json = [NSJSONSerialization dataWithJSONObject:reflection options:0 error:nil];
++            if (![json writeToFile:[dir stringByAppendingPathComponent:[l[0] stringByAppendingString:@".json"]] atomically:YES]) return 0;
++            if (![fm copyItemAtPath:library toPath:[dir stringByAppendingPathComponent:[l[0] stringByAppendingString:@".metallib"]] error:nil]) return 0;
++            map[l[0]] = l[2];
++        }
++    }
++    g_msl_dir = dir; g_shmap = map;
++    return 1;
++}
++
++static NSString *rrow(NSString *vkey, NSString *fkey, unsigned chmask) {
++    NvShader *vs = [NvShader new], *fs = [NvShader new];
++    strcpy(vs->key, vkey.UTF8String); strcpy(fs->key, fkey.UTF8String); fs->stage = 1;
++    pso_key key = {0}; key.cfmt[0] = MTLPixelFormatRGBA8Unorm; key.samples = 1; key.chmask = chmask;
++    pso_skey sk; char hex[sizeof sk * 2 + 1]; pso_skey_from(&key, vs, fs, 0, NULL, &sk); pso_skey_hex(&sk, hex);
++    return [NSString stringWithFormat:@"R\t%s\n", hex];
++}
++static int write_manifest(void) {
++    NSMutableString *m = [NSMutableString string];
++    for (int t = 0; t < NT; t++) {
++        if (t % 4 == 0) [m appendFormat:@"S\ths%d\t0\n", t];
++        else { NSString *v = [NSString stringWithFormat:@"hv%d", t], *f = [NSString stringWithFormat:@"hf%d", t]; [m appendString:rrow(v, f, 15)]; [m appendString:rrow(v, f, 7)]; }
++    }
++    g_manifest = [g_dir stringByAppendingPathComponent:@"pso_manifest.tsv"];
++    return [m writeToFile:g_manifest atomically:YES encoding:NSUTF8StringEncoding error:nil];
++}
++
++// the engine's prewarm state as a fresh process has it (what dm_gfx_teardown resets of it)
++static void reset_warm(void) {
++    nvn_hm_clear(&g_pso, hm_rel); g_shcache = nil; g_warm_items = [NSMutableArray array]; g_warm_dict = nil; g_warm_loads = nil;
++    g_warm_started = 0; atomic_store(&g_warm_bg, 0); atomic_store(&g_warm_stop, 0); atomic_store(&g_warm_ready, 0); atomic_store(&g_warm_running, 0); atomic_store(&g_warm_done, 0);
++    atomic_store(&g_sweep_warm, 0); atomic_store(&g_sweep_pairs, 0);
++    g_warm_shaders = g_warm_rps = g_warm_mps = g_warm_cps = g_warm_skip_fz = g_warm_skip_stale = 0; g_warm_claim_shaders = g_warm_claim_rps = g_warm_claim_cps = 0;
++}
++
++static unsigned g_cum[NT + 1];   // library loads after the first i tasks, built one after another (calibration): the loads the head of k tasks makes are g_cum[k]
++static long g_lines_upto[NT + 1]; // the lines of the first i tasks
++static void calibrate(void) {
++    reset_warm(); warm_load_begin();
++    long lines = 0; NSArray<WarmTask *> *tasks = warm_parse(@[g_manifest], &lines);
++    EXPECT("the manifest makes the tasks", NT, tasks.count);
++    EXPECT("its lines", 70, lines);
++    g_gate->entered = dispatch_semaphore_create(0); g_gate->release = dispatch_semaphore_create(0); g_gate->block_at = 0; g_gate->delay_us = 0; atomic_store(&g_gate->calls, 0);
++    for (int i = 0; i < NT && i < (int)tasks.count; i++) { g_lines_upto[i + 1] = g_lines_upto[i] + warm_task_lines(tasks[(NSUInteger)i]); warm_task(tasks[(NSUInteger)i]); g_cum[i + 1] = atomic_load(&g_gate->calls); }
++    EXPECT("one library per S task, two per R task", 70, g_cum[NT]);
++    EXPECT("the lines the tasks stand for add up to the lines of the lists", lines, g_lines_upto[NT]);
++    reset_warm();
++}
++
++typedef struct { const char *percent, *tail, *threads; unsigned block_at; useconds_t delay; } cfg;
++static void set_env(const char *k, const char *v) { if (v) setenv(k, v, 1); else unsetenv(k); }
++// warm_start under the environment c; the log it printed. The gate holds the library load number block_at (0: none)
++static NSString *run_start(cfg c) {
++    reset_warm(); (void)log_since();
++    set_env("DM_PSO_PREPARE_PERCENT", c.percent); set_env("DM_PSO_PREPARE_TAIL", c.tail); set_env("DM_PSO_PREPARE_THREADS", c.threads);
++    g_gate->entered = dispatch_semaphore_create(0); g_gate->release = dispatch_semaphore_create(0);
++    g_gate->block_at = c.block_at; g_gate->delay_us = c.delay; atomic_store(&g_gate->calls, 0); atomic_store(&g_gate->inflight, 0); atomic_store(&g_gate->max_inflight, 0);
++    warm_start();
++    set_env("DM_PSO_PREPARE_PERCENT", NULL); set_env("DM_PSO_PREPARE_TAIL", NULL); set_env("DM_PSO_PREPARE_THREADS", NULL);
++    return log_since();
++}
++
++static NSArray<WarmItem *> *items_now(void) {
++    os_unfair_lock_lock(&g_warm_lock); NSArray<WarmItem *> *a = [g_warm_items copy]; os_unfair_lock_unlock(&g_warm_lock); return a;
++}
++static int task_of(WarmItem *it) { return [[(it->kind == 0 ? it->key : it->vs_key) substringFromIndex:2] intValue]; }   // hs12 / hv5
++static NSDictionary<NSString *, NSNumber *> *tally(NSArray<WarmItem *> *items) {
++    NSMutableDictionary *d = [NSMutableDictionary dictionary];
++    for (WarmItem *it in items) { NSString *k = [NSString stringWithFormat:@"%d:%@", it->kind, it->kind == 0 ? it->key : it->vs_key]; d[k] = @([d[k] intValue] + 1); }
++    return d;
++}
++// the items are exactly those of the tasks [from, to): each S one item, each R pair two, and nothing else
++static void check_items(const char *name, NSArray<WarmItem *> *items, int from, int to) {
++    NSMutableDictionary *want = [NSMutableDictionary dictionary];
++    for (int t = from; t < to; t++) { if (t % 4 == 0) want[[NSString stringWithFormat:@"0:hs%d", t]] = @1; else want[[NSString stringWithFormat:@"1:hv%d", t]] = @2; }
++    NSDictionary *got = tally(items); checks++;
++    if (![got isEqualToDictionary:want]) { failed++; printf("FAIL %s: the items are not exactly the tasks [%d, %d): %lu items for %lu expected keys\n", name, from, to, (unsigned long)items.count, (unsigned long)want.count); }
++}
++typedef struct { long done; uint64_t shaders, rps; long items; int running, bg, dict, sweep; unsigned calls; } obs;
++static obs observe(void) {
++    obs o = {.done = atomic_load(&g_warm_done), .shaders = g_warm_shaders, .rps = g_warm_rps, .items = (long)items_now().count, .running = atomic_load(&g_warm_running), .bg = atomic_load(&g_warm_bg),
++             .dict = g_warm_dict != nil, .sweep = atomic_load(&g_sweep_warm), .calls = atomic_load(&g_gate->calls)};
++    return o;
++}
++static int wait_idle(double seconds) { uint64_t t0 = bp_now(); while (atomic_load(&g_warm_running)) { if ((bp_now() - t0) > (uint64_t)(seconds * 1e9)) return 0; usleep(2000); } return 1; }
++
++// every line built, as a start without the variable leaves it
++static void check_whole(const char *name, NSString *log) {
++    obs o = observe(); char b[160];
++    #define N(s) (snprintf(b, sizeof b, "%s: %s", name, s), b)
++    EXPECT(N("lines done"), 70, o.done); EXPECT(N("shaders enqueued"), 10, o.shaders); EXPECT(N("render pipelines built"), 60, o.rps); EXPECT(N("items"), 70, o.items);
++    EXPECT(N("prewarm no longer running"), 0, o.running); EXPECT(N("not marked as running beside the game"), 0, o.bg); EXPECT(N("shader dictionary released"), 0, o.dict);
++    EXPECT(N("archive sweep allowed"), 1, o.sweep); EXPECT(N("libraries loaded"), g_cum[NT], o.calls);
++    check_items(N("items are the whole list"), items_now(), 0, NT);
++    EXPECT_NOLOG(N("no head line"), log, "head done");
++    EXPECT_NOLOG(N("no plan line"), log, "(the first ");
++    EXPECT_NOLOG(N("no tail line"), log, "prewarm tail");
++    EXPECT_LOG(N("the prewarm's own end line"), log, "pipeline prewarm done: shaders 10 / render pipelines 60");
++    EXPECT_LOG(N("the prepare line, every line, before the first frame"), log, "pipeline prepare: 70 lines (10 shaders, 60 render pipelines, 0 compute pipelines) in ");
++    usleep(200000);   // nothing runs on after warm_start
++    obs o2 = observe();
++    EXPECT(N("nothing built after warm_start returned"), o.calls, o2.calls); EXPECT(N("no item added after it"), o.items, o2.items);
++    warm_claim(); EXPECT(N("every pipeline claimed into the cache"), 60, g_warm_claim_rps); EXPECT(N("cache keys"), 60, g_pso.n);
++    #undef N
++}
++
++int main(void) { @autoreleasepool {
++    alarm(240);   // a hang fails the run rather than the suite
++    setvbuf(stdout, NULL, _IOLBF, 0);
++    setenv("DM_PSO_ARCHIVE", "off", 1); setenv("DM_NVN_PREDICT", "0", 1); setenv("DM_PSO_PREPARE", "1", 1);
++    unsetenv("DM_NVN_HILITE"); unsetenv("DM_NVN_MAGSCAN"); unsetenv("DM_PSO_RECORD"); unsetenv("DM_PSO_USER"); unsetenv("DM_SAVE"); unsetenv("DM_PSO_PREBUILD"); unsetenv("DM_PSO_HYBRID");
++    char tmpl[1024]; snprintf(tmpl, sizeof tmpl, "%s/t_pso_head.XXXXXX", NSTemporaryDirectory().fileSystemRepresentation);
++    if (!mkdtemp(tmpl)) { perror("mkdtemp"); return 1; }
++    g_dir = @(tmpl);
++    g_logfd = open([g_dir stringByAppendingPathComponent:@"engine.log"].fileSystemRepresentation, O_RDWR | O_CREAT | O_TRUNC, 0600);
++    if (g_logfd < 0 || dup2(g_logfd, 2) < 0) { perror("log"); return 1; }
++    setenv("DM_PSO_MANIFEST", [g_dir stringByAppendingPathComponent:@"pso_manifest.tsv"].UTF8String, 1);
++    mtl_init();
++    if (!build_fixtures(g_dir) || !write_manifest()) { printf("failed to make the synthetic shader libraries and manifest\n"); [NSFileManager.defaultManager removeItemAtPath:g_dir error:nil]; return 1; }
++    pso4_init();   // the real compiler first (as warm_start does), then the counting device in front of it
++    const char *mode = g_comp4 ? "Metal 4" : "MTLDevice";
++    g_gate = [HeadGateDevice new]; g_gate->device = g_dev; g_dev = (id<MTLDevice>)g_gate;
++    calibrate();
++    const int K = 20; const long HEAD_LINES = g_lines_upto[K];   // 50 percent of 40 tasks: tasks 0..19, 5 S and 15 R: 35 lines; the tail 35 lines too
++    EXPECT("the head of 50 percent holds 35 lines", 35, HEAD_LINES);
++    EXPECT("the task after the head loads a library of its own (the gate will hold it)", 1, g_cum[K + 1] > g_cum[K]);
++    char b[200];
++
++    // ---- 1. no variable, 100, a value that is no whole number from 1 to 100, and 99 percent of 40 tasks (ceil(39.6) = 40: no tail): all the same, the step as it was
++    {
++        struct { const char *name; const char *p; int warned; } w[] = {{"unset", NULL, 0}, {"empty", "", 0}, {"100", "100", 0}, {"abc", "abc", 1}, {"0", "0", 1}, {"101", "101", 1}, {"-5", "-5", 1}, {"50.5", "50.5", 1}, {"99 (head = all 40 tasks)", "99", 0}};
++        for (unsigned i = 0; i < sizeof w / sizeof *w; i++) {
++            NSString *log = run_start((cfg){.percent = w[i].p});
++            snprintf(b, sizeof b, "PERCENT %s", w[i].name); check_whole(b, log);
++            if (w[i].warned) EXPECT_LOG(b, log, "is not a whole number from 1 to 100: ignored, every line of the prewarm lists is built before the first frame");
++            else EXPECT_NOLOG(b, log, "not a whole number");
++            if (i == 0) show_log("no variable", log);
++            if (i == 3) show_log("DM_PSO_PREPARE_PERCENT=abc", log);
++        }
++        // the tail switch alone changes nothing without a split
++        NSString *log = run_start((cfg){.tail = "0"}); check_whole("TAIL=0 without a percentage", log);
++    }
++
++    // ---- 2. 50 percent, tail on: the head is built when warm_start returns, the tail is held at its first library
++    {
++        NSString *log = run_start((cfg){.percent = "50", .block_at = g_cum[K] + 1});
++        show_log("DM_PSO_PREPARE_PERCENT=50, tail held at its first library load", log);
++        EXPECT("the tail's worker reached its first library", 0, dispatch_semaphore_wait(g_gate->entered, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)));
++        obs o = observe();
++        EXPECT("head: lines done = the head's lines", HEAD_LINES, o.done); EXPECT("head: shaders", 5, o.shaders); EXPECT("head: render pipelines", 30, o.rps); EXPECT("head: items", 35, o.items);
++        EXPECT("head: the head's libraries plus the tail's held one", g_cum[K] + 1, o.calls);
++        EXPECT("head: the prewarm runs on (the tail)", 1, o.running); EXPECT("head: marked as running beside the game", 1, o.bg); EXPECT("head: the shader dictionary is kept for the tail", 1, o.dict);
++        EXPECT("head: no archive sweep yet", 0, o.sweep);
++        check_items("head items are the first 20 tasks", items_now(), 0, K);
++        EXPECT("the tail runs at utility QoS", QOS_CLASS_UTILITY, atomic_load(&g_gate->qos_block));
++        EXPECT("the head's workers ran at user-initiated QoS", QOS_CLASS_USER_INITIATED, atomic_load(&g_gate->qos_first));
++        EXPECT_LOG("plan line", log, "DM_PSO_PREPARE_PERCENT=50: head 35 lines (the first 20 of 40 tasks) before the first frame, tail 35 lines (20 tasks) afterwards in the background");
++        EXPECT_LOG("head time line", log, "pipeline prepare: head 35 of 35 lines done in ");
++        EXPECT_LOG("the prepare line counts the head", log, "pipeline prepare: 35 lines (5 shaders, 30 render pipelines, 0 compute pipelines) in ");
++        EXPECT_LOG("head end line", log, "pipeline prewarm head done: shaders 5 / render pipelines 30");
++        EXPECT_LOG("tail started line", log, "pipeline prewarm tail: started in the background, 20 tasks (35 lines), one worker at utility QoS");
++        EXPECT_NOLOG("no whole-list end line yet", log, "pipeline prewarm done:");
++        EXPECT_NOLOG("no tail end line yet", log, "prewarm tail: finished");
++        atomic_store(&g_gate->max_inflight, 0);
++        dispatch_semaphore_signal(g_gate->release);
++        EXPECT("the tail finishes", 1, wait_idle(60));
++        NSString *log2 = log_since(); show_log("  ... released", log2);
++        o = observe();
++        EXPECT("tail: lines done = the whole list", 70, o.done); EXPECT("tail: shaders", 10, o.shaders); EXPECT("tail: render pipelines", 60, o.rps); EXPECT("tail: items", 70, o.items);
++        EXPECT("tail: not running", 0, o.running); EXPECT("tail: dictionary released at its end", 0, o.dict); EXPECT("tail: archive sweep allowed only now", 1, o.sweep);
++        EXPECT("tail: every library loaded once", g_cum[NT] + 0, o.calls);
++        EXPECT("tail: one worker, never two loads at once", 1, atomic_load(&g_gate->max_inflight));
++        NSArray<WarmItem *> *all = items_now();
++        check_items("tail: every task exactly once", all, 0, NT);
++        check_items("tail items are the last 20 tasks", [all subarrayWithRange:NSMakeRange(35, all.count - 35)], K, NT);
++        int ascending = 1, last = -1; for (NSUInteger i = 35; i < all.count; i++) { int t = task_of(all[i]); if (t < last) ascending = 0; last = t; }
++        EXPECT("tail items come in the manifest's order", 1, ascending);
++        EXPECT_LOG("tail finished line", log2, "pipeline prewarm tail: finished, 20 tasks (35 lines) in ");
++        EXPECT_LOG("whole-list end line at the tail's end", log2, "pipeline prewarm done: shaders 10 / render pipelines 60");
++        warm_claim(); EXPECT("all pipelines claimed", 60, g_warm_claim_rps); EXPECT("cache keys", 60, g_pso.n);
++    }
++
++    // ---- 3. 50 percent, tail skipped: only the head, nothing runs afterwards, no sweep
++    {
++        NSString *log = run_start((cfg){.percent = "50", .tail = "0"});
++        show_log("DM_PSO_PREPARE_PERCENT=50 DM_PSO_PREPARE_TAIL=0", log);
++        usleep(300000);
++        obs o = observe();
++        EXPECT("skip: lines done", HEAD_LINES, o.done); EXPECT("skip: shaders", 5, o.shaders); EXPECT("skip: render pipelines", 30, o.rps); EXPECT("skip: items", 35, o.items);
++        EXPECT("skip: libraries loaded (the head's, nothing after)", g_cum[K], o.calls);
++        EXPECT("skip: not running", 0, o.running); EXPECT("skip: never marked as running beside the game", 0, o.bg); EXPECT("skip: dictionary released", 0, o.dict);
++        EXPECT("skip: no archive sweep (the tail's files would go)", 0, o.sweep);
++        check_items("skip: items are the first 20 tasks", items_now(), 0, K);
++        EXPECT_LOG("skip: plan line says skipped", log, "tail 35 lines (20 tasks) SKIPPED (DM_PSO_PREPARE_TAIL=0): not built, a draw that needs one builds it on demand");
++        EXPECT_LOG("skip: head time line", log, "pipeline prepare: head 35 of 35 lines done in ");
++        EXPECT_LOG("skip: tail skipped", log, "tail 35 lines: skipped");
++        EXPECT_LOG("skip: head end line", log, "pipeline prewarm head done: shaders 5 / render pipelines 30");
++        EXPECT_NOLOG("skip: no tail started", log, "prewarm tail");
++        EXPECT_NOLOG("skip: no whole-list end line", log, "pipeline prewarm done:");
++        warm_claim(); EXPECT("skip: the head's pipelines claimed", 30, g_warm_claim_rps); EXPECT("skip: cache keys", 30, g_pso.n);
++    }
++
++    // ---- 4. other percentages, run to the end: 1 (a head of one task), 30, 97 (a tail of one task), 51; each task exactly once
++    {
++        struct { const char *p; int head; } w[] = {{"1", 1}, {"30", 12}, {"51", 21}, {"97", 39}};
++        for (unsigned i = 0; i < sizeof w / sizeof *w; i++) {
++            NSString *log = run_start((cfg){.percent = w[i].p});
++            EXPECT("percent: the tail finishes", 1, wait_idle(60));
++            NSString *log2 = log_since(); snprintf(b, sizeof b, "PERCENT=%s", w[i].p);
++            show_log(b, [log stringByAppendingString:log2]);
++            obs o = observe();
++            EXPECT(b, 70, o.done); EXPECT(b, 60, o.rps); EXPECT(b, 70, o.items); EXPECT(b, 0, o.dict); EXPECT(b, 1, o.sweep); EXPECT(b, g_cum[NT], o.calls);
++            check_items(b, items_now(), 0, NT);
++            snprintf(b, sizeof b, "head %ld lines (the first %d of 40 tasks)", g_lines_upto[w[i].head], w[i].head);
++            checks++; if ([[log stringByAppendingString:log2] rangeOfString:[NSString stringWithUTF8String:b]].location == NSNotFound) { failed++; printf("FAIL percent %s: no \"%s\" in the log\n", w[i].p, b); }
++            warm_claim(); EXPECT("percent: cache keys", 60, g_pso.n);
++        }
++    }
++
++    // ---- 5. the progress screen counts the head (one worker and slow loads: the step lasts past 0.5 s with more than 0.3 s to go)
++    {
++        NSString *log = run_start((cfg){.percent = "50", .threads = "1", .delay = 40000});
++        show_log("DM_PSO_PREPARE_PERCENT=50, one worker, 40 ms a library", log);
++        checks++; if ([log rangeOfString:@" of 35 lines done after "].location == NSNotFound || [log rangeOfString:@"the progress screen shows"].location == NSNotFound) { failed++; printf("FAIL the progress screen did not show against 35 lines\n--- log\n%s\n", log.UTF8String); }
++        EXPECT_NOLOG("the screen is never counted against the whole list", log, " of 70 lines done after ");
++        EXPECT_LOG("the screen was shown", log, "progress screen shown");
++        EXPECT("slow: the tail finishes", 1, wait_idle(60)); (void)log_since();
++        check_items("slow: every task once", items_now(), 0, NT);
++    }
++
++    // ---- 5b. the game's own thread beside the tail: it claims what the tail has built at every "submission" (warm_claim, as the submit thread does) and loads one shader of the tail
++    //          on demand (shader_get, as a draw that comes before the tail's worker does): nothing is lost or claimed twice, and the pipelines end up in the cache once each
++    {
++        NSString *log = run_start((cfg){.percent = "50", .delay = 8000}); (void)log;
++        int demanded = 0; unsigned claims = 0;
++        while (atomic_load(&g_warm_running)) {
++            warm_claim(); claims++;
++            if (!demanded && g_warm_rps > 40) { demanded = 1; EXPECT("on demand: a shader of the tail loads", 1, shader_get(@"hv37", 0) != nil); }
++            usleep(300);
++        }
++        warm_claim();
++        EXPECT("beside the game: the tail was still running while the game's thread claimed", 1, claims > 3);
++        EXPECT("beside the game: every pipeline claimed once", 60, g_warm_claim_rps);
++        EXPECT("beside the game: every shader of the S tasks claimed once", 10, g_warm_claim_shaders);
++        EXPECT("beside the game: the cache holds one pipeline per row", 60, g_pso.n);
++        EXPECT("beside the game: the on-demand shader is the one the cache keeps", 1, g_shcache[@"hv37"] != nil);
++        EXPECT("beside the game: the whole list was walked", 70, atomic_load(&g_warm_done)); EXPECT("beside the game: the sweep was allowed at the tail's end", 1, atomic_load(&g_sweep_warm));
++        (void)log_since();
++    }
++
++    // ---- 6. the process is ending (mtl_warm_stop's flag) while the tail runs: it ends between two tasks, warm_finish does not run, the dictionary goes
++    {
++        NSString *log = run_start((cfg){.percent = "50", .block_at = g_cum[K] + 1});
++        EXPECT("stop: the tail's worker reached its first library", 0, dispatch_semaphore_wait(g_gate->entered, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)));
++        atomic_store(&g_warm_stop, 1);
++        dispatch_semaphore_signal(g_gate->release);
++        EXPECT("stop: the background group (what teardown waits for) is idle", 0, dispatch_group_wait(bg_group(), dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)));
++        EXPECT("stop: the prewarm is no longer running", 1, wait_idle(10));
++        NSString *log2 = log_since(); show_log("g_warm_stop while the tail runs", [log stringByAppendingString:log2]);
++        obs o = observe();
++        EXPECT("stop: the task under way finished, no more started", HEAD_LINES + 1, o.done); EXPECT("stop: items", 36, o.items); EXPECT("stop: dictionary released", 0, o.dict);
++        EXPECT("stop: no archive sweep, the lists were not all asked for", 0, o.sweep);
++        check_items("stop: the head and the one tail task under way", items_now(), 0, K + 1);
++        EXPECT_LOG("stop: the tail says it stopped", log2, "pipeline prewarm tail: stopped after 1 of 20 tasks");
++        EXPECT_NOLOG("stop: no whole-list end line", log2, "pipeline prewarm done:");
++        atomic_store(&g_warm_stop, 0);
++    }
++
++    // ---- 7. a start that compacts the pipeline archive builds every line before the first frame whatever the percentage
++    {
++        g_compact_enabled = 1;
++        NSString *log = run_start((cfg){.percent = "50"});
++        g_compact_enabled = 0;
++        check_whole("compaction", log);
++        EXPECT_LOG("compaction: the log says why", log, "this start compacts the pipeline archive, and a compaction has to see the whole prewarm");
++        show_log("DM_PSO_PREPARE_PERCENT=50 with a compacting start", log);
++    }
++
++    // ---- 8. the graphics are torn down while the tail runs (dm_gfx_teardown: g_gfx_teardown, then a wait for the background group): no deadlock, the tail ends after its task, the dictionary
++    //         is released by the tail and then by teardown, with no use after release (the tail is the only thread that could still touch it)
++    {
++        NSString *log = run_start((cfg){.percent = "50", .block_at = g_cum[K] + 1});
++        EXPECT("teardown: the tail's worker reached its first library", 0, dispatch_semaphore_wait(g_gate->entered, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)));
++        dispatch_semaphore_t rel = g_gate->release; g_dev = g_gate->device;   // the held load goes on with the real device; the tail's next loads are not gated
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ dispatch_semaphore_signal(rel); });
++        uint64_t t0 = bp_now();
++        dm_gfx_teardown();   // waits for the tail's task under way, which waits for the semaphore above
++        double waited = (bp_now() - t0) / 1e9;
++        NSString *log2 = log_since(); show_log("dm_gfx_teardown while the tail runs", [log stringByAppendingString:log2]);
++        EXPECT("teardown: it did wait for the tail's task (and for nothing longer)", 1, waited >= 0.15 && waited < 30);
++        EXPECT("teardown: the prewarm is no longer running", 0, atomic_load(&g_warm_running));
++        EXPECT("teardown: the dictionary is released", 0, g_warm_dict != nil);
++        EXPECT_LOG("teardown: the tail says it stopped", log2, "pipeline prewarm tail: stopped after 1 of 20 tasks");
++    }
++
++    [NSFileManager.defaultManager removeItemAtPath:g_dir error:nil];
++    printf("t_pso_head: %d checks, %d failed; %s\n", checks, failed, mode);
++    return failed != 0;
++} }
+--- /dev/null
++++ b/dm/gfx/tests/t_warm_head.c
+@@ -0,0 +1,159 @@
++// Pure-C CPU-only tests for the prepare step's head/tail split (nvn_warm_head.h, DM_PSO_PREPARE_PERCENT): how many tasks the head holds, what the variable's text means, and that the
++// workers' claiming of task indexes partitions the list (the head is the first k tasks in order, the tail the rest, nothing lost, nothing twice). No Metal, no game, no GPU.
++#include "../nvn/nvn_warm_head.h"
++#include <limits.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++static int checks, failed;
++#define CHECK(c, label) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
++
++// the definition written in the plainest way: ceil(n * p / 100) in 128 bits, no overflow possible
++static long ref_head(long n, int p) {
++    if (n <= 0) return 0;
++    if (p < 1) p = 1;
++    if (p > 100) p = 100;
++    __int128 v = ((__int128)n * p + 99) / 100;
++    return (long)v;
++}
++
++static void head_count(void) {
++    // the default: 100 is every task, for any n, so a start without the variable (or with 100) builds exactly what it always did
++    long ns[] = {0, 1, 2, 3, 7, 99, 100, 101, 199, 200, 201, 1000, 6472, 14753, 25000, 1000000, LONG_MAX / 2, LONG_MAX - 1, LONG_MAX};
++    for (unsigned i = 0; i < sizeof ns / sizeof *ns; i++) {
++        CHECK(warm_head_count(ns[i], 100) == ns[i], "percent 100 is every task");
++        CHECK(warm_head_count(ns[i], 150) == ns[i], "percent over 100 is every task");
++        CHECK(warm_head_count(ns[i], INT_MAX) == ns[i], "INT_MAX percent is every task");
++        for (int p = 1; p <= 100; p++) CHECK(warm_head_count(ns[i], p) == ref_head(ns[i], p), "head equals ceil(n * p / 100) (128-bit reference)");
++    }
++    // n = 0: nothing, whatever the percentage
++    for (int p = -3; p <= 103; p++) CHECK(warm_head_count(0, p) == 0, "no tasks: no head");
++    CHECK(warm_head_count(-1, 50) == 0 && warm_head_count(LONG_MIN, 50) == 0, "a negative count is no tasks");
++    // exhaustive for small n: the ceiling, a head of at least one task and at most n, growing with p
++    for (long n = 1; n <= 1500; n++) {
++        long prev = 0;
++        for (int p = 1; p <= 100; p++) {
++            long h = warm_head_count(n, p);
++            CHECK(h == ref_head(n, p), "small n: ceil(n * p / 100)");
++            CHECK(h >= 1 && h <= n, "a head holds at least one task and never more than n");
++            CHECK(h >= prev, "the head never shrinks as the percentage grows");
++            prev = h;
++        }
++        CHECK(warm_head_count(n, 100) == n, "100: all");
++    }
++    // the cases of the Ocarina of Time list (14,753 lines; the tasks are fewer, and a pair's lines share one)
++    CHECK(warm_head_count(14753, 50) == 7377, "14,753 tasks at 50 percent: 7,377 (ceil of 7,376.5)");
++    CHECK(warm_head_count(10001, 50) == 5001, "odd count at 50 percent rounds up");
++    CHECK(warm_head_count(10000, 50) == 5000, "even count at 50 percent is exactly half");
++    CHECK(warm_head_count(1, 1) == 1 && warm_head_count(1, 99) == 1, "one task is always the head");
++    CHECK(warm_head_count(2, 50) == 1 && warm_head_count(3, 50) == 2, "small halves");
++    CHECK(warm_head_count(100, 1) == 1 && warm_head_count(101, 1) == 2 && warm_head_count(150, 1) == 2, "one percent rounds up");
++    // percentages below 1 count as 1 (the env parser never hands one over)
++    CHECK(warm_head_count(1000, 0) == 10 && warm_head_count(1000, -50) == 10 && warm_head_count(1000, INT_MIN) == 10, "a percentage under 1 is 1");
++    // huge n: no overflow (the product n * p alone would overflow a long from 93 quadrillion on)
++    CHECK(warm_head_count(LONG_MAX, 99) == ref_head(LONG_MAX, 99) && warm_head_count(LONG_MAX, 99) < LONG_MAX, "LONG_MAX tasks at 99 percent");
++    CHECK(warm_head_count(LONG_MAX, 50) == ref_head(LONG_MAX, 50), "LONG_MAX tasks at 50 percent");
++    CHECK(warm_head_count(LONG_MAX, 1) == ref_head(LONG_MAX, 1), "LONG_MAX tasks at 1 percent");
++    CHECK(warm_head_count(LONG_MAX - 99, 99) == ref_head(LONG_MAX - 99, 99), "near LONG_MAX, a whole number of hundreds");
++}
++
++static void percent_parse(void) {
++    CHECK(warm_percent_parse(NULL) == 0, "unset: 0, the caller builds everything");
++    CHECK(warm_percent_parse("") == 0, "empty");
++    CHECK(warm_percent_parse("   ") == 0, "blanks only");
++    CHECK(warm_percent_parse("1") == 1 && warm_percent_parse("50") == 50 && warm_percent_parse("99") == 99 && warm_percent_parse("100") == 100, "the range 1..100");
++    for (int p = 1; p <= 100; p++) { char b[8]; snprintf(b, sizeof b, "%d", p); CHECK(warm_percent_parse(b) == p, "every value 1..100 parses to itself"); }
++    CHECK(warm_percent_parse("0") == 0 && warm_percent_parse("-1") == 0 && warm_percent_parse("101") == 0 && warm_percent_parse("1000") == 0, "out of range");
++    CHECK(warm_percent_parse("-50") == 0, "negative");
++    CHECK(warm_percent_parse("abc") == 0 && warm_percent_parse("50abc") == 0 && warm_percent_parse("5 0") == 0 && warm_percent_parse("50%") == 0, "not a whole number");
++    CHECK(warm_percent_parse("50.5") == 0 && warm_percent_parse("5e1") == 0 && warm_percent_parse("0x32") == 0, "not a plain decimal");
++    CHECK(warm_percent_parse(" 50") == 50 && warm_percent_parse("50 ") == 50 && warm_percent_parse("\t50\t") == 50, "blanks around it");
++    CHECK(warm_percent_parse("50\n") == 50 && warm_percent_parse("50\r\n") == 50, "a line end (a line of env.txt)");
++    CHECK(warm_percent_parse("+50") == 50, "a plus sign (strtol's)");
++    CHECK(warm_percent_parse("99999999999999999999999999") == 0, "far out of range (strtol saturates)");
++    CHECK(warm_percent_parse("-99999999999999999999999999") == 0, "far out of range, negative");
++    CHECK(warm_percent_parse("050") == 50, "leading zeros are decimal");
++}
++
++// ---- claiming: the head's workers share one counter [0, k), the tail's worker has its own [k, n) ----
++enum { MAXN = 200000 };
++static _Atomic unsigned char g_seen[MAXN];     // how many times each index came out
++static _Atomic int g_who[MAXN];                // 1: a head worker took it, 2: the tail worker did
++typedef struct { _Atomic long *next; long end; int role; long taken; long last; int ascending; } worker;
++static void *run(void *arg) {
++    worker *w = arg; w->last = -1; w->ascending = 1;
++    for (;;) {
++        long i = warm_claim_index(w->next, w->end);
++        if (i < 0) break;
++        atomic_fetch_add(&g_seen[i], 1); atomic_store(&g_who[i], w->role);
++        if (i <= w->last) w->ascending = 0;
++        w->last = i; w->taken++;
++    }
++    return NULL;
++}
++static void partition(long n, int percent, int head_workers, int tail_concurrent) {
++    long k = warm_head_count(n, percent);
++    memset((void *)g_seen, 0, sizeof g_seen); memset((void *)g_who, 0, sizeof g_who);
++    _Atomic long head_next = 0, tail_next = k;
++    pthread_t th[16]; worker hw[16]; worker tw = {.next = &tail_next, .end = n, .role = 2};
++    for (int i = 0; i < head_workers; i++) hw[i] = (worker){.next = &head_next, .end = k, .role = 1};
++    if (tail_concurrent) {   // the tail running beside the head: the two ranges must not meet
++        pthread_t tt; pthread_create(&tt, NULL, run, &tw);
++        for (int i = 0; i < head_workers; i++) pthread_create(&th[i], NULL, run, &hw[i]);
++        for (int i = 0; i < head_workers; i++) pthread_join(th[i], NULL);
++        pthread_join(tt, NULL);
++    } else {   // as in the app: the head's workers join, then the tail's one starts
++        for (int i = 0; i < head_workers; i++) pthread_create(&th[i], NULL, run, &hw[i]);
++        for (int i = 0; i < head_workers; i++) pthread_join(th[i], NULL);
++        pthread_t tt; pthread_create(&tt, NULL, run, &tw); pthread_join(tt, NULL);
++    }
++    long head_taken = 0, lost = 0, twice = 0, wrong_side = 0;
++    for (long i = 0; i < n; i++) {
++        unsigned c = atomic_load(&g_seen[i]);
++        if (c == 0) lost++; else if (c > 1) twice++;
++        int who = atomic_load(&g_who[i]);
++        if (who == 1) head_taken++;
++        if ((i < k && who != 1) || (i >= k && who != 2)) wrong_side++;
++    }
++    for (long i = n; i < MAXN && i < n + 64; i++) if (atomic_load(&g_seen[i])) twice++;   // nothing past the end
++    long tail_taken = tw.taken, hsum = 0; int head_asc = 1;
++    for (int i = 0; i < head_workers; i++) { hsum += hw[i].taken; head_asc &= hw[i].ascending; }
++    CHECK(lost == 0, "no task lost");
++    CHECK(twice == 0, "no task built twice, none claimed past the end");
++    CHECK(wrong_side == 0, "tasks below the head's size are the head's, the rest the tail's");
++    CHECK(head_taken == k && hsum == k, "the head built exactly its first k tasks");
++    CHECK(tail_taken == n - k, "the tail built exactly the rest");
++    CHECK(head_asc && tw.ascending, "each worker takes its tasks in ascending (file) order");
++    CHECK(k + (n - k) == n, "head + tail = n");
++}
++
++static void claiming(void) {
++    // a single counter: every index once, in order, then -1 for ever, and the counter itself only grows
++    _Atomic long c = 0; long got[8]; int g = 0;
++    for (int i = 0; i < 8; i++) { long v = warm_claim_index(&c, 5); got[g++] = v; }
++    CHECK(got[0] == 0 && got[1] == 1 && got[2] == 2 && got[3] == 3 && got[4] == 4, "indexes 0..4 in order");
++    CHECK(got[5] == -1 && got[6] == -1 && got[7] == -1, "then -1 for ever");
++    c = 0; CHECK(warm_claim_index(&c, 0) == -1, "an empty range gives nothing");
++    c = 7; CHECK(warm_claim_index(&c, 7) == -1 && warm_claim_index(&c, 7) == -1 && atomic_load(&c) == 9, "a counter at its end gives nothing (and only grows)");
++    c = 3; CHECK(warm_claim_index(&c, 10) == 3, "a tail counter starts where the head ends");
++    long ns[] = {0, 1, 2, 3, 99, 100, 101, 1000, 14753, 20000};
++    int ps[] = {1, 2, 25, 33, 50, 51, 99, 100};
++    for (unsigned a = 0; a < sizeof ns / sizeof *ns; a++) for (unsigned b = 0; b < sizeof ps / sizeof *ps; b++) {
++        partition(ns[a], ps[b], 1, 0); partition(ns[a], ps[b], 8, 0); partition(ns[a], ps[b], 8, 1);
++    }
++    partition(150000, 50, 8, 0); partition(150000, 50, 16, 1);
++    partition(MAXN - 100, 37, 12, 1);
++    // percent 100 leaves no tail: every worker is a head worker and the tail's range [n, n) is empty
++    partition(5000, 100, 8, 0);
++    CHECK(warm_head_count(5000, 100) == 5000, "100: the head is the list");
++}
++
++int main(void) {
++    head_count();
++    percent_parse();
++    claiming();
++    printf("t_warm_head: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++}

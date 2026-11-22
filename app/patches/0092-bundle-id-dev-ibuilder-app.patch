@@ -1,0 +1,81 @@
+# 0092-bundle-id-dev-ibuilder-app.patch -- the app's bundle identifier is dev.ibuilder.app (was dev.nxpocket.gameapp). Applies after 0091.
+# UNTESTED ON DEVICE: nothing ran on an iPhone; the C# was compiled only (see the owner's report).
+#
+# What: every place the snapshot and the earlier patches name the OLD id as a LIVE value now names the new one:
+#   * GameAppBackground.cs BackgroundPrefix fallback (the background task id is <runtime bundle id> + ".build.<n>"),
+#   * GameAppExport.cs: the two fallbacks of the base id an exported game derives its own id from (<app id>.g<title id>) and the comments describing it,
+#   * GameAppUi.cs: the same fallback in the player's id derivation,
+#   * Info.plist.fragment: BGTaskSchedulerPermittedIdentifiers (dev.ibuilder.app.build.*, dev.ibuilder.app.*, and dev.ibuilder.app.@TEAM_SUFFIX@.build.* that scripts/build-app.sh
+#     still fills in from IBUILDER_TEAM_SUFFIX or removes).
+# Why: the owner wants the app to ship under its own name. It installs as a NEW app: the old app (dev.nxpocket.gameapp) keeps its data and is not touched.
+# Left as they are on purpose: the Keychain service "dev.nxpocket.nas" and the UTType ids "dev.nxpocket.ibuilder.*" (not the bundle id; renaming the types would change what Files
+#   offers to open and gains nothing), and the C symbols nxpocket_* of the signing shim.
+diff -ruN l/GameAppBackground.cs m/GameAppBackground.cs
+--- l/GameAppBackground.cs
++++ m/GameAppBackground.cs
+@@ -48,7 +48,7 @@
+     /// Whether a continued-processing task is asked for or running (a build's or a warm-up's). GameAppWarm.cs asks again for the warm-up's when none is.
+     private static bool BackgroundInFlight { get { lock (backgroundLock) return backgroundId != null; } }
+ 
+-    private static string BackgroundPrefix => (NSBundle.MainBundle.BundleIdentifier ?? "dev.nxpocket.gameapp") + ".build.";
++    private static string BackgroundPrefix => (NSBundle.MainBundle.BundleIdentifier ?? "dev.ibuilder.app") + ".build.";
+ 
+     /// Ask the system to keep this build running in the background. Called from BeginRun for a build (not a boot).
+     private void BackgroundBegin(string game, bool warm = false)
+diff -ruN l/GameAppExport.cs m/GameAppExport.cs
+--- l/GameAppExport.cs
++++ m/GameAppExport.cs
+@@ -331,10 +331,10 @@
+     /// The framework's Info.plist, complete: in Documents it only needed what zsign reads, inside an app bundle the
+     /// installer also wants an identifier of its own, a version and the platform (the simulator's installd refused it
+     /// without CFBundleIdentifier when the framework had none).
+-    /// The bundle identifier the app was built with. An installer rewrites CFBundleIdentifier (a team suffix: dev.nxpocket.gameapp.<TEAM>) and keeps the original in ALTBundleIdentifier; an export
++    /// The bundle identifier the app was built with. An installer rewrites CFBundleIdentifier (a team suffix: dev.ibuilder.app.<TEAM>) and keeps the original in ALTBundleIdentifier; an export
+     /// must start from the original, or its identifier carries the suffix twice and, with ALTBundleIdentifier left in, the installer takes the export for GameApp itself.
+     private static string OriginalBundleId(NSDictionary plist) =>
+-        (plist?["ALTBundleIdentifier"] as NSString)?.ToString() ?? (plist?["CFBundleIdentifier"] as NSString)?.ToString() ?? "dev.nxpocket.gameapp";
++        (plist?["ALTBundleIdentifier"] as NSString)?.ToString() ?? (plist?["CFBundleIdentifier"] as NSString)?.ToString() ?? "dev.ibuilder.app";
+ 
+     private static byte[] FrameworkPlist(string original, string appPlist, string titleId)
+     {
+@@ -363,7 +363,7 @@
+         var baseId = OriginalBundleId(dict);
+         dict["CFBundleIdentifier"] = new NSString(GameAppUi.ExportBundleId(baseId, titleId));
+         // The background task (the shader warm-up keeps going when the app is left) is "<runtime bundle id>.build.<n>" and Info.plist must permit THAT id: the player's own, and the one an installer
+-        // gives it (a team suffix: dev.nxpocket.gameapp.<TEAM> -> the suffix is kept after the player's id). The wildcard of the base app does not match (device test, 2026-11-19).
++        // gives it (a team suffix: dev.ibuilder.app.<TEAM> -> the suffix is kept after the player's id). The wildcard of the base app does not match (device test, 2026-11-19).
+         {
+             var exportId = GameAppUi.ExportBundleId(baseId, titleId);
+             var runtimeId = NSBundle.MainBundle.BundleIdentifier ?? baseId;
+diff -ruN l/GameAppUi.cs m/GameAppUi.cs
+--- l/GameAppUi.cs
++++ m/GameAppUi.cs
+@@ -677,7 +677,7 @@
+     /// The export's bundle identifier: GameApp's own, plus the title id in lower case, so it installs beside GameApp
+     /// and beside the other exported games. An installer may still rewrite it (SideStore appends its team).
+     public static string ExportBundleId(string baseId, string titleId) =>
+-        (string.IsNullOrEmpty(baseId) ? "dev.nxpocket.gameapp" : baseId) + ".g" + (titleId ?? "").ToLowerInvariant();
++        (string.IsNullOrEmpty(baseId) ? "dev.ibuilder.app" : baseId) + ".g" + (titleId ?? "").ToLowerInvariant();
+ 
+     public static string ExportManifestText(string titleId, string dump, string name, string appBuild, string exported) =>
+         Inv($"title_id\t{titleId}\ndump\t{dump}\nname\t{name}\napp_build\t{appBuild}\nexported\t{exported}\n");
+diff -ruN l/Info.plist.fragment m/Info.plist.fragment
+--- l/Info.plist.fragment
++++ m/Info.plist.fragment
+@@ -16,12 +16,12 @@
+ 	     entitlement is needed (the GPU variant would need one a sideloading profile cannot carry). -->
+ 	<key>BGTaskSchedulerPermittedIdentifiers</key>
+ 	<array>
+-		<string>dev.nxpocket.gameapp.build.*</string>
+-		<!-- the id a sideloading service or a cable install gives the app (dev.nxpocket.gameapp.<TEAM> / .usb): the task id is that id plus ".build.<n>" (GameAppBackground.cs BackgroundPrefix) -->
+-		<string>dev.nxpocket.gameapp.*</string>
++		<string>dev.ibuilder.app.build.*</string>
++		<!-- the id a sideloading service or a cable install gives the app (dev.ibuilder.app.<TEAM> / .usb): the task id is that id plus ".build.<n>" (GameAppBackground.cs BackgroundPrefix) -->
++		<string>dev.ibuilder.app.*</string>
+ 		<!-- An installer gives the app a bundle id with the team suffix, and the system matches the task id (<runtime bundle id>.build.<n>) against THIS list only by the exact id (device test, 2026-11-19:
+ 		     the base id's wildcard was refused, the exact one accepted). scripts/build-app.sh fills in the team suffix from IBUILDER_TEAM_SUFFIX and leaves the entry out when it is not set; a cable install adds its own. -->
+-		<string>dev.nxpocket.gameapp.@TEAM_SUFFIX@.build.*</string>
++		<string>dev.ibuilder.app.@TEAM_SUFFIX@.build.*</string>
+ 	</array>
+ 	<!-- ProMotion: a display link may run above 60 Hz (the engine's 120 fps path; load/front_pad.m front_screen_max_fps) -->
+ 	<key>CADisableMinimumFrameDurationOnPhone</key>

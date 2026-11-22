@@ -1,0 +1,17 @@
+# cargo-nextest configuration (CI job `test` of .github/workflows/ci.yml runs `cargo nextest run --profile ci`).
+# Locally `cargo nextest run --release --workspace` uses the default profile; scripts/test-report.sh (plain `cargo test`) stays the reference command of CONTRIBUTING.md.
+
+[profile.default]
+# a test that runs longer than this is reported as slow (it is not killed)
+slow-timeout = { period = "60s" }
+
+[profile.ci]
+# run everything and report every failure, as `cargo test --no-fail-fast` did
+fail-fast = false
+# a stuck test is killed after 3 periods (15 min) instead of hanging the job until its timeout
+slow-timeout = { period = "300s", terminate-after = 3 }
+# the reasons of a skip (`SKIP <crate> <test>: ...` on stderr) stay out of the log; the skip log file counts them
+failure-output = "immediate-final"
+success-output = "never"
+status-level = "fail"
+final-status-level = "slow"

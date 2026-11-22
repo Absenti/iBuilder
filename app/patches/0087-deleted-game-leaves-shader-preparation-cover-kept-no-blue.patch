@@ -1,0 +1,450 @@
+# 0087-deleted-game-leaves-shader-preparation-cover-kept-no-blue.patch -- the owner's point Q after 0086: a deleted game's cloud card that said "Preparing the shaders" for ever, had lost
+# its cover, and was drawn in blue. Applies after 0086. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# Q. After the owner deleted South Park (its build and its file), its card was back in the cloud ("On the NAS", Download) but still said "Preparing the shaders · South Park … · 5,009 of 5,…"
+#    with a full bar, for ever. Cause (GameAppWarm.cs GameWarm): Stop bumped the run's number but left the run ACTIVE; only the end of the CURRENT run cleared it, and a stopped run is never
+#    current again. So EVERY stop (a delete, Play, an export, the owner's Pause) left a frozen "active" run with its last counts: on the card of its title (whatever its state: the strip only
+#    compared the title id), in the menu's Pause, the sheet's "Preparing", the Build tab, and the queue never started again (WarmKick waits for no active run) until iBuilder was quit; "Delete
+#    the build" was refused meanwhile (its Busy included the preparation). NOW:
+#    - Stop ends the run at once (WarmRun, GameAppField.cs: a number and an on/off; a late thread of an older run never ends a newer one); the next run's thread waits for the stopped one's
+#      to be gone (its workers finish the library they are on), so one run's workers at a time write warmed.tsv.
+#    - The preparation's line, bar and Pause show on a BUILT game only (WarmShown.On: the card, the sheet, so the iPad inspector, the menu), whose run is going or which is the paused queue's
+#      first: never on a cloud card, a download, or a game whose build or file was deleted.
+#    - "Delete…" stops the run (StopWarm: its continued-processing task and lock-screen / Dynamic Island progress end), takes the title out of the queue BEFORE the files go (log
+#      "shader warm-up: <game> left the queue (deleted)"), and removes its markers (games/<id>/warmed.tsv, prepared.tsv; games/<id>/ whole with the saves): a later build is prepared again.
+#      Deleting only the build (after a full export) does the same: the run when it is that title's, the queue entry, the markers, then the next game goes on (WarmSync); the preparation
+#      no longer blocks that delete.
+#    - Its cover stays when the cloud still lists the title (CoverKeep.OnDelete: a base game of that title id in the listing, any name or case): games/<id>/icon.jpg and the person's own
+#      cover are not deleted (keeping the saves), or are put back after games/<id>/ went (with the saves); the question says "Its cover stays: the game is still in the cloud." The cloud
+#      card draws it greyed, as any cloud cover; the NAS cover pass (0084) is not needed for it.
+#    - "On the NAS" (and the cloud dot) in the muted ink, the design's ink at 60 % (it was #A9BDF5, a light blue); the storage bar's segments lose their blue and violet too (accent, green,
+#      ink at 60 % and 34 %, then the free space).
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile (-t:Compile):
+#   0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness87: … P86;P87): 270 of 270 checks (22 new: the run's on/off, delete during and after the
+#   preparation and with the queue paused -> no line, the title out of the queue; the deletion plans with and without the cloud; the wiring); 12 of 12 mutations killed.
+# NOT VERIFIED: nothing ran on a device: the end of the lock-screen progress at a delete, the kept cover on the real cloud card, the new colours' look.
+# NEW UI STRINGS: "Its cover stays: the game is still in the cloud."; log lines "shader warm-up: … left the queue (deleted)", "shader warm-up: … left the queue (its build is deleted)",
+#   "delete: the cover of … is kept: the game is still in the cloud".
+diff -ruN h/GameAppBuildCleanupUi.cs i/GameAppBuildCleanupUi.cs
+--- h/GameAppBuildCleanupUi.cs	2026-11-21 23:45:32
++++ i/GameAppBuildCleanupUi.cs	2026-11-21 23:56:39
+@@ -40,7 +40,7 @@
+                                 BuildRunning: running || stop.Busy,
+                                 PausedHere: pausedBuilds.Any(r => r.Game == game),
+                                 OtherHoldsExtract: pausedBuilds.Any(r => r.Game != game && r.Extracted),
+-                                Busy: exporting || exportSizing || deleteSizing || deletes.Busy || GameWarm.Active);
++                                Busy: exporting || exportSizing || deleteSizing || deletes.Busy);   // patch 0087: the shader preparation no longer blocks it: DeleteTheBuild stops it
+     }
+ 
+     /// StartExport's completion calls this after its own alert is up. Nothing is asked here: the plan is made, the size is measured on a worker, and a timer waits for the screen to be free.
+@@ -109,10 +109,17 @@
+             return;
+         }
+         Write($"build cleanup: deleting the build of {name} in the background: {string.Join(", ", plan.Folders)} (the game file, the shader cache, games/<id>/, Exports/ and prod.keys stay)");
++        // patch 0087: a game with no build has no shader preparation: its run stops (with its background task and lock-screen progress), it leaves the queue, its markers go
++        var tid = GameAppUi.BaseTitleIdOf(ask.Game);
++        if (WarmForget.StopsRun(tid, GameWarm.ActiveGame)) StopWarm($"the build of {name} is deleted");
++        if (WarmForget.FromQueue(warmQueue.Titles, tid)) { SaveWarmQueue(); Write($"shader warm-up: {name} left the queue (its build is deleted)"); }
++        foreach (var rel in WarmForget.MarkerFiles(tid))
++            try { var path = Path.Combine(GameAppMain.Documents, rel); if (File.Exists(path)) File.Delete(path); } catch (Exception) { }
+         BuildCleanup.Execute(plan, GameAppMain.Documents, ask.Game, DeleteFolderInBackground, text => Write(text), (removed, failed) =>
+         {
+             Write($"build cleanup: done, {removed} item(s) removed" + (failed > 0 ? $", {failed} could not be removed" : "") + (ask.Bytes > 0 && failed == 0 ? $" (about {BuildCleanupText.Amount(ask.Bytes, ask.Exact)} freed)" : "") + "; build it again from the Build tab");
+             RefreshScreen();
++            WarmSync($"after the build of {name} was deleted");   // patch 0087: the next game of the queue goes on
+         });
+         RefreshScreen();   // the stamp is gone: the game is "Needs setup" now, the folders follow
+     }
+diff -ruN h/GameAppField.cs i/GameAppField.cs
+--- h/GameAppField.cs	2026-11-21 23:47:04
++++ i/GameAppField.cs	2026-11-21 23:54:53
+@@ -5,7 +5,9 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Globalization;
++using System.Linq;
+ using System.Text.RegularExpressions;
++using System.Threading;
+ 
+ /// The build's progress from what the chain says: its stage line (gameapp.stage) and, in stage 3, its last "progress: N/M" log line (the shaders being read, before any "(N/M shaders)").
+ /// GameAppUi.ParseStage moved the bar only for the rewrite's modules and the translation's shader count: stage 1 (75 s of "unpacking 2.3 of 26.2 GB" for Ocarina) and the start of stage 3
+@@ -292,4 +294,68 @@
+     }
+ 
+     public void Invalidate() => has = false;
++}
++
++/// Patch 0087 (the owner, after deleting South Park: its cloud card still said "Preparing the shaders · South Park · 5,009 of 5,0…" with a full bar, for ever): GameWarm.Stop bumped the run's
++/// number but left the run ACTIVE; only the end of the CURRENT run cleared it, and a stopped run is never current again. So every stop (a delete, Play, an export, the owner's Pause) left a frozen
++/// "active" run with its last counts on the screen, the Library's menus and the Build tab, and the queue never started again (WarmKick waits for no active run) until iBuilder was quit. Stop
++/// ends the run at once now; the next run's thread waits for the old one to be gone (GameWarm.Start).
++public sealed class WarmRun
++{
++    private readonly object gate = new object();
++    private int generation;
++    private volatile bool active;
++    private string title;
++
++    /// A run starts: its number (the run's thread compares it, Current).
++    public int Start(string tid) { lock (gate) { generation++; active = true; title = tid?.ToUpperInvariant(); return generation; } }
++
++    /// Every run ends now, whether its thread is back or not. Returns whether one was going.
++    public bool Stop() { lock (gate) { bool was = active; generation++; active = false; return was; } }
++
++    /// The run's thread is back: it ends unless a newer run started meanwhile.
++    public void Ended(int mine) { lock (gate) { if (generation == mine) active = false; } }
++
++    public bool Current(int mine) => Volatile.Read(ref generation) == mine;
++    public bool Active => active;
++    public string Title { get { lock (gate) return active ? title : null; } }
++}
++
++/// Patch 0087: where the shader preparation's line (and its bar, and its Pause in a menu) shows: on a BUILT game only, whose preparation is going, or paused by the owner while it is the queue's
++/// first. Never on a cloud card, a game being downloaded, or a game whose build or file was deleted.
++public static class WarmShown
++{
++    /// The title whose line shows: the one being prepared, or (the owner paused the queue) the queue's first.
++    public static string Title(bool active, string activeTid, bool queuePaused, IReadOnlyList<string> queue) =>
++        active ? activeTid?.ToUpperInvariant() : queuePaused && queue != null && queue.Count > 0 ? queue[0] : null;
++
++    public static bool On(string tid, bool built, string shownTitle) =>
++        tid != null && built && shownTitle != null && string.Equals(tid, shownTitle, StringComparison.OrdinalIgnoreCase);
++}
++
++/// Patch 0087: a game deleted (its file, or only its build) leaves the shader preparation at once: its run stops when it is the one going (its background task and lock-screen progress end
++/// with it), its title leaves the queue, and its markers go (games/<id>/warmed.tsv, prepared.tsv: a later build of it is prepared again). What the game learned and played stays.
++public static class WarmForget
++{
++    public static readonly IReadOnlyList<string> Markers = new[] { "warmed.tsv", "prepared.tsv" };
++
++    public static List<string> MarkerFiles(string tid) =>
++        tid == null ? new List<string>() : Markers.Select(m => "games/" + tid.ToUpperInvariant() + "/" + m).ToList();
++
++    /// Whether the run going must stop: it prepares this title.
++    public static bool StopsRun(string tid, string activeTid) => tid != null && activeTid != null && string.Equals(tid, activeTid, StringComparison.OrdinalIgnoreCase);
++
++    /// The title leaves the queue's titles. Returns whether it was in it.
++    public static bool FromQueue(List<string> titles, string tid) => titles != null && tid != null && titles.RemoveAll(t => string.Equals(t, tid, StringComparison.OrdinalIgnoreCase)) > 0;
++}
++
++/// Patch 0087: a game deleted while the cloud still lists it keeps its cover (games/<id>/icon.jpg, and the person's own cover): its cloud card shows it, not the initials (South Park's did).
++public static class CoverKeep
++{
++    public static bool OnDelete(string game, IEnumerable<string> cloudNames)
++    {
++        var id = GameAppUi.BaseTitleIdOf(game);
++        return id != null && (cloudNames ?? Enumerable.Empty<string>()).Any(n => Cloud.IsGameFile(n) && GameAppUi.ContentKindOf(n) == GameAppUi.ContentKind.Base
++                                                                                 && string.Equals(GameAppUi.BaseTitleIdOf(n), id, StringComparison.OrdinalIgnoreCase));
++    }
+ }
+diff -ruN h/GameAppMain.cs i/GameAppMain.cs
+--- h/GameAppMain.cs	2026-11-21 23:45:32
++++ i/GameAppMain.cs	2026-11-21 23:56:17
+@@ -2279,8 +2279,9 @@
+         var facts = GatherFacts();
+         var all = Dumps().Select(Path.GetFileName).ToList();
+         var builtId = BuiltTitleId();
+-        var keep = GameAppUi.PlanDeletion(game, all, facts.FrameworkGame, builtId, keepSaves: true);
+-        var everything = GameAppUi.PlanDeletion(game, all, facts.FrameworkGame, builtId, keepSaves: false);
++        bool keepCover = CoverKeep.OnDelete(game, cloudFiles.Select(f => f.Name));   // patch 0087: the cloud still lists it: its cover stays for its cloud card
++        var keep = GameAppUi.PlanDeletion(game, all, facts.FrameworkGame, builtId, keepSaves: true, keepCover: keepCover);
++        var everything = GameAppUi.PlanDeletion(game, all, facts.FrameworkGame, builtId, keepSaves: false, keepCover: keepCover);
+         // "Frees ..." is measured on a worker thread (the build and the shaders are thousands of files); the question comes up when the numbers are in.
+         deleteSizing = true;
+         System.Threading.Tasks.Task.Run(() =>
+@@ -2300,7 +2301,8 @@
+         var message = $"Frees {GameAppUi.SizeText(keepBytes)}: the game file, its shaders" + (keep.BuildToo ? ", its build (the extracted game)" : "")
+                       + " and its settings."
+                       + (extra.Count > 0 ? $"\nAlso its update and add-ons: {string.Join(", ", extra.Select(GameAppUi.DisplayName))}." : "")
+-                      + "\nSaves are kept unless you choose otherwise. This cannot be undone.";
++                      + "\nSaves are kept unless you choose otherwise. This cannot be undone."
++                      + (keep.Kept?.Count > 0 || everything.Kept?.Count > 0 ? "\nIts cover stays: the game is still in the cloud." : "");
+         var alert = UIAlertController.Create($"Delete {GameAppUi.DisplayName(game)}?", message, UIAlertControllerStyle.Alert);
+         alert.AddAction(UIAlertAction.Create("Delete, keep saves", UIAlertActionStyle.Destructive, _ => PerformDelete(game, keep)));
+         alert.AddAction(UIAlertAction.Create($"Delete with saves ({GameAppUi.SizeText(allBytes)})", UIAlertActionStyle.Destructive, _ => PerformDelete(game, everything)));
+@@ -2312,12 +2314,18 @@
+     {
+         if (running || deletes.Busy) return;
+         StopWarm("a delete starts");   // GameAppWarm.cs (patch 0076): the preparation may be reading this game's pack; it resumes by itself after the delete (WarmSync below)
++        // patch 0087: the deleted game leaves the shader preparation's queue now, not at the next sync (its card showed the stopped run's line for ever)
++        if (WarmForget.FromQueue(warmQueue.Titles, GameAppUi.BaseTitleIdOf(game))) { SaveWarmQueue(); Write($"shader warm-up: {GameAppUi.DisplayName(game)} left the queue (deleted)"); }
+         // The files and folders go on the delete worker (extract/, shaders/<id> and shaders/<id>.work are tens of thousands of files); BeginRun waits for it, no size is measured meanwhile.
+         long freed = 0;
+         int removed = 0, failed = 0;
+         var notes = new List<string>();
+         deletes.Enqueue(() =>
+         {
++            // patch 0087: the cover kept for the cloud card (inside games/<id>/ when it goes whole): read now, put back after
++            var keptBytes = new Dictionary<string, byte[]>();
++            foreach (var rel in plan.Kept ?? Array.Empty<string>())
++                try { var path = Path.Combine(GameAppMain.Documents, rel); if (File.Exists(path)) keptBytes[path] = File.ReadAllBytes(path); } catch (Exception) { }
+             // a game deleted here gets no placeholder (patch 0071): its built record goes FIRST, so a kill in the middle of the delete cannot bring it back as one
+             try { BuiltLedger.Update(GameAppMain.Documents, list => BuiltLedger.Remove(list, plan.Files.Where(f => f.IndexOf('/') < 0))); }
+             catch (Exception error) { notes.Add($"delete: the built record could not be updated ({error.Message}): the game may come back as an empty placeholder"); }
+@@ -2334,6 +2342,10 @@
+                 try { if (Directory.Exists(path)) { BackgroundDelete.DeleteTree(path); removed++; } }
+                 catch (Exception error) { failed++; notes.Add($"delete: {rel}/ not removed ({error.Message})"); }
+             }
++            foreach (var (path, bytes) in keptBytes)
++                try { Directory.CreateDirectory(Path.GetDirectoryName(path)); File.WriteAllBytes(path, bytes); }
++                catch (Exception error) { notes.Add($"delete: the cover could not be kept ({error.Message})"); }
++            if (keptBytes.Count > 0) notes.Add($"delete: the cover of {GameAppUi.DisplayName(game)} is kept: the game is still in the cloud");
+             // the deleted game files have no import record any more (patch 0068)
+             try { ImportLedger.Update(GameAppMain.Documents, list => ImportLedger.Remove(list, plan.Files.Where(f => f.IndexOf('/') < 0))); }
+             catch (Exception error) { notes.Add($"delete: the import records could not be updated ({error.Message})"); }
+diff -ruN h/GameAppRedesignUi.cs i/GameAppRedesignUi.cs
+--- h/GameAppRedesignUi.cs	2026-11-21 23:47:04
++++ i/GameAppRedesignUi.cs	2026-11-21 23:56:39
+@@ -24,7 +24,7 @@
+     public static readonly UIColor Raised = Theme.Hex(0x25252B);
+     public static readonly UIColor Line = UIColor.FromWhiteAlpha(1f, 0.08f);
+     public static readonly UIColor Edge = UIColor.FromWhiteAlpha(1f, 0.14f);
+-    public static readonly UIColor CloudInk = Theme.Hex(0xA9BDF5);
++    public static readonly UIColor CloudInk = Theme.Text.ColorWithAlpha(0.6f);   // patch 0087: the muted ink (it was a light blue, #A9BDF5): no blue in the design
+     public static readonly UIColor OnAccent = UIColor.Black;
+ 
+     public static UIColor Rgb((double R, double G, double B) c, float alpha = 1f) => UIColor.FromRGBA((nfloat) c.R, (nfloat) c.G, (nfloat) c.B, alpha);
+@@ -1053,7 +1053,7 @@
+         cardBar.Hidden = fraction == null || !(state == LibState.Downloading || state == LibState.Building);
+         parts.Add(cardBar);
+         gridLive[e.Name] = (line, cardBar);   // patch 0082 (review M3): updated in place between two rebuilds
+-        if (WarmStrip(e.Name, false) is UIView warm) parts.Add(warm);   // GameAppWarm.cs (0070, 0076): the shaders being prepared, with its bar
++        if (WarmStrip(e.Name, false, state == LibState.Built) is UIView warm) parts.Add(warm);   // GameAppWarm.cs (0070, 0076): the shaders being prepared, with its bar
+         // the actions on ONE row (the owner's third correction): the primary a pill filling the width, a second action (Export IPA beside Play) a 36 pt round icon-only button at its right
+         bool canRun = CanRunHere(facts);
+         var accent = Look.AccentOf(e.Icon, grey);
+@@ -1108,7 +1108,7 @@
+         var path = Path.Combine(GameAppMain.Documents, name);
+         bool local = e.Cloud == null || File.Exists(path);
+         var tid = GameAppUi.BaseTitleIdOf(name);
+-        bool warmShown = tid != null && string.Equals(tid, WarmShownTitle(), StringComparison.OrdinalIgnoreCase);
++        bool warmShown = WarmShown.On(tid, state == LibState.Built, WarmShownTitle());   // patch 0087: a built game only
+         bool warmQueued = tid != null && warmQueue.Titles.Contains(tid.ToUpperInvariant());
+         bool update = state == LibState.Built && GameAppUi.ContentChangedSinceBuild(name, libNames ?? Dumps().Select(Path.GetFileName).ToList(), facts);
+         var targets = UploadTargets().Where(t => e.Cloud == null || e.Cloud.SourceId != t.Id).ToList();
+diff -ruN h/GameAppShelf.cs i/GameAppShelf.cs
+--- h/GameAppShelf.cs	2026-11-21 23:47:04
++++ i/GameAppShelf.cs	2026-11-21 23:56:03
+@@ -991,7 +991,7 @@
+         if (WarmOffered(game))
+         {
+             // patch 0076: in the main app the row is "Prepare now" (this game first in the queue, the queue resumed; Pause when this game is the one being prepared)
+-            bool thisOne = GameWarm.Active && string.Equals(tid, GameWarm.ActiveGame, StringComparison.OrdinalIgnoreCase);
++            bool thisOne = ready && GameWarm.Active && string.Equals(tid, GameWarm.ActiveGame, StringComparison.OrdinalIgnoreCase);   // patch 0087: a built game only
+             // patch 0086: a finished preparation says so ("Shaders prepared", "5,009 prepared"), with no Pause and no bar (prepared.tsv's "all" row of this app build and chain)
+             string preparedText = null;
+             try { var mk = Path.Combine(docs, "games", (tid ?? "").ToUpperInvariant(), "prepared.tsv"); if (tid != null && File.Exists(mk)) preparedText = File.ReadAllText(mk); } catch (Exception) { }
+@@ -999,10 +999,10 @@
+             var prepare = SettingsRow(GameExport.IsPlayer ? "Prepare the shaders…" : prepared ? "Shaders prepared" : thisOne ? "Pause the preparation" : "Prepare now", prepared ? null : () => Then(() => PrepareShadersFor(game)), !prepared, false);
+             prepare.Value.Text = GameExport.IsPlayer ? (GameWarm.Active ? "Running" : "")
+                                : prepared ? WarmDone.Label(WarmDone.Count(preparedText))
+-                               : thisOne ? "Preparing" : tid != null && warmQueue.Titles.Contains(tid) ? (warmQueue.Paused ? "Paused" : "In the queue") : "";
++                               : thisOne ? "Preparing" : ready && tid != null && warmQueue.Titles.Contains(tid) ? (warmQueue.Paused ? "Paused" : "In the queue") : "";
+             var shaderViews = new List<UIView> { Look.Section("Shaders"), Look.Group(prepare.Button) };
+             warmSheetViews.Clear();
+-            if (WarmStrip(game, true) is UIView sheetWarm) shaderViews.Add(sheetWarm);   // GameAppWarm.cs (patch 0070): the automatic preparation of this game, live
++            if (WarmStrip(game, true, ready) is UIView sheetWarm) shaderViews.Add(sheetWarm);   // GameAppWarm.cs (patch 0070): the automatic preparation of this game, live
+             shaderViews.Add(Theme.Label("After a build, and whenever you open iBuilder, it compiles all the built games' shaders by itself, one game after another, at low priority: the ones the game asks for first, then the rest. "
+                 + "Play stays available and stops it; it resumes by itself. \"Prepare now\" puts this game first. Settings › Shader preparation sets the cores.", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0));
+             shadersBlock = Theme.Column(8, shaderViews.ToArray());
+diff -ruN h/GameAppTheme.cs i/GameAppTheme.cs
+--- h/GameAppTheme.cs	2026-11-21 23:45:32
++++ i/GameAppTheme.cs	2026-11-21 23:56:39
+@@ -301,7 +301,8 @@
+ /// Design A's bar: games, builds, shaders (and exported apps), then the free space, with a legend.
+ internal sealed class StorageBarView : UIView
+ {
+-    private static readonly UIColor[] Colors = { Theme.Hex(0x9DB7FF), Theme.Hex(0xC8A6FF), Theme.Hex(0xFF9CC9), Theme.Hex(0x7CF0B0), UIColor.FromWhiteAlpha(1f, 0.16f) };
++    // patch 0087: the design's colours only (no blue, no violet): the accent, the good green, the ink at 60 % and 34 %, the free space
++    private static readonly UIColor[] Colors = { Theme.Accent, Theme.Ok, Theme.Text.ColorWithAlpha(0.6f), Theme.Text.ColorWithAlpha(0.34f), UIColor.FromWhiteAlpha(1f, 0.16f) };
+     private readonly UIView track = new UIView();
+     private readonly List<UIView> parts = new List<UIView>();
+     private readonly UILabel legend = new UILabel { Lines = 0 };
+diff -ruN h/GameAppUi.cs i/GameAppUi.cs
+--- h/GameAppUi.cs	2026-11-21 23:45:32
++++ i/GameAppUi.cs	2026-11-21 23:55:12
+@@ -573,12 +573,15 @@
+     /// `keepSaves` is false. When the build on disk is this game's (`builtGame` the framework stamp's game, or
+     /// `builtTitleId` profile.tsv's title id), the extraction (the RomFS, the largest file), the framework and the
+     /// boot files go too. Paths may not exist; the caller skips those.
+-    public sealed record DeletionPlan(IReadOnlyList<string> Files, IReadOnlyList<string> Folders, bool BuildToo);
++    /// `Kept` (patch 0087): files inside a folder of the plan that survive it (the cover of a game the cloud still lists), put back after the folder went.
++    public sealed record DeletionPlan(IReadOnlyList<string> Files, IReadOnlyList<string> Folders, bool BuildToo, IReadOnlyList<string> Kept = null);
+ 
+-    public static DeletionPlan PlanDeletion(string fileName, IEnumerable<string> allDumps, string builtGame, string builtTitleId, bool keepSaves)
++    /// `keepCover` (patch 0087, CoverKeep.OnDelete): the cloud still lists the game: its cover (games/<id>/icon.jpg, the person's own cover) stays for its cloud card.
++    public static DeletionPlan PlanDeletion(string fileName, IEnumerable<string> allDumps, string builtGame, string builtTitleId, bool keepSaves, bool keepCover = false)
+     {
+         var files = new List<string>();
+         var folders = new List<string>();
++        var kept = new List<string>();
+         if (string.IsNullOrEmpty(fileName)) return new DeletionPlan(files, folders, false);
+         var id = BaseTitleIdOf(fileName);
+         var dumps = new List<string> { fileName };
+@@ -602,14 +605,24 @@
+             if (keepSaves)
+             {
+                 foreach (var f in new[] { "settings.tsv", "launcher.json", "icon.jpg", "icon.none", "pso_user.tsv" })
+-                    files.Add("games/" + id + "/" + f);
++                    if (!(keepCover && f == "icon.jpg")) files.Add("games/" + id + "/" + f);
++                files.AddRange(WarmForget.MarkerFiles(id));   // patch 0087: the shader preparation's markers (warmed.tsv, prepared.tsv): a later build is prepared again
+                 folders.Add("games/" + id + "/rewrite-cache");
+                 folders.Add("games/" + id + "/temp");
+                 folders.Add("games/" + id + "/slot");   // its build parked while another game had the slot (patch 0073)
+             }
+-            else folders.Add("games/" + id);
++            else
++            {
++                folders.Add("games/" + id);
++                if (keepCover) kept.Add("games/" + id + "/icon.jpg");
++            }
+         }
+-        files.AddRange(GameCover.DeletionFiles(fileName));   // the person's own cover (GameAppCover.cs): games/<id>/cover.jpg, or the file name's key before the id was known
++        foreach (var f in GameCover.DeletionFiles(fileName))
++        {
++            bool part = f.EndsWith(".part", StringComparison.Ordinal);
++            if (!keepCover || part) files.Add(f);   // the person's own cover goes with the game, unless the cloud still lists it (patch 0087)
++            else if (!keepSaves && id != null && f.StartsWith("games/" + id + "/", StringComparison.Ordinal)) kept.Add(f);   // inside games/<id>/, which goes whole: put back after it
++        }   // the person's own cover (GameAppCover.cs): games/<id>/cover.jpg, or the file name's key before the id was known
+         var buildToo = string.Equals(builtGame, fileName, StringComparison.Ordinal)
+                        || (id != null && string.Equals(builtTitleId, id, StringComparison.OrdinalIgnoreCase));
+         if (buildToo)
+@@ -618,7 +631,7 @@
+             folders.Add("DmGameProbe.framework");
+             files.AddRange(new[] { "gameapp.framework", "gameapp.boot-only", "pipeline.boot", "profile.tsv", "gameapp.extracted" });   // gameapp.extracted: the extraction marker (patch 0073)
+         }
+-        return new DeletionPlan(files, folders, buildToo);
++        return new DeletionPlan(files, folders, buildToo, kept);
+     }
+ 
+     /// "1.4 GB" / "350 MB": the space a deletion frees, for the confirmation.
+diff -ruN h/GameAppWarm.cs i/GameAppWarm.cs
+--- h/GameAppWarm.cs	2026-11-21 23:46:00
++++ i/GameAppWarm.cs	2026-11-21 23:56:03
+@@ -501,8 +501,10 @@
+ internal static class GameWarm
+ {
+     private static readonly object gate = new object();
+-    private static int generation;            // bumped by Stop and by each Start: a run whose number is not the current one ends
+-    private static volatile bool active;
++    // patch 0087: the run's number and on/off (GameAppField.cs WarmRun): Stop ends the run AT ONCE (it left it "active" for ever before: a deleted game's card kept "Preparing the shaders ·
++    // 5,009 of 5,0…" and the queue never started again); a run whose number is not the current one ends. The thread of the last run: the next one waits for it to be gone.
++    private static readonly WarmRun runState = new WarmRun();
++    private static Thread lastThread;
+     private static string status = "";
+     private static string activeGame;
+     private static volatile string pauseReason;   // the automatic run (Everything): why no worker compiles now (hot phone, memory), null when they do
+@@ -515,9 +517,9 @@
+ 
+     private static GameWarmLogic.WarmKind runKind;
+     private static int progressDone, progressTotal;
+-    public static bool Active => active;
++    public static bool Active => runState.Active;
+     /// The run is an exported player's first-start preparation (the title screen offers "play anyway" while it goes).
+-    public static bool FirstStart => active && runKind == GameWarmLogic.WarmKind.SeedList;
++    public static bool FirstStart => runState.Active && runKind == GameWarmLogic.WarmKind.SeedList;
+     /// The kind of the run that is going (or went last).
+     public static GameWarmLogic.WarmKind Kind => runKind;
+     /// 0..1 of the run's libraries done (0 before the count is known).
+@@ -526,8 +528,8 @@
+     public static int Done => Volatile.Read(ref progressDone);
+     public static int Total => Volatile.Read(ref progressTotal);
+     /// Why the automatic run waits now ("paused while the phone is hot", "waiting for memory"), or null.
+-    public static string Pause => active ? pauseReason : null;
+-    public static string Status => active ? status : "";
++    public static string Pause => runState.Active ? pauseReason : null;
++    public static string Status => runState.Active ? status : "";
+ 
+     /// The "Shader preparation" setting (GameWarmLogic.ParseCores: 0 Auto, else a core count). Set by the view controller at launch and when the owner changes it; every worker of a run that is going
+     /// reads it before each library, so a change applies to that run at once (workers above the new count finish their library and wait; the others start within two seconds).
+@@ -548,7 +550,7 @@
+         }
+         catch (Exception) { return false; }
+     }
+-    public static string ActiveGame => active ? activeGame : null;
++    public static string ActiveGame => runState.Active ? activeGame : null;
+ 
+     /// Whether there is anything to prepare: the pack's library image of this host's chain (a Mac-made pack holds .metallib files: nothing to compile). A cheap look, no parsing: it
+     /// decides whether the settings sheet offers "Prepare the shaders…".
+@@ -580,7 +582,7 @@
+     public static void Stop(string why)
+     {
+         bool was;
+-        lock (gate) { was = active; generation++; }
++        lock (gate) { was = runState.Stop(); }
+         if (was) Log($"shader warm-up: stopped ({why})");
+     }
+ 
+@@ -608,20 +610,32 @@
+     {
+         if (string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(packRoot)) return;
+         int mine;
+-        lock (gate) { mine = ++generation; active = true; activeGame = titleId; status = ""; runKind = kind; pauseReason = null; progressDone = 0; progressTotal = 0; }
++        Thread previous;
++        lock (gate) { mine = runState.Start(titleId); activeGame = titleId; status = ""; runKind = kind; pauseReason = null; progressDone = 0; progressTotal = 0; previous = lastThread; }
+         var t = new Thread(() =>
+         {
+             bool complete = false;
+-            try { complete = Run(titleId, packRoot, mine, kind, why); }
++            try
++            {
++                // patch 0087: a stopped run is over at once on the screen, but its workers may still finish the library they are on: this run starts once that thread is gone (one run's
++                // workers at a time, warmed.tsv written by one run), and not at all when it was itself stopped or replaced meanwhile
++                if (previous != null && previous.IsAlive) previous.Join();
++                if (Current(mine))
++                {
++                    lock (gate) { progressDone = 0; progressTotal = 0; }
++                    complete = Run(titleId, packRoot, mine, kind, why);
++                }
++            }
+             catch (Exception error) { Log("shader warm-up: [ORANGE] " + error.Message); }
+             finally
+             {
+-                lock (gate) { if (generation == mine) active = false; }
++                lock (gate) runState.Ended(mine);
+                 try { Changed?.Invoke(); } catch (Exception) { }
+                 try { Ended?.Invoke(titleId, complete); } catch (Exception) { }
+             }
+         })
+         { IsBackground = true, Name = "shader-warm-up" };
++        lock (gate) lastThread = t;
+         t.Start();
+     }
+ 
+@@ -638,7 +652,7 @@
+         catch (Exception) { return false; }
+     }
+ 
+-    private static bool Current(int mine) => Volatile.Read(ref generation) == mine;
++    private static bool Current(int mine) => runState.Current(mine);
+ 
+     /// The threads a run starts. The seed-list run (an exported player's first start): four (the boot's own prepare used six) at UserInitiated. A manual run of the whole library: two at Utility.
+     /// The automatic run: as many as the setting can ask for (GameWarmLogic.MaxCores), each one compiling only while its number is below GameWarmLogic.AutoWorkers.
+@@ -1168,8 +1182,7 @@
+     private UIProgressView warmBuildBar;
+ 
+     /// The game whose line shows: the one being prepared, or (paused by the owner) the queue's first.
+-    private string WarmShownTitle() =>
+-        GameWarm.Active ? GameWarm.ActiveGame?.ToUpperInvariant() : warmQueue.Paused ? warmQueue.Titles.FirstOrDefault() : null;
++    private string WarmShownTitle() => WarmShown.Title(GameWarm.Active, GameWarm.ActiveGame, warmQueue.Paused, warmQueue.Titles);   // GameAppField.cs (patch 0087)
+ 
+     private string WarmLine()
+     {
+@@ -1206,13 +1219,13 @@
+     }
+ 
+     /// A bar and its line for `game`'s tile, row (`sheet` false) or sheet, when `game` is the one being prepared (or, paused, the queue's first); else null. The sheet's has Pause / Resume; a tile
+-    /// or a row is one big button, so theirs is in its long-press menu (WarmMenuItems). Main thread.
+-    private UIView WarmStrip(string game, bool sheet)
++    /// or a row is one big button, so theirs is in its long-press menu (WarmMenuItems). `built`: the game is built here (patch 0087: never on a cloud card or a game with no build). Main thread.
++    private UIView WarmStrip(string game, bool sheet, bool built)
+     {
+         var tid = GameAppUi.BaseTitleIdOf(game);
+         if (tid == null) return null;
+         if (GameExport.IsPlayer) return null;
+-        if (!string.Equals(tid, WarmShownTitle(), StringComparison.OrdinalIgnoreCase)) return null;
++        if (!WarmShown.On(tid, built, WarmShownTitle())) return null;
+         warmGames[tid] = game;
+         var text = Theme.Label(WarmLine(), Theme.Font(12, UIFontWeight.Medium), Theme.Accent, 3);
+         text.AccessibilityIdentifier = sheet ? "sheet-warm-status" : "game-warm-status";

@@ -1,0 +1,783 @@
+# 0068-remove-game-file-after-build.patch -- after a SUCCESSFUL build the game file of a game the app imported itself is replaced by an empty stub of the same name; the game stays in the library; every import is recorded in Documents/gameapp.imports.tsv.
+# Applies after 0067 (the tree with 0010..0067 applied). UNTESTED ON DEVICE: compiled (dotnet build, ios-arm64, Release: rc 0, no error, 39 warnings: the same as the 0067 tree, none new) and the pure classes run in a host harness (a net console program built
+# from the real source text of GameAppSourceRemoval.cs and the classes it uses: 341 checks in all, 88 of them new here, 52 mutations of the classes in all, 17 of them new here, each caught); no iPhone run. Measured and assumed are told apart below.
+#
+# WHY (the owner's decision): an imported game is a clone or a copy of a file that exists somewhere else ("since the game is cloned it is already somewhere"), and after the build iBuilder needs its build, not the file. The library is made from the game files in
+#   Documents (Dumps()), so deleting the file would make a built game vanish; it is replaced by a ZERO-BYTE STUB with the same name: the game keeps its name, title id, cover, settings, saves, mods, its Ready status (the stamp), Play and Export IPA (all of which
+#   go by name or by the build, not by the file's content).
+#
+# THE RECORD -- GameAppSourceRemoval.cs (new; no UIKit, run by the harness): ImportRecord / ImportLedger = Documents/gameapp.imports.tsv, one line per file the APP imported: name, size, how (clone | copy | download), source (a short label: "picker", "folder <name>",
+#   the Cloud page's source name, "NAS"), source id (the Cloud source's id when there is one), time, and the time its content was removed ("" = still here). Written through a .part and one rename under one lock (imports run on workers), read again only when the file
+#   changed, never throws on a bad file (an unreadable ledger is an empty one: nothing is removed). The launch sweep (0063) knows gameapp.imports.tsv.part. Every import path records:
+#     * the old Import picker (CopyIn: iOS copied the file into tmp/, the app moved it): how=copy, source "picker"; written on a worker;
+#     * "Add from a folder without copying" (0067): how=clone or copy from GameImport.Place, source "folder <name>"; a file that was "AlreadyThere" is not recorded;
+#     * the Cloud page's Download and Download and build: a Files-folder source: how=clone or copy (CopyFromFolder now returns the Placed), source = the source's name and id; the NAS: how=download, source "NAS";
+#     * "Find them in a folder" (an update or DLC found in a folder, CopyContentIn): how=copy, source "folder <name>".
+#   Only game files (.nsp .xci .nsz .nup) are recorded: never prod.keys. A file the owner put into Documents by hand has NO record and is never removed. Deleting a game removes its records (PerformDelete's worker).
+#
+# WHEN (SourceRemoval.ShouldRemove, one file at a time; Plan = the game's base file, its update and its DLC, each by its own record): a file is replaced ONLY IF every line holds: it is a game file (never prod.keys, a certificate, anything else) / the Settings
+#   toggle is on / the build's chain returned 0 (StopOutcome.Finished: not a pause, a cancel or a failure; an OS kill never reaches it; the hook is in BeginRun's chain-return callback after Finish(), for a build, not a boot) / the framework stamp names this game
+#   and the update / DLC in Documents are what the build included (the stamp's content= signature; an update or DLC added since the build stays) / no build of this game runs, is paused, or waits in the queue / the ledger says THE APP imported the file and it is
+#   not removed yet / the file is still what was imported (its size is the record's: a file the owner replaced by hand is not ours) and has content. A "removed" record on a file that has content again (put back by hand) is NOT ours either. The removal is on a worker
+#   thread, never the main thread: `source: removed <name> (<size>) after the build (it was cloned|copied|downloaded, from <source>)` per file, and ONCE, before the very first removal ever, `source: from now on a built game's file is replaced by an empty stub of the
+#   same name, the game stays in the library (Settings > Remove the game file after a successful build turns this off)`. A file kept for a reason worth saying gets a `source: <file> kept (...)` line (a hand-placed file does not).
+#   Execute: the LEDGER FIRST (the record says "removed"), then the stub (SourceStub.Replace: <name>.part written empty and renamed over the file: one rename, so a reader sees the old file or the stub, never half of either); if the stub cannot be made the record is put
+#   back and the file is as it was; if the ledger cannot be written nothing is touched.
+#
+# WHAT A STUB MEANS TO THE REST OF THE APP
+#   * IsStub(size, record) = size 0 and a "removed" record (a zero-byte file with no record is "empty": the same guards, the word "Empty file"). Never a game with 0 bytes shown as such: the size column of the tile / row chip, the Build tab row, the game sheet's Game
+#     line and the build screen say "File removed".
+#   * What needs the CONTENT asks first (GameFileHasContent: the base game, its update and its DLC must all have content): Set up (SetUpAndPlay, so also "Set up and play", Build, Update, Resume from the start and every flow that calls it), Rebuild (the alert is not
+#     even shown), Update (adding an update or DLC after the build), "Add to the build queue", and the queue's own start (no alert in the middle of a queue: the item fails with "the game file was removed after the build: add it again", the queue goes on). Message:
+#     "The game file was removed after the build to free space. Add it again to rebuild." (title "The game file was removed") with "Add it again from <source>" when the Files-folder source the file came from still lists it (one button adds back every missing file that
+#     source lists: Download clones them over the stubs, instant), "Add a game file…" (the old picker), "Add from a folder…" (0067), "Not now". The icon passes (FetchMissingIcons, FetchMissingNupIcons) skip a file with no content. Play, Export IPA, the sheet, cover,
+#     title id, settings, saves, mods keep working: they never read the file.
+#   * Importing a file with the same name over a stub REPLACES it: "Add from a folder" does not count a stub as "In the library" (0067's check), the old picker's CopyIn and Download replace by rename; the new import writes a new record (not removed).
+#
+# THE SETTING: Settings > BUILD, a switch in the flat list: "Remove the game file after a successful build" (id setting-remove-source; default ON: the owner asked for it; key remove_source_after_build in gameapp.settings.tsv; off = nothing is removed). Its note:
+#   "iBuilder imported the file as a clone or a copy of one that is somewhere else: once the game is built it keeps the game (its name, cover, settings and saves) and frees the file. Add the file again to rebuild. Files you put into iBuilder's folder yourself are
+#   never removed." The exported player has none of this.
+#
+# NEW STRINGS: "Remove the game file after a successful build", the note above, "File removed", "Empty file", "The game file was removed", "The game file was removed after the build to free space. Add it again to rebuild.", "Add it again from <source>", "Add a game file…",
+#   "Add from a folder…", "Not now", "The game file is empty", "The game file has no content. Add it again to build it.", "the game file was removed after the build: add it again" (a failed queue item's note). Log lines: `source: removed <name> (<size>) after the build (it was <how>, from
+#   <source>)`, `source: from now on a built game's file is replaced by an empty stub ...`, `source: <file> kept (...)`, `source: <game>: the game file was removed after the build (<files>): nothing to build from`, `source: adding <files> again from <source>`, `source: the import of <name>
+#   could not be recorded (...)`, `build setting: the game file is removed (an empty stub stays) after a successful build of a game iBuilder imported` / `... is kept after a build`. ACCESSIBILITY IDS: setting-remove-source (the switch).
+#
+# MEASURED (host harness, .NET 11, Apple silicon Mac, APFS): the ledger (format / parse round trip, garbage, a name twice in any case, tabs and newlines in a field, 160 imports from 16 threads: 160 records and a whole file, no .part, an unreadable ledger is empty, an
+#   unwritable one throws and leaves no .part); ShouldRemove over a table of 23 cases and 30,720 generated cases against an independent statement of the rule (Remove exactly when every line holds: 4 of them); the plans (base + update + DLC, each by its own record:
+#   an imported update and DLC go although the base was put there by hand, and the other way round; a DLC added since the build: nothing of the game goes; a failed build, a running build: nothing); the stub (the content is gone, same name, no .part; the rename
+#   fails: the game file is exactly as it was; 300 replacements under a reader (over 50,000 reads in every run): the file was never missing and never anything but its full size or empty); EXECUTED on real folder trees: the base game, its update and its imported DLC become 0-byte stubs
+#   with the log lines above, the DLC put there by hand, Beta (by hand) and another imported game are untouched, keys / certificate / saves / cover / shader cache / extract / Exports / the stamp keep their SHA-256, run again removes nothing; a failed, paused or
+#   cancelled build, the toggle off, a build of the game running: the same tree untouched; a stub that cannot be made for one file: that file keeps its content and record, the others go; a ledger that cannot be written: the file is not touched; an import over a stub
+#   replaces it (a real clone). SourceReAdd and the words.
+# NOT EXERCISED / ASSUMED (no device run): everything UIKit (the switch, the alert, the size texts, the queue's failed note); that BeginRun's chain-return callback is reached with rc 0 after a real build (and that a build finishing in a later launch, after the
+#   stage-3 restart, reaches it too: it is the same callback); that the stamp's game= is the file name the library uses (the harness assumes it, as GameStatusOf does); atomic rename and the stub on the phone's APFS; a re-add through "Add it again from <source>" on the
+#   phone (Download clones over the stub); the first removal's one-time line on a real ledger; the storage bars after a removal.
+# RISKS: a file the owner replaces by hand with another of EXACTLY the same size would be taken for the imported one (the record has no hash: reading 26 GB would defeat the purpose); the ledger is written on a worker after CopyIn, so an app kill in that instant leaves no
+#   record (the file is then never removed: the safe direction); a "removed" record whose stub was never made (a kill between the two) leaves a file with content under a "removed" record: it is treated as put there by hand and never removed; records of files the owner
+#   deletes in Files stay (harmless: the file is not there); the toggle is global, not per game.
+diff -ruN a/GameAppCoverUi.cs b/GameAppCoverUi.cs
+--- a/GameAppCoverUi.cs
++++ b/GameAppCoverUi.cs
+@@ -214,6 +214,7 @@
+         foreach (var name in facts.Games ?? new List<string>())
+         {
+             if (!GameAppUi.IsNup(name)) continue;
++            if (GameFileContent(name) != SourceFileState.Content) continue;   // a package removed after its build has nothing to read an icon from (GameAppSourceUi.cs)
+             var rel = GameAppUi.IconRelativePath(name);
+             if (rel != null && File.Exists(CoverFileOf(name, rel))) continue;
+             // a package that gave no icon (or could not be read) is tried again only when the file is newer than the note
+diff -ruN a/GameAppImportUi.cs b/GameAppImportUi.cs
+--- a/GameAppImportUi.cs
++++ b/GameAppImportUi.cs
+@@ -91,7 +91,8 @@
+             bool scoped = folder.StartAccessingSecurityScopedResource();   // held until the sheet is closed or the files are added
+             try
+             {
+-                var library = Dumps().Select(Path.GetFileName).ToList();
++                // a file with no content (removed after its build, or empty) is not "in the library": an import of the same name replaces it (patch 0068)
++                var library = Dumps().Select(Path.GetFileName).Where(n => GameFileContent(n) == SourceFileState.Content).ToList();
+                 if (File.Exists(Path.Combine(GameAppMain.Documents, "prod.keys"))) library.Add("prod.keys");
+                 scan = FolderScan.Scan(FolderListing.OnDisk(root), library);
+             }
+@@ -151,12 +152,12 @@
+         Write($"import: picked {chosen.Count} file(s)");
+         // each file's URL is a path under the picked folder, whose security scope is still held (as ScanFolderForContent / CopyContentIn read the files they found)
+         var jobs = chosen.Select(f => (Url: NSUrl.FromFilename(Path.Combine(folder.Path, f.Relative)), Name: f.Name)).ToList();
+-        RunImportJobs(jobs, EndFolderImport);
++        RunImportJobs(jobs, EndFolderImport, "folder " + folder.LastPathComponent);
+     }
+ 
+     /// Adds `jobs` to Documents (the file's own name, as CopyIn does; the title-id / update / DLC handling is the file name's, read by the refresh that follows: RefreshGames + RefreshScreen), one after the other on a
+     /// worker thread: a coordinated read (a file only in iCloud is downloaded first), then GameImport.Place. `afterwards` runs on the main thread when all are done.
+-    private void RunImportJobs(List<(NSUrl Url, string Name)> jobs, Action afterwards)
++    private void RunImportJobs(List<(NSUrl Url, string Name)> jobs, Action afterwards, string sourceLabel)
+     {
+         importBusy = true;
+         bool awake = !UIApplication.SharedApplication.IdleTimerDisabled;   // not undone when a build already keeps the screen awake
+@@ -190,6 +191,7 @@
+                                     BeginInvokeOnMainThread(() => ShowImportProgress(index, jobs.Count, name, total > 0 ? done / (double) total : 0, "Copying"))),
+                                 log, FreeBytes);
+                             if (placed.How != PlacedHow.AlreadyThere && IsPickerCopy(path)) try { File.Delete(path); } catch (Exception) { }   // the picker made a copy in our container after all: it is ours to remove
++                            if (placed.How != PlacedHow.AlreadyThere) RecordImportFile(Path.Combine(documents, name), placed.How == PlacedHow.Cloned ? ImportHow.Clone : ImportHow.Copy, sourceLabel);   // the app made this file: it may free it after the build (GameAppSourceUi.cs)
+                         }
+                         catch (Exception e) { error = e.Message; }
+                     });
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -1386,7 +1386,7 @@
+         int at = steps.FindIndex(r => r.State == GameAppUi.StepState.Now);
+         if (at < 0) at = steps.Count - 1;
+         var names = Dumps().Select(Path.GetFileName).ToList();
+-        string meta = game == null ? "" : GameAppUi.ContentLine(game, names) ?? GameAppUi.SizeText(SafeLength(Path.Combine(GameAppMain.Documents, game)));
++        string meta = game == null ? "" : GameAppUi.ContentLine(game, names) ?? GameFileSizeText(game);
+         var fraction = buildFinished && !failedRun && !EndedByUser ? 1.0 : GameAppUi.ParseStage(lastStage).Fraction;
+         var primary = game != null ? GameAppUi.GameAction(game, facts) : null;
+         var window = LiveLogWindow();
+@@ -1739,6 +1739,7 @@
+                                 int index = i;
+                                 CopyWithProgress(readable.Path, dest, (done, total) =>
+                                     BeginInvokeOnMainThread(() => { if (downloads.ContainsKey(key)) downloads[key] = (index + done / (double) Math.Max(1, total)) / paths.Count; }));
++                                RecordImportFile(dest, ImportHow.Copy, "folder " + folder.LastPathComponent);   // GameAppSourceUi.cs
+                             }
+                             catch (Exception e) { failure = e; }
+                         });
+@@ -2066,10 +2067,15 @@
+                         var fraction = Math.Min(0.999, (done0 + sent) / (double) all);
+                         BeginInvokeOnMainThread(() => { if (downloads.ContainsKey(key)) downloads[key] = fraction; });
+                     };
++                    string how;
+                     if (source.Kind == CloudKind.Nas)
++                    {
+                         Nas.Download(nas, Nas.Password(nas.User, password), f.Remote, dest, progress, null);
++                        how = ImportHow.Download;
++                    }
+                     else
+-                        CopyFromFolder(source, f, dest, progress, line => BeginInvokeOnMainThread(() => Write(line)));
++                        how = CopyFromFolder(source, f, dest, progress, line => BeginInvokeOnMainThread(() => Write(line))).How == PlacedHow.Cloned ? ImportHow.Clone : ImportHow.Copy;
++                    RecordImportFile(dest, how, source.Name, source.Id);   // GameAppSourceUi.cs: the app made this file (a worker thread: a small file, under a lock)
+                     before += f.Size;
+                 }
+             }
+@@ -2095,7 +2101,7 @@
+ 
+     /// A file of a Files folder, copied here. The coordinated read makes the provider (iCloud Drive, Google Drive,
+     /// OneDrive...) download it first when it is only in the cloud.
+-    private static void CopyFromFolder(CloudSource source, CloudFile f, string dest, Action<long, long> progress, Action<string> log = null)
++    private static Placed CopyFromFolder(CloudSource source, CloudFile f, string dest, Action<long, long> progress, Action<string> log = null)
+     {
+         var folder = ResolveFolder(source, out var why);
+         if (folder == null) throw new InvalidOperationException(why);
+@@ -2104,15 +2110,17 @@
+         {
+             var url = folder.Append(f.Remote ?? f.Name, false);
+             Exception failure = null;
++            Placed placed = null;
+             var coordinator = new NSFileCoordinator();
+             coordinator.CoordinateRead(url, (NSFileCoordinatorReadingOptions) 0, out NSError error, readable =>
+             {
+                 // An APFS clone first (the file is on this volume: instant, no space), else the copy with progress, both through <name>.part and one rename (GameAppImport.cs); one log line per file
+-                try { GameImport.Place(readable.Path, dest, FileClone.Try, (from, part) => GameImport.CopyBytes(from, part, progress), log, FreeBytes); }
++                try { placed = GameImport.Place(readable.Path, dest, FileClone.Try, (from, part) => GameImport.CopyBytes(from, part, progress), log, FreeBytes); }
+                 catch (Exception e) { failure = e; }
+             });
+             if (error != null) throw new InvalidOperationException(error.LocalizedDescription);
+             if (failure != null) throw failure;
++            return placed;
+         }
+         finally { if (scoped) folder.StopAccessingSecurityScopedResource(); }
+     }
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -884,7 +884,7 @@
+         if (partsSwept) return;
+         partsSwept = true;
+         var documents = GameAppMain.Documents;
+-        SweepPartsIn(documents, "Documents", name => name == "prod.keys.part" || name == ".titleids.tsv.part" || name == "gameapp.paused.tsv.part" || IsPartOf(name, OurPartExtensions), log);
++        SweepPartsIn(documents, "Documents", name => name == "prod.keys.part" || name == ".titleids.tsv.part" || name == "gameapp.paused.tsv.part" || name == ImportLedger.FileName + ".part" || IsPartOf(name, OurPartExtensions), log);
+         var exports = Path.Combine(documents, "Exports");
+         if (Directory.Exists(exports) && new DirectoryInfo(exports).LinkTarget == null)
+         {
+@@ -1687,6 +1687,7 @@
+         foreach (var name in facts.Games ?? new List<string>())
+         {
+             if (GameAppUi.IsNup(name)) continue;   // the extractor reads NSP/XCI only: a Switch 2 game's icon comes with its build
++            if (GameFileContent(name) != SourceFileState.Content) continue;   // a game file removed after its build (or empty) has nothing to read an icon from (GameAppSourceUi.cs)
+             var rel = GameAppUi.IconRelativePath(name);
+             if (rel == null)
+             {
+@@ -1956,6 +1957,7 @@
+         if (!nup && !File.Exists(keys)) { Write("no prod.keys in Documents: the tool cannot read an NSP without them"); return; }
+         var path = Path.Combine(GameAppMain.Documents, game);
+         if (!File.Exists(path)) { Write($"{game} is no longer in Documents"); return; }
++        if (!GameFileHasContent(game)) return;   // GameAppSourceUi.cs: the file was removed after the build: it says so and offers to add it again (patch 0068)
+         rebuildRequested = true;
+         BeginRunWithArguments(keys, path, "--romfs-image");
+     }
+@@ -2233,6 +2235,9 @@
+                 try { if (Directory.Exists(path)) { BackgroundDelete.DeleteTree(path); removed++; } }
+                 catch (Exception error) { failed++; notes.Add($"delete: {rel}/ not removed ({error.Message})"); }
+             }
++            // the deleted game files have no import record any more (patch 0068)
++            try { ImportLedger.Update(GameAppMain.Documents, list => ImportLedger.Remove(list, plan.Files.Where(f => f.IndexOf('/') < 0))); }
++            catch (Exception error) { notes.Add($"delete: the import records could not be updated ({error.Message})"); }
+         }, _ =>
+         {
+             foreach (var note in notes) Write(note);
+@@ -2729,7 +2734,11 @@
+                 failedRun = outcome == StopOutcome.Failed;
+                 Write($"memory at the end: {GameAppMain.MemLine()}");
+                 Write($"free space at the end: {GameAppMain.FreeSpace()}");
+-                if (!RestartForStage3(rc, chainError)) Finish();   // GameAppResume.cs: the chain may end on purpose before stage 3
++                if (!RestartForStage3(rc, chainError))   // GameAppResume.cs: the chain may end on purpose before stage 3
++                {
++                    Finish();
++                    if (!bootOnly) RemoveSourceAfterBuild(name, outcome);   // GameAppSourceUi.cs (patch 0068): a successful build of an imported game frees the game file (an empty stub stays)
++                }
+             });
+         });
+     }
+@@ -3179,6 +3188,7 @@
+                 throw;
+             }
+             Write($"imported: {name}");
++            RecordImport(destination, "copy", "picker");   // GameAppSourceUi.cs: the app made this file (iOS copied it into tmp/ first): it may free it after the build
+             RefreshGames();
+             RefreshScreen();
+         }
+diff -ruN a/GameAppQueueUi.cs b/GameAppQueueUi.cs
+--- a/GameAppQueueUi.cs
++++ b/GameAppQueueUi.cs
+@@ -60,6 +60,7 @@
+ 
+     private void AddToBuildQueue(string game)
+     {
++        if (!GameFileHasContent(game)) return;   // GameAppSourceUi.cs: the file was removed after the build (patch 0068)
+         if (!BuildQueue.Add(buildQueue, game)) { Write($"build queue: {GameAppUi.DisplayName(game)} is already in it"); return; }
+         SaveBuildQueue();
+         Write($"build queue: {GameAppUi.DisplayName(game)} added ({buildQueue.Queued} waiting). The Build tab starts it.");
+@@ -181,6 +182,13 @@
+             return;
+         }
+         var path = Path.Combine(GameAppMain.Documents, item.Game);
++        if (ContentMissing(item.Game).Count > 0)
++        {
++            BuildQueue.Ended(buildQueue, item.Game, false, "the game file was removed after the build: add it again");   // GameAppSourceUi.cs (patch 0068): no alert in the middle of the queue
++            SaveBuildQueue();
++            QueueStartNext();
++            return;
++        }
+         if (!File.Exists(path))
+         {
+             BuildQueue.Ended(buildQueue, item.Game, false, "the game file is no longer in iBuilder");
+diff -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs
++++ b/GameAppShelf.cs
+@@ -220,7 +220,7 @@
+     {
+         long size = 0;
+         try { size = new FileInfo(Path.Combine(GameAppMain.Documents, e.Name)).Length; } catch (Exception) { }
+-        return size > 0 ? GameAppUi.SizeText(size) : "";
++        return size > 0 ? GameAppUi.SizeText(size) : GameFileContent(e.Name) == SourceFileState.Stub ? SourceText.Removed_ : "";   // (a game file removed after its build: patch 0068)
+     }
+ 
+     /// The buttons a game has right now, and its state chip. A running build or boot disables them (the phone is theirs).
+@@ -268,6 +268,7 @@
+     /// The update or DLC added since the build goes in: the whole build runs again.
+     private void DoUpdate(string name)
+     {
++        if (!GameFileHasContent(name)) return;   // GameAppSourceUi.cs: the file was removed after the build (patch 0068)
+         selected = name;
+         if (AskIfHot(() => DoUpdate(name))) return;
+         SetUpAndPlay(name);
+@@ -276,6 +277,7 @@
+ 
+     private void ConfirmRebuild(string name)
+     {
++        if (!GameFileHasContent(name)) return;   // GameAppSourceUi.cs
+         var a = UIAlertController.Create("Rebuild " + GameAppUi.DisplayName(name) + "?", "The whole build runs again: about a minute for most games.", UIAlertControllerStyle.Alert);
+         a.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
+         a.AddAction(UIAlertAction.Create("Rebuild", UIAlertActionStyle.Default, _ => DoUpdate(name)));
+@@ -652,7 +654,7 @@
+             }
+             if (stop.State == StopState.Cancelled && stop.Game == name && chip == "Not built yet") { chip = StopText.Cancelled(); tone = Theme.Muted; }   // "Cancelled" until the next run or launch
+             var cloudCopy = Cloud.CloudCopyOf(name, cloudFiles);
+-            phoneList.AddArrangedSubview(BuildRow(CoverOf(name, facts), GameAppUi.DisplayName(name), GameAppUi.SizeText(SafeLength(Path.Combine(GameAppMain.Documents, name))) + (cloudCopy != null ? " · also in the cloud" : ""),
++            phoneList.AddArrangedSubview(BuildRow(CoverOf(name, facts), GameAppUi.DisplayName(name), GameFileSizeText(name) + (cloudCopy != null ? " · also in the cloud" : ""),
+                                                   false, frac, chip, tone, acts, !facts.Running, i == 0));
+         }
+         if (phone.Count == 0) phoneList.AddArrangedSubview(Theme.Label("No game on this " + GameAppUi.DeviceName + " yet. Tap + to import a .nsp, .xci, .nsz or .nup, or pick one in the cloud.", Theme.Font(14, UIFontWeight.Regular), Theme.Muted, 0));
+@@ -842,9 +844,20 @@
+             }
+             catch (Exception error) { Write($"could not save the build setting: {error.Message}"); }
+         };
++        var removeSource = new UISwitch { On = SourceRemoval.ToggleOn(ReadAppSettings()), AccessibilityIdentifier = "setting-remove-source", OnTintColor = Theme.Accent };
++        removeSource.ValueChanged += (_, __) =>
++        {
++            try
++            {
++                File.WriteAllText(AppSettingsPath, GameAppUi.WithAppSetting(ReadAppSettings(), SourceRemoval.SettingKey, removeSource.On ? "1" : "0"));
++                Write($"build setting: the game file is {(removeSource.On ? "removed (an empty stub stays) after a successful build of a game iBuilder imported" : "kept after a build")}");
++            }
++            catch (Exception error) { Write($"could not save the build setting: {error.Message}"); }
++        };
+         var buildCard = SettingsCard(
+             SettingsSwitchRow("Parallel shader preparation", "Uses every core while a build translates the shaders. Applies from the next build.", parallel),
+             SettingsSwitchRow("Low performance", "Cooler and slower: at most two jobs at once, also in a build that is running.", lowPerf),
++            SettingsSwitchRow(SourceText.SettingTitle, SourceText.SettingNote, removeSource),   // GameAppSourceRemoval.cs (patch 0068)
+             cacheHolder);
+ 
+         setLogs = SettingsRow("Logs", () => ShowTab(3), true, false, 3, "settings-logs");
+@@ -1022,8 +1035,7 @@
+         // STORAGE
+         var storage = new List<UIView>();
+         UILabel Line(string k, string v) { var r = SettingsRow(k, null, false, false); r.Value.Text = v; storage.Add(r.Button); return r.Value; }
+-        long gameBytes = 0; try { gameBytes = new FileInfo(Path.Combine(docs, game)).Length; } catch (Exception) { }
+-        Line("Game", GameAppUi.SizeText(gameBytes));
++        Line("Game", GameFileSizeText(game));
+         // Build and Shaders are folders of thousands of files: "…" until the worker thread has measured them (FolderSizes), then the value (RefreshStorageViews calls sheetStorageFill).
+         string Known(long bytes) => bytes < 0 ? "…" : GameAppUi.SizeText(bytes);
+         string BuildText() { long ex = sizes.Get(FolderSizes.Extract), fw = sizes.Get(FolderSizes.Framework); return Known(ex < 0 || fw < 0 ? -1 : ex + fw); }
+diff -ruN a/GameAppSourceRemoval.cs b/GameAppSourceRemoval.cs
+--- a/GameAppSourceRemoval.cs
++++ b/GameAppSourceRemoval.cs
+@@ -0,0 +1,305 @@
++// gameapp/GameAppSourceRemoval.cs -- "Remove the game file after a successful build": which files the app imported itself (the provenance record), when such a file is replaced by an empty stub of the same name, how the stub
++// is made, and what a stub means to the rest of the app, with no UIKit (patch 0068; the host harness compiles this file as it is).
++//
++// Why (the owner's decision): a game that was imported is a clone or a copy of a file that exists somewhere else ("since the game is cloned it is already somewhere"), and after a successful build iBuilder needs only its
++// build, not the game file. So after a build the file is replaced by a ZERO-BYTE STUB with the same name: the library is made from the game files in Documents (Dumps()), so the game stays, keeps its name, its title id,
++// its cover, its settings, saves and mods, its Ready status (the stamp), Play and Export IPA; only what needs the CONTENT (Rebuild, Update, Set up again, the icon pass) says "The game file was removed after the build to free
++// space. Add it again to rebuild." and offers to add it again.
++//
++//   ImportRecord / ImportLedger   Documents/gameapp.imports.tsv: what the APP imported (file name, size, how: clone / copy / download, where from, when, and when its content was removed). A file the owner put into
++//                                 Documents by hand has no record and is NEVER removed.
++//   SourceRemoval                 ShouldRemove (one file) and Plan (a game's base file, its update and its DLC): the table of every case in which nothing is removed; Execute (the ledger first, then the stub).
++//   SourceStub                    IsStub, and the stub itself: written as <name>.part and renamed over the file in one step (atomic); a failure leaves the file as it was.
++//   SourceReAdd                   whether a Files-folder source that the file came from still lists it (an instant clone to add it again).
++//   SourceText                    the words.
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using System.Text;
++
++/// One import the app did. `How`: clone, copy (iOS or the app copied the bytes) or download (a NAS). `Source`: a short label ("picker", "folder switch_games", the Cloud page's source name, "NAS"); `SourceId`: the Cloud
++/// source's id when the file came from one (the folder can then be asked for it again), else "". `At`, `RemovedAt`: UTC "yyyy-MM-ddTHH:mm:ssZ"; RemovedAt "" = the content is still here.
++public sealed record ImportRecord(string Name, long Size, string How, string Source, string SourceId, string At, string RemovedAt)
++{
++    public bool Removed => !string.IsNullOrEmpty(RemovedAt);
++}
++
++/// How a file came to be here.
++public static class ImportHow
++{
++    public const string Clone = "clone", Copy = "copy", Download = "download";
++}
++
++public static class ImportLedger
++{
++    public const string FileName = "gameapp.imports.tsv";
++
++    private static readonly object gate = new object();
++    private static readonly Dictionary<string, (long Stamp, List<ImportRecord> Records)> cache = new Dictionary<string, (long, List<ImportRecord>)>(StringComparer.Ordinal);
++
++    public static string PathIn(string documents) => System.IO.Path.Combine(documents, FileName);
++
++    public static string Now() => DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
++
++    private static string Clean(string s) => (s ?? "").Replace('\t', ' ').Replace('\n', ' ').Replace('\r', ' ');
++
++    public static List<ImportRecord> Parse(string text)
++    {
++        var list = new List<ImportRecord>();
++        foreach (var raw in (text ?? "").Split('\n'))
++        {
++            var line = raw.TrimEnd('\r');
++            if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
++            var p = line.Split('\t');
++            if (p.Length < 7 || p[0].Length == 0) continue;
++            long.TryParse(p[1], NumberStyles.None, CultureInfo.InvariantCulture, out var size);
++            var record = new ImportRecord(p[0], size, p[2], p[3], p[4], p[5], p[6]);
++            list.RemoveAll(r => string.Equals(r.Name, record.Name, StringComparison.OrdinalIgnoreCase));   // Documents is on a case-insensitive file system: one record per name, the last wins
++            list.Add(record);
++        }
++        return list;
++    }
++
++    public static string Format(IEnumerable<ImportRecord> list)
++    {
++        var sb = new StringBuilder("# what this app imported (it may remove the content after a successful build): file name, size, how (clone|copy|download), source, source id, imported at, content removed at\n");
++        foreach (var r in list)
++            sb.Append(Clean(r.Name)).Append('\t').Append(r.Size.ToString(CultureInfo.InvariantCulture)).Append('\t').Append(Clean(r.How)).Append('\t').Append(Clean(r.Source)).Append('\t')
++              .Append(Clean(r.SourceId)).Append('\t').Append(Clean(r.At)).Append('\t').Append(Clean(r.RemovedAt)).Append('\n');
++        return sb.ToString();
++    }
++
++    public static ImportRecord Find(IEnumerable<ImportRecord> list, string name) =>
++        list?.FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
++
++    /// Adds the record, or replaces the one of the same name (importing again over a file, or over a stub, is a new import: its content is here).
++    public static List<ImportRecord> Upsert(IEnumerable<ImportRecord> list, ImportRecord record)
++    {
++        var next = list.Where(r => !string.Equals(r.Name, record.Name, StringComparison.OrdinalIgnoreCase)).ToList();
++        next.Add(record);
++        return next;
++    }
++
++    public static List<ImportRecord> Remove(IEnumerable<ImportRecord> list, IEnumerable<string> names)
++    {
++        var gone = new HashSet<string>(names ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
++        return list.Where(r => !gone.Contains(r.Name)).ToList();
++    }
++
++    // ---- the file: read when it changed, written through a .part and one rename, under one lock (imports run on workers) --------------
++
++    private static long StampOf(string path)
++    {
++        try { var f = new FileInfo(path); return f.Exists ? f.LastWriteTimeUtc.Ticks ^ (f.Length << 20) : 0; } catch (Exception) { return -1; }
++    }
++
++    /// The records now. A small file, read again only when it changed. Never throws (an unreadable file is an empty ledger: nothing is removed).
++    public static List<ImportRecord> Load(string documents)
++    {
++        var path = PathIn(documents);
++        lock (gate)
++        {
++            var stamp = StampOf(path);
++            if (cache.TryGetValue(path, out var hit) && hit.Stamp == stamp) return hit.Records.ToList();
++            List<ImportRecord> records;
++            try { records = stamp == 0 ? new List<ImportRecord>() : Parse(File.ReadAllText(path)); } catch (Exception) { records = new List<ImportRecord>(); }
++            cache[path] = (stamp, records);
++            return records.ToList();
++        }
++    }
++
++    /// Changes the ledger: `change` gets the records and returns the new ones; the file is written only when they differ. Throws when the file cannot be written (the callers say so in the log).
++    public static List<ImportRecord> Update(string documents, Func<List<ImportRecord>, List<ImportRecord>> change)
++    {
++        var path = PathIn(documents);
++        lock (gate)
++        {
++            List<ImportRecord> before;
++            try { before = File.Exists(path) ? Parse(File.ReadAllText(path)) : new List<ImportRecord>(); } catch (Exception) { before = new List<ImportRecord>(); }
++            var after = change(before.ToList());
++            if (Format(after) == Format(before)) { cache[path] = (StampOf(path), after); return after.ToList(); }
++            Directory.CreateDirectory(documents);
++            var part = path + ".part";
++            try { File.WriteAllText(part, Format(after)); File.Move(part, path, true); }
++            catch { try { File.Delete(part); } catch (Exception) { } throw; }
++            cache[path] = (StampOf(path), after);
++            return after.ToList();
++        }
++    }
++
++    /// One import: the app made this file, now. (Only game files are recorded; prod.keys never.) Replaces the record of the same name.
++    public static void RecordImport(string documents, string name, long size, string how, string source, string sourceId = "")
++    {
++        if (!InPlaceImport.Accepts(name) || string.Equals(name, InPlaceImport.Keys, StringComparison.Ordinal)) return;
++        Update(documents, list => Upsert(list, new ImportRecord(name, size, how, source ?? "", sourceId ?? "", Now(), "")));
++    }
++}
++
++/// What a build ended with and what else is going on, read by the app right before it decides. `Game`: the base game file that was built. `StampGame` / `StampContent`: Documents/gameapp.framework (`game=`, `content=`).
++/// `CurrentContent`: the update / DLC signature of the files in Documents now. `BuildRunning`, `PausedHere`, `QueuedHere`: a build of THIS game runs / is paused / waits in the queue.
++public sealed record SourceState(string Game, string StampGame, string StampContent, string CurrentContent, bool BuildRunning, bool PausedHere, bool QueuedHere);
++
++public enum RemoveWhy { Remove, NotAGameFile, ToggleOff, BuildNotFinished, StampMismatch, ContentChanged, BuildBusy, NoRecord, AlreadyRemoved, Missing, SizeChanged }
++
++public sealed record SourceDecision(string File, RemoveWhy Why, ImportRecord Record);
++
++public static class SourceRemoval
++{
++    public const string SettingKey = "remove_source_after_build";
++
++    /// The Settings toggle: on unless the settings file says 0 / off / no / false. (The default is ON: the owner asked for it.)
++    public static bool ToggleOn(string settingsText) =>
++        GameAppUi.AppSetting(settingsText, SettingKey, "1").ToLowerInvariant() is not ("0" or "off" or "no" or "false");
++
++    /// Whether `file` (the base game's file, or its update's or a DLC's) has its content removed now. NOTHING is removed unless every line holds:
++    ///   a game file (never prod.keys, a certificate, anything else) / the Settings toggle is on / the build's chain returned 0 (not a pause, a cancel, a failure; an OS kill never gets here) / the build stamp names this
++    ///   game and its update / DLC are what the build included / no build of this game runs, is paused or waits in the queue / the app has a record that IT imported the file, not removed yet / the file is still what was
++    ///   imported (its size is the record's: a file the owner replaced by hand is not ours any more) and has content.
++    /// `actualSize`: the file's length now, -1 when it is not there.
++    public static RemoveWhy ShouldRemove(string file, ImportRecord record, long actualSize, StopOutcome outcome, bool toggle, SourceState state)
++    {
++        if (string.IsNullOrEmpty(file) || string.Equals(file, InPlaceImport.Keys, StringComparison.OrdinalIgnoreCase) || !InPlaceImport.Accepts(file)) return RemoveWhy.NotAGameFile;
++        if (!toggle) return RemoveWhy.ToggleOff;
++        if (outcome != StopOutcome.Finished) return RemoveWhy.BuildNotFinished;
++        if (state == null || string.IsNullOrEmpty(state.StampGame) || !string.Equals(state.StampGame, state.Game, StringComparison.Ordinal)) return RemoveWhy.StampMismatch;
++        bool isBase = string.Equals(file, state.Game, StringComparison.Ordinal);
++        if (state.StampContent == null ? !isBase : !string.Equals(state.StampContent, state.CurrentContent ?? "", StringComparison.Ordinal)) return RemoveWhy.ContentChanged;   // an update or DLC the build did not include stays
++        if (state.BuildRunning || state.PausedHere || state.QueuedHere) return RemoveWhy.BuildBusy;
++        if (record == null) return RemoveWhy.NoRecord;
++        if (actualSize < 0) return RemoveWhy.Missing;
++        if (record.Removed) return actualSize == 0 ? RemoveWhy.AlreadyRemoved : RemoveWhy.NoRecord;   // content again under a "removed" record: put there by hand (an import writes a new record), so it is not ours
++        if (actualSize == 0) return RemoveWhy.Missing;
++        if (record.Size != actualSize) return RemoveWhy.SizeChanged;
++        return RemoveWhy.Remove;
++    }
++
++    /// The base game file, its update and its DLC (the files a build of the game reads), each decided on its own. `names`: the game files in Documents.
++    public static List<SourceDecision> Plan(string game, IReadOnlyList<string> names, IReadOnlyList<ImportRecord> ledger, Func<string, long> sizeOf, StopOutcome outcome, bool toggle, SourceState state) =>
++        SourceGroup.Files(game, names).Select(f => { var r = ImportLedger.Find(ledger, f); return new SourceDecision(f, ShouldRemove(f, r, sizeOf(f), outcome, toggle, state), r); }).ToList();
++
++    /// Removes what `decisions` say (Why == Remove): for each file the ledger FIRST (the record says "removed" now), then the stub (SourceStub.Replace). If the stub cannot be made the record is put back and the file is as it
++    /// was. `log` gets one line per file (SourceText.Removed) and, before the very first removal ever, the line that says what this is. Returns the bytes freed (sizes in the records). Worker threads only.
++    public static long Execute(string documents, IEnumerable<SourceDecision> decisions, Action<string> log, Action<string, string> move = null)
++    {
++        long freed = 0;
++        bool first = !ImportLedger.Load(documents).Any(r => r.Removed);
++        foreach (var d in decisions.Where(d => d.Why == RemoveWhy.Remove))
++        {
++            var path = Path.Combine(documents, d.File);
++            try
++            {
++                var when = ImportLedger.Now();
++                ImportLedger.Update(documents, list => ImportLedger.Upsert(list, d.Record with { RemovedAt = when }));
++                try { SourceStub.Replace(path, move); }
++                catch
++                {
++                    ImportLedger.Update(documents, list => ImportLedger.Upsert(list, d.Record));   // the stub was not made: the file is as it was, the record says so
++                    throw;
++                }
++                freed += d.Record.Size;
++                if (first) { log?.Invoke(SourceText.FirstRemoval); first = false; }
++                log?.Invoke(SourceText.Removed(d.File, d.Record.Size, d.Record.How, d.Record.Source));
++            }
++            catch (Exception e) { log?.Invoke($"source: {d.File} was not removed ({e.Message})"); }
++        }
++        return freed;
++    }
++}
++
++/// The files a build of a game reads: its base file, its newest update and its DLC (GameAppUi.UpdateFor / DlcFor). A rebuild needs the content of ALL of them.
++public static class SourceGroup
++{
++    public static List<string> Files(string game, IReadOnlyList<string> names)
++    {
++        var files = new List<string>();
++        var own = names.FirstOrDefault(n => string.Equals(n, game, StringComparison.OrdinalIgnoreCase));
++        if (own != null) files.Add(own);
++        var update = GameAppUi.UpdateFor(game, names);
++        if (update != null) files.Add(update);
++        files.AddRange(GameAppUi.DlcFor(game, names));
++        return files.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
++    }
++}
++
++public static class SourceStub
++{
++    /// A stub: no content, and the ledger says the app removed it. (A zero-byte file with no such record is just an empty file: IsEmpty.)
++    public static bool IsStub(long size, ImportRecord record) => size == 0 && record != null && record.Removed;
++
++    public static bool IsStub(string documents, string name, IReadOnlyList<ImportRecord> ledger)
++    {
++        try { var f = new FileInfo(Path.Combine(documents, name)); return f.Exists && IsStub(f.Length, ImportLedger.Find(ledger, name)); } catch (Exception) { return false; }
++    }
++
++    /// A game file with no content, stub or not: nothing can be built from it, and an import of the same name replaces it (it is not "in the library").
++    public static bool IsEmpty(long size) => size == 0;
++
++    /// Replaces `path` by an empty file: the stub is written as `<path>.part` and renamed over `path` (one rename: the file is the old one or the stub, never half of either); a failure removes the .part and leaves the file
++    /// as it was. `move`: the rename (File.Move with overwrite by default; the harness makes it fail).
++    public static void Replace(string path, Action<string, string> move = null)
++    {
++        var part = path + GameImport.PartSuffix;
++        try
++        {
++            using (File.Create(part)) { }
++            (move ?? ((from, to) => File.Move(from, to, true)))(part, path);
++        }
++        catch
++        {
++            try { File.Delete(part); } catch (Exception) { }
++            throw;
++        }
++    }
++}
++
++/// "Add it again from <source>": the Files-folder source the file came from, when it still lists the file.
++public static class SourceReAdd
++{
++    /// `listed`: what the Cloud sources list now (source id, its name, the file name). null when the file did not come from a source or the source no longer lists it.
++    public static (string SourceId, string SourceName)? Find(ImportRecord record, IEnumerable<(string SourceId, string SourceName, string Name)> listed)
++    {
++        if (record == null || string.IsNullOrEmpty(record.SourceId)) return null;
++        foreach (var l in listed ?? Array.Empty<(string, string, string)>())
++            if (l.SourceId == record.SourceId && string.Equals(l.Name, record.Name, StringComparison.OrdinalIgnoreCase)) return (l.SourceId, l.SourceName);
++        return null;
++    }
++}
++
++/// The words.
++public static class SourceText
++{
++    public const string Message = "The game file was removed after the build to free space. Add it again to rebuild.";
++    public const string Title = "The game file was removed";
++    public const string Removed_ = "File removed";
++    public const string SettingTitle = "Remove the game file after a successful build";
++    public const string SettingNote = "iBuilder imported the file as a clone or a copy of one that is somewhere else: once the game is built it keeps the game (its name, cover, settings and saves) and frees the file. Add the file again to rebuild. Files you put into iBuilder's folder yourself are never removed.";
++    public const string FirstRemoval = "source: from now on a built game's file is replaced by an empty stub of the same name, the game stays in the library (Settings > Remove the game file after a successful build turns this off)";
++
++    private static string Inv(FormattableString text) => text.ToString(CultureInfo.InvariantCulture);
++
++    /// `source: removed <name> (<size>) after the build (it was <how>, from <source>)`
++    public static string Removed(string name, long size, string how, string source) =>
++        Inv($"source: removed {name} ({GameAppUi.SizeText(size)}) after the build (it was {HowText(how)}, from {(string.IsNullOrEmpty(source) ? "a file picker" : source)})");
++
++    public static string HowText(string how) => how switch { ImportHow.Clone => "cloned", ImportHow.Copy => "copied", ImportHow.Download => "downloaded", _ => string.IsNullOrEmpty(how) ? "imported" : how };
++
++    public static string ReAdd(string source) => "Add it again from " + source;
++
++    /// The line the log gets when nothing was removed and the reason is worth saying (not for a file with no record: that is every hand-placed file).
++    public static string Kept(string file, RemoveWhy why) => why switch
++    {
++        RemoveWhy.ToggleOff => null,
++        RemoveWhy.NoRecord => null,
++        RemoveWhy.NotAGameFile => null,
++        RemoveWhy.AlreadyRemoved => null,
++        RemoveWhy.BuildNotFinished => null,
++        RemoveWhy.StampMismatch => $"source: {file} kept (the build on disk is not this game's)",
++        RemoveWhy.ContentChanged => $"source: {file} kept (the update / DLC in iBuilder are not what the build included)",
++        RemoveWhy.BuildBusy => $"source: {file} kept (a build of this game is running, paused or queued)",
++        RemoveWhy.SizeChanged => $"source: {file} kept (it is not the file iBuilder imported any more)",
++        RemoveWhy.Missing => null,
++        _ => null,
++    };
++}
+diff -ruN a/GameAppSourceUi.cs b/GameAppSourceUi.cs
+--- a/GameAppSourceUi.cs
++++ b/GameAppSourceUi.cs
+@@ -0,0 +1,148 @@
++// gameapp/GameAppSourceUi.cs -- "Remove the game file after a successful build": the view controller's half (patch 0068). The records, the decision, the stub and the words are in GameAppSourceRemoval.cs (no UIKit, run by the
++// host harness).
++//
++//   * Every import path writes a record into Documents/gameapp.imports.tsv (file name, size, how, source, time): the old Import picker (CopyIn: iOS copied the file into tmp/, the app moved it), "Add from a folder without
++//     copying" (a clone, else a copy), the Cloud page's Download / Download and build (a Files-folder source: a clone, else a copy; the NAS: a download) and "Find them in a folder" (an update or DLC). A file the owner put
++//     into Documents by hand has no record and is never removed.
++//   * RemoveSourceAfterBuild runs when a build's chain returned 0 (after Finish): on a worker thread it replaces the game file (and its update and DLC, each by its own record) by an empty stub of the same name, and logs
++//     `source: removed <name> (<size>) after the build (it was <how>, from <source>)`. The stub keeps the game in the library (the library is built from the game files in Documents) and everything that goes by its name.
++//   * What needs the content asks first (GameFileHasContent): Set up / Rebuild / Update, "Add to the build queue", the queue's own start (no alert there: the item fails with the reason), the icon passes (they skip it).
++//     The message is "The game file was removed after the build to free space. Add it again to rebuild." with "Add it again from <source>" when the Files-folder source it came from still lists it (a clone: instant) and
++//     the two ways of the + menu.
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Threading.Tasks;
++
++using Foundation;
++using UIKit;
++
++/// What a game file in Documents holds: content, nothing because the app removed it after the build (a stub), nothing at all (an empty file), or it is not there.
++internal enum SourceFileState { Content, Stub, Empty, Missing }
++
++public sealed partial class GameAppViewController
++{
++    private static SourceFileState GameFileContent(string name)
++    {
++        try
++        {
++            var f = new FileInfo(Path.Combine(GameAppMain.Documents, name));
++            if (!f.Exists) return SourceFileState.Missing;
++            if (f.Length > 0) return SourceFileState.Content;
++            return SourceStub.IsStub(0, ImportLedger.Find(ImportLedger.Load(GameAppMain.Documents), name)) ? SourceFileState.Stub : SourceFileState.Empty;
++        }
++        catch (Exception) { return SourceFileState.Missing; }
++    }
++
++    /// The size column of a game: its size, "File removed" for a stub (never "0 MB"), "Empty file" for a file with nothing in it.
++    private static string GameFileSizeText(string name)
++    {
++        long size = 0;
++        try { var f = new FileInfo(Path.Combine(GameAppMain.Documents, name)); if (f.Exists) size = f.Length; else return GameAppUi.SizeText(0); } catch (Exception) { return GameAppUi.SizeText(0); }
++        if (size > 0) return GameAppUi.SizeText(size);
++        return GameFileContent(name) == SourceFileState.Stub ? SourceText.Removed_ : "Empty file";
++    }
++
++    // ---- the records ---------------------------------------------------------------------------------------------------------
++
++    /// The app made this file now (`how`: clone / copy / download; `source`: a short label). Any thread: a small file, under a lock, off the main thread when it is called from there.
++    private void RecordImportFile(string path, string how, string source, string sourceId = "")
++    {
++        try
++        {
++            var name = Path.GetFileName(path);
++            if (!InPlaceImport.Accepts(name)) return;
++            ImportLedger.RecordImport(GameAppMain.Documents, name, new FileInfo(path).Length, how, source, sourceId);
++        }
++        catch (Exception error) { BeginInvokeOnMainThread(() => Write($"source: the import of {Path.GetFileName(path)} could not be recorded ({error.Message}): it will not be removed after a build")); }
++    }
++
++    /// From the main thread (CopyIn): the same, on a worker.
++    private void RecordImport(string path, string how, string source) => Task.Run(() => RecordImportFile(path, how, source));
++
++    // ---- after a build ---------------------------------------------------------------------------------------------------------
++
++    /// A build's chain ended: `outcome` says how. Main thread: the facts are a few small reads; the ledger, the stubs and the sizes are on a worker.
++    private void RemoveSourceAfterBuild(string game, StopOutcome outcome)
++    {
++        if (GameExport.IsPlayer || outcome != StopOutcome.Finished || failedRun || !InPlaceImport.Accepts(game)) return;
++        bool toggle = SourceRemoval.ToggleOn(ReadAppSettings());
++        if (!toggle) return;
++        var documents = GameAppMain.Documents;
++        string stampGame = null, stampContent = null;
++        try
++        {
++            var stamp = GameAppUi.ParseFrameworkStamp(File.Exists(FrameworkStampPath) ? File.ReadAllText(FrameworkStampPath) : null);
++            stampGame = stamp?.Game; stampContent = stamp?.Content;
++        }
++        catch (Exception) { }
++        var names = Dumps().Select(Path.GetFileName).ToList();
++        var state = new SourceState(game, stampGame, stampContent, GameAppUi.ContentSignature(game, names),
++                                    BuildRunning: running && stop.Game == game, PausedHere: pausedBuilds.Any(r => r.Game == game),
++                                    QueuedHere: buildQueue.Items.Any(i => i.Game == game && i.State != BuildQueue.Failed));
++        Task.Run(() =>
++        {
++            var lines = new List<string>();
++            try
++            {
++                var plan = SourceRemoval.Plan(game, names, ImportLedger.Load(documents), f => { try { var i = new FileInfo(Path.Combine(documents, f)); return i.Exists ? i.Length : -1; } catch (Exception) { return -1; } }, outcome, toggle, state);
++                foreach (var d in plan) { var why = SourceText.Kept(d.File, d.Why); if (why != null) lines.Add(why); }
++                long freed = plan.Any(d => d.Why == RemoveWhy.Remove) ? SourceRemoval.Execute(documents, plan, lines.Add) : 0;
++                BeginInvokeOnMainThread(() =>
++                {
++                    foreach (var line in lines) Write(line);
++                    if (freed > 0) { sizes.Invalidate(); RefreshScreen(); }
++                });
++            }
++            catch (Exception error) { BeginInvokeOnMainThread(() => Write($"source: the removal after the build failed ({error.GetType().Name}: {error.Message})")); }
++        });
++    }
++
++    // ---- what needs the content ----------------------------------------------------------------------------------------------------
++
++    /// The files of this game a build reads (the base game, its update, its DLC) that have no content: removed after a build (a stub) or empty. Empty when a build can read them all.
++    private List<string> ContentMissing(string game) =>
++        SourceGroup.Files(game, Dumps().Select(Path.GetFileName).ToList()).Where(n => GameFileContent(n) is SourceFileState.Stub or SourceFileState.Empty).ToList();
++
++    /// true: go on. false: a file the build reads has no content and the person was told (the alert) -- callers just return. A file that is not there is the callers' own message.
++    private bool GameFileHasContent(string game)
++    {
++        var missing = ContentMissing(game);
++        if (missing.Count == 0) return true;
++        ShowSourceRemoved(game, missing);
++        return false;
++    }
++
++    private string SourceNameOf(string sourceId) => cloudSources.FirstOrDefault(s => s.Id == sourceId)?.Name ?? "its source";
++
++    private void ShowSourceRemoved(string game, List<string> missing)
++    {
++        var ledger = ImportLedger.Load(GameAppMain.Documents);
++        bool stub = missing.Any(n => GameFileContent(n) == SourceFileState.Stub);
++        // the Files-folder source the first of them came from, when it still lists it: one button adds back every missing file that source lists
++        var listed = cloudFiles.Select(f => (f.SourceId, SourceNameOf(f.SourceId), f.Name)).ToList();
++        (string SourceId, string SourceName)? again = null;
++        foreach (var n in missing) { again = SourceReAdd.Find(ImportLedger.Find(ledger, n), listed); if (again != null) break; }
++        Write($"source: {GameAppUi.DisplayName(game)}: {(stub ? "the game file was removed after the build" : "the game file is empty")} ({string.Join(", ", missing)}): nothing to build from");
++        var a = UIAlertController.Create(stub ? SourceText.Title : "The game file is empty", stub ? SourceText.Message : "The game file has no content. Add it again to build it.", UIAlertControllerStyle.Alert);
++        if (again != null)
++        {
++            var id = again.Value.SourceId;
++            a.AddAction(UIAlertAction.Create(SourceText.ReAdd(again.Value.SourceName), UIAlertActionStyle.Default, _ => ReAddFromSource(missing, id)));
++        }
++        a.AddAction(UIAlertAction.Create("Add a game file…", UIAlertActionStyle.Default, _ => Import()));
++        a.AddAction(UIAlertAction.Create("Add from a folder…", UIAlertActionStyle.Default, _ => ImportFromFolder()));
++        a.AddAction(UIAlertAction.Create("Not now", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(a);
++    }
++
++    /// "Add it again from <source>": the Files-folder source still lists them; Download clones each (a copy when it cannot) over its stub.
++    private void ReAddFromSource(List<string> files, string sourceId)
++    {
++        var list = files.Select(n => cloudFiles.FirstOrDefault(f => f.SourceId == sourceId && string.Equals(f.Name, n, StringComparison.OrdinalIgnoreCase))).Where(f => f != null).ToList();
++        if (list.Count == 0 || downloads.ContainsKey(list[0].Name)) return;
++        Write($"source: adding {string.Join(", ", list.Select(f => f.Name))} again from {SourceNameOf(sourceId)}");
++        Download(list, GameAppMain.Documents);
++    }
++}

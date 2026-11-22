@@ -1,0 +1,3 @@
+ERR
+null
+gather offsets: unexpected call spvGatherConstOffsets(spvDescriptorSet0.t0, spvDescriptorSet0.s0, _20, int(_7), float2(1.0))

@@ -1,0 +1,19 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_other.bin": "f4e1bc876bd105b9dfca579fc8d30748c1d4024d3e1db02f5444c70e819d3734",
+  "pkg/ps_data.bin": "736a7384461123236019e0d25780a2e0dc0df665136911ce8782c85f1b348f7e",
+  "pkg/ps_other.bin": "84f67f8ff820782bc6ebdb6857d487abc2c276fc1e4e489a02b5c17407e0e44f",
+  "pkg/vs_other.bin": "711d41ffdab94cd508fa5353ebbfa3fd3f5a8eb7ad28208e8e5ada50bf62a98f",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "ab1029c1db28aff053ac3eb9804482720d76c6ccf0445002b83466b83cfa5d16",
+  "tables/shader_map.tsv": "a0c44f557a77dfa6da2135c554285071649bf1da267833c4475a1cc4b81a309c",
+  "tables/shader_pairs.tsv": "328f84d2d84f327e195c09cf54ddd7c39ff3852d54703aa37b83746e75d5e8c3"
+ },
+ "log": [
+  "single-stage programs: 3 vertex shaders are paired with a cover of 1 pixel shader(s) (1a228bda824fe62f)",
+  "shaders: 9 (compute 1, pixel 5, vertex 3); sources other 8, data 1; compute shader answers 1 rows; variation pairs 3"
+ ],
+ "shaders": 9,
+ "updates": []
+}

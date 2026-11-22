@@ -1,0 +1,15 @@
+using namespace metal;
+struct main0_out
+{
+    float4 gl_Position [[position]];
+};
+
+void f()
+{
+      _7 = _16;
+uint _47 = ((_1)) & 1;
+bool _42 = _47 != 0;
+{
+  int _35 = _42 ? (-1) : 0;
+}
+

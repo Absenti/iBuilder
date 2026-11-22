@@ -1,0 +1,183 @@
+0020-warm-up-manual-only.patch -- the shader warm-up ("Preparing the shaders", docs/DECISIONS.md 79 / 85, GameAppWarm.cs) becomes MANUAL ONLY. docs/CONFORMITY-AUDIT.md, row D-WARM.
+Applied by scripts/build-app.sh to its copy of the C# snapshot (patch -p1, run in the project folder), after 0010 and before nothing else; app/gameapp/ is not edited.
+  * GameAppMain.cs: no warm-up at the end of a build (Finish), none at a launch (StartWarmAtLaunch keeps only the debug launch argument); a "Prepare the shaders..." / "Stop preparing
+    the shaders" button in the game settings sheet (library AND an exported player's Settings), offered only when the game has a library of this host's chain.
+  * GameAppWarm.cs: GameWarm.Enabled (the warm_shaders row that defaulted to on) is gone; GameWarm.HasLibrary; the sheet's action asks, then starts or stops one run.
+--- a/GameAppWarm.cs
++++ b/GameAppWarm.cs
+@@ -16,6 +16,10 @@
+ //
+ // What is kept: Documents/games/<id>/warmed.tsv, one row per library compiled (name, a digest of its text, ms), under a header naming
+ // this app build and chain: another build of the app (the OS or the host may differ, the cache may be gone) starts it again.
++//
++// MANUAL ONLY (app/patches/0020-warm-up-manual-only.patch): nothing here starts by itself. Not at a launch (an exported player used to prepare ALL its libraries at EVERY launch:
++// it read and hashed the whole library image each time, and compiled it all on the first), not after a build. The player starts it from the game's settings sheet ("Prepare the
++// shaders…", GameAppSettingsViewController.PrepareShaders) and can stop it there; it also stops when a build or a boot starts. The one other way in is the debug launch argument.
+ //
+ // The pure parts (the image's index, the warmed.tsv rows, the options' decision) have no iOS types and are tested on a Mac
+ // (gameapp/tests/GameWarm.Tests, compiled with WARM_LOGIC_ONLY); the part below #if !WARM_LOGIC_ONLY needs the iOS SDK.
+@@ -293,19 +297,17 @@
+     public static string Status => active ? status : "";
+     public static string ActiveGame => active ? activeGame : null;
+ 
+-    /// Documents/gameapp.settings.tsv warm_shaders: on unless 0/off/no/false. (No switch on the Settings page yet: Agent B's page.)
+-    public static bool Enabled
++    /// Whether there is anything to prepare: the pack's library image of this host's chain (a Mac-made pack holds .metallib files: nothing to compile). A cheap look, no parsing: it
++    /// decides whether the settings sheet offers "Prepare the shaders…".
++    public static bool HasLibrary(string titleId, string packRoot)
+     {
+-        get
++        try
+         {
+-            try
+-            {
+-                var p = Path.Combine(GameAppMain.Documents, "gameapp.settings.tsv");
+-                var text = File.Exists(p) ? File.ReadAllText(p) : "";
+-                return GameAppUi.AppSetting(text, "warm_shaders", "1").ToLowerInvariant() is not ("0" or "off" or "no" or "false");
+-            }
+-            catch (Exception) { return true; }
++            if (string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(packRoot) || !Directory.Exists(packRoot)) return false;
++            var pack = Directory.EnumerateDirectories(packRoot).FirstOrDefault(d => string.Equals(Path.GetFileName(d), titleId, StringComparison.OrdinalIgnoreCase));
++            return pack != null && File.Exists(Path.Combine(pack, "b-" + GameAppBuild.ShaderChain + ".img"));
+         }
++        catch (Exception) { return false; }
+     }
+ 
+     /// The same compile the host does (nvn_mtl.m src_compile), with the options it gives. See the file's head before touching this.
+@@ -335,10 +337,10 @@
+ 
+     private sealed record Item(string Name, string Path, long Offset, long Size);
+ 
+-    /// Starts preparing `titleId`'s libraries from `packRoot` (Documents/shaders, or the player's bundle copy). Returns at once.
++    /// Starts preparing `titleId`'s libraries from `packRoot` (Documents/shaders, or the player's bundle copy). Returns at once. Only the player's tap calls it.
+     public static void Start(string titleId, string packRoot)
+     {
+-        if (!Enabled || string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(packRoot)) return;
++        if (string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(packRoot)) return;
+         int mine;
+         lock (gate) { mine = ++generation; active = true; activeGame = titleId; status = ""; }
+         var t = new Thread(() => { try { Run(titleId, packRoot, mine); } catch (Exception error) { Log("shader warm-up: [ORANGE] " + error.Message); } finally { lock (gate) { if (generation == mine) active = false; } Changed?.Invoke(); } })
+@@ -493,12 +495,12 @@
+ 
+ public sealed partial class GameAppViewController
+ {
+-    /// After a successful build (Finish), or at a player's first launch: prepare the game's shaders in the background.
++    /// The player asked ("Prepare the shaders…" in the game's settings): prepare the game's shaders in the background. Nothing else calls this: not a launch, not the end of a build.
+     private void StartWarm(string game) => StartWarmTitle(string.IsNullOrEmpty(game) ? null : GameAppUi.BaseTitleIdOf(GameExport.IsPlayer ? GameExport.PlayerDump : game));
+ 
+     private void StartWarmTitle(string tid)
+     {
+-        if (tid == null || !GameWarm.Enabled) return;
++        if (tid == null) return;
+         GameWarm.Sink = line => BeginInvokeOnMainThread(() => Write(line));
+         var root = GameExport.IsPlayer ? Path.Combine(GameExport.BundleGame, "shaders") : Path.Combine(GameAppMain.Documents, "shaders");
+         GameWarm.Changed -= WarmChanged;
+@@ -526,14 +528,41 @@
+         if (GameWarm.Active && GameWarm.Status.Length > 0 && !runCardView.Hidden && !failedRun) runLine.Text += "\n" + GameWarm.Status;
+     }
+ 
+-    /// At launch: a player prepares its own cache (its bundle identifier is its own: the build's warm-up filled another app's).
+-    /// A debug launch can name a game with the launch argument "-GAMEAPP_WARM_TITLE <title id>" (the simulator's check: it reaches
+-    /// NSUserDefaults; an environment variable cannot be set through the device tools).
++    /// A launch starts NOTHING by itself. (It used to start an exported player's whole warm-up at every launch.) The one exception is a debug launch that names a game with the
++    /// launch argument "-GAMEAPP_WARM_TITLE <title id>" (the simulator's check: it reaches NSUserDefaults; an environment variable cannot be set through the device tools).
+     private void StartWarmAtLaunch()
+     {
+-        if (GameExport.IsPlayer) { StartWarm(GameExport.PlayerDump); return; }
+         var test = NSUserDefaults.StandardUserDefaults.StringForKey("GAMEAPP_WARM_TITLE");
+         if (!string.IsNullOrEmpty(test)) StartWarmTitle(test.ToUpperInvariant());
+     }
++
++    /// Where the game's pack is: Documents/shaders, or an exported player's bundle copy.
++    private static string WarmPackRoot() => GameExport.IsPlayer ? Path.Combine(GameExport.BundleGame, "shaders") : Path.Combine(GameAppMain.Documents, "shaders");
++
++    /// The title id the warm-up works on for `game` (a player's is its own dump's), or null.
++    private static string WarmTitleOf(string game) => GameAppUi.BaseTitleIdOf(GameExport.IsPlayer ? GameExport.PlayerDump : game);
++
++    /// Whether the settings sheet of `game` offers "Prepare the shaders…": the game has a title id and a library of this host's chain to compile.
++    private bool WarmOffered(string game)
++    {
++        var tid = WarmTitleOf(game);
++        return tid != null && GameWarm.HasLibrary(tid, WarmPackRoot());
++    }
++
++    /// "Prepare the shaders…" / "Stop preparing the shaders" (the game's settings sheet): stops a run that is going, else asks and starts one. Never called by anything but that button.
++    private void PrepareShadersFor(string game)
++    {
++        if (GameWarm.Active) { GameWarm.Stop("the player stopped it"); return; }
++        if (running) { Write("shader warm-up: not now, a build or a game is running (the phone is theirs)"); return; }
++        var tid = WarmTitleOf(game);
++        if (tid == null || !GameWarm.HasLibrary(tid, WarmPackRoot())) { Write("shader warm-up: no shader library of this app's chain for this game: nothing to prepare"); return; }
++        var alert = UIAlertController.Create("Prepare the shaders?",
++            "Compiles this game's shader libraries now, in the background, so the first play session does not stop to compile them. It can take from minutes to an hour, uses the battery and "
++            + "warms the phone: best on a charger. It waits while the phone is warm and stops when you start a game or a build; what it finished is kept.",
++            UIAlertControllerStyle.Alert);
++        alert.AddAction(UIAlertAction.Create("Prepare", UIAlertActionStyle.Default, _ => StartWarm(game)));
++        alert.AddAction(UIAlertAction.Create("Not now", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(alert);
++    }
+ }
+ #endif
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -845,7 +845,7 @@
+         bool interrupted = ReportInterruptedRunIfAny();
+         RefreshGames();
+         RefreshScreen();
+-        StartWarmAtLaunch();   // GameAppWarm.cs: an exported player prepares its own Metal cache
++        StartWarmAtLaunch();   // GameAppWarm.cs: starts nothing by itself (only a debug launch argument); the shaders are prepared when the player asks
+         // Back from the Files app or the background, Documents may have gained a game or a key: say so.
+         NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.WillEnterForegroundNotification,
+                                                        _ => { RefreshScreen(); RefreshCloud(null); });
+@@ -1982,6 +1982,7 @@
+         var canRebuild = !GameExport.IsPlayer && GameAppUi.ShowRebuild(facts) && ready;
+         var sheet = SettingsFor(game, canRebuild);
+         if (GameAppUi.BaseTitleIdOf(game) != null) sheet.ManageSaves = () => ShowSaves(game);
++        if (WarmOffered(game)) { sheet.PrepareShaders = () => PrepareShadersFor(game); sheet.PrepareShadersRunning = GameWarm.Active; }
+         if (!GameExport.IsPlayer && GameAppUi.BaseTitleIdOf(game) != null) sheet.ManageMods = () => ShowMods(game, ready);
+         if (!GameExport.IsPlayer && GameAppUi.ContentKindOf(game) == GameAppUi.ContentKind.Base)
+         {
+@@ -2388,7 +2389,7 @@
+         // The run may have left a boot request (a refused in-process boot, or a boot that never came back): the
+         // main button now says what is owed, and the checklist shows the framework that is waiting.
+         RefreshScreen();
+-        if (!failedRun) StartWarm(lastRunGame ?? selected);   // GameAppWarm.cs: prepare the shaders so the first session hits Metal's cache
++        // GameAppWarm.cs: the shaders are prepared only when the player asks (game settings › Prepare the shaders…), never at the end of a build
+     }
+ 
+     private static string Took(TimeSpan elapsed) =>
+@@ -2877,6 +2878,11 @@
+     /// "Mods & cheats…": Atmosphere-layout mods, 60 fps patches and cheats (GameAppModsUi.cs); set for a game in iBuilder.
+     public Action ManageMods { get; set; }
+ 
++    /// "Prepare the shaders…" (GameAppWarm.cs): compiles the game's Metal libraries now so the first play session does not stop for them. Only this button starts it; set when the game
++    /// has a library of this host's chain. `PrepareShadersRunning`: it is running now, and the button reads "Stop preparing the shaders".
++    public Action PrepareShaders { get; set; }
++    public bool PrepareShadersRunning { get; set; }
++
+     /// The game's update and DLC, as lines, and "Add an update or DLC…" (the screen's importer): set for a game in iBuilder.
+     public string ContentInfo { get; set; }
+     public Action AddContent { get; set; }
+@@ -3022,6 +3028,22 @@
+             views.Add(modsButton);
+             views.Add(Text("Mods in the Atmosphere layout (RomFS files, code patches such as 60 fps, cheats), from a .zip or a folder in Files. "
+                            + "A 60 fps mod usually goes with the FPS setting \"60\" above.", UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
++        }
++
++        if (PrepareShaders != null)
++        {
++            var prepare = UIButton.FromType(UIButtonType.System);
++            var pconfig = UIButtonConfiguration.TintedButtonConfiguration;
++            pconfig.Title = PrepareShadersRunning ? "Stop preparing the shaders" : "Prepare the shaders…";
++            pconfig.Image = UIImage.GetSystemImage(PrepareShadersRunning ? "stop.circle" : "hammer");
++            pconfig.ImagePadding = 6;
++            prepare.Configuration = pconfig;
++            prepare.AccessibilityIdentifier = "prepare-shaders";
++            var prepareAction = PrepareShaders;
++            prepare.TouchUpInside += (_, __) => DismissViewController(true, () => prepareAction());
++            views.Add(prepare);
++            views.Add(Text("Compiles the game's shader libraries now, in the background, so the first play session does not stop to compile them. It never starts by itself. "
++                           + "It can take from minutes to an hour: best on a charger.", UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
+         }
+ 
+         if (ExportGame != null)

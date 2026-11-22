@@ -1,0 +1,272 @@
+# nvn: (1) the MTLDevice pipeline archive (0414) leaves out pipelines without a fragment stage on iOS; (2) DM_NVN_RENDER_COND=0
+# ignores render conditions
+#
+# Why: South Park: The Fractured But Whole (01008F2005154000), iPhone 15 Pro, iOS 27.2.1, 2026-11-22.
+#   (1) "[RED] pipeline binary archive: the write failed (Failed to generate machO ... expecting 'fragment' stage in pipeline no. '10')", then "off for this run". A vertex-only
+#       render pipeline (rasterization disabled) added to the archive made every later write fail.
+#   (2) Stretches of frames encoded no draw (draft 0508 counts why). The prime suspect is a render condition the host evaluates false on the CPU, and that needs a switch to try
+#       from the game's env.txt without a rebuild.
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m; two tests):
+#   (1) dva_storable, at dva_offer and again at dva_add (an entry queued before): a render or mesh pipeline with no fragment function, no vertex function, or rasterization
+#       disabled is built as before but left out of the archive.
+#       Counted, logged once ("pipeline archive: pipelines without a fragment stage are left out ..."), and the count is in every "written" line
+#       ("pipeline archive: N pipelines without a fragment stage left out").
+#       Default on iOS only. A Mac writes such pipelines and finds them again, and 0414's t_pso_binary_archive relies on that. DM_PSO_ARCHIVE_NOFRAG=1 leaves them out
+#       anywhere, 0 keeps them anywhere.
+#       No persistent poison, unchanged from 0414: the off state is per process, and the file on disk is the last good write. DVA_FAIL_SESSIONS runs in a row that end on a
+#       failed write start the file again empty. With the filter, the pipeline that caused it is no longer offered, so the next session writes normally.
+#   (2) DM_NVN_RENDER_COND=0: SetRenderEnableConditional blocks are still evaluated and counted (0508's true / false / unknown) but never drop anything: draws and clears run, as
+#       before the host evaluated conditions. Logged once when set.
+#       The draws a false condition would have dropped are counted ("render condition ignored ..." at 1-4 and powers of two; the total in 0508's 300-present line).
+#       SetRenderEnable(false), the game's own switch, is kept. Default 1: evaluated, as now.
+#       0508's per-reason counts still count. render_condition_false then stays 0 for conditional blocks; the would-be drops are g_rc_ignored.
+# Env names (games/<id>/env.txt, read by the app's apply_env_files: DM_* names; no launcher row needed): DM_NVN_RENDER_COND=0, DM_PSO_ARCHIVE_NOFRAG=0|1.
+# Shader chain: not touched (b24b25240cad).
+# Tests (M1 Pro, tree = base + 0506 + 0507 + 0508 + 0509):
+#   - t_pso_archive_nofrag (new, make check_t_pso_archive_nofrag) 11/0;
+#   - t_render_cond_switch (new, make check_t_render_cond_switch: default and DM_NVN_RENDER_COND=0) 4/0 + 5/0;
+#   - 0414's check_t_pso_binary_archive 22 sessions / 0 failed;
+#   - t_nvn 506/0, t_dead_targets 197/0, t_drop_reasons 13/0, t_present_keep 10/0, t_vbuf_clamp 15/0.
+#   NOT run on a device; no host dylib built. The iPhone's write failure itself was not reproduced on the Mac (macOS writes such pipelines fine).
+
+# Rebased 2026-11-22 onto the new 0506 (upstream c96c45e9 + 79555b67 + the pool-end fallback): context only, same behaviour.
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -213,6 +213,7 @@
+ static uint64_t g_dva_count_cap, g_dva_guard;   // DM_PSO_ARCHIVE_COUNT (pipelines), DM_PSO_ARCHIVE_GUARD_MB (bytes; 0: no guard)
+ static _Atomic uint64_t g_dva_count, g_dva_since_write;   // pipelines in the archive (the file's, from its .hdr, + those added in this run); added since the last good write
+ static _Atomic int g_dva_writing;   // dva_write holds or wants g_dva_rw: a lookup misses at once
++static _Atomic uint64_t g_dva_nofrag; static int dva_storable(int kind, id d);   // draft 0509: pipelines without a fragment stage left out of the archive
+ static _Atomic uint64_t g_dva_waited, g_dva_busy;   // lookups that waited for an add and then looked; lookups that missed because the archive was being written or the wait ran out
+ static NSMutableArray<NSArray *> *g_dva_since;   // the descriptors added since the last good write (g_dva_lk): back to the waiting list when a write fails (M3)
+ static int g_dva_fail_runs, g_dva_fail_noted;   // runs that ended on a failed write before this one (<archive>.fail); this run's failure is counted there
+@@ -409,8 +410,9 @@
+         os_unfair_lock_lock(&g_dva_lk); g_dva_dirty = 0; unsigned waiting = (unsigned)g_dva_pend.count;
+         if (sz >= g_dva_cap && !g_dva_capped) { g_dva_capped = 1; atomic_fetch_add(&g_dva_dropped, g_dva_pend.count); [g_dva_pend removeAllObjects]; MLOG("pipeline binary archive: %.1f MB reached the %.0f MB cap: nothing more is added, the archive stays in use", sz / 1048576.0, g_dva_cap / 1048576.0); }
+         os_unfair_lock_unlock(&g_dva_lk);
+-        MLOG("pipeline binary archive: written, %.1f MB in %.0f ms: %llu pipelines taken from it, %llu built, %llu added, %u waiting, %llu dropped (queue full), %llu adds held back for heat or memory, %llu timed writes deferred (frames presented or compiles under way)",
+-             sz / 1048576.0, (bp_now() - t0) / 1e6, (unsigned long long)g_dva_hits, (unsigned long long)g_dva_miss, (unsigned long long)g_dva_added, waiting, (unsigned long long)g_dva_dropped, (unsigned long long)g_dva_held, (unsigned long long)g_dva_deferred);
++        MLOG("pipeline binary archive: written, %.1f MB in %.0f ms: %llu pipelines taken from it, %llu built, %llu added, %u waiting, %llu dropped (queue full), %llu adds held back for heat or memory, %llu timed writes deferred (frames presented or compiles under way); pipeline archive: %llu pipelines without a fragment stage left out",
++             sz / 1048576.0, (bp_now() - t0) / 1e6, (unsigned long long)g_dva_hits, (unsigned long long)g_dva_miss, (unsigned long long)g_dva_added, waiting, (unsigned long long)g_dva_dropped, (unsigned long long)g_dva_held, (unsigned long long)g_dva_deferred,
++             (unsigned long long)atomic_load(&g_dva_nofrag));
+         return;
+     }
+     remove(tmp.fileSystemRepresentation); atomic_store(&g_dva_writing, 0);
+@@ -442,6 +444,7 @@
+          (unsigned long long)atomic_load(&g_dva_count), (unsigned long long)g_dva_count_cap, atomic_load(&g_dva_size) / 1048576.0, g_dva_cap / 1048576.0);
+ }
+ static int dva_add(NSArray *it) {   // one descriptor into the archive, under the write lock; 1 when added
++    if (!dva_storable([it[0] intValue], it[1])) return 0;   // draft 0509: queued before the offer checked it
+     os_unfair_lock_lock(&g_dva_lk); int fits = !g_dva_capped && dva_fits(); if (!fits) dva_cap_reached(); os_unfair_lock_unlock(&g_dva_lk);
+     if (!fits) return 0;
+     pthread_rwlock_wrlock(&g_dva_rw);
+@@ -499,9 +502,28 @@
+     pthread_rwlock_unlock(&g_dva_rw);
+     atomic_fetch_add(ps ? &g_dva_hits : &g_dva_miss, 1);
+     return ps;
++}
++// Draft 0509: a render or mesh pipeline with no fragment stage (rasterization disabled: a vertex-only pipeline, e.g. transform feedback or vertex stores) goes into the archive
++// fine but makes every later write of it fail ("Failed to generate machO ... expecting 'fragment' stage in pipeline no. '10'", South Park on an iPhone 15 Pro, 2026-11-22; "missing
++// 'vertex' stage in pipeline no. '32'" earlier): the write keeps failing until DVA_FAIL_MAX turns the archive off for the run. Such pipelines are left out (built as without the
++// archive), at the offer and again at the add (one queued before), counted, logged once and in each "written" line. A run that ended on failed writes does not poison the next:
++// the archive state is per process, the file on disk is the last good write, and DVA_FAIL_SESSIONS failed runs in a row start it again empty
++// Where: on iOS by default (the failure is the iPhone's; a Mac writes such pipelines into the archive and finds them again: t_pso_binary_archive). DM_PSO_ARCHIVE_NOFRAG=1 leaves
++// them out on any system, 0 keeps them everywhere
++static int dva_nofrag_out(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PSO_ARCHIVE_NOFRAG"); v = e && *e ? atoi(e) != 0 : TARGET_OS_IPHONE; } return v; }
++static int dva_storable(int kind, id d) {
++    if (!dva_nofrag_out()) return 1;
++    id fs = nil; BOOL rast = YES;
++    if (kind == 0) { MTLRenderPipelineDescriptor *rd = d; fs = rd.fragmentFunction; rast = rd.rasterizationEnabled; if (!rd.vertexFunction) fs = nil; }
++    else if (kind == 2) { if (@available(iOS 18.0, macOS 15.0, *)) { MTLMeshRenderPipelineDescriptor *md = d; fs = md.fragmentFunction; rast = md.rasterizationEnabled; } }
++    else return 1;
++    if (fs && rast) return 1;
++    if (atomic_fetch_add(&g_dva_nofrag, 1) == 0) MLOG("pipeline archive: pipelines without a fragment stage are left out (built as without the archive: one such pipeline made every later write fail)");
++    return 0;
+ }
+ static void dva_offer(int kind, id d) {
+     if (DVA_ST() != 1) return;
++    if (!dva_storable(kind, d)) return;
+     os_unfair_lock_lock(&g_dva_lk);
+     if (g_dva_capped) { os_unfair_lock_unlock(&g_dva_lk); return; }
+     if (atomic_load(&g_dva_count) + g_dva_pend.count >= g_dva_count_cap) atomic_fetch_add(&g_dva_dropped, 1);   // no room for it under the count cap
+@@ -1877,6 +1899,12 @@
+     MLOG("%sdraw dropped: %s (%llu so far, frame %llu, pass %llu)%s%s", r == DR_PAST || r == DR_CULL || r == DR_SCISSOR || r == DR_RASTDISC ? "" : "[RED] ", g_dr_name[r], (unsigned long long)n,
+          (unsigned long long)mtl_frame_now(), (unsigned long long)g_stat_pass_now(), *d ? ": " : "", d);
+ }
++static int g_rc_would; static uint64_t g_rc_ignored;
++static void rc_note_ignored(void) {   // draft 0509: a draw a false condition would have dropped, drawn because DM_NVN_RENDER_COND=0
++    uint64_t n = ++g_rc_ignored;
++    if (n <= 4 || !(n & (n - 1))) MLOG("render condition ignored (DM_NVN_RENDER_COND=0): a draw a false condition would drop is drawn (%llu so far, frame %llu): %s at %#llx, values %llu / %llu",
++        (unsigned long long)n, (unsigned long long)mtl_frame_now(), g_rc_last_mode ? "draw if not equal" : "draw if equal", (unsigned long long)g_rc_last_addr, (unsigned long long)g_rc_last_x, (unsigned long long)g_rc_last_y);
++}
+ static void rc_note_drop(const char *what) {
+     drop_note(DR_RC, "%s inside a render-enable block evaluated false: %s at %#llx, values %llu / %llu%s", what,
+               g_rc_last_mode >= 2 ? "SetRenderEnable(false)" : g_rc_last_mode ? "draw if not equal" : "draw if equal", (unsigned long long)g_rc_last_addr,
+@@ -1957,6 +1985,10 @@
+ // GPU would at that point in the queue: Ocarina of Time reports its queries a submission ahead of the conditional draws, so every one has landed by then (1.48 million
+ // conditions on its Kokiri Forest route, 42% false; the host drew them all, GPU p50 17.06 → 16.44 ms a frame on an M4 Pro). Inside a block evaluated false, draws and clears are dropped
+ static int g_rc_skip;   // logical queue state: a render-enable block evaluated false is active
++// Draft 0509: DM_NVN_RENDER_COND=0 ignores render conditions: every draw and clear runs, as the host did before conditions were evaluated. Default 1 (evaluated). The conditions
++// are still evaluated and counted (true / false / unknown); the draws a false one would have dropped are counted as g_rc_ignored ("render conditions ignored" in the 300-present line)
++static int rc_eval_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RENDER_COND"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_RENDER_COND=0: render conditions are ignored, every draw and clear runs (as before the host evaluated them); they are still counted"); } return v; }
++// (g_rc_would, g_rc_ignored: with the dropped-draw counters above)
+ // Latest command-ordered writer of each report counter. Completed reports are read
+ // from memory, so CPU rewrites remain visible. Unfinished queries stay unknown;
+ // timestamp counters and explicit writes can supply known bytes before completion.
+@@ -6757,8 +6789,9 @@
+     }
+     if (np % 300 == 0) { uint64_t w[DR_N]; for (int i = 0; i < DR_N; i++) { w[i] = g_dr[i] - win_dr0[i]; win_dr0[i] = g_dr[i]; }
+         char b[700]; drop_line(b, sizeof b, w);
+-        MLOG("draws up to present %llu: draw records replayed %llu, presents whose frame encoded no draw %llu of 300; dropped in these 300 by reason: %s; render conditions true %llu / false %llu / unknown %llu so far",
+-             (unsigned long long)np, (unsigned long long)(g_draw_ops - win_ops0), (unsigned long long)win_zero, b, (unsigned long long)g_rc_eval[0], (unsigned long long)g_rc_eval[1], (unsigned long long)g_rc_eval[2]);
++        MLOG("draws up to present %llu: draw records replayed %llu, presents whose frame encoded no draw %llu of 300; dropped in these 300 by reason: %s; render conditions true %llu / false %llu / unknown %llu so far%s",
++             (unsigned long long)np, (unsigned long long)(g_draw_ops - win_ops0), (unsigned long long)win_zero, b, (unsigned long long)g_rc_eval[0], (unsigned long long)g_rc_eval[1], (unsigned long long)g_rc_eval[2],
++             g_rc_ignored ? [NSString stringWithFormat:@"; render conditions ignored (DM_NVN_RENDER_COND=0): %llu draws drawn that a false one would drop", (unsigned long long)g_rc_ignored].UTF8String : "");
+         win_zero = 0; win_ops0 = g_draw_ops; }
+ }
+ 
+@@ -19212,10 +19245,11 @@
+                 break; }
+             case OP_RENDER_COND: { const p_render_cond *rc = a;   // SetRenderEnable / SetRenderEnableConditional (hle_nvn.c)
+                 g_rc_last_mode = rc->mode; g_rc_last_addr = rc->addr;
+-                if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
++                if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); g_rc_would = 0; }   // SetRenderEnable is the game's own switch: kept with DM_NVN_RENDER_COND=0 too
+                 else { uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
+                     g_rc_skip = known && (rc->mode ? x == y : x != y);
+                     g_rc_last_x = x; g_rc_last_y = y; g_rc_last_known = known; g_rc_eval[!known ? 2 : g_rc_skip ? 1 : 0]++;
++                    if (!rc_eval_on()) { g_rc_would = g_rc_skip; g_rc_skip = 0; }   // draft 0509: DM_NVN_RENDER_COND=0
+                     PD("E %llu conditional render %s addr=%#llx values %llu / %llu%s%s", g_stat_pass, rc->mode ? "draw if not equal" : "draw if equal", (unsigned long long)rc->addr, (unsigned long long)x, (unsigned long long)y, known ? "" : " (unknown, drawn)", g_rc_skip ? " → not drawn" : ""); }
+                 break; }
+             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = 1;   // the fence value this submission (segment) commits with
+@@ -19299,12 +19333,12 @@
+             case OP_MULTI_DRAW:
+                 // A lookahead from outside the range stops at its boundary, including scans for inline writes to the arguments.
+                 g_mdx_epoch++; g_mdx_stop = NULL;
+-                g_draw_ops++; if (!g_rc_skip) draw_multi(a); else rc_note_drop("a multi-draw");
++                g_draw_ops++; if (g_rc_would) rc_note_ignored(); if (!g_rc_skip) draw_multi(a); else rc_note_drop("a multi-draw");
+                 g_mdx_epoch++;
+                 break;
+-            case OP_DRAW: { g_draw_ops++; if (g_rc_skip) { rc_note_drop("a draw"); break; } if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
++            case OP_DRAW: { g_draw_ops++; if (g_rc_would) rc_note_ignored(); if (g_rc_skip) { rc_note_drop("a draw"); break; } if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
+                 p_draw t; g_exec_cur = p; g_exec_next = p + h.size; draw(draw_rec(a, h.size, &t), NULL); g_exec_next = NULL; break; }   // Lookahead start point
+-            case OP_DRAW_IDX: { g_draw_ops++; if (g_rc_skip) { rc_note_drop("an indexed draw"); break; } if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
++            case OP_DRAW_IDX: { g_draw_ops++; if (g_rc_would) rc_note_ignored(); if (g_rc_skip) { rc_note_drop("an indexed draw"); break; } if (g_fsm_ntaken && fsm_take(p)) { PD("L %llu face-split draw already drawn in an earlier pass (DM_NVN_FACE_MERGE)", g_stat_pass); break; }
+                 p_draw_idx t; g_exec_cur = p; g_exec_next = p + h.size; draw(NULL, draw_idx_rec(a, h.size, &t)); g_exec_next = NULL; break; }
+             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
+             case OP_BIND_PROGRAM: { const p_bind_program *b = a; state_op(h.op,a);
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -270,6 +270,16 @@
+ 	./t_present_keep && DM_NVN_PRESENT_KEEP=0 ./t_present_keep
+ t_drop_reasons: t_drop_reasons.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_drop_reasons.m $(MTL_T_SRC) $(FW)
++t_render_cond_switch: t_render_cond_switch.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_render_cond_switch.m $(MTL_T_SRC) $(FW)
++.PHONY: check_t_render_cond_switch
++check_t_render_cond_switch: t_render_cond_switch
++	./t_render_cond_switch && DM_NVN_RENDER_COND=0 ./t_render_cond_switch
++t_pso_archive_nofrag: t_pso_archive_nofrag.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_archive_nofrag.m $(MTL_T_SRC) $(FW)
++.PHONY: check_t_pso_archive_nofrag
++check_t_pso_archive_nofrag: t_pso_archive_nofrag
++	MTL_DEBUG_LAYER=1 ./t_pso_archive_nofrag
+ .PHONY: check_t_vbuf_clamp
+ check_t_vbuf_clamp: t_vbuf_clamp
+ 	./t_vbuf_clamp && DM_NVN_VBUF_CLAMP=0 ./t_vbuf_clamp && DM_NVN_VBUF_CLAMP=2 ./t_vbuf_clamp
+--- /dev/null
++++ b/dm/gfx/tests/t_pso_archive_nofrag.m
+@@ -0,0 +1,49 @@
++// The MTLDevice path's pipeline archive (engine-patches/0414) with pipelines that have no fragment stage (draft 0509): a vertex-only render pipeline (rasterization disabled) is
++// built as before but never offered to the archive nor added from the queue, it is counted, the "pipeline archive: ... left out" line is logged once, and a normal pipeline beside
++// it is added and the archive written, still on. South Park on an iPhone 15 Pro: "Failed to generate machO ... expecting 'fragment' stage in pipeline no. '10'" turned the archive
++// off for the run. Draft for 01008F2005154000
++#include "../nvn/nvn_mtl.m"
++#include <unistd.h>
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(label, c) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
++static const char *k_src =
++    "#include <metal_stdlib>\nusing namespace metal;\n"
++    "struct V { float4 p [[position]]; };\n"
++    "vertex V vs(uint vid [[vertex_id]]) { V o; o.p = float4(float(vid & 1), float(vid >> 1), 0, 1); return o; }\n"
++    "vertex void vs_tf(uint vid [[vertex_id]], device float *out [[buffer(0)]]) { out[vid] = float(vid); }\n"
++    "fragment float4 fs(V i [[stage_in]]) { return float4(i.p.x, 0.25, 0.5, 1); }\n";
++static unsigned pending(void) { os_unfair_lock_lock(&g_dva_lk); unsigned n = (unsigned)g_dva_pend.count; os_unfair_lock_unlock(&g_dva_lk); return n; }
++int main(void) { @autoreleasepool {
++    char dir[] = "/tmp/t_pso_archive_nofrag.XXXXXX"; if (!mkdtemp(dir)) return 2;
++    setenv("DM_PSO_ARCHIVE_NOFRAG", "1", 1);   // the iPhone's default, on this Mac
++    setenv("DM_PSO_BINARY_DIR", dir, 1); setenv("DM_PSO_MTL4", "0", 1); setenv("DM_PSO_ARCHIVE_SECS", "3600", 1);
++    mtl_init();
++    CHECK("the archive is on", dva_on());
++    NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_src) options:nil error:&e];
++    CHECK("the library compiles", lib != nil); if (!lib) { printf("%s\n", e.localizedDescription.UTF8String); return 1; }
++    MTLRenderPipelineDescriptor *vo = [MTLRenderPipelineDescriptor new]; vo.vertexFunction = [lib newFunctionWithName:@"vs_tf"]; vo.rasterizationEnabled = NO;
++    NSError *pe = nil; id<MTLRenderPipelineState> p1 = dva_rps(vo, &pe);
++    CHECK("the vertex-only pipeline is built", p1 != nil);
++    CHECK("it is not offered to the archive", pending() == 0);
++    CHECK("it is counted", atomic_load(&g_dva_nofrag) == 1);
++    MTLRenderPipelineDescriptor *nd = [MTLRenderPipelineDescriptor new]; nd.vertexFunction = [lib newFunctionWithName:@"vs"]; nd.fragmentFunction = [lib newFunctionWithName:@"fs"];
++    nd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
++    id<MTLRenderPipelineState> p2 = dva_rps(nd, &pe);
++    CHECK("a normal pipeline is built and offered", p2 != nil && pending() == 1);
++    CHECK("one queued before the offer checked it is not added", !dva_add(@[@0, vo]) && atomic_load(&g_dva_nofrag) == 2);
++    MTLRenderPipelineDescriptor *nofs = [nd copy]; nofs.fragmentFunction = nil;   // rasterization on but no fragment function: left out as well
++    dva_offer(0, nofs);
++    CHECK("no fragment function: left out", pending() == 1 && atomic_load(&g_dva_nofrag) == 3);
++    dva_save(5000, 1);
++    CHECK("the normal pipeline is added", atomic_load(&g_dva_added) == 1);
++    CHECK("the archive is written and stays on", atomic_load(&g_dva_wr) >= 1 && DVA_ST() == 1 && g_dva_fails == 0);
++    CHECK("the file exists", access([g_dva_path fileSystemRepresentation], F_OK) == 0);
++    [NSFileManager.defaultManager removeItemAtPath:@(dir) error:nil];
++    printf("t_pso_archive_nofrag: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }
+--- /dev/null
++++ b/dm/gfx/tests/t_render_cond_switch.m
+@@ -0,0 +1,41 @@
++// DM_NVN_RENDER_COND (nvn_mtl.m rc_eval_on, draft 0509): 1 (default) evaluates SetRenderEnableConditional and drops the draws of a false block; 0 ignores conditions, so every draw
++// runs, as the host did before; the conditions are still evaluated and counted, and the draws a false one would drop are counted (g_rc_ignored). SetRenderEnable(false), the game's
++// own switch, is kept either way. The check target runs both. A draw record replayed through mtl_exec: OP_RENDER_COND then OP_DRAW, with no program bound (the draw path's
++// no_program return counts that the draw reached the draw path)
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(label, c) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
++static uint8_t g_buf[4096]; static size_t g_n;
++static void put(uint32_t op, const void *a, uint32_t n) { op_hdr h = {0}; h.op = op; h.size = (uint32_t)(sizeof h + ((n + 7) & ~7u)); memcpy(g_buf + g_n, &h, sizeof h); if (n) memcpy(g_buf + g_n + sizeof h, a, n); g_n += h.size; }
++static void run(int mode, uint64_t addr) {   // render condition (mode 0: draw if equal), one draw, end
++    g_n = 0; p_render_cond rc = {mode, 0, addr}; put(OP_RENDER_COND, &rc, sizeof rc);
++    p_draw d = {0}; d.prim = 4; d.count = 3; d.instances = 1; put(OP_DRAW, &d, sizeof d);
++    p_render_cond on = {2, 0, 0}; put(OP_RENDER_COND, &on, sizeof on);
++    put(OP_END, NULL, 0);
++    mtl_exec(g_buf);
++}
++int main(void) { @autoreleasepool {
++    mtl_init();
++    const int eval = rc_eval_on();
++    uint64_t *rep = calloc(4, 8); rep[0] = 1; rep[2] = 2;   // counter 1 and 2: "draw if equal" is false
++    uint64_t a = (uint64_t)(uintptr_t)rep;
++    memset(&S, 0, sizeof S);
++    uint64_t np0 = g_dr[DR_NOPROG], rc0 = g_dr[DR_RC], ops0 = g_draw_ops, ig0 = g_rc_ignored, f0 = g_rc_eval[1];
++    run(0, a);
++    CHECK("the draw record is counted", g_draw_ops == ops0 + 1);
++    CHECK("the condition is evaluated false and counted either way", g_rc_eval[1] == f0 + 1);
++    if (eval) { CHECK("evaluated: the draw is dropped as render_condition_false", g_dr[DR_RC] == rc0 + 1 && g_dr[DR_NOPROG] == np0 && g_rc_ignored == ig0); }
++    else { CHECK("DM_NVN_RENDER_COND=0: the draw runs (reaches the draw path)", g_dr[DR_NOPROG] == np0 + 1 && g_dr[DR_RC] == rc0);
++           CHECK("DM_NVN_RENDER_COND=0: the draw a false condition would drop is counted", g_rc_ignored == ig0 + 1); }
++    // SetRenderEnable(false) is the game's own: kept with the switch off too
++    np0 = g_dr[DR_NOPROG]; rc0 = g_dr[DR_RC];
++    run(3, 0);
++    CHECK("SetRenderEnable(false) drops the draw in both modes", g_dr[DR_RC] == rc0 + 1 && g_dr[DR_NOPROG] == np0);
++    printf("t_render_cond_switch (DM_NVN_RENDER_COND %s): %d checks, %d failed\n", eval ? "1" : "0", checks, failed);
++    return failed != 0;
++} }

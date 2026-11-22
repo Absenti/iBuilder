@@ -1,0 +1,34 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+{
+   T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+};
+
+
+float dmsh_hmma16816_f16(thread const uint& p_lane, thread const uint& p_blk, thread const uint& p_a0, thread const uint& p_a1, thread const uint& p_a2, thread const uint& p_a3, thread const uint& p_b0, thread const uint& p_b1, thread const uint& p_acc0, thread const uint& p_acc1, thread const uint& p_fl, thread const uint& p_aaddr, thread const uint& p_ao0, thread const uint& p_ao1, thread const uint& p_ao2, thread const uint& p_ao3, thread const uint& p_astr, thread uint& p_d1, threadgroup spvUnsafeArray<uint, 256>& p_scr, threadgroup spvUnsafeArray<uint, 4>& extra)
+{
+    r

@@ -1,0 +1,310 @@
+name: CI
+
+# What runs on every push to main and every pull request. The job names below are the status checks a branch protection rule can require; keep them stable:
+#   fmt  clippy  test  c-tests  no-spawn  patches  scripts  forbidden-files  secrets  ios-ffi  workflows
+#
+# Where each job runs, and why:
+#   * macos-latest : the jobs that COMPILE the workspace (clippy, test, ios-ffi), the C tests of app/c (clang + Apple's libc), the no-spawn gate (Mach-O imports), and the one that needs
+#                    BSD patch (patches). The crates are only known to build on macOS (aarch64); Linux is untested, so nothing here compiles the workspace on Linux.
+#   * ubuntu-latest: the jobs that do not compile the workspace (fmt only parses it, scripts, forbidden-files, secrets, workflows).
+#
+# Toolchain: Rust 1.100.0, pinned (RUST_TOOLCHAIN below), because the same compiler must give the same rustfmt and clippy answer here as on the maintainer's machine (new lints arrive
+# with every stable release and would turn a green main red without a commit). The workspace is edition 2024, which needs Rust 1.85 or newer. Bump the pin on purpose, in a pull request
+# that also fixes what the new clippy says.
+#
+# Third-party actions are pinned by full commit SHA (the tag is in the comment); dependabot (.github/dependabot.yml) proposes the bumps. The two release binaries (gitleaks, actionlint)
+# are pinned by version AND by sha256; cargo-nextest is pinned by version and installed by taiki-e/install-action, which checks the release's checksum.
+# Speed: every compiling job restores a Swatinem/rust-cache keyed by the job, the toolchain and Cargo.lock (saved on main only, so a pull request cannot poison it); the test job runs the
+# suite with cargo-nextest (one process per test, all cores busy, no slow test holding a binary's other tests back) and builds the release profile without LTO (see the job).
+# The test job does NOT set IBUILDER_STRICT_FIXTURES: the byte-compare oracle tests and the big-fixture tests need files that are not in this repository (a game's dump, the Python
+# oracle), so they skip, loudly (ibuilder_testkit::skip) and are COUNTED in the job summary. A green `test` therefore means "everything that can be checked from the repository alone
+# passed", not "every game was compared"; docs/CONVENTIONS.md rule 5.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.100.0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with rustfmt
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with clippy
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      # The suite runs in the release profile (some tests chew through large synthetic inputs), but without the product's LTO and single codegen unit: those only cost link time here,
+      # and no test output depends on them (the outputs compared are the chain's bytes, not the tools' machine code). The product build (scripts/build-app.sh) keeps Cargo.toml's profile.
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: cargo-nextest@0.9.151
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The skip accounting of scripts/test-report.sh, kept with nextest: every `ibuilder_testkit::skip(reason)` appends `crate<TAB>test<TAB>reason` to IBUILDER_SKIP_LOG (one write per
+      # line, so the parallel test processes can share the file), and the summary below counts the distinct (crate, test) pairs. nextest runs no doctests: `cargo test --doc` does.
+      # Locally, scripts/test-report.sh (plain cargo test) gives the same two numbers.
+      - name: cargo nextest run --release --workspace (profile ci of .config/nextest.toml)
+        env:
+          IBUILDER_SKIP_LOG: ${{ runner.temp }}/skipped-tests.log
+        run: |
+          : > "$IBUILDER_SKIP_LOG"
+          cargo nextest run --release --workspace --locked --profile ci 2>&1 | tee "$RUNNER_TEMP/nextest.txt"
+      - name: cargo test --doc --release --workspace
+        run: cargo test --doc --release --workspace --locked
+      - name: Test report in the job summary
+        if: always()
+        env:
+          IBUILDER_SKIP_LOG: ${{ runner.temp }}/skipped-tests.log
+        run: |
+          out="$RUNNER_TEMP/nextest.txt"
+          [ -f "$out" ] || exit 0
+          skipped=0
+          [ -f "$IBUILDER_SKIP_LOG" ] && skipped="$(cut -f1,2 "$IBUILDER_SKIP_LOG" | sort -u | grep -c . || true)"
+          {
+            echo '### cargo nextest run --release --workspace (macOS)'
+            echo '```'
+            grep -E '^ *Summary ' "$out" | tail -n 1 || true
+            echo "of the tests that passed, $skipped skipped (fully or partly) for missing fixtures: a skip is a verification that did not happen here"
+            if [ "$skipped" -gt 0 ]; then
+              cut -f1,2 "$IBUILDER_SKIP_LOG" | sort -u | cut -f1 | sort | uniq -c | awk '{ printf "  %-24s %s\n", $2, $1 }'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  c-tests:
+    name: c-tests
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The two inputs app/c/test/run.sh compiles against, at the versions the app is built with: zstd 1.5.7 (the decoder of app/c/stdzstd.c and the NSZ converter) and SPIRV-Cross
+      # vulkan-sdk-1.4.363.0 = f11ba9f (only its C header: the test links with -undefined dynamic_lookup). Public repositories, pinned by commit, no credentials.
+      - name: zstd 1.5.7 sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: facebook/zstd
+          ref: f8745da6ff1ad1e7bab384bd1f9d742439278e99 # v1.5.7
+          path: ext/zstd
+          persist-credentials: false
+          sparse-checkout: lib
+      - name: SPIRV-Cross header (vulkan-sdk-1.4.363.0)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/SPIRV-Cross
+          ref: f11ba9f0b21ba8fc15153d50a2a1ae31ab1cf8f7 # vulkan-sdk-1.4.363.0
+          path: ext/spirv-cross
+          persist-credentials: false
+          sparse-checkout: |
+            spirv_cross_c.h
+          sparse-checkout-cone-mode: false
+      - name: app/c/test/run.sh (NSZ converter and SPIRV-Cross driver, host build)
+        run: |
+          ZSTD_SRC="$GITHUB_WORKSPACE/ext/zstd/lib" SPVC_INC="$GITHUB_WORKSPACE/ext/spirv-cross" OUT="$RUNNER_TEMP/ctest" sh app/c/test/run.sh 2>&1 | tee "$RUNNER_TEMP/ctest.txt"
+          grep -q 'ALL OK (0 failures)' "$RUNNER_TEMP/ctest.txt" || { echo "::error::app/c/test/run.sh did not end with ALL OK"; exit 1; }
+
+  no-spawn:
+    name: no-spawn
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The real check needs the app (scripts/check-no-spawn.sh <GameApp.app>): the release workflow runs it on the published IPA. Here the gate itself is tested, so a change to
+      # scripts/lib-spawn.sh or scripts/check-no-spawn.sh that stops it seeing a spawn (or makes it fail everything) is caught before a release: a program without a spawn must pass
+      # (exit 0) and one that imports posix_spawn must fail (exit 1).
+      - name: scripts/check-no-spawn.sh on two test programs
+        run: |
+          d="$RUNNER_TEMP/nospawn"; mkdir -p "$d"
+          printf '#include <stdio.h>\nint main(void) { puts("ok"); return 0; }\n' > "$d/clean.c"
+          printf '#include <spawn.h>\nextern char **environ;\nint main(int c, char **v) { pid_t p; (void)c; return posix_spawn(&p, v[0], 0, 0, v, environ); }\n' > "$d/spawn.c"
+          clang -O1 "$d/clean.c" -o "$d/clean"
+          clang -O1 "$d/spawn.c" -o "$d/spawn"
+          rc=0; scripts/check-no-spawn.sh "$d/clean" || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::check-no-spawn.sh exits $rc on a program that spawns nothing (expected 0)"; exit 1; }
+          rc=0; scripts/check-no-spawn.sh "$d/spawn" || rc=$?
+          [ "$rc" -eq 1 ] || { echo "::error::check-no-spawn.sh exits $rc on a program that imports posix_spawn (expected 1)"; exit 1; }
+          echo "the gate passes a clean program and fails a spawning one"
+      - name: scripts/test-lib-spawn.sh (universal binaries, symlinks, $-suffixed imports)
+        run: scripts/test-lib-spawn.sh
+
+  patches:
+    name: patches
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # every app/patches/*.patch applies, in order, to a fresh copy of the C# snapshot (nothing is compiled)
+      - name: scripts/check-patches-apply.sh
+        run: scripts/check-patches-apply.sh
+
+  scripts:
+    name: scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: bash -n and shellcheck (severity error) on scripts/ and app/
+        run: |
+          shellcheck --version
+          status=0
+          while IFS= read -r -d '' f; do
+            case "$(head -n 1 "$f")" in
+              *zsh*) echo "skipped (zsh, which shellcheck does not support): $f"; continue ;;
+            esac
+            bash -n "$f" || { echo "::error file=$f::bash -n found a syntax error"; status=1; }
+            shellcheck -S error "$f" || status=1
+          done < <(git ls-files -z 'scripts/*.sh' 'app/*.sh')
+          exit "$status"
+      - name: apps.json is valid, and scripts/update-source.py passes its own tests
+        run: |
+          python3 -I scripts/update-source.py --validate
+          python3 -I scripts/update-source.py --self-test
+
+  forbidden-files:
+    name: forbidden-files
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # no keys, certificates, provisioning profiles, game containers, Switch modules (outside the synthetic fixtures), .ipa / .dylib, or file over 10 MB in the tree
+      - name: scripts/check-forbidden-files.sh
+        run: scripts/check-forbidden-files.sh
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the whole history is scanned, not only the tip
+          persist-credentials: false
+      # The release binary, not the gitleaks action: no token, no Node, no license question, and the file is checked against the sha256 that GitHub reports for that release asset.
+      - name: Install gitleaks 8.30.1
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb # gitleaks_8.30.1_linux_x64.tar.gz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+      - name: gitleaks git (values are redacted in the log)
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --verbose --no-banner .'
+
+  ios-ffi:
+    name: ios-ffi
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} with the iOS device target
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target aarch64-apple-ios --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # libibuilder_ffi.a for the device, with the real stage workers (scripts/build-ios-ffi.sh): builds it, then checks that the archive exports exactly the symbols of include/ibuilder.h
+      - name: Build libibuilder_ffi.a for aarch64-apple-ios
+        env:
+          TARGETS: aarch64-apple-ios
+        run: scripts/build-ios-ffi.sh "$RUNNER_TEMP/ios-ffi"
+
+  workflows:
+    name: workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint 1.7.12
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 # actionlint_1.7.12_linux_amd64.tar.gz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -version
+      - name: actionlint
+        run: '"$RUNNER_TEMP/actionlint" -color'

@@ -1,0 +1,29 @@
+OK
+{}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    constant _16* vp_c0 [[id(0)]];
+};
+
+struct main0_out
+{
+    float4 m_20 [[user(locn0)]];
+    float4 m_21 [[user(locn1)]];
+    float4 m_22 [[user(locn2)]];
+    float4 gl_Position [[position, invariant]];
+    float gl_PointSize [[point_size]];
+};
+
+vertex main0_out main0(a (b [[c(1)]], d [[e(2)]]))
+{
+    main0_out out = {};
+    out.gl_PointSize = 1.0;
+    float _64 = fma(as_type<float>(gl_BaseInstance), 2.0, 1.0);
+    float _23 = (*spvDescriptorSet0.vp_c0)._m0[100

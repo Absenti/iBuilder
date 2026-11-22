@@ -1,0 +1,16 @@
+# Device test 2026-11-19 on the re-exported player (iOS 27.0.1): in "Find the game files" a tap on ANY file of the picker does nothing, a 94-byte file as well as the 12 GB .romfs (folders open; the delegate is
+# never called; patch 0054, any file offered, did not change it). The picker now uses the content-type initialiser (UTTypes.Item, iOS 14+), which still opens in place. Applies after 0056.
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -683,7 +683,9 @@
+     {
+         // The custom type alone was not enough: on an iPhone 15 Pro (iOS 27.0.1) the picker showed the .romfs file as a normal, enabled item and a tap did nothing (the delegate was never called; device test
+         // 2026-11-19). Any file is offered, like the other pickers of this app (the certificate, the import): GameExport.UsePickedRomfs checks the name, the size and the content digest anyway.
+-        var picker = new UIDocumentPickerViewController(new[] { "dev.nxpocket.ibuilder.romfs", "public.data", "public.item" }, UIDocumentPickerMode.Open);
++        // The old initialiser (document types as strings, Open mode) shows the files but a tap on one does nothing on iOS 27.0.1: not the game files (12 GB) and not a 94-byte file either (tested with the
++        // cable on the re-exported player, 2026-11-19; folders open, the delegate is never called). The content-type initialiser (iOS 14+) opens the file in place the same way and takes the tap.
++        var picker = new UIDocumentPickerViewController(new[] { UniformTypeIdentifiers.UTTypes.Item }) { AllowsMultipleSelection = false, ShouldShowFileExtensions = true };
+         Write("game files: the picker is open (any file; the manifest decides)");
+         gameFilesPicker = new FolderPickerDelegate(url =>
+         {

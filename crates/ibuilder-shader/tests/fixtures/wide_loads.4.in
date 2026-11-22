@@ -1,0 +1,35 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    device _25* vp_s0 [[id(1)]];
+    const device _25* cp_s1 [[id(2)]];
+    constant _23* fp_s12 [[id(3)]];
+};
+
+kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])
+{
+    int _100 = int(_5);
+    int _102 = _100 + 0;
+    uint _103 = uint(int(uint(_102) >> uint(2)));
+    float _104 = as_type<float>((*spvDescriptorSet0.cp_s1)._m0[int(_103)]);
+    int _105 = _100 + 8;
+    uint _106 = uint(int(uint(_105) >> uint(2)));
+    float _107 = as_type<float>((*spvDescriptorSet0.cp_s1)._m0[int(_106)]);
+    int _108 = _100 + 4;
+    uint _109 = uint(int(uint(_108) >> uint(2)));
+    float _110 = as_type<float>((*spvDescriptorSet0.cp_s1)._m0[int(_109)]);
+    int _111 = _100 + 4;
+    int _112 = _111 + -4;
+    uint _113 = uint(int(uint(_112) >> uint(2)));
+    float _114 = as_type<float>((*spvDescriptorSet0.cp_s1)._m0[int(_113)]);
+    int _115 = _100 + 8;
+    uint _116 = uint(int(uint(_115) >> uint(2)));
+    float _117 = as_type<float>((*spvDescriptorSet0.cp_s1)._m0[int(_116)]);
+    if (_5)
+}

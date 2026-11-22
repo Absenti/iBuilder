@@ -1,0 +1,930 @@
+# 0084-attach-update-dlc-mods-cheats-and-cloud-covers.patch -- before the first build: its mods and cheats, its update and DLC (several files at once, one removed again); and the covers of the
+# NAS / Files games before their download (why the owner saw none, and the fix: .nsz and .nup too, one NAS session, a cache, one log line per game).
+# Applies after 0083. Goes with two changes outside app/patches (the repository's own files): crates/ibuilder-ffi ibuilder_nup_icon_read (+ include/ibuilder.h, tests/nup_icon.rs) and
+# app/gameapp_shim_rust.c gameapp_nup_icon_read. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, the Rust tested, the pure C# in the host harness (below).
+#
+# 1. MODS AND CHEATS BEFORE THE FIRST BUILD: the not-built game's "…" sheet (0082) and its long-press menu gain "Mods and cheats…", the existing Mods page (GameAppModsUi.cs: Atmosphere romfs /
+#    exefs / cheats from a .zip or a folder, a switch per mod, per .pchtxt block and per cheat). The page gains "A cheat file (.txt)…" (Import-mode picker): an Atmosphere cheat file
+#    named after the build id (atmosphere/contents/<tid>/cheats/<build id>.txt) becomes the mod "Cheats <8 digits>" through GameMods.Import (CheatImport, GameMods.ImportCheatFile), its
+#    cheats switched one by one. The mods store is per title id (Documents/games/<tid>/mods), so what is chosen before the build is applied by that first build: the chain plans the
+#    exefs patches in every rewrite (crates/ibuilder-pipeline rewrite.rs mods_plan, checked), the RomFS files and cheats at each boot. Built games keep their Mods page in the sheet.
+# 2. UPDATE AND DLC IN THE BUILD: "Add an update or DLC…" in the not-built sheet, in a local game's long-press menu and in the built sheet's "Update and DLC" row: Pick files… (the
+#    Import-mode picker, AllowsMultipleSelection; the Open-mode pickers deliver nothing on the owner's iOS 27.2.1), Find them in a folder… (0062's scan, now a list with a tick per file:
+#    ChecklistSheet), From the cloud (N)… (the NAS / Files candidates, a tick each, downloaded by 0079's Download). Each picked file is classified by title id (ContentAttach.Classify:
+#    this game's update or DLC, else refused with a short reason: another game, the base game, not a game file, a .nup, no title id); the valid ones are moved in by CopyIn (the import
+#    record: 0068 / 0073 can free them later), the others' copies deleted; one answer ("Attached: … Not attached: … (why)"). The Build row says what the build will merge ("23.9 GB · Not
+#    built · update v131072 · 1 DLC", ContentAttach.Summary, the chain's own UpdateFor / DlcFor); "Remove <update / DLC>…" in the not-built sheet removes one (0062's RemoveFiles question).
+#    The chain merges them as before: the update is the extractor's update argument (BeginRunWithArguments UpdateFor), each DLC's RomFS is games/<id>/aoc (ExtractDlc). A .nup carries its
+#    update inside the package: no "Add an update or DLC" for it (refused with that reason if picked).
+# 3. COVERS BEFORE THE DOWNLOAD. Why the owner saw none (from the code, 0079's FetchCloudIcons): (a) every outcome went to stderr only (Console.Error), never to the app's log, so a failure
+#    or a "no icon" was invisible; (b) nothing at all without prod.keys, silently; (c) a .nup on the NAS was never tried (gameapp_nup_icon needs a local path); (d) a failed read (one SSH
+#    connection per cover, a timeout) was retried only at the next launch, silently; (e) a compressed control NCA (.ncz of an .nsz) or a personalised ticket gave "no icon" with no word. NOW
+#    (FetchCloudCovers, GameAppAttachUi.cs; CloudCovers, GameAppAttach.cs): .nsp .xci .nsz read with prod.keys (the control NCA; an .ncz one is said), a .nup read over SFTP through the new
+#    ibuilder_nup_icon_read (its head: superblock, table of contents, meta block, NPDMs; no keys), ONE NAS session for the whole pass (Nas.WithSession), a Files folder opened once, a cache
+#    per remote file (Documents/gameapp.cloudcovers.tsv: source, remote path, size, outcome; a file of another size is read again; a cached icon whose file is gone is read again; the cloud
+#    listing keeps no modification time, so size stands in for it), off the main thread after the listing, never while a build runs, one line per game in the log ("cover: X (On the NAS):
+#    read before the download" / "none: <why>" / "needs prod.keys" / "read failed: <why> (tried again at the next launch)"). Greyed with the cloud badge as before, the real cover under it.
+#
+# VERIFIED (2026-11-21, M1 Pro): check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile (-t:Compile):
+#   0 errors / 40 warnings, the same per file and code as before 0080 (the two Import-mode pickers' obsolete-API warnings silenced on their lines, as 0067 did). Rust: cargo test -p
+#   ibuilder-ffi all pass (nup_icon 6 of 6, 2 new: the callback gives the same icon and title as the file, a failing / short / foreign reader is an error, bad arguments refused), cargo
+#   clippy -p ibuilder-ffi --all-targets -D warnings clean, cargo fmt clean; the shim compiles (xcrun clang -fsyntax-only -Wall, arm64-apple-ios26.0, no warning). Host harness (harness84:
+#   PAD81;P82;P83;P84, GameAppAttach.cs and GameAppMods.cs added): 203 of 203 checks (25 new, among them the REAL GameMods.ImportCheatFile on a scratch Documents); 10 of 10 mutations killed.
+# NOT VERIFIED: no device: the pickers, the lists, a .nup cover over a real SFTP server, the cache across launches, the time a pass takes on the owner's NAS.
+# NEW UI STRINGS: "Mods and cheats…", "Add an update or DLC…", "Add an update or DLC", "Pick files… (several at once)", "Find them in a folder…", "From the cloud (", "Attach to ",
+#   "Downloaded, then merged by the build.", "Attached: ", "Not attached: ", "Nothing was picked.", "Remove ", "A cheat file (.txt)…", "Not a cheat file", the CheatImport.NeedsBuildId text,
+#   "it belongs to another game", "it is the base game, not an update or a DLC", "a Switch 2 package: its update is inside it", "Add ", "Matched by title id; copied (or cloned) into iBuilder,
+#   then merged by the build."; log lines "cover: ", "attach: ", "needs prod.keys", "read before the download".
+diff -ruN e/GameAppAttach.cs f/GameAppAttach.cs
+--- e/GameAppAttach.cs	1970-01-01 01:00:00
++++ f/GameAppAttach.cs	2026-11-21 23:25:23
+@@ -0,0 +1,141 @@
++// gameapp/GameAppAttach.cs: the pure part of app/patches/0084: an update or DLC attached to a game before its build (classified by title id, summed up on the Build row), an Atmosphere
++// cheat file picked alone, and the covers of the games on the NAS / in a Files folder before their download (what to read, a cache per remote file, one line per game that has none).
++// No UIKit: the host harness compiles it as it is.
++
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++
++/// The files picked to attach to one game: each one is its update, one of its DLC, or refused with a short reason (another game's, a base game, not a game file). The pairing is the
++/// chain's own (GameAppUi.UpdateFor / DlcFor: base 0100…000, update …800, DLC …1xxx of the same base id); a file attached is simply in Documents under its own name.
++public static class ContentAttach
++{
++    public enum Kind { Update, Dlc, Refused }
++
++    public sealed record Pick(string Name, Kind Kind, string Why);
++
++    public static List<Pick> Classify(string game, IEnumerable<string> picked)
++    {
++        var list = new List<Pick>();
++        var baseId = GameAppUi.BaseTitleIdOf(game);
++        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++        foreach (var raw in picked ?? Enumerable.Empty<string>())
++        {
++            var name = Path.GetFileName(raw ?? "");
++            if (name.Length == 0 || !seen.Add(name)) continue;
++            if (!Cloud.IsGameFile(name)) { list.Add(new Pick(name, Kind.Refused, "not a game file (.nsp, .xci, .nsz)")); continue; }
++            if (GameAppUi.IsNup(name)) { list.Add(new Pick(name, Kind.Refused, "a Switch 2 package: its update is inside it")); continue; }
++            var kind = GameAppUi.ContentKindOf(name);
++            var id = GameAppUi.BaseTitleIdOf(name);
++            if (id == null) { list.Add(new Pick(name, Kind.Refused, "its name carries no [title id]")); continue; }
++            if (baseId == null || !string.Equals(id, baseId, StringComparison.OrdinalIgnoreCase)) { list.Add(new Pick(name, Kind.Refused, "it belongs to another game")); continue; }
++            if (kind == GameAppUi.ContentKind.Base) { list.Add(new Pick(name, Kind.Refused, "it is the base game, not an update or a DLC")); continue; }
++            list.Add(new Pick(name, kind == GameAppUi.ContentKind.Update ? Kind.Update : Kind.Dlc, null));
++        }
++        return list;
++    }
++
++    /// "update v131072 · 1 DLC", "2 DLC", "" (what the build will merge, as UpdateFor / DlcFor pick it).
++    public static string Summary(string game, IEnumerable<string> local)
++    {
++        var names = (local ?? Enumerable.Empty<string>()).ToList();
++        if (GameAppUi.IsNup(game) || GameAppUi.ContentKindOf(game) != GameAppUi.ContentKind.Base) return "";
++        var update = GameAppUi.UpdateFor(game, names);
++        int dlc = GameAppUi.DlcFor(game, names).Count;
++        var parts = new List<string>();
++        if (update != null) { long v = GameAppUi.VersionOf(update); parts.Add(v > 0 ? "update v" + v.ToString(CultureInfo.InvariantCulture) : "update"); }
++        if (dlc > 0) parts.Add(dlc + " DLC");
++        return string.Join(" · ", parts);
++    }
++
++    /// The attached files of a game, the ones a person may remove before the build: its update(s) and DLC in Documents.
++    public static List<string> Attached(string game, IEnumerable<string> local) =>
++        GameAppUi.IsNup(game) ? new List<string>() :
++        (local ?? Enumerable.Empty<string>()).Where(n => !string.Equals(n, game, StringComparison.OrdinalIgnoreCase)
++                                                        && string.Equals(GameAppUi.BaseTitleIdOf(n), GameAppUi.BaseTitleIdOf(game), StringComparison.OrdinalIgnoreCase)
++                                                        && GameAppUi.ContentKindOf(n) is GameAppUi.ContentKind.Update or GameAppUi.ContentKind.AddOn).ToList();
++
++    /// The answer after a pick: "Attached: X, Y. Not attached: Z (it belongs to another game)."
++    public static string Report(IEnumerable<Pick> picks)
++    {
++        var l = (picks ?? Enumerable.Empty<Pick>()).ToList();
++        var ok = l.Where(p => p.Kind != Kind.Refused).Select(p => p.Name).ToList();
++        var no = l.Where(p => p.Kind == Kind.Refused).Select(p => $"{p.Name} ({p.Why})").ToList();
++        var parts = new List<string>();
++        if (ok.Count > 0) parts.Add("Attached: " + string.Join(", ", ok) + ".");
++        if (no.Count > 0) parts.Add("Not attached: " + string.Join(", ", no) + ".");
++        return parts.Count == 0 ? "Nothing was picked." : string.Join(" ", parts);
++    }
++}
++
++/// An Atmosphere cheat file picked alone (`atmosphere/contents/<title id>/cheats/<build id>.txt`, or the same .txt from Files): its name must be the build id (16 hex digits), which is how
++/// the boot matches it to the game's code (ibuilder-mods boot.rs cheat_file_bid).
++public static class CheatImport
++{
++    public static string BuildIdOf(string fileName) =>
++        fileName != null && fileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase) ? GameMods.BidOfName(Path.GetFileName(fileName)) : null;
++
++    public const string NeedsBuildId = "A cheat file is named after the game's build id: 16 hex digits, then .txt (as in atmosphere/contents/<title id>/cheats/).";
++
++    /// The mod a lone cheat file becomes: "Cheats 0123ABCD" (the first 8 digits of its build id).
++    public static string ModName(string buildId) => "Cheats " + (buildId ?? "").Substring(0, Math.Min(8, (buildId ?? "").Length));
++}
++
++/// The covers of cloud games before their download (patch 0084).
++public static class CloudCovers
++{
++    public enum Do { Skip, Package, Nup, NeedsKeys }
++
++    /// What the pass does with one cloud file. `iconHere`: games/<id>/icon.jpg (or the person's cover) exists; `cached`: this remote file (same size) was read already and gave no cover;
++    /// `failedNow`: a read failed in this session (tried again at the next launch).
++    public static Do Decide(string name, bool hasKeys, bool iconHere, bool cached, bool failedNow, bool placeholder)
++    {
++        if (!Cloud.IsGameFile(name) || iconHere || failedNow || cached || placeholder) return Do.Skip;
++        if (GameAppUi.ContentKindOf(name) != GameAppUi.ContentKind.Base) return Do.Skip;   // an update / DLC shows its base game
++        if (GameAppUi.IsNup(name)) return Do.Nup;                                         // not encrypted: no keys
++        return hasKeys ? Do.Package : Do.NeedsKeys;                                        // .nsp .xci .nsz: the control NCA needs prod.keys
++    }
++
++    public sealed record Entry(string Source, string Remote, long Size, string Outcome, string Why, string At);
++
++    public const string FileName = "gameapp.cloudcovers.tsv";
++
++    private static string Clean(string s) => (s ?? "").Replace('\t', ' ').Replace('\n', ' ').Replace('\r', ' ');
++
++    public static string Format(IEnumerable<Entry> list) =>
++        "# cloud covers read before the download (app patch 0084): source, remote, size, outcome, why, when\n"
++        + string.Concat((list ?? Enumerable.Empty<Entry>()).Select(e => $"{Clean(e.Source)}\t{Clean(e.Remote)}\t{e.Size.ToString(CultureInfo.InvariantCulture)}\t{Clean(e.Outcome)}\t{Clean(e.Why)}\t{Clean(e.At)}\n"));
++
++    public static List<Entry> Parse(string text)
++    {
++        var list = new List<Entry>();
++        foreach (var raw in (text ?? "").Split('\n'))
++        {
++            var c = raw.TrimEnd('\r').Split('\t');
++            if (c.Length != 6 || raw.StartsWith("#", StringComparison.Ordinal) || !long.TryParse(c[2], NumberStyles.None, CultureInfo.InvariantCulture, out var size)) continue;
++            list.Add(new Entry(c[0], c[1], size, c[3], c[4], c[5]));
++        }
++        return list;
++    }
++
++    /// The entry of this remote file: same source, same remote path, same size (a file replaced on the NAS by another of another size is read again).
++    public static Entry Find(IEnumerable<Entry> list, string source, string remote, long size) =>
++        (list ?? Enumerable.Empty<Entry>()).LastOrDefault(e => e.Source == source && e.Remote == remote && e.Size == size);
++
++    public static List<Entry> Upsert(IEnumerable<Entry> list, Entry e) =>
++        (list ?? Enumerable.Empty<Entry>()).Where(x => !(x.Source == e.Source && x.Remote == e.Remote)).Append(e).ToList();
++
++    /// A cached "none" stands (no read again) while the file is the same size; an icon outcome needs its icon file (it was deleted: read again).
++    public static bool Stands(Entry e, bool iconHere) => e != null && (e.Outcome == "none" || (e.Outcome == "icon" && iconHere));
++
++    /// One line per game that has no cover, and one for a cover read: what the owner's log says.
++    public static string Line(string name, string where, string outcome, string why) => outcome switch
++    {
++        "icon" => $"cover: {name} ({where}): read before the download",
++        "none" => $"cover: {name} ({where}): none: {why ?? "the package carries no icon"} (Choose a cover… gives it one once it is on this iPhone)",
++        "keys" => $"cover: {name} ({where}): needs prod.keys (an .nsp, .xci or .nsz cover is read with them)",
++        _ => $"cover: {name} ({where}): read failed: {why ?? "no answer"} (tried again at the next launch)",
++    };
++}
+diff -ruN e/GameAppAttachUi.cs f/GameAppAttachUi.cs
+--- e/GameAppAttachUi.cs	1970-01-01 01:00:00
++++ f/GameAppAttachUi.cs	2026-11-21 23:29:27
+@@ -0,0 +1,361 @@
++// gameapp/GameAppAttachUi.cs: app/patches/0084 (UIKit): an update or DLC attached before the build (several files at once, from Files, a folder or a cloud source; one removed again), and
++// the covers of the cloud games before their download (one NAS session for a pass, a cache per remote file, .nup covers read over SFTP, one log line per game without a cover).
++// The decisions are GameAppAttach.cs (pure, run by the host harness).
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Runtime.InteropServices;
++using System.Threading;
++using Foundation;
++using UIKit;
++
++/// A .nup on the NAS: its head read through the shim's gameapp_nup_icon_read, the bytes asked of an SFTP stream (crates/ibuilder-ffi ibuilder_nup_icon_read).
++internal static unsafe class NupRemote
++{
++    [DllImport("__Internal")] private static extern int gameapp_nup_icon_read(delegate* unmanaged<IntPtr, ulong, byte*, int, long> read, IntPtr ctx, ulong size, byte[] buf, int cap, out ulong titleId);
++
++    [UnmanagedCallersOnly]
++    private static long Read(IntPtr ctx, ulong offset, byte* buf, int len)
++    {
++        try
++        {
++            var s = (Stream) GCHandle.FromIntPtr(ctx).Target;
++            s.Position = (long) offset;
++            var span = new Span<byte>(buf, len);
++            int total = 0;
++            while (total < len)
++            {
++                int n = s.Read(span.Slice(total));
++                if (n <= 0) break;
++                total += n;
++            }
++            return total;
++        }
++        catch (Exception) { return -1; }
++    }
++
++    /// (the icon or null, the title the build names the game by, why there is none)
++    public static (byte[] Icon, ulong TitleId, string Why) Icon(Stream stream, long size)
++    {
++        var handle = GCHandle.Alloc(stream);
++        try
++        {
++            var buf = new byte[1 << 20];
++            int rc = gameapp_nup_icon_read(&Read, GCHandle.ToIntPtr(handle), (ulong) size, buf, buf.Length, out var tid);
++            if (rc > buf.Length) { buf = new byte[rc]; rc = gameapp_nup_icon_read(&Read, GCHandle.ToIntPtr(handle), (ulong) size, buf, buf.Length, out tid); }
++            if (rc > 0 && rc <= buf.Length) return (buf.AsSpan(0, rc).ToArray(), tid, null);
++            return rc == 0 ? (null, tid, "the package carries no icon") : (null, 0, "not a readable Switch 2 package (the shim's log says why)");
++        }
++        finally { handle.Free(); }
++    }
++}
++
++/// A short list with a tick per row, "Add N": the files of a folder or a cloud source to attach to a game (several at once).
++internal sealed class ChecklistSheet : UIViewController
++{
++    private readonly string title, note;
++    private readonly List<(string Name, string Detail)> rows;
++    private readonly bool[] on;
++    private readonly Action<List<int>> done;
++    private UIButton add;
++
++    public ChecklistSheet(string title, string note, List<(string Name, string Detail)> rows, Action<List<int>> done)
++    {
++        this.title = title; this.note = note; this.rows = rows; this.done = done;
++        on = Enumerable.Repeat(true, rows.Count).ToArray();
++    }
++
++    public override void ViewDidLoad()
++    {
++        base.ViewDidLoad();
++        View.BackgroundColor = Theme.Hex(0x121217);
++        var cancel = Look.Capsule("Cancel", null, false, null, 36, 14);
++        cancel.TouchUpInside += (_, __) => DismissViewController(true, null);
++        add = Look.Capsule("", null, true, null, 36, 14);
++        add.AccessibilityIdentifier = "checklist-add";
++        add.TouchUpInside += (_, __) => { var picked = Enumerable.Range(0, rows.Count).Where(i => on[i]).ToList(); DismissViewController(true, () => done(picked)); };
++        var head = Theme.Row(10, cancel, new UIView(), add);
++        var t = Theme.Label(title, Theme.Font(20, UIFontWeight.Bold), Theme.Text, 2);
++        t.AccessibilityTraits = UIAccessibilityTrait.Header;
++        var list = Theme.Column(0);
++        for (int i = 0; i < rows.Count; i++)
++        {
++            int k = i;
++            var b = new UIButton(UIButtonType.Custom) { AccessibilityIdentifier = "checklist-row-" + i };
++            var mark = Theme.Symbol("checkmark.circle.fill", 22, Theme.Accent);
++            var name = Theme.Label(rows[i].Name, Theme.Font(15, UIFontWeight.Regular), Theme.Text, 2);
++            var detail = Theme.Label(rows[i].Detail ?? "", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 2);
++            var row = Theme.Row(12, mark, Theme.Column(2, name, detail));
++            row.UserInteractionEnabled = false;
++            row.TranslatesAutoresizingMaskIntoConstraints = false;
++            b.AddSubview(row);
++            NSLayoutConstraint.ActivateConstraints(new[] { row.TopAnchor.ConstraintEqualTo(b.TopAnchor, 10), row.BottomAnchor.ConstraintEqualTo(b.BottomAnchor, -10), row.LeadingAnchor.ConstraintEqualTo(b.LeadingAnchor), row.TrailingAnchor.ConstraintEqualTo(b.TrailingAnchor), b.HeightAnchor.ConstraintGreaterThanOrEqualTo(44) });
++            void Show() { mark.Image = UIImage.GetSystemImage(on[k] ? "checkmark.circle.fill" : "circle"); mark.TintColor = on[k] ? Theme.Accent : Theme.Muted; b.AccessibilityLabel = rows[k].Name; b.AccessibilityValue = on[k] ? "chosen" : "not chosen"; }
++            b.TouchUpInside += (_, __) => { on[k] = !on[k]; Show(); Count(); };
++            Show();
++            if (i > 0) { var rule = new UIView { BackgroundColor = Look.Line }; rule.HeightAnchor.ConstraintEqualTo(1).Active = true; list.AddArrangedSubview(rule); }
++            list.AddArrangedSubview(b);
++        }
++        var column = Theme.Column(14, head, t, Theme.Label(note ?? "", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0), Look.Card(list, 2, 16));
++        var scroll = new UIScrollView { AlwaysBounceVertical = true, AlwaysBounceHorizontal = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        column.TranslatesAutoresizingMaskIntoConstraints = false;
++        scroll.AddSubview(column);
++        Theme.PinColumn(scroll, column, 16, 32, 20);
++        View.AddSubview(scroll);
++        NSLayoutConstraint.ActivateConstraints(new[] { scroll.TopAnchor.ConstraintEqualTo(View.SafeAreaLayoutGuide.TopAnchor), scroll.BottomAnchor.ConstraintEqualTo(View.BottomAnchor), scroll.LeadingAnchor.ConstraintEqualTo(View.LeadingAnchor), scroll.TrailingAnchor.ConstraintEqualTo(View.TrailingAnchor) });
++        Count();
++    }
++
++    private void Count()
++    {
++        int n = on.Count(x => x);
++        var c = add.Configuration;
++        c.AttributedTitle = new NSAttributedString(n == 0 ? "Add" : $"Add {n}", new UIStringAttributes { Font = Theme.Font(14, UIFontWeight.Semibold) });
++        add.Configuration = c;
++        add.Enabled = n > 0;
++    }
++}
++
++public sealed partial class GameAppViewController
++{
++    // ---- an update or DLC, attached before the build ---------------------------------------------------------------
++
++    /// "Add an update or DLC…": files (several at once, the Import-mode picker: the Open-mode one delivers nothing on iOS 27.2.1, DEVICE-FINDINGS), a folder, or a cloud source.
++    private void ShowContentChooser(string game, UIView source)
++    {
++        var names = Dumps().Select(Path.GetFileName).ToList();
++        var inCloud = GameAppUi.RelatedContent(game, cloudFiles.Select(f => f.Name)).Where(n => !names.Contains(n, StringComparer.OrdinalIgnoreCase))
++                               .Select(n => Cloud.CloudCopyOf(n, cloudFiles)).Where(f => f != null).ToList();
++        var sheet = UIAlertController.Create("Add an update or DLC", GameAppUi.DisplayName(game) + ": the build merges them (matched by title id).", UIAlertControllerStyle.ActionSheet);
++        sheet.AddAction(UIAlertAction.Create("Pick files… (several at once)", UIAlertActionStyle.Default, _ => AttachPicked(game)));
++        sheet.AddAction(UIAlertAction.Create("Find them in a folder…", UIAlertActionStyle.Default, _ => PresentFolderPicker("update and DLC folder", url => ScanFolderForContent(game, url))));
++        if (inCloud.Count > 0)
++            sheet.AddAction(UIAlertAction.Create($"From the cloud ({inCloud.Count})…", UIAlertActionStyle.Default, _ => AttachFromCloud(game, inCloud)));
++        sheet.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
++        Theme.Anchor(sheet, source, View);
++        PresentWhenFree(sheet);
++    }
++
++    private void AttachFromCloud(string game, List<CloudFile> files)
++    {
++        var rows = files.Select(f => (f.Name, Cloud.Where(f, cloudSources))).ToList();
++        PresentWhenFree(new ChecklistSheet("Attach to " + GameAppUi.DisplayName(game), "Downloaded, then merged by the build.", rows,
++            picked => { var set = picked.Select(i => files[i]).ToList(); if (set.Count > 0) Download(set, GameAppMain.Documents); }));
++    }
++
++    private NSObject attachDelegate;
++
++    /// Several files at once; each is this game's update or DLC, or refused with its reason; the valid ones are moved in (CopyIn: the import record, so 0068/0073 can free them later).
++    private void AttachPicked(string game)
++    {
++#pragma warning disable CA1422   // the Import-mode picker on purpose: the Open-mode pickers deliver nothing on the owner's iOS 27.2.1 (DEVICE-FINDINGS)
++        var picker = new UIDocumentPickerViewController(new[] { "public.item" }, UIDocumentPickerMode.Import) { AllowsMultipleSelection = true };
++#pragma warning restore CA1422
++        var d = new AttachDelegate(urls => BeginInvokeOnMainThread(() =>
++        {
++            var picks = ContentAttach.Classify(game, urls.Select(u => u.LastPathComponent));
++            foreach (var url in urls)
++            {
++                var p = picks.FirstOrDefault(x => string.Equals(x.Name, url.LastPathComponent, StringComparison.OrdinalIgnoreCase));
++                if (p != null && p.Kind != ContentAttach.Kind.Refused) CopyIn(url);
++                else { try { File.Delete(url.Path); } catch (Exception) { } }   // the picker's own copy in our tmp/
++            }
++            var text = ContentAttach.Report(picks);
++            Write($"attach: {GameAppUi.DisplayName(game)}: {text}");
++            var a = UIAlertController.Create(GameAppUi.DisplayName(game), text, UIAlertControllerStyle.Alert);
++            a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++            PresentWhenFree(a);
++            RefreshScreen();
++        }));
++        attachDelegate = d;
++        picker.Delegate = d;
++        PresentWhenFree(picker);
++    }
++
++    private sealed class AttachDelegate : NSObject, IUIDocumentPickerDelegate
++    {
++        private readonly Action<NSUrl[]> picked;
++        public AttachDelegate(Action<NSUrl[]> picked) => this.picked = picked;
++        public void DidPickDocument(UIDocumentPickerViewController controller, NSUrl url) => picked(new[] { url });
++        [Export("documentPicker:didPickDocumentsAtURLs:")]
++        public void DidPickDocumentAtUrls(UIDocumentPickerViewController controller, NSUrl[] urls) => picked(urls);
++    }
++
++    /// One attached file removed before the build (its update or a DLC).
++    private void RemoveAttached(string file)
++    {
++        var path = Path.Combine(GameAppMain.Documents, file);
++        if (!File.Exists(path)) return;
++        RemoveFiles(new List<string> { path }, Cloud.CloudCopyOf(file, cloudFiles) != null);   // the app's own question (it says whether it stays in the cloud)
++    }
++
++    // ---- covers before the download --------------------------------------------------------------------------------
++
++    private readonly HashSet<string> coverKeysNoted = new HashSet<string>(StringComparer.Ordinal);
++    private static readonly object coverCacheGate = new object();
++
++    private static string CoverCachePath => Path.Combine(GameAppMain.Documents, CloudCovers.FileName);
++
++    private static List<CloudCovers.Entry> LoadCoverCache()
++    {
++        try { return File.Exists(CoverCachePath) ? CloudCovers.Parse(File.ReadAllText(CoverCachePath)) : new List<CloudCovers.Entry>(); }
++        catch (Exception) { return new List<CloudCovers.Entry>(); }
++    }
++
++    private static void SaveCoverCache(List<CloudCovers.Entry> list)
++    {
++        lock (coverCacheGate)
++        {
++            var part = CoverCachePath + ".part";
++            try { File.WriteAllText(part, CloudCovers.Format(list)); File.Move(part, CoverCachePath, true); }
++            catch (Exception) { try { File.Delete(part); } catch (Exception) { } }
++        }
++    }
++
++    /// The covers of the games only in a cloud source, before their download (it replaces the pass of 0051 / 0079, same files: games/<id>/icon.jpg, the person's cover still first).
++    /// Off the main thread, never while a build runs, never in the listing's way: the listing ends, then this starts. ONE NAS session for the whole pass; a Files folder opened once.
++    private void FetchCloudCovers()
++    {
++        if (GameExport.IsPlayer || running) return;
++        var docs = GameAppMain.Documents;
++        var keys = Path.Combine(docs, "prod.keys");
++        bool hasKeys = File.Exists(keys);
++        string Doc(string rel) => Path.Combine(docs, rel.Replace('/', Path.DirectorySeparatorChar));
++        string Key(CloudFile f) => f.SourceId + "\t" + (f.Remote ?? f.Name);
++        var local = Dumps().Select(Path.GetFileName).ToList();
++        var cache = LoadCoverCache();
++        var todo = new List<(CloudFile F, CloudCovers.Do Do)>();
++        foreach (var f in Cloud.CloudOnlyGames(local, cloudFiles))
++        {
++            var rel = GameAppUi.IconRelativePath(f.Name);
++            bool iconHere = (rel != null && File.Exists(Doc(rel))) || HasCustomCover(f.Name);
++            var entry = CloudCovers.Find(cache, f.SourceId, f.Remote ?? f.Name, f.Size);
++            var d = CloudCovers.Decide(f.Name, hasKeys, iconHere, CloudCovers.Stands(entry, iconHere), cloudIconFailed.Contains(Key(f)), false);
++            if (d == CloudCovers.Do.NeedsKeys) { if (coverKeysNoted.Add(Key(f))) Write(CloudCovers.Line(f.Name, CloudWords(f).Where, "keys", null)); }
++            else if (d != CloudCovers.Do.Skip) todo.Add((f, d));
++        }
++        if (todo.Count == 0 || Interlocked.CompareExchange(ref cloudIconsRunning, 1, 0) != 0) return;
++        var nas = LoadNas();
++        var password = NasPassword();
++        var sources = cloudSources;
++        System.Threading.Tasks.Task.Run(() =>
++        {
++            int got = 0;
++            var failed = new List<string>();
++            var lines = new List<string>();
++            void Post() { var l = lines.ToList(); lines.Clear(); if (l.Count > 0) BeginInvokeOnMainThread(() => { foreach (var x in l) Write(x); }); }
++            // one result: the icon, the title the package names, why there is none, whether the read failed
++            (byte[] Jpeg, ulong Title, string Why, bool Failed) ReadOne(CloudCovers.Do how, Stream stream, long size)
++            {
++                try
++                {
++                    if (how == CloudCovers.Do.Nup) { var r = NupRemote.Icon(stream, size); return (r.Icon, r.TitleId & ~0xFFFUL, r.Why, r.Why != null && r.Why.StartsWith("not a readable", StringComparison.Ordinal)); }
++                    var jpeg = GameIconsStream.Read(keys, stream, out var control, out var why);
++                    return (jpeg, CoverPass.BaseIdFromControl(control), why, false);
++                }
++                catch (Exception e) { return (null, 0, (e.InnerException ?? e).Message, true); }
++            }
++            void Land(CloudFile f, (byte[] Jpeg, ulong Title, string Why, bool Failed) r)
++            {
++                var where = CloudWords(f).Where;
++                if (r.Failed) { failed.Add(Key(f)); lines.Add(CloudCovers.Line(f.Name, where, "failed", r.Why)); return; }
++                if (GameAppUi.IconRelativePath(f.Name) == null && r.Title != 0)
++                {
++                    GameAppUi.SetTitleFromContent(f.Name, r.Title);   // a name with no [title id]: the package names it (0051, 0079)
++                    GameAppUi.SaveTitlesFromContent(GameAppMain.Documents);
++                    got++;
++                }
++                var rel = GameAppUi.IconRelativePath(f.Name);
++                string outcome = r.Jpeg != null && rel != null ? "icon" : "none";
++                if (outcome == "icon")
++                {
++                    lock (CoverPass.Gate)
++                    {
++                        var icon = Doc(rel);
++                        if (!File.Exists(icon))
++                        {
++                            Directory.CreateDirectory(Path.GetDirectoryName(icon));
++                            var part = GameCover.PartOf(icon);
++                            File.WriteAllBytes(part, r.Jpeg);
++                            File.Move(part, icon, true);
++                            got++;
++                        }
++                    }
++                }
++                lock (coverCacheGate) cache = CloudCovers.Upsert(cache, new CloudCovers.Entry(f.SourceId, f.Remote ?? f.Name, f.Size, outcome, outcome == "none" ? r.Why ?? (rel == null ? "the package names no title" : null) : null, DateTime.UtcNow.ToString("o")));
++                lines.Add(CloudCovers.Line(f.Name, where, outcome, r.Why ?? (rel == null ? "the package names no title" : null)));
++            }
++            try
++            {
++                foreach (var group in todo.GroupBy(x => x.F.SourceId))
++                {
++                    if (running) break;   // a build started: the rest waits for the next pass
++                    var source = sources.FirstOrDefault(s => s.Id == group.Key);
++                    if (source == null) continue;
++                    try
++                    {
++                        if (source.Kind == CloudKind.Nas)
++                        {
++                            if (string.IsNullOrEmpty(password)) continue;
++                            Nas.WithSession(nas, Nas.Password(nas.User, password), open =>   // ONE connection for the whole source (it was one per cover)
++                            {
++                                foreach (var (f, how) in group)
++                                {
++                                    if (running) break;
++                                    (byte[], ulong, string, bool) r;
++                                    try { var (stream, size) = open(f.Remote); using (stream) r = ReadOne(how, stream, size); }
++                                    catch (Exception e) { r = (null, 0, (e.InnerException ?? e).Message, true); }
++                                    Land(f, r);
++                                    Post();
++                                    if (got > 0 && got % 3 == 0) BeginInvokeOnMainThread(RefreshScreen);
++                                }
++                            });
++                        }
++                        else
++                        {
++                            var folder = ResolveFolder(source, out var whyNot);
++                            if (folder == null) continue;
++                            bool scoped = folder.StartAccessingSecurityScopedResource();
++                            try
++                            {
++                                foreach (var (f, how) in group)
++                                {
++                                    if (running) break;
++                                    var path = Path.Combine(folder.Path, f.Remote ?? f.Name);
++                                    if (!File.Exists(path)) continue;   // only in iCloud (a placeholder): not downloaded for a cover
++                                    if (how == CloudCovers.Do.Nup)
++                                    {
++                                        var buf = new byte[1 << 20];
++                                        int rc = NupNative.gameapp_nup_icon(path, buf, buf.Length, out var tid);
++                                        if (rc > buf.Length) { buf = new byte[rc]; rc = NupNative.gameapp_nup_icon(path, buf, buf.Length, out tid); }
++                                        Land(f, rc > 0 && rc <= buf.Length ? (buf.AsSpan(0, rc).ToArray(), tid & ~0xFFFUL, null, false) : rc == 0 ? (null, tid & ~0xFFFUL, "the package carries no icon", false) : (null, 0, "not a readable Switch 2 package", true));
++                                    }
++                                    else
++                                    {
++                                        using var stream = File.OpenRead(path);
++                                        Land(f, ReadOne(how, stream, stream.Length));
++                                    }
++                                    Post();
++                                }
++                            }
++                            finally { if (scoped) folder.StopAccessingSecurityScopedResource(); }
++                        }
++                    }
++                    catch (Exception e)
++                    {
++                        // the session itself failed (the NAS is not reachable, its key changed...): every cover of the source says it, and is tried again at the next launch
++                        foreach (var (f, _) in group) if (!failed.Contains(Key(f))) { failed.Add(Key(f)); lines.Add(CloudCovers.Line(f.Name, CloudWords(f).Where, "failed", (e.InnerException ?? e).Message)); }
++                        Post();
++                    }
++                }
++                List<CloudCovers.Entry> snapshot;
++                lock (coverCacheGate) snapshot = cache.ToList();
++                SaveCoverCache(snapshot);
++            }
++            finally { Interlocked.Exchange(ref cloudIconsRunning, 0); }
++            BeginInvokeOnMainThread(() => { foreach (var k in failed) cloudIconFailed.Add(k); if (got > 0) RefreshScreen(); });
++        });
++    }
++}
+diff -ruN e/GameAppIcons.cs f/GameAppIcons.cs
+--- e/GameAppIcons.cs	2026-11-21 20:48:00
++++ f/GameAppIcons.cs	2026-11-21 23:26:58
+@@ -44,9 +44,16 @@
+     /// The same, and the title id of the control NCA the icon came from (0 when there is none): patch 0079 names a game only in the cloud whose file name has no id by it, as 0051 does for a local
+     /// one (CoverPass.BaseIdFromControl keeps a base game's only).
+     [System.Diagnostics.CodeAnalysis.DynamicDependency(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods, typeof(P))]
+-    internal static byte[] Read(string keysPath, Stream stream, out ulong controlTitleId)
++    internal static byte[] Read(string keysPath, Stream stream, out ulong controlTitleId) => Read(keysPath, stream, out controlTitleId, out _);
++
++    /// Patch 0084: the same, and why there is no icon when there is none (said in the log, one line per game): no control NCA, a compressed one (.ncz: an .nsz that compressed it too), a
++    /// personalised ticket (no title key here), no icon in the control data.
++    [System.Diagnostics.CodeAnalysis.DynamicDependency(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods, typeof(P))]
++    internal static byte[] Read(string keysPath, Stream stream, out ulong controlTitleId, out string why)
+     {
+         controlTitleId = 0;
++        why = null;
++        bool personal = false, ncz = false;
+         const System.Reflection.BindingFlags Any = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+         var icon = typeof(P).GetMethod("Icon", Any) ?? throw new MissingMethodException("P.Icon");
+         var ks = ExternalKeyReader.ReadKeyFile(keysPath);
+@@ -75,20 +82,24 @@
+             pfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+             var t = new byte[0x2c0];
+             f.Get.Read(out _, 0, t, ReadOption.None).ThrowIfFailure();
+-            if (t[0x281] != 0) continue;   // a personalised ticket: no title key here
++            if (t[0x281] != 0) { personal = true; continue; }   // a personalised ticket: no title key here
+             ks.ExternalKeySet.Add(new RightsId(t.AsSpan(0x2a0, 0x10)), new AccessKey(t.AsSpan(0x180, 0x10))).ThrowIfFailure();
+         }
+         foreach (DirectoryEntryEx e in pfs.EnumerateEntries("*", SearchOptions.Default))
+         {
++            if (e.Name.EndsWith(".ncz", StringComparison.OrdinalIgnoreCase) && e.Size <= 64L << 20) ncz = true;
+             if (!e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase) || e.Size > 64L << 20) continue;   // the control NCA is small
+             using var f = new UniqueRef<IFile>();
+             pfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+             var nca = new Nca(ks, f.Release().AsStorage());
+             if (nca.Header.ContentType == NcaContentType.Control) { control = nca; break; }
+         }
+-        if (control == null) return null;
++        if (control == null) { why = ncz ? "its control data is compressed (.ncz): read once the file is on this iPhone" : "no control data in the package"; return null; }
+         controlTitleId = control.Header.TitleId;
+-        var result = ((byte[], string)) icon.Invoke(null, new object[] { control });
+-        return result.Item1;
++        byte[] jpeg;
++        try { jpeg = (((byte[], string)) icon.Invoke(null, new object[] { control })).Item1; }
++        catch (Exception e) when (personal) { why = "a personalised ticket: no title key to read the control data (" + (e.InnerException ?? e).Message + ")"; return null; }
++        if (jpeg == null) why = "no icon in the control data";
++        return jpeg;
+     }
+ }
+diff -ruN e/GameAppLibrary.cs f/GameAppLibrary.cs
+--- e/GameAppLibrary.cs	2026-11-21 20:48:00
++++ f/GameAppLibrary.cs	2026-11-21 23:28:40
+@@ -1708,11 +1708,10 @@
+                     PresentWhenFree(none);
+                     return;
+                 }
+-                var listing = string.Join("\n", found.Select(p => "• " + (GameAppUi.ContentKindOf(Path.GetFileName(p)) == GameAppUi.ContentKind.Update ? GameAppUi.UpdateLabel(Path.GetFileName(p)) : "DLC " + GameAppUi.DlcLabel(Path.GetFileName(p)))));
+-                var ask = UIAlertController.Create($"Found {found.Count} for {GameAppUi.DisplayName(game)}", listing, UIAlertControllerStyle.Alert);
+-                ask.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
+-                ask.AddAction(UIAlertAction.Create("Add them", UIAlertActionStyle.Default, _ => CopyContentIn(folder, found)));
+-                PresentWhenFree(ask);
++                // patch 0084: a list with a tick per file (several at once; all ticked), not one "Add them"
++                var rows = found.Select(p => { var n = Path.GetFileName(p); return (n, GameAppUi.ContentKindOf(n) == GameAppUi.ContentKind.Update ? GameAppUi.UpdateLabel(n) : "DLC " + GameAppUi.DlcLabel(n)); }).ToList();
++                PresentWhenFree(new ChecklistSheet($"Found {found.Count} for {GameAppUi.DisplayName(game)}", "Matched by title id; copied (or cloned) into iBuilder, then merged by the build.", rows,
++                    picked => { var chosen = picked.Select(i => found[i]).ToList(); if (chosen.Count > 0) CopyContentIn(folder, chosen); }));
+             });
+         });
+     }
+@@ -1874,114 +1873,8 @@
+     /// older than its landing). Patch 0079: a file whose name carries no title id gets it from the package, as a local
+     /// one does (0051: kept in Documents/.titleids.tsv), so its cover, its update / DLC pairing and its version follow;
+     /// a read that FAILED (not a package without an icon) leaves no marker: it is tried again at the next launch.
+-    private void FetchCloudIcons()
+-    {
+-        var keys = Path.Combine(GameAppMain.Documents, "prod.keys");
+-        if (!File.Exists(keys) || running) return;
+-        var keysTime = File.GetLastWriteTimeUtc(keys);
+-        var local = Dumps().Select(Path.GetFileName).ToList();
+-        string Doc(string rel) => Path.Combine(GameAppMain.Documents, rel.Replace('/', Path.DirectorySeparatorChar));
+-        string Key(CloudFile f) => f.SourceId + "\t" + (f.Remote ?? f.Name);
+-        var todo = Cloud.CloudOnlyGames(local, cloudFiles).Where(f => !GameAppUi.IsNup(f.Name) && !cloudIconFailed.Contains(Key(f))).Select(f =>
+-        {
+-            var rel = GameAppUi.IconRelativePath(f.Name);
+-            if (rel == null)
+-            {
+-                // no title id in the file name: read from the package, as FetchMissingIcons does for a local file (the same marker, games/_unresolved/<hash>.none)
+-                var unresolved = Doc(GameAppUi.UnresolvedMarker(f.Name));
+-                if (File.Exists(unresolved) && File.GetLastWriteTimeUtc(unresolved) >= keysTime) return default;
+-                return (File: f, Icon: (string) null, None: unresolved);
+-            }
+-            var icon = Doc(rel);
+-            var none = Doc(GameAppUi.NoIconRelativePath(f.Name));
+-            if (File.Exists(icon) || (File.Exists(none) && File.GetLastWriteTimeUtc(none) >= keysTime)) return default;
+-            return (File: f, Icon: icon, None: none);
+-        }).Where(x => x.File != null).ToList();
+-        if (todo.Count == 0 || Interlocked.CompareExchange(ref cloudIconsRunning, 1, 0) != 0) return;
+-        var nas = LoadNas();
+-        var password = NasPassword();
+-        var sources = cloudSources;
+-        var documents = GameAppMain.Documents;
+-        System.Threading.Tasks.Task.Run(() =>
+-        {
+-            int got = 0;
+-            var failed = new List<string>();
+-            try
+-            {
+-                foreach (var (f, icon0, none) in todo)
+-                {
+-                    byte[] jpeg = null; string why = null; bool threw = false; ulong controlId = 0;
+-                    try
+-                    {
+-                        var source = sources.FirstOrDefault(s => s.Id == f.SourceId);
+-                        if (source == null) continue;
+-                        if (source.Kind == CloudKind.Nas)
+-                        {
+-                            if (string.IsNullOrEmpty(password)) continue;
+-                            (jpeg, controlId) = Nas.WithReadStream(nas, Nas.Password(nas.User, password), f.Remote, stream => (GameIconsStream.Read(keys, stream, out var id), id));
+-                        }
+-                        else
+-                        {
+-                            var folder = ResolveFolder(source, out var whyNot);
+-                            if (folder == null) continue;
+-                            bool scoped = folder.StartAccessingSecurityScopedResource();
+-                            try
+-                            {
+-                                var path = Path.Combine(folder.Path, f.Remote ?? f.Name);   // "X.nsp", or "Sub/X.nsp" for a game of a subfolder (patch 0079)
+-                                if (!File.Exists(path)) continue;   // only in iCloud (a placeholder): not downloaded for a cover
+-                                using var stream = File.OpenRead(path);
+-                                jpeg = GameIconsStream.Read(keys, stream, out controlId);
+-                            }
+-                            finally { if (scoped) folder.StopAccessingSecurityScopedResource(); }
+-                        }
+-                    }
+-                    catch (Exception error) { why = (error.InnerException ?? error).Message; threw = true; }
+-                    var icon = icon0;
+-                    if (!threw && icon0 == null)
+-                    {
+-                        var baseId = CoverPass.BaseIdFromControl(controlId);
+-                        if (baseId != 0)
+-                        {
+-                            GameAppUi.SetTitleFromContent(f.Name, baseId);
+-                            GameAppUi.SaveTitlesFromContent(documents);
+-                            icon = Doc(GameAppUi.IconRelativePath(f.Name));
+-                            got++;   // the game has its id now: drawn again even without a cover
+-                            GameAppDiag.Event("title-from-content", $"{f.Name} (in the cloud): {controlId:X16}");
+-                        }
+-                        else why ??= controlId == 0 ? "no control data with a title id" : $"the control data is not a base game's ({controlId:X16})";
+-                    }
+-                    var outcome = CoverPass.CloudOutcomeOf(jpeg, threw);
+-                    try
+-                    {
+-                        lock (CoverPass.Gate)
+-                        {
+-                            if (outcome == CoverPass.CloudOutcome.Retry) failed.Add(Key(f));
+-                            else if (icon != null && File.Exists(icon)) { }   // the file landed meanwhile and its own pass read it
+-                            else if (outcome == CoverPass.CloudOutcome.Icon && icon != null)
+-                            {
+-                                Directory.CreateDirectory(Path.GetDirectoryName(icon));
+-                                var part = GameCover.PartOf(icon);
+-                                File.WriteAllBytes(part, jpeg);
+-                                File.Move(part, icon, true);
+-                                got++;
+-                            }
+-                            else
+-                            {
+-                                var marker = icon != null ? Doc(GameAppUi.NoIconRelativePath(f.Name)) : none;
+-                                Directory.CreateDirectory(Path.GetDirectoryName(marker));
+-                                File.WriteAllText(marker, (why ?? "no icon in the control data") + "\n");
+-                            }
+-                        }
+-                    }
+-                    catch (Exception) { }
+-                    Console.Error.WriteLine($"[gameapp] cloud icon of {f.Name}: {(jpeg != null ? jpeg.Length + " bytes" : why ?? "none")}{(threw ? " (tried again at the next launch)" : "")}");
+-                    if (got > 0 && got % 3 == 0) BeginInvokeOnMainThread(RefreshScreen);
+-                }
+-            }
+-            finally { Interlocked.Exchange(ref cloudIconsRunning, 0); }
+-            BeginInvokeOnMainThread(() => { foreach (var k in failed) cloudIconFailed.Add(k); if (got > 0) RefreshScreen(); });
+-        });
+-    }
++    // patch 0084: the covers before the download are GameAppAttachUi.cs FetchCloudCovers (one NAS session a pass, a cache per remote file, .nup covers over SFTP, a log line per game)
++    private void FetchCloudIcons() => FetchCloudCovers();
+ 
+     /// The NAS folder chooser's rows per level (BrowseNas).
+     private const int NasFolderRows = 200;
+diff -ruN e/GameAppMods.cs f/GameAppMods.cs
+--- e/GameAppMods.cs	2026-11-21 20:48:00
++++ f/GameAppMods.cs	2026-11-21 23:25:32
+@@ -436,6 +436,22 @@
+         return new ImportResult(names, placed.Count, notes);
+     }
+ 
++    /// Patch 0084: an Atmosphere cheat file picked alone (`<build id>.txt`): it becomes the mod "Cheats <8 digits>" with `cheats/<build id>.txt`, through the same Import as a folder (so the
++    /// same rules: what matches the game is kept, the new mod is on; its cheats are switched one by one on the page). Throws with the reason when the name is not a build id.
++    public static ImportResult ImportCheatFile(string documents, string titleId, string path)
++    {
++        var bid = CheatImport.BuildIdOf(path);
++        if (bid == null) throw new InvalidOperationException(CheatImport.NeedsBuildId);
++        var tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cheat-import-" + Guid.NewGuid().ToString("N"), CheatImport.ModName(bid));
++        try
++        {
++            Directory.CreateDirectory(System.IO.Path.Combine(tmp, "cheats"));
++            File.Copy(path, System.IO.Path.Combine(tmp, "cheats", bid + ".txt"));
++            return ImportPath(documents, titleId, tmp);
++        }
++        finally { try { Directory.Delete(System.IO.Path.GetDirectoryName(tmp), true); } catch (Exception) { } }
++    }
++
+     /// Import from a .zip file or a folder on disk.
+     public static ImportResult ImportPath(string documents, string titleId, string path)
+     {
+diff -ruN e/GameAppModsUi.cs f/GameAppModsUi.cs
+--- e/GameAppModsUi.cs	2026-11-21 20:48:00
++++ f/GameAppModsUi.cs	2026-11-21 23:29:27
+@@ -190,6 +190,7 @@
+         var sheet = UIKit.UIAlertController.Create("Add mods", "A .zip or a folder holding atmosphere/contents/<title id>/..., a mods folder, or a .pchtxt / .ips patch.", UIKit.UIAlertControllerStyle.ActionSheet);
+         sheet.AddAction(UIKit.UIAlertAction.Create("A .zip archive…", UIKit.UIAlertActionStyle.Default, _ => PickZip()));
+         sheet.AddAction(UIKit.UIAlertAction.Create("A folder…", UIKit.UIAlertActionStyle.Default, _ => PickFolder()));
++        sheet.AddAction(UIKit.UIAlertAction.Create("A cheat file (.txt)…", UIKit.UIAlertActionStyle.Default, _ => PickCheat()));   // patch 0084: an Atmosphere cheat file alone
+         sheet.AddAction(UIKit.UIAlertAction.Create("Cancel", UIKit.UIAlertActionStyle.Cancel, null));
+         Theme.Anchor(sheet, source, View);
+         PresentViewController(sheet, true, null);
+@@ -220,6 +221,35 @@
+                 if (error != null) { log?.Invoke($"mods: {name} not added: {error.Message}"); Say("Not added", error.Message); }
+                 else if (r.ReadError != null) Say("Not read", r.ReadError.Message);
+                 else if (r.AddError != null) { log?.Invoke($"mods: {name} not added: {r.AddError.Message}"); Say("Not added", r.AddError.Message); }
++                else Imported(r.Result, name);
++            }, work => BeginInvokeOnMainThread(work));
++        }));
++        PresentViewController(picker, true, null);
++    }
++
++    /// Patch 0084: an Atmosphere cheat file picked alone (`<build id>.txt`); Import mode, as the zip's. It becomes a mod "Cheats <id>" whose cheats are switched one by one below.
++    private void PickCheat()
++    {
++#pragma warning disable CA1422   // the Import-mode picker on purpose: the Open-mode pickers deliver nothing on the owner's iOS 27.2.1 (DEVICE-FINDINGS)
++        var picker = new UIKit.UIDocumentPickerViewController(new[] { "public.plain-text", "public.text", "public.data", "public.item" }, UIKit.UIDocumentPickerMode.Import);
++#pragma warning restore CA1422
++        picker.Delegate = new PickerDelegate(url => BeginInvokeOnMainThread(() =>
++        {
++            var name = url?.LastPathComponent ?? "";
++            if (CheatImport.BuildIdOf(name) == null) { Say("Not a cheat file", $"{name}: {CheatImport.NeedsBuildId}"); return; }
++            if (busy) return;
++            busy = true;
++            var picked = url.Path;
++            Bg.Run(() =>
++            {
++                try { return new ModImport { Result = GameMods.ImportCheatFile(documents, titleId, picked) }; }
++                catch (Exception e) { return new ModImport { AddError = e }; }
++                finally { try { File.Delete(picked); } catch { } }   // the picker's own copy in our tmp/
++            }, (r, error) =>
++            {
++                busy = false;
++                var why = error ?? r.AddError;
++                if (why != null) { log?.Invoke($"mods: {name} not added: {why.Message}"); Say("Not added", why.Message); }
+                 else Imported(r.Result, name);
+             }, work => BeginInvokeOnMainThread(work));
+         }));
+diff -ruN e/GameAppNas.cs f/GameAppNas.cs
+--- e/GameAppNas.cs	2026-11-21 20:48:00
++++ f/GameAppNas.cs	2026-11-21 23:26:23
+@@ -358,6 +358,15 @@
+         log?.Invoke($"NAS: {Path.GetFileName(localPath)} downloaded ({total / 1048576.0:0.0} MB)");
+     }
+ 
++    /// Patch 0084: ONE connection for several remote reads (the covers of a listing: it was one SSH connection per cover). `work` gets an opener: a seekable stream over a remote path (only
++    /// the bytes read cross the network) and its size. The connection ends when `work` returns.
++    public static void WithSession(NasConfig cfg, AuthenticationMethod auth, Action<Func<string, (Stream Stream, long Size)>> work)
++    {
++        using var client = Connect(cfg, auth, null, out _);
++        try { work(remote => (client.OpenRead(remote), client.GetAttributes(remote).Size)); }
++        finally { client.Disconnect(); }
++    }
++
+     /// Runs `read` on a seekable stream over `remote` (only the bytes it reads cross the network), then disconnects.
+     public static T WithReadStream<T>(NasConfig cfg, AuthenticationMethod auth, string remote, Func<Stream, T> read)
+     {
+diff -ruN e/GameAppRedesign.cs f/GameAppRedesign.cs
+--- e/GameAppRedesign.cs	2026-11-21 20:48:21
++++ f/GameAppRedesign.cs	2026-11-21 23:28:31
+@@ -184,9 +184,9 @@
+ /// Play with a development certificate), Export IPA for a built game, Settings, Choose a cover… (not for a game only in the cloud), then the long-press menu's items of the patches before
+ /// where they apply (Update, 0076 the shader preparation's Pause / Resume and "Prepare the shaders now", 0065 the paused build's Cancel, the queue, the uploads, Remove download), and last
+ /// Delete… (a game on this iPhone) or Hide from the library (a game only in the cloud).
+-public enum HoldItem { Primary, Settings, ChooseCover, Export, Update, WarmToggle, WarmNow, CancelPaused, AddToQueue, Upload, RemoveDownload, Delete, Hide }
++public enum HoldItem { Primary, Settings, ChooseCover, Export, Update, WarmToggle, WarmNow, CancelPaused, AddToQueue, Upload, RemoveDownload, Delete, Hide, AddContent, Mods }
+ 
+-public sealed record HoldFacts(LibState State, bool CanRunHere, bool Update, bool LocalFile, bool Busy, bool WarmShown, bool WarmQueued, int UploadTargets, bool HasCloudCopy);
++public sealed record HoldFacts(LibState State, bool CanRunHere, bool Update, bool LocalFile, bool Busy, bool WarmShown, bool WarmQueued, int UploadTargets, bool HasCloudCopy, bool CanAttach = false, bool HasTitle = false);
+ 
+ public static class HoldMenuPlan
+ {
+@@ -199,6 +199,9 @@
+         bool cloud = f.State == LibState.CloudOnly || f.State == LibState.Downloading;
+         if (GameSettingsRule.HasSettings(f.State)) items.Add(HoldItem.Settings);   // patch 0082: settings exist only for a BUILT game (a cloud one: Download / Cancel, Hide; a local one: Build, cover, Delete)
+         if (f.LocalFile && !cloud) items.Add(HoldItem.ChooseCover);
++        // patch 0084: before the first build too, an update or DLC (a base game, not a .nup) and the mods and cheats (any game with a title id): they go into that first build
++        if (f.LocalFile && !cloud && f.CanAttach && f.State != LibState.Building) items.Add(HoldItem.AddContent);
++        if (f.LocalFile && !cloud && f.HasTitle && !GameSettingsRule.HasSettings(f.State)) items.Add(HoldItem.Mods);
+         if (built && f.Update && !f.Busy) items.Add(HoldItem.Update);
+         if (built && !f.Busy && f.WarmShown) items.Add(HoldItem.WarmToggle);
+         else if (built && !f.Busy && f.WarmQueued) items.Add(HoldItem.WarmNow);
+@@ -539,7 +542,7 @@
+ 
+ /// Patch 0082: the Build tab of the prototype: READY TO BUILD (the games of this iPhone that need a build) and IN THE CLOUD, each a compact row, a count beside each section's title; the
+ /// header's counts come from the same list, so they can never disagree with the rows (the "0 on this iPhone" seen on the owner's phone beside a listed game).
+-public sealed record BuildGame(string Name, LibState State, string Size, string CloudWhere, bool Update, double? Fraction);
++public sealed record BuildGame(string Name, LibState State, string Size, string CloudWhere, bool Update, double? Fraction, string Content = null);   // Content (patch 0084): "update v131072 · 1 DLC"
+ public sealed record BuildRowView(string Name, string Note, bool NoteAccent, LibAct Act, string Button, bool Primary, bool HasMore, bool Cloud, double? Fraction);
+ public sealed record BuildSection(string Title, int Count, IReadOnlyList<BuildRowView> Rows);
+ 
+@@ -551,7 +554,7 @@
+ 
+     public static BuildRowView Row(BuildGame g)
+     {
+-        string Sized(string s) => string.IsNullOrEmpty(g.Size) ? s : g.Size + " · " + s;
++        string Sized(string s) => (string.IsNullOrEmpty(g.Size) ? s : g.Size + " · " + s) + (string.IsNullOrEmpty(g.Content) || g.CloudWhere != null ? "" : " · " + g.Content);
+         switch (g.State)
+         {
+             case LibState.CloudOnly: return new BuildRowView(g.Name, Sized(g.CloudWhere ?? "In the cloud"), false, LibAct.Download, "Download", true, false, true, null);
+diff -ruN e/GameAppRedesignUi.cs f/GameAppRedesignUi.cs
+--- e/GameAppRedesignUi.cs	2026-11-21 20:48:21
++++ f/GameAppRedesignUi.cs	2026-11-21 23:28:31
+@@ -1079,7 +1079,8 @@
+         var targets = UploadTargets().Where(t => e.Cloud == null || e.Cloud.SourceId != t.Id).ToList();
+         // patch 0082 (review L7): "Remove download" only for the file the app brought from that source (or of its size)
+         bool downloaded = local && e.Cloud != null && DownloadPairing.SameFile(SafeLength(path), e.Cloud, ImportLedger.Find(libLedger ?? ImportLedger.Load(GameAppMain.Documents), name));
+-        var plan = HoldMenuPlan.Items(new HoldFacts(state, canRun, update, local, facts.Running, warmShown, warmQueued, targets.Count, downloaded));
++        bool canAttach = GameAppUi.ContentKindOf(name) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(name);   // patch 0084
++        var plan = HoldMenuPlan.Items(new HoldFacts(state, canRun, update, local, facts.Running, warmShown, warmQueued, targets.Count, downloaded, canAttach, tid != null));
+         var list = new List<HoldOverlay.Entry>();
+         var primary = LibraryActions.For(state, canRun)[0];
+         foreach (var item in plan)
+@@ -1104,6 +1105,8 @@
+                 case HoldItem.RemoveDownload: list.Add(new HoldOverlay.Entry("Remove download (stays in the cloud)", "icloud.slash", false, () => RemoveGameDownload(name), "hold-remove-download")); break;
+                 case HoldItem.Delete: list.Add(new HoldOverlay.Entry("Delete…", "trash", true, () => ConfirmDelete(name), "hold-delete")); break;
+                 case HoldItem.Hide: list.Add(new HoldOverlay.Entry("Hide from the library", "eye.slash", true, () => HideFromLibrary(name), "hold-hide")); break;
++                case HoldItem.AddContent: list.Add(new HoldOverlay.Entry("Add an update or DLC…", "plus.square.on.square", false, () => ShowContentChooser(name, null), "hold-add-content")); break;
++                case HoldItem.Mods: list.Add(new HoldOverlay.Entry("Mods and cheats…", "puzzlepiece.extension", false, () => ShowMods(name, false), "hold-mods")); break;
+             }
+         }
+         return list;
+diff -ruN e/GameAppShelf.cs f/GameAppShelf.cs
+--- e/GameAppShelf.cs	2026-11-21 20:48:00
++++ f/GameAppShelf.cs	2026-11-21 23:28:31
+@@ -269,7 +269,7 @@
+             var state = LibStateOf(e, facts, out var fraction);
+             bool update = state == LibState.Built && GameAppUi.ContentChangedSinceBuild(name, localNames, facts);
+             rowsOf[name] = e;
+-            games.Add(new BuildGame(name, state, GameFileSizeText(name), null, update, fraction));
++            games.Add(new BuildGame(name, state, GameFileSizeText(name), null, update, fraction, ContentAttach.Summary(name, localNames)));   // patch 0084: what the build merges
+         }
+         foreach (var f in shownCloud)
+         {
+@@ -389,6 +389,18 @@
+         var name = e.Name;
+         var sheet = UIAlertController.Create(GameAppUi.DisplayName(name), GameSettingsRule.NotBuiltNote, UIAlertControllerStyle.ActionSheet);
+         if (!GameExport.IsPlayer) sheet.AddAction(UIAlertAction.Create("Choose a cover…", UIAlertActionStyle.Default, _ => ShowCoverChooser(name)));
++        // patch 0084: what goes INTO the first build: its mods and cheats, its update and DLC (and one attached file removed again)
++        if (GameAppUi.BaseTitleIdOf(name) != null) sheet.AddAction(UIAlertAction.Create("Mods and cheats…", UIAlertActionStyle.Default, _ => ShowMods(name, false)));
++        if (GameAppUi.ContentKindOf(name) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(name))
++        {
++            sheet.AddAction(UIAlertAction.Create("Add an update or DLC…", UIAlertActionStyle.Default, _ => ShowContentChooser(name, source)));
++            foreach (var file in ContentAttach.Attached(name, Dumps().Select(Path.GetFileName)))
++            {
++                var f = file;
++                var label = GameAppUi.ContentKindOf(f) == GameAppUi.ContentKind.Update ? GameAppUi.UpdateLabel(f) : "DLC " + GameAppUi.DlcLabel(f);
++                sheet.AddAction(UIAlertAction.Create("Remove " + label + "…", UIAlertActionStyle.Destructive, _ => RemoveAttached(f)));
++            }
++        }
+         if (!running) sheet.AddAction(UIAlertAction.Create("Delete the game file", UIAlertActionStyle.Destructive, _ => ConfirmDelete(name)));   // 0064's question, with what it frees
+         sheet.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
+         Theme.Anchor(sheet, source, View);
+@@ -931,7 +943,7 @@
+             var inCloud = GameAppUi.RelatedContent(game, cloudFiles.Select(f => f.Name)).Where(n => !names.Contains(n, StringComparer.OrdinalIgnoreCase)).ToList();
+             var contentItems = new List<UIMenuElement>
+             {
+-                UIAction.Create("Add files… (pick several)", UIImage.GetSystemImage("doc.badge.plus"), null, _ => Then(Import)),
++                UIAction.Create("Add files… (pick several)", UIImage.GetSystemImage("doc.badge.plus"), null, _ => Then(() => AttachPicked(game))),   // patch 0084: classified for THIS game
+                 UIAction.Create("Find them in a folder…", UIImage.GetSystemImage("folder.badge.questionmark"), null, _ => Then(() => PresentFolderPicker("update and DLC folder", url => ScanFolderForContent(game, url)))),
+             };
+             if (inCloud.Count > 0)

@@ -1,0 +1,18 @@
+struct main0_out
+{
+    float4 m_color [[color(0)]];
+};
+
+fragment main0_out main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], float4 gl_FragCoord [[position]])
+{
+    main0_out out = {};
+    float _10 = t0.read(uint2(1, 2), 0u).x;
+    float _11 = gl_FragCoord.z;
+    bool _12 = _10 > _11;
+    bool _13 = _10 > _11;
+    }
+    {
+        _39 = _33;
+    gl_FragCoord.z;
+    return out;
+}

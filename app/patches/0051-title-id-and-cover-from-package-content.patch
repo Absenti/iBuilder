@@ -1,0 +1,173 @@
+# A dump whose file name carries no title id (`Some Game (v4.0.0 + all DLC) (EU).xci`) had NO cover and none of what keys on the title id: IconRelativePath is null without an id in the name.
+# Now the id is read from the package (the application's control NCA, GameIconsContent), kept in Documents/.titleids.tsv, and BaseTitleIdOf answers it like for any other dump; the cover is read with it.
+# Applies after 0050.
+diff -ruN a/GameAppIcons.cs b/GameAppIcons.cs
+--- a/GameAppIcons.cs
++++ b/GameAppIcons.cs
+@@ -15,6 +15,27 @@
+ using LibHac.Tools.FsSystem;
+ using LibHac.Tools.FsSystem.NcaUtils;
+ 
++/// The same extractor steps as GameIcons.Read (GameAppMain.cs), and the base title id the application's control NCA names.
++internal static class GameIconsContent
++{
++    [System.Diagnostics.CodeAnalysis.DynamicDependency(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods, typeof(P))]
++    internal static (byte[] Jpeg, ulong BaseTitleId) Read(string keysPath, string dumpPath)
++    {
++        const System.Reflection.BindingFlags Any = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
++        var open = typeof(P).GetMethod("OpenNsp", Any) ?? throw new MissingMethodException("P.OpenNsp");
++        var pick = typeof(P).GetMethod("Pick", Any) ?? throw new MissingMethodException("P.Pick");
++        var icon = typeof(P).GetMethod("Icon", Any) ?? throw new MissingMethodException("P.Icon");
++        var ks = ExternalKeyReader.ReadKeyFile(keysPath);
++        var metaType = Nullable.GetUnderlyingType(open.GetParameters()[2].ParameterType) ?? open.GetParameters()[2].ParameterType;
++        var ncas = open.Invoke(null, new object[] { ks, dumpPath, Enum.Parse(metaType, "Application"), null, false });
++        var ctrl = pick.Invoke(null, new object[] { ncas, Enum.Parse(pick.GetParameters()[1].ParameterType, "Control"), null });
++        if (ctrl == null) return (null, 0);
++        ulong id = ctrl is Nca nca ? nca.Header.TitleId & ~0xFFFUL : 0;
++        var result = ((byte[], string)) icon.Invoke(null, new object[] { ctrl });
++        return (result.Item1, id);
++    }
++}
++
+ internal static class GameIconsStream
+ {
+     [System.Diagnostics.CodeAnalysis.DynamicDependency(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods, typeof(P))]
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -68,6 +68,7 @@
+     {
+         GameAppDiag.Start();   // the hidden diagnostics (Documents/.diag): how the last launch ended, this one's context, the sampler
+         GameAppDiag.Event("main", string.Join(" ", args ?? Array.Empty<string>()));
++        GameAppUi.LoadTitlesFromContent(Documents);   // the title ids read from dumps that name none
+         RegisterShaderTranslator();
+         // The library's icons are read through the extractor's private functions: say once whether trimming kept them.
+         try { GameIcons.Read(null, null); Console.Error.WriteLine("[gameapp] icon reader: the extractor's OpenNsp / Pick / Icon are here"); }
+@@ -1514,7 +1515,14 @@
+         {
+             if (GameAppUi.IsNup(name)) continue;   // the extractor reads NSP/XCI only: a Switch 2 game's icon comes with its build
+             var rel = GameAppUi.IconRelativePath(name);
+-            if (rel == null) continue;
++            if (rel == null)
++            {
++                // no title id in the file name: it is read from the package (once; the answer is kept in Documents/.titleids.tsv), and the cover with it
++                var unresolved = Path.Combine(GameAppMain.Documents, GameAppUi.UnresolvedMarker(name).Replace('/', Path.DirectorySeparatorChar));
++                if (File.Exists(unresolved) && File.GetLastWriteTimeUtc(unresolved) >= keysTime) continue;
++                todo.Add((Path.Combine(GameAppMain.Documents, name), null, unresolved));
++                continue;
++            }
+             var icon = Path.Combine(GameAppMain.Documents, rel.Replace('/', Path.DirectorySeparatorChar));
+             var none = Path.Combine(GameAppMain.Documents, GameAppUi.NoIconRelativePath(name).Replace('/', Path.DirectorySeparatorChar));
+             if (File.Exists(icon)) continue;
+@@ -1527,19 +1535,47 @@
+             int got = 0;
+             try
+             {
+-                foreach (var (dump, icon, none) in todo)
++                foreach (var (dump, icon0, none) in todo)
+                 {
+-                    byte[] jpeg = null; string why = null;
+-                    try { jpeg = GameIcons.Read(keys, dump); }
+-                    catch (Exception error) { why = (error.InnerException ?? error).Message; }
++                    byte[] jpeg = null; string why = null; var icon = icon0;
++                    var fileName = Path.GetFileName(dump);
+                     try
+                     {
+-                        Directory.CreateDirectory(Path.GetDirectoryName(icon));
+-                        if (jpeg != null && jpeg.Length > 0) { File.WriteAllBytes(icon, jpeg); got++; }
+-                        else File.WriteAllText(none, (why ?? "no icon in the control data") + "\n");
++                        if (icon == null)
++                        {
++                            var (read, id) = GameIconsContent.Read(keys, dump);
++                            jpeg = read;
++                            if (id != 0)
++                            {
++                                GameAppUi.SetTitleFromContent(fileName, id);
++                                GameAppUi.SaveTitlesFromContent(GameAppMain.Documents);
++                                icon = Path.Combine(GameAppMain.Documents, GameAppUi.IconRelativePath(fileName).Replace('/', Path.DirectorySeparatorChar));
++                                got++;   // the game has its id now: the screen is drawn again even when there is no cover
++                                GameAppDiag.Event("title-from-content", $"{fileName}: {id:X16}");
++                            }
++                            else why = "the application's control NCA names no title id";
++                        }
++                        else jpeg = GameIcons.Read(keys, dump);
+                     }
++                    catch (Exception error) { why = (error.InnerException ?? error).GetType().Name + ": " + (error.InnerException ?? error).Message; }
++                    try
++                    {
++                        if (icon != null)
++                        {
++                            Directory.CreateDirectory(Path.GetDirectoryName(icon));
++                            if (jpeg != null && jpeg.Length > 0) { File.WriteAllBytes(icon, jpeg); got++; }
++                            else File.WriteAllText(icon0 == null ? icon.Replace("icon.jpg", "icon.none") : none, (why ?? "no icon in the control data") + "\n");
++                        }
++                        else
++                        {
++                            Directory.CreateDirectory(Path.GetDirectoryName(none));
++                            File.WriteAllText(none, (why ?? "no icon in the control data") + "\n");
++                        }
++                    }
+                     catch (Exception) { }
+-                    Console.Error.WriteLine($"[gameapp] icon of {Path.GetFileName(dump)}: {(jpeg != null ? jpeg.Length + " bytes" : why ?? "none")}");
++                    var verdict = $"icon of {fileName}: {(jpeg != null ? jpeg.Length + " bytes" : why ?? "none")}";
++                    Console.Error.WriteLine("[gameapp] " + verdict);
++                    GameAppDiag.Event("icon", verdict);
+                 }
+             }
+             finally
+diff -ruN a/GameAppUi.cs b/GameAppUi.cs
+--- a/GameAppUi.cs
++++ b/GameAppUi.cs
+@@ -219,8 +219,51 @@
+     {
+         if (string.IsNullOrEmpty(fileName)) return null;
+         var m = TitleIdInName.Match(fileName);
+-        if (!m.Success) return null;
++        if (!m.Success) return titleFromContent.TryGetValue(fileName, out var read) ? read : (ulong?) null;
+         return ulong.Parse(m.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
++    }
++
++    // A dump whose file name carries no title id (`Some Game (v4.0.0 + all DLC) (EU).xci`): the id is read from the package itself (its application's control
++    // NCA, FetchMissingIcons) and kept in Documents/.titleids.tsv, so the saves, the mods, the warm-up, the shader pack and the cover find the game by the same id as for any other dump.
++    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ulong> titleFromContent = new System.Collections.Concurrent.ConcurrentDictionary<string, ulong>();
++
++    internal static void SetTitleFromContent(string fileName, ulong baseTitleId) => titleFromContent[fileName] = baseTitleId;
++
++    internal static bool HasTitleFromContent(string fileName) => titleFromContent.ContainsKey(fileName);
++
++    internal static void LoadTitlesFromContent(string documents)
++    {
++        try
++        {
++            var path = System.IO.Path.Combine(documents, ".titleids.tsv");
++            if (!System.IO.File.Exists(path)) return;
++            foreach (var line in System.IO.File.ReadAllLines(path))
++            {
++                var p = line.Split('\t');
++                if (p.Length == 2 && ulong.TryParse(p[1], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var id)) titleFromContent[p[0]] = id;
++            }
++        }
++        catch (Exception) { }
++    }
++
++    internal static void SaveTitlesFromContent(string documents)
++    {
++        try
++        {
++            var lines = titleFromContent.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => kv.Key + "\t" + kv.Value.ToString("X16", CultureInfo.InvariantCulture));
++            var path = System.IO.Path.Combine(documents, ".titleids.tsv");
++            System.IO.File.WriteAllText(path + ".part", string.Join("\n", lines) + "\n");
++            if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
++            System.IO.File.Move(path + ".part", path);
++        }
++        catch (Exception) { }
++    }
++
++    /// `games/_unresolved/<hash>.none` relative to Documents: this dump (no title id in its name) was read and gave none; tried again only with newer keys.
++    internal static string UnresolvedMarker(string fileName)
++    {
++        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(fileName ?? ""));
++        return "games/_unresolved/" + Convert.ToHexString(hash, 0, 8) + ".none";
+     }
+ 
+     public enum ContentKind { Base, Update, AddOn, Unknown }

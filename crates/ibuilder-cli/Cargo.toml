@@ -1,0 +1,68 @@
+[package]
+name = "ibuilder-cli"
+description = "ibuilder: Mac CLI that runs profile -> rewrite -> assemble -> sign on already-extracted inputs, through adapters over the stage crates (also the adapter set the FFI crate uses)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ibuilder_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ibuilder"
+path = "src/bin/ibuilder.rs"
+
+# Each stage worker is wired through a feature; a feature is on only because its crate exists and builds (they are other agents' crates: path dependencies, read-only).
+# With a feature off the stage fails with a message that names it (adapters::Unwired).
+[features]
+default = ["profile", "rewrite", "macho", "sign", "mods", "shaders", "shader-finish", "shadersplit", "nup"]
+# stage 1 for a Switch 2 `.nup` container (`ibuilder-nup`: the Rust port of pack_nup.py): `ibuilder --nup FILE --out DIR`, the pipeline's `nup` config key
+nup = ["dep:ibuilder-nup"]
+profile = ["dep:ibuilder-profile"]
+rewrite = ["dep:ibuilder-rewrite", "dep:memmap2"]
+macho = ["dep:ibuilder-macho"]
+sign = ["dep:ibuilder-sign"]
+mods = ["dep:ibuilder-mods"]
+# stage 3 (shaders): the build driver and the live translation (ibuilder-shaderbuild)
+#   shader-finish   joins ibuilder_shader::finish as the per-shader finisher (without it `build` fails with a message that says so: the mock finisher is never used for a real build)
+#   shadersplit     the split (ibuilder-shadersplit); without it `split` fails with a message that says so
+#   shader-host-tools  `adapters::shaders::process_tools`: the engine's native tools as child processes (Mac only, never in the app: off by default)
+shaders = ["dep:ibuilder-shaderbuild"]
+shader-finish = ["shaders", "ibuilder-shaderbuild/f2-finish"]
+shadersplit = ["shaders", "dep:ibuilder-shadersplit"]
+shader-host-tools = ["shaders", "ibuilder-shaderbuild/host-tools"]
+mock-stages = ["ibuilder-pipeline/mock"]
+# measuring only (docs/chain/MEMORY-RUST.md): the allocation profiler replaces the global allocator and the binary prints where the live heap was at its peak
+memprofile = ["ibuilder-alloc/profile"]
+# measuring only: the plain system allocator instead of ibuilder-alloc's (what the big-block allocator saves, docs/chain/MEMORY-RUST.md)
+system-alloc = []
+
+[dependencies]
+ibuilder-pipeline = { path = "../ibuilder-pipeline" }
+# the binary's global allocator: big blocks go back to the kernel when freed (docs/chain/MEMORY-RUST.md)
+ibuilder-alloc = { path = "../ibuilder-alloc" }
+ibuilder-profile = { path = "../ibuilder-profile", optional = true }
+ibuilder-rewrite = { path = "../ibuilder-rewrite", optional = true }
+ibuilder-macho = { path = "../ibuilder-macho", optional = true }
+ibuilder-sign = { path = "../ibuilder-sign", optional = true }
+ibuilder-mods = { path = "../ibuilder-mods", optional = true }
+ibuilder-nup = { path = "../ibuilder-nup", optional = true }
+ibuilder-shaderbuild = { path = "../ibuilder-shaderbuild", optional = true }
+ibuilder-shadersplit = { path = "../ibuilder-shadersplit", optional = true }
+# the build's global rayon pool (utility QoS workers, `build_pool`) and the rewrite's own pool
+rayon = { workspace = true }
+# the rewrite reads the module through a file mapping (clean pages are not footprint)
+memmap2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+# the example `rewriteprofile`: the allocation profiler, the rewrite crate and the file mapping it compares with fs::read
+ibuilder-alloc = { path = "../ibuilder-alloc", features = ["profile"] }
+ibuilder-rewrite = { path = "../ibuilder-rewrite" }
+rayon = { workspace = true }
+memmap2 = { workspace = true }
+sha2 = { workspace = true }
+ibuilder-pipeline = { path = "../ibuilder-pipeline", features = ["mock"] }
+# the tests use the stand-in workers
+ibuilder-cli = { path = ".", features = ["mock-stages"] }

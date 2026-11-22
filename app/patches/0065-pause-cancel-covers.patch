@@ -1,0 +1,1985 @@
+# 0065-pause-cancel-covers.patch -- Pause, Cancel and Resume of a running build; a Switch 2 package's own icon (.nup); "Choose a cover…" for any game.
+# Applies after 0064 (the tree with 0010..0064 applied). UNTESTED ON DEVICE: compiled (dotnet build, ios-arm64, Release: rc 0, no error; 47 warnings against 45 for the tree without it: two more call sites of the
+# CA1416 BGContinuedProcessingTask.UpdateTitle warning GameAppBackground.cs already has) and the pure classes run in a host harness (a net console program built from the real source text of GameAppStop.cs, GameAppCover.cs,
+# GameAppQueue.cs, GameAppUi.cs and GameAppPerf.cs: 209 checks, 5 mutations of the classes each caught); no iPhone run. Measured and assumed are told apart below.
+#
+# WHY (the owner's requests, and the field facts of the 22,000-shader build on the iPhone): the owner asked for Pause and Cancel of a build and for a 'Choose a cover' option; the Switch 2 package of Zelda Ocarina of Time has no
+#   icon at all (no NACP, no icon in its metadata), so it can only show its initials. A handler must never walk or delete a big folder on the main thread (0x8BADF00D, patch 0064): nothing here does; the sizes in the cancel dialog
+#   are the cached FolderSizes, the cleanup is DeleteFolderInBackground, the request is raised from a pool thread, the decoding of a photo is on a worker.
+#
+# FEATURE A -- PAUSE / CANCEL / RESUME (the Rust side is done: gameapp_request_stop(kind) 1 = pause, 2 = cancel; gameapp_run_chain() returns 131 paused / 130 cancelled, which is not a failure):
+#   * GameAppStop.cs (new; no UIKit, run by the harness): StopMachine, the state machine (Idle, Running, Pausing, Paused, Cancelling, Cancelled; every transition returns what the caller must DO and calls nothing itself), StopText
+#       (the words), CancelPlan (what a cancel deletes: only what the build made; never shadercache/, games/<id>/, the game file, the finished shaders/<id>), StopFiles / PausedStore / StopRecovery (the paused state rebuilt from
+#       the files at launch), ResumePlan (Continue on extract/ with the continuation file, or from the start), QueueStartPlan.
+#   * GameAppStopUi.cs (new): the buttons, the dialog, the resume, the Build tab card, the launch reconstruction, the system's task. The chain clears a request when a run starts, so a Pause or Cancel pressed BEFORE the chain is on the
+#       stack (the C# extraction of an NSP/XCI runs first, in the same process) is kept in the StopMachine and applied before gameapp_run_chain is called: the chain is NOT started, the run ends as paused / cancelled at once; one raised
+#       in the microseconds around the chain's own clear is raised again every 2 s while the stop is honoured (a Timer; raising twice is harmless).
+#       Pause (build-pause): the card says 'Pausing… (finishes the current shader)' (or '(finishes the current step)', '(finishes reading the game)' during the extraction), both buttons off. When the chain returns 131: the record
+#       Documents/gameapp.paused.tsv (game, id, whether extract/ holds it, stage number, time, the last stage line: the chain's own marker shaders/<id>.work/stopped.by.user exists only when stage 3 was cut), the queue item
+#       becomes 'paused' (the queue stops by itself), the continued-processing task is completed with the title 'Paused: <game>'; no 'build failed' line, no notification, no gameapp.killed.
+#       Paused: a card 'Paused · 14,990 of 21,990 shaders' with Resume (build-resume) and Cancel (build-cancel), a 'Paused · 75%' chip on the library tile and row, 'Paused · 14,990 of 21,990 shaders' on the Build tab's game row.
+#       Resume = the chain again: Continue (StartContinuedBuild on the files in extract/, which writes Documents/gameapp.continue.run: game=<file>, stage=N, why=paused; a Switch 2 package is not read again) or, when extract/ is not
+#       that game's any more (another game was built meanwhile) or the package read itself was cut, from the start (the shaders already finished still come from the cache). NEVER gameapp.continue, except when a run already
+#       happened in this process and the person confirms the restart ('GameApp starts again': the file the launch already reads). After a stop (130 / 131) pythonRanThisProcess is cleared: the shim makes and destroys a handle
+#       at every run_chain, so a second run in the process is possible (the Rust agent's tests); not exercised on the phone.
+#       Cancel (build-cancel): a dialog 'Cancel the build of <game>?' with 'Cancel and keep the extracted game (next build starts faster)' (deletes only shaders/<id>.work) and 'Cancel and free the space (N GB)' (also extract/ and a
+#       partial framework folder; N from the cached extract + shaders-work sizes, 'at least' when one is not known, no number when none is) and 'Keep building'. Both run on DeleteFolderInBackground (one at a time, nothing measured
+#       meanwhile, BeginRun refuses meanwhile), then the status is 'Cancelled' (the Build tab row's chip, the build screen). The cancel removes the item from the queue and stops the queue. A cancel from the paused state is the same
+#       without a chain. A stop that came after the chain had finished is no stop: the build is finished and nothing is deleted.
+#   * The paused state survives a relaunch: RecoverStoppedBuilds (launch-profile part 'RecoverStoppedBuilds') rebuilds it from the files: the marker says 'pause' (or the app's own list has the game: a pause before stage 3 leaves
+#       no marker), gameapp.killed does not name the game (iOS ended that run: the 'interrupted, resume' flow stays as it is) and its framework is not built. A marker that says 'cancel' is a cancel whose cleanup never finished:
+#       its work folder is removed in the background. A deleted game loses its record.
+#   * Queue (GameAppQueue.cs, GameAppQueueUi.cs): a 'paused' state; Next skips it (nothing restarts it by itself); 'Start the queue' with a paused build asks ('<game> is paused: Resume <game> / Start without it / Not now');
+#       Resume continues the queue; cancel removes the item and stops the queue; the queue page and its status line say so.
+#   * The iOS 26 continued-processing task (GameAppBackground.cs): when the system expires it (or the person taps its stop button in the Dynamic Island) a BUILD's task is treated as a PAUSE: the request is raised, the wait for the
+#       chain to return and for the record is bounded (5 s) and on a pool thread, then SetTaskCompleted(true) with the title 'Paused: <game>'; never on the main thread. A warm-up's task, or a build still reading its game, keeps
+#       the old behaviour (the work goes on as far as iOS lets the process live).
+#   * The build screen (GameAppLibrary.cs, GameBuildViewController): Pause and Cancel under the live log while it runs, 'PAUSED' / Resume / Cancel when paused, 'CANCELLED'; its steps are not marked done.
+#   * Hooks in GameAppMain.cs: BeginRun (StopBegin; ChainStarting before gameapp_run_chain; ChainReturned after it: 130 / 131 are not failures), Finish (StopEnding, BackgroundEnd(paused), no notification for a stop), the 1 s ticker
+#       (the card's clock and 'Pausing…'), a deleted game's record, the launch.
+#
+# FEATURE B -- the NUP icon (shim export int gameapp_nup_icon(const char *path, uint8_t *buf, int cap, uint64_t *title_id), Rust: crates/ibuilder-nup icon.rs + ibuilder-ffi, by the perf agent):
+#   * GameAppCoverUi.cs FetchMissingNupIcons (called from RefreshScreen next to FetchMissingIcons, which keeps skipping .nup and needs the keys a Switch 2 package does not): a background task, not while a build runs, one package at a
+#       time: the icon (a 1 MiB buffer, asked again with the length when it is bigger) is written to games/<id>/icon.jpg through icon.jpg.part; the package's title id names the game when its file name has none (the same
+#       SetTitleFromContent / SaveTitlesFromContent the NSP path uses, id & ~0xFFF); no icon (rc 0: the owner's Ocarina package) or a damaged package is recorded as games/<id>/icon.none (games/_unresolved/<hash>.none without an id),
+#       and tried again only when the file is newer than the note. Reads only the head of the file. The owner's Ocarina package has no icon: its result is 'none' and the initials stay. Part 'nup icons/worker' of the launch profile.
+#
+# FEATURE C -- CHOOSE A COVER (GameAppCover.cs, no UIKit, run by the harness; GameAppCoverUi.cs):
+#   * games/<id>/cover.jpg (512 x 512, JPEG 0.9), a file of its own: the chain writes games/<id>/icon.jpg at every build and never touches cover.jpg. A game with no [title id] in its name and none read yet: games/_unresolved/
+#       <hash>.cover.jpg (the hash GameAppUi.UnresolvedMarker uses); once the id is read the cover is found at the old key too and a new choice goes under the id.
+#   * Precedence: cover.jpg, then icon.jpg (then the extraction's icon, then the initials): CoverOf, so the tint (Theme.AverageColor), the tiles, the rows, the sheet's header and the Build tab follow; the exported player's own
+#       screen (GameCover.PlayerCandidates: its Documents' cover, the bundle's, then the icons). GameAppExport.cs: the app icon is made from the cover when there is one; games/<id>/ travels whole, and a cover kept under the file
+#       name's key is added as documents/games/<id>/cover.jpg. Deleting a game removes its cover (GameAppUi.PlanDeletion; the saves stay).
+#   * Where: the long-press menu of a Library tile and row ('Choose a cover…' submenu), the game sheet's GAME section (a row; it opens an action sheet), the Build tab row's More menu. Entries: 'Photo Library…' (PHPickerViewController,
+#       images, one; no permission prompt: PhotosUI is a system process, nothing to add to Info.plist; the project already links PhotosUI through the bindings), 'Files…' (UIDocumentPickerViewController for public.image, asCopy:
+#       the picker's copy in our container is deleted after the read), 'Remove custom cover' when one is set. The picture is decoded OFF the main thread: an ImageIO thumbnail (the orientation applied, no more than 1024 on the
+#       short side), the centred square, 512 x 512, JPEG 0.9, written through cover.jpg.part and renamed. The launch sweep (SweepLeftoverParts) removes cover.jpg.part, icon.jpg.part and <hash>.cover.jpg.part in games/<id>/ and
+#       games/_unresolved/ (one level, by exact name).
+#
+# NEW STRINGS: Pause, Resume, Cancel, 'Pausing… (finishes the current shader)', 'Pausing… (finishes the current step)', 'Pausing… (finishes reading the game)', 'Cancelling…', 'Cancelled', 'Paused', 'Paused · ' (card and chip),
+#   'Cancel the build of ', 'Cancel and keep the extracted game (next build starts faster)', 'Cancel and free the space', 'Keep building', 'Not now', 'Cancel the paused build…', ' is paused', 'Start without it', 'Paused: '
+#   (the task's title), 'GameApp starts again' (existing), 'Choose a cover…', 'Choose a cover', 'Photo Library…', 'Files…', 'Remove custom cover'. ACCESSIBILITY IDS: build-pause, build-resume, build-cancel (the Build tab card),
+#   build-row-resume, build-row-cancel (a Build tab game row), game-resume (a library tile / row), build-screen-pause, build-screen-cancel (the build screen), sheet-cancel-build, cover-choose (the game sheet's row, and the
+#   menu's identifier), cover-photos, cover-files, cover-remove (menu actions).
+#
+# MEASURED (host harness, .NET 11, Apple silicon Mac): 209 checks, every transition of the state machine (also the pending-before-start cases: a Pause or a Cancel during the extraction applies before the chain, a Pause then a
+#   Cancel is a cancel), 20,000 races of a Pause against the chain's start (never a request lost), the cancel plans for 32 combinations (none lists shadercache/, games/, the finished pack, a game file or prod.keys; a paused build whose extraction another game replaced deletes only its own work folder) and EXECUTED on a
+#   real folder tree (shader cache, games/<id>/ with a save and the rewrite cache, another game's work folder, the game file all survive), the relaunch reconstruction (killed, built, cancel marker, no id, two games, the round
+#   trip), the resume plans, the queue, the cover paths and precedence, the crop and decode sizes. Mutations of the classes (the chain ignores a pending request / a cancel also deletes shadercache / recovery ignores
+#   gameapp.killed / 131 as a failure / the icon beats the cover) fail the checks that name them. Compile: dotnet build -c Release -r ios-arm64, rc 0, links PhotosUI and UniformTypeIdentifiers.
+# NOT EXERCISED / ASSUMED (no device run): everything UIKit (the card, the buttons, the dialog, the menus, the build screen, the pickers); the stop latency on the phone (the Rust agent's estimate is under 2 s: one translator call +
+#   one shader; a module of the rewrite in hand, the split of the game's shaders and the C# extraction finish first, so a Pause there waits); a second gameapp_run_chain in the same process on the phone; the Dynamic Island's stop
+#   button reaching ExpirationHandler (assumed: the system expires the task); BGContinuedProcessingTask.UpdateTitle after the expiration (wrapped in a try, not known to be honoured); PHPicker's LoadDataRepresentation giving
+#   HEIC / JPEG / PNG bytes that ImageIO decodes with the orientation applied; the image processing itself (CoreGraphics is not in the harness: the crop and size arithmetic is); that gameapp_nup_icon links and answers on the
+#   phone (the compile used stand-in exports: app-work/device's shim predates the two exports; the real ones are in app/gameapp_shim_rust.c, and build-app.sh's import check only reads the unpatched snapshot, so it does not
+#   demand them: scripts/build-app.sh builds the shim from the repo's source and the link would fail loudly if they were missing).
+# RISKS: Cancel after a Rebuild of a built game leaves that game needing setup (the chain removed its stamp and extract/flat when it started: nothing to restore); the 'free the space (N GB)' number is the cached extract +
+#   shaders-work size, taken when the dialog opens (shaders-work is measured at launch, at the end of a build and by a delete: during a build it can be old); a pause during the C# extraction of a big NSP waits for it (it cannot be
+#   interrupted); the paused record is the app's, the marker the chain's: if the two disagree (a marker with no record: progress unknown, 'Paused'; a record with no marker: a pause before stage 3) the safer reading is taken
+#   (the extraction is not trusted, the game is read again); a Switch 2 title id whose low 12 bits are not 000 would be stored as id & ~0xFFF like an NSP's, and could differ from the chain's games/<id>/ name.
+diff -ruN a/GameAppBackground.cs b/GameAppBackground.cs
+--- a/GameAppBackground.cs
++++ b/GameAppBackground.cs
+@@ -15,8 +15,9 @@
+ //   * The task must report progress or the scheduler may expire it as stalled: the ticker (1 s) feeds it, never going back.
+ //   * Nothing here touches UIKit: the callbacks run on a system queue, and the only app state they read or write is
+ //     under `backgroundLock`.
+-//   * On expiration the system ends the task, not the process; the chain goes on as far as iOS lets the process live, and
+-//     the kill/resume of entry 74 covers the rest.
++//   * On expiration the system ends the task, not the process. A BUILD's task is then PAUSED (patch 0065, GameAppStopUi.PauseFromTheSystem): the pause is requested, the wait for the chain to return is bounded (about
++//     5 s) and off the main thread, the paused record is written, the task's title says "Paused" and it is completed. The same when the person taps the task's stop button in the Dynamic Island (it expires the task).
++//     A shader warm-up's task, or a build that cannot stop yet (its extraction is running), keeps the old behaviour: the work goes on as far as iOS lets the process live, and the kill/resume of entry 74 covers the rest.
+ //   * A build that ends the process on purpose between the rewrite and the shaders (entry 75) ends the task with it: iOS
+ //     cannot start an app by itself, so the continuation still needs the user's tap.
+ using System;
+@@ -86,6 +87,11 @@
+             continued.Progress.CompletedUnitCount = backgroundDone;
+             continued.ExpirationHandler = () =>
+             {
++                if (!backgroundWarm && stop.Stoppable)
++                {
++                    PauseFromTheSystem(continued);   // GameAppStopUi.cs: runs off this queue, never blocks it or the main thread
++                    return;
++                }
+                 lock (backgroundLock) { if (backgroundTask == continued) backgroundTask = null; }
+                 BeginInvokeOnMainThread(() => Write("background: the system ended the background task; the build goes on while iOS lets this process live"));
+             };
+@@ -122,8 +128,8 @@
+         }
+     }
+ 
+-    /// The build ended (Finish) or the process is about to end on purpose (RestartForStage3).
+-    private void BackgroundEnd(bool success)
++    /// The build ended (Finish) or the process is about to end on purpose (RestartForStage3). `paused`: the person paused it (or the system did): the task's title says so and the bar is not filled.
++    private void BackgroundEnd(bool success, bool paused = false)
+     {
+         lock (backgroundLock)
+         {
+@@ -134,7 +140,8 @@
+             backgroundWarm = false;
+             if (task != null)
+             {
+-                if (success) task.Progress.CompletedUnitCount = ProgressUnits;
++                if (paused) { try { task.UpdateTitle("Paused: " + GameAppUi.DisplayName(stop.Game ?? ""), StopText.PausedLine(lastStage)); } catch (Exception) { } }
++                else if (success) task.Progress.CompletedUnitCount = ProgressUnits;
+                 task.SetTaskCompleted(success);
+             }
+             else if (id != null) BGTaskScheduler.Shared.Cancel(id);   // never started: do not let it start for a finished build
+diff -ruN a/GameAppCover.cs b/GameAppCover.cs
+--- a/GameAppCover.cs
++++ b/GameAppCover.cs
+@@ -0,0 +1,112 @@
++// gameapp/GameAppCover.cs -- "Choose a cover…": where a game's own cover lives, which picture wins, how a picked photo is cut (patch 0065). No UIKit: the host harness compiles this file as it is;
++// GameAppCoverUi.cs (the view controller's half) does the picking and the drawing.
++//
++//   Documents/games/<title id>/cover.jpg        the person's cover, 512 x 512, JPEG 0.9. A file of its own: the chain writes games/<id>/icon.jpg at every build, and a build never touches cover.jpg.
++//   Documents/games/_unresolved/<hash>.cover.jpg  a game whose file name carries no [title id] and whose id has not been read from the package yet: the same hash of the file name GameAppUi.UnresolvedMarker uses.
++//                                                 Once the id is known the cover is found at the id's path too (Candidates), and a new choice is written there.
++//   precedence (CoverOf, the tint, the list rows, the sheet's header, the Build tab, the exported app's icon):  cover.jpg, then icon.jpg, then the initials (CoverArt).
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++
++public static class GameCover
++{
++    public const string FileName = "cover.jpg";
++    public const int Size = 512;
++    public const double JpegQuality = 0.9;
++    /// The short side of the picture the photo is decoded to before it is cut: twice the cover, so the final reduction is a clean one. A photo smaller than that is not enlarged by the decoder.
++    public const int DecodeShortSide = 1024;
++
++    /// `games/<id>/cover.jpg` relative to Documents, or null when the file name carries no title id (an update or an add-on shares its base game's).
++    public static string RelativePath(string fileName)
++    {
++        var id = GameAppUi.BaseTitleIdOf(fileName);
++        return id == null ? null : "games/" + id + "/" + FileName;
++    }
++
++    /// `games/_unresolved/<hash>.cover.jpg`: the key of a game with no id (the hash of its file name, the one UnresolvedMarker uses).
++    public static string UnresolvedRelativePath(string fileName)
++    {
++        var marker = GameAppUi.UnresolvedMarker(fileName);
++        return marker.Substring(0, marker.Length - ".none".Length) + ".cover.jpg";
++    }
++
++    /// Where a new choice is written: the id's path when the id is known, else the file name's.
++    public static string WritePath(string fileName) => RelativePath(fileName) ?? UnresolvedRelativePath(fileName);
++
++    /// Where a cover may be, best first: the id's path, then the file name's (a cover chosen before the id was read stays found).
++    public static IReadOnlyList<string> Candidates(string fileName)
++    {
++        var list = new List<string>();
++        var byId = RelativePath(fileName);
++        if (byId != null) list.Add(byId);
++        list.Add(UnresolvedRelativePath(fileName));
++        return list;
++    }
++
++    /// The picture a game shows: its cover if there is one, else its icon, else null (the initials). Paths relative to Documents; `exists` asks the file system (the harness fakes it).
++    public static string Resolve(string fileName, Func<string, bool> exists)
++    {
++        foreach (var rel in Candidates(fileName)) if (exists(rel)) return rel;
++        var icon = GameAppUi.IconRelativePath(fileName);
++        return icon != null && exists(icon) ? icon : null;
++    }
++
++    /// The person's own cover of this game, or null.
++    public static string Custom(string fileName, Func<string, bool> exists) => Candidates(fileName).FirstOrDefault(exists);
++
++    /// The temporary name a cover or an icon is written to, renamed over the final one when it is whole.
++    public static string PartOf(string path) => path + ".part";
++
++    /// True for the temporary names the launch sweep removes in games/<id>/ and games/_unresolved/.
++    public static bool IsOurPart(string name) =>
++        name == FileName + ".part" || name == "icon.jpg.part" || (name != null && name.EndsWith(".cover.jpg.part", StringComparison.Ordinal));
++
++    /// The cover files a deletion of the game removes (paths relative to Documents).
++    public static IReadOnlyList<string> DeletionFiles(string fileName) => Candidates(fileName).SelectMany(p => new[] { p, PartOf(p) }).ToList();
++
++    /// The part of a photo that becomes the cover: the largest centred square.
++    public static (int X, int Y, int Side) SquareCrop(int width, int height)
++    {
++        int side = Math.Max(1, Math.Min(width, height));
++        return ((width - side) / 2, (height - side) / 2, side);
++    }
++
++    /// The longest side the decoder is asked for (kCGImageSourceThumbnailMaxPixelSize bounds the LONGER side): the shorter side comes out at DecodeShortSide, never more than the photo has.
++    public static int DecodeMaxPixel(int width, int height)
++    {
++        int shorter = Math.Max(1, Math.Min(width, height)), longer = Math.Max(width, height);
++        if (shorter <= DecodeShortSide) return Math.Max(1, longer);   // already small: as it is
++        return (int) Math.Min(longer, Math.Ceiling((double) longer * DecodeShortSide / shorter));
++    }
++
++    // ---- the exported app --------------------------------------------------------------------------------------------
++
++    /// The file the exported app's icon is made from: the cover, else games/<id>/icon.jpg, else null (CoverArt). `titleId`: the build's id (a dump with no id in its name is exported under it).
++    public static string ExportSource(string titleId, string dump, Func<string, bool> exists)
++    {
++        var byId = "games/" + titleId + "/" + FileName;
++        if (exists(byId)) return byId;
++        var byName = UnresolvedRelativePath(dump);
++        if (exists(byName)) return byName;
++        var icon = "games/" + titleId + "/icon.jpg";
++        return exists(icon) ? icon : null;
++    }
++
++    /// Where the player of an export finds the cover: its own Documents first (the copy PreparePlayerDocuments made, or one chosen there), then the bundle; the icon after the covers.
++    public static IReadOnlyList<string> PlayerCandidates(string documents, string bundleGame, string titleId) => new[]
++    {
++        Path.Combine(documents, "games", titleId, FileName),
++        Path.Combine(bundleGame, "documents", "games", titleId, FileName),
++        Path.Combine(documents, "games", titleId, "icon.jpg"),
++        Path.Combine(bundleGame, "documents", "games", titleId, "icon.jpg"),
++    };
++
++    /// The entry name a cover that is NOT already inside games/<id>/ (the export carries that folder whole) gets in the bundle, or null when the folder's own copy is the one.
++    public static string ExtraBundleEntry(string sourceRelative, string titleId)
++    {
++        if (sourceRelative == null || !sourceRelative.EndsWith(FileName, StringComparison.Ordinal)) return null;
++        return sourceRelative == "games/" + titleId + "/" + FileName ? null : "documents/games/" + titleId + "/" + FileName;
++    }
++}
+diff -ruN a/GameAppCoverUi.cs b/GameAppCoverUi.cs
+--- a/GameAppCoverUi.cs
++++ b/GameAppCoverUi.cs
+@@ -0,0 +1,288 @@
++// gameapp/GameAppCoverUi.cs -- "Choose a cover…" and the Switch 2 package's own icon (patch 0065). The paths, the precedence and the cut of a photo are in GameAppCover.cs (no UIKit, run by the host harness).
++//
++//   * Choose a cover…   the long-press menu of a Library tile and row, the game sheet's GAME section and the Build tab row's menu: Photo Library… (PHPickerViewController: no permission prompt), Files…
++//                       (the document picker, images) and Remove custom cover when one is set. The picture is decoded OFF the main thread (ImageIO thumbnail, the orientation applied), cut to the centred square,
++//                       resized to 512 x 512 and written as JPEG 0.9 to games/<id>/cover.jpg through cover.jpg.part: a file of its own, so a build never overwrites it.
++//   * .nup icons        FetchMissingNupIcons: the icon of a Switch 2 package is read from the head of the file by the shim (gameapp_nup_icon: no keys, a few hundred KB to ~15 MB), on a background task, never while a
++//                       build runs; the package's title id names the game when its file name has none. A package without an icon (the owner's Ocarina of Time has none: its metadata has no NACP) gets the "no icon"
++//                       marker like the other formats, so it is not read again at every refresh; the initials stay.
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Runtime.InteropServices;
++using System.Threading;
++using System.Threading.Tasks;
++
++using CoreGraphics;
++using Foundation;
++using ImageIO;
++using PhotosUI;
++using UIKit;
++using UniformTypeIdentifiers;
++
++internal static class NupNative
++{
++    /// The icon of a .nup (app/gameapp_shim_rust.c). > 0: its length (copied into buf only when <= cap: ask again with a bigger buffer); 0: no icon (titleId is still set); < 0: unreadable or damaged.
++    [DllImport("__Internal")] internal static extern int gameapp_nup_icon(string path, byte[] buf, int cap, out ulong titleId);
++}
++
++public sealed partial class GameAppViewController
++{
++    // ---- Choose a cover… -------------------------------------------------------------------------------------------------------
++
++    private static string CoverFileOf(string game, string rel) => Path.Combine(GameAppMain.Documents, rel.Replace('/', Path.DirectorySeparatorChar));
++
++    private static bool HasCustomCover(string game) => GameCover.Custom(game, rel => File.Exists(CoverFileOf(game, rel))) != null;
++
++    /// The submenu of the long-press menus and the Build tab's "More": Photo Library…, Files…, and Remove custom cover when one is set.
++    private UIMenu CoverMenu(string game)
++    {
++        var items = new List<UIMenuElement>
++        {
++            UIAction.Create("Photo Library…", UIImage.GetSystemImage("photo.on.rectangle"), "cover-photos", _ => ChooseCoverFromPhotos(game)),
++            UIAction.Create("Files…", UIImage.GetSystemImage("folder"), "cover-files", _ => ChooseCoverFromFiles(game)),
++        };
++        if (HasCustomCover(game))
++        {
++            var remove = UIAction.Create("Remove custom cover", UIImage.GetSystemImage("trash"), "cover-remove", _ => RemoveCover(game));
++            remove.Attributes = UIMenuElementAttributes.Destructive;
++            items.Add(remove);
++        }
++        return UIMenu.Create("Choose a cover…", UIImage.GetSystemImage("photo"), (NSString) "cover-choose", (UIMenuOptions) 0, items.ToArray());
++    }
++
++    /// The same choices as an action sheet (the game sheet's row opens it after the sheet is gone).
++    private void ShowCoverChooser(string game)
++    {
++        var sheet = UIAlertController.Create("Choose a cover", GameAppUi.DisplayName(game), UIAlertControllerStyle.ActionSheet);
++        sheet.AddAction(UIAlertAction.Create("Photo Library…", UIAlertActionStyle.Default, _ => ChooseCoverFromPhotos(game)));
++        sheet.AddAction(UIAlertAction.Create("Files…", UIAlertActionStyle.Default, _ => ChooseCoverFromFiles(game)));
++        if (HasCustomCover(game)) sheet.AddAction(UIAlertAction.Create("Remove custom cover", UIAlertActionStyle.Destructive, _ => RemoveCover(game)));
++        sheet.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
++        Theme.Anchor(sheet, null, View);
++        PresentWhenFree(sheet);
++    }
++
++    private NSObject coverPickerDelegate;   // alive while a picker is up
++
++    private void ChooseCoverFromPhotos(string game)
++    {
++        var configuration = new PHPickerConfiguration { Filter = PHPickerFilter.ImagesFilter, SelectionLimit = 1 };
++        var picker = new PHPickerViewController(configuration);
++        var picked = new CoverPhotoDelegate(this, game);
++        coverPickerDelegate = picked;
++        picker.Delegate = picked;
++        PresentWhenFree(picker);
++    }
++
++    private sealed class CoverPhotoDelegate : PHPickerViewControllerDelegate
++    {
++        private readonly GameAppViewController owner;
++        private readonly string game;
++        public CoverPhotoDelegate(GameAppViewController owner, string game) { this.owner = owner; this.game = game; }
++
++        public override void DidFinishPicking(PHPickerViewController picker, PHPickerResult[] results)
++        {
++            picker.DismissViewController(true, null);
++            if (results == null || results.Length == 0) return;
++            // The photo's bytes arrive on a background queue, and are decoded there: never on the main thread.
++            results[0].ItemProvider.LoadDataRepresentation("public.image", (data, error) =>
++            {
++                if (data == null) { owner.BeginInvokeOnMainThread(() => owner.Write($"cover: the photo could not be loaded ({error?.LocalizedDescription ?? "no data"})")); return; }
++                using var source = CGImageSource.FromData(data);
++                owner.SaveCover(game, source, "the Photo Library");
++            });
++        }
++    }
++
++    private void ChooseCoverFromFiles(string game)
++    {
++        var picker = new UIDocumentPickerViewController(new[] { UTTypes.Image }, true);   // asCopy: the picked file is copied into this app's container (and deleted again after the read)
++        var picked = new CoverFileDelegate(this, game);
++        coverPickerDelegate = picked;
++        picker.Delegate = picked;
++        PresentWhenFree(picker);
++    }
++
++    private sealed class CoverFileDelegate : NSObject, IUIDocumentPickerDelegate
++    {
++        private readonly GameAppViewController owner;
++        private readonly string game;
++        public CoverFileDelegate(GameAppViewController owner, string game) { this.owner = owner; this.game = game; }
++
++        public void DidPickDocument(UIDocumentPickerViewController controller, NSUrl url) => Pick(url);
++        public void DidPickDocumentAtUrls(UIDocumentPickerViewController controller, NSUrl[] urls) { if (urls != null && urls.Length > 0) Pick(urls[0]); }
++
++        private void Pick(NSUrl url)
++        {
++            var path = url?.Path;
++            if (string.IsNullOrEmpty(path)) return;
++            Task.Run(() =>
++            {
++                bool scoped = url.StartAccessingSecurityScopedResource();
++                try
++                {
++                    using var source = CGImageSource.FromUrl(url);
++                    owner.SaveCover(game, source, "Files");
++                }
++                finally
++                {
++                    if (scoped) url.StopAccessingSecurityScopedResource();
++                    if (IsPickerCopy(path)) try { File.Delete(path); } catch (Exception) { }   // the picker's own copy in our container
++                }
++            });
++        }
++    }
++
++    /// Cuts the picture to the centred square, 512 x 512, JPEG 0.9. Off the main thread. Null when it cannot be decoded.
++    private static byte[] MakeCoverJpeg(CGImageSource source)
++    {
++        if (source == null || source.ImageCount == 0) return null;
++        var properties = source.GetProperties(0);
++        int width = (int) (properties?.PixelWidth ?? 0), height = (int) (properties?.PixelHeight ?? 0);
++        var options = new CGImageThumbnailOptions
++        {
++            CreateThumbnailFromImageAlways = true,
++            CreateThumbnailWithTransform = true,   // the photo's orientation is applied
++            ShouldCache = false,
++            MaxPixelSize = width > 0 && height > 0 ? GameCover.DecodeMaxPixel(width, height) : 2048,
++        };
++        using var decoded = source.CreateThumbnail(0, options);
++        if (decoded == null) return null;
++        var (x, y, side) = GameCover.SquareCrop((int) decoded.Width, (int) decoded.Height);
++        using var square = decoded.WithImageInRect(new CGRect(x, y, side, side));
++        if (square == null) return null;
++        using var space = CGColorSpace.CreateDeviceRGB();
++        using var context = new CGBitmapContext(null, GameCover.Size, GameCover.Size, 8, GameCover.Size * 4, space, CGImageAlphaInfo.NoneSkipLast);
++        context.InterpolationQuality = CGInterpolationQuality.High;
++        context.DrawImage(new CGRect(0, 0, GameCover.Size, GameCover.Size), square);
++        using var scaled = context.ToImage();
++        var data = new NSMutableData();
++        using var destination = CGImageDestination.Create(data, "public.jpeg", 1);
++        if (destination == null) return null;
++        destination.AddImage(scaled, new CGImageDestinationOptions { LossyCompressionQuality = (float) GameCover.JpegQuality });
++        return destination.Close() ? data.ToArray() : null;
++    }
++
++    /// Worker thread: decode, cut, write games/<id>/cover.jpg through cover.jpg.part; then the screen is drawn again (main thread).
++    private void SaveCover(string game, CGImageSource source, string from)
++    {
++        string failure = null;
++        try
++        {
++            var jpeg = MakeCoverJpeg(source);
++            if (jpeg == null || jpeg.Length == 0) failure = "the picture could not be read";
++            else
++            {
++                var path = CoverFileOf(game, GameCover.WritePath(game));
++                Directory.CreateDirectory(Path.GetDirectoryName(path));
++                var part = GameCover.PartOf(path);
++                try { File.WriteAllBytes(part, jpeg); File.Move(part, path, true); }
++                catch { try { File.Delete(part); } catch (Exception) { } throw; }
++            }
++        }
++        catch (Exception error) { failure = $"{error.GetType().Name}: {error.Message}"; }
++        BeginInvokeOnMainThread(() =>
++        {
++            Write(failure == null ? $"cover: {GameAppUi.DisplayName(game)} has the cover chosen from {from}" : $"cover: not changed ({failure})");
++            RefreshScreen();
++        });
++    }
++
++    private void RemoveCover(string game)
++    {
++        Task.Run(() =>
++        {
++            int removed = 0;
++            foreach (var rel in GameCover.DeletionFiles(game))
++                try { var path = CoverFileOf(game, rel); if (File.Exists(path)) { File.Delete(path); removed++; } } catch (Exception) { }
++            BeginInvokeOnMainThread(() => { Write($"cover: {GameAppUi.DisplayName(game)} has its own cover again ({removed} file(s) removed)"); RefreshScreen(); });
++        });
++    }
++
++    // ---- the icon of a Switch 2 package ---------------------------------------------------------------------------------------
++
++    private static int nupIconsRunning;
++
++    /// The .nup games with no icon yet and none recorded as missing: read on a background task, one after another, never while a build runs. The package is not encrypted: no prod.keys.
++    private void FetchMissingNupIcons(UiFacts facts)
++    {
++        if (GameExport.IsPlayer || running || facts.Running || stop.Busy) return;
++        var documents = GameAppMain.Documents;
++        var todo = new List<string>();
++        foreach (var name in facts.Games ?? new List<string>())
++        {
++            if (!GameAppUi.IsNup(name)) continue;
++            var rel = GameAppUi.IconRelativePath(name);
++            if (rel != null && File.Exists(CoverFileOf(name, rel))) continue;
++            // a package that gave no icon (or could not be read) is tried again only when the file is newer than the note
++            var marker = CoverFileOf(name, rel != null ? GameAppUi.NoIconRelativePath(name) : GameAppUi.UnresolvedMarker(name));
++            try { if (File.Exists(marker) && File.GetLastWriteTimeUtc(marker) >= File.GetLastWriteTimeUtc(Path.Combine(documents, name))) continue; }
++            catch (Exception) { continue; }
++            todo.Add(name);
++        }
++        if (todo.Count == 0 || Interlocked.CompareExchange(ref nupIconsRunning, 1, 0) != 0) return;
++        Task.Run(() =>
++        {
++            int changed = 0;
++            var clock = System.Diagnostics.Stopwatch.StartNew();
++            try
++            {
++                foreach (var name in todo)
++                {
++                    if (stop.Busy) break;   // a build started meanwhile: the rest waits for the next refresh
++                    changed += ReadNupCover(documents, name);
++                }
++            }
++            finally { Interlocked.Exchange(ref nupIconsRunning, 0); }
++            var ms = clock.ElapsedMilliseconds;
++            BeginInvokeOnMainThread(() => { NoteTime("nup icons/worker", ms); if (changed > 0) RefreshScreen(); });   // a launch-profile line when the background read was long
++        });
++    }
++
++    /// Worker thread. 1 when something the screen shows changed (an icon, or the game's id), else 0.
++    private static int ReadNupCover(string documents, string name)
++    {
++        int changed = 0;
++        string verdict;
++        try
++        {
++            var path = Path.Combine(documents, name);
++            var buffer = new byte[1 << 20];
++            int rc = NupNative.gameapp_nup_icon(path, buffer, buffer.Length, out var titleId);
++            if (rc > buffer.Length) { buffer = new byte[rc]; rc = NupNative.gameapp_nup_icon(path, buffer, buffer.Length, out titleId); }
++            if (rc >= 0 && titleId != 0 && GameAppUi.IconRelativePath(name) == null)
++            {
++                // the file name has no [title id]: the package's own names the game (the same id the build names games/<id>/ by), like an NSP's control NCA
++                GameAppUi.SetTitleFromContent(name, titleId & ~0xFFFUL);
++                GameAppUi.SaveTitlesFromContent(documents);
++                GameAppDiag.Event("title-from-content", $"{name}: {titleId:X16}");
++                changed = 1;
++            }
++            var rel = GameAppUi.IconRelativePath(name);
++            if (rc > 0 && rel != null)
++            {
++                var icon = CoverFileOf(name, rel);
++                Directory.CreateDirectory(Path.GetDirectoryName(icon));
++                var part = GameCover.PartOf(icon);
++                try { using (var f = File.Create(part)) f.Write(buffer, 0, rc); File.Move(part, icon, true); }
++                catch { try { File.Delete(part); } catch (Exception) { } throw; }
++                changed = 1;
++                verdict = $"{rc} bytes";
++            }
++            else
++            {
++                // no icon (rc 0: the metadata has none), a damaged package (rc < 0), or an icon with no id to name it by: said once, not read again until the file changes
++                var marker = CoverFileOf(name, rel != null ? GameAppUi.NoIconRelativePath(name) : GameAppUi.UnresolvedMarker(name));
++                Directory.CreateDirectory(Path.GetDirectoryName(marker));
++                verdict = rc < 0 ? $"unreadable or damaged ({rc})" : rc == 0 ? "none: the package carries no icon" : "an icon but no title id to name it by";
++                File.WriteAllText(marker, verdict + "\n");
++            }
++        }
++        catch (Exception error) { verdict = error.GetType().Name + ": " + error.Message; }
++        Console.Error.WriteLine($"[gameapp] icon of {name}: {verdict}");
++        GameAppDiag.Event("icon", $"icon of {name}: {verdict}");
++        return changed;
++    }
++}
+diff -ruN a/GameAppExport.cs b/GameAppExport.cs
+--- a/GameAppExport.cs
++++ b/GameAppExport.cs
+@@ -274,8 +274,12 @@
+         }
+         AddBytes(app + Folder + "/manifest.tsv", Encoding.UTF8.GetBytes(manifestText));
+ 
+-        // Its own identity: a bundle identifier of its own so it installs beside GameApp, the game's name and icon.
+-        var icon = Path.Combine(games, "icon.jpg");
++        // Its own identity: a bundle identifier of its own so it installs beside GameApp, the game's name and icon. The person's own cover (games/<id>/cover.jpg, GameAppCover.cs) wins over the icon the package gave:
++        // the app icon is made from it, and it travels with games/<id>/ (the player's own screen finds it there, GameCover.PlayerCandidates).
++        var coverRel = GameCover.ExportSource(titleId, dump, rel => File.Exists(Path.Combine(documents, rel.Replace('/', Path.DirectorySeparatorChar))));
++        var icon = coverRel != null ? Path.Combine(documents, coverRel.Replace('/', Path.DirectorySeparatorChar)) : Path.Combine(games, "icon.jpg");
++        var coverEntry = GameCover.ExtraBundleEntry(coverRel, titleId);   // a cover chosen before the game's id was read lives under the file name's key: it is carried in games/<id>/ too
++        if (coverEntry != null) AddFile(icon, app + Folder + "/" + coverEntry);
+         bool hasIcon = false;
+         if (File.Exists(icon))
+             foreach (var (size, suffix) in new[] { (120, "@2x"), (180, "@3x") })
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -349,6 +349,13 @@
+         if (!running)
+         {
+             var at = GameAppUi.BuildSteps(lastStage, stepStarts, lastRunEnd).FirstOrDefault(r => r.State == GameAppUi.StepState.Now);
++            if (EndedByUser)   // the person paused or cancelled it: not "Stopped at …", not "Built in …" (GameAppStopUi.cs)
++            {
++                runLine.Text = (stop.State == StopState.Paused ? StopText.PausedLine(lastStage) : StopText.Cancelled()) + " · " + GameAppUi.FormatElapsed(lastRunEnd - startedAt);
++                runLine.TextColor = Theme.Warn;
++                progress.Hidden = true;
++                return;
++            }
+             runLine.Text = failedRun ? $"Stopped at {LowerFirst(at?.Name ?? "the start")} · {GameAppUi.FormatElapsed(lastRunEnd - startedAt)}"
+                                      : $"Built in {GameAppUi.FormatElapsed(lastRunEnd - startedAt)}";
+             runLine.TextColor = failedRun ? Theme.Warn : Theme.Ok;
+@@ -1319,8 +1326,11 @@
+         {
+             // The log opens over the library, and its back button brings the build screen back (logsBack).
+             OnLog = OpenLogFromBuild,
++            OnPause = PausePressed,
++            OnCancel = () => { var g = running ? stop.Game : stop.Game ?? selected; if (g != null) AskCancel(g); },
+             OnPrimary = () =>
+             {
++                if (!running && stop.State == StopState.Paused && stop.Game != null) { var paused = stop.Game; buildScreen?.DismissViewController(true, () => ResumePaused(paused)); return; }   // "Resume"
+                 if (failedRun && !running) { OpenLogFromBuild(toError: true); return; }   // "See what stopped it"
+                 buildScreen?.DismissViewController(true, () => { if (!running) PrimaryTapped(); });
+             },
+@@ -1375,12 +1385,12 @@
+         var game = selected;
+         var entry = entries.FirstOrDefault(e => e.Name == game);
+         var now = running ? DateTime.Now : lastRunEnd == default ? DateTime.Now : lastRunEnd;
+-        var steps = GameAppUi.BuildSteps(lastStage, stepStarts, now, finished: buildFinished && !failedRun);
++        var steps = GameAppUi.BuildSteps(lastStage, stepStarts, now, finished: buildFinished && !failedRun && !EndedByUser);
+         int at = steps.FindIndex(r => r.State == GameAppUi.StepState.Now);
+         if (at < 0) at = steps.Count - 1;
+         var names = Dumps().Select(Path.GetFileName).ToList();
+         string meta = game == null ? "" : GameAppUi.ContentLine(game, names) ?? GameAppUi.SizeText(SafeLength(Path.Combine(GameAppMain.Documents, game)));
+-        var fraction = buildFinished && !failedRun ? 1.0 : GameAppUi.ParseStage(lastStage).Fraction;
++        var fraction = buildFinished && !failedRun && !EndedByUser ? 1.0 : GameAppUi.ParseStage(lastStage).Fraction;
+         var primary = game != null ? GameAppUi.GameAction(game, facts) : null;
+         var window = LiveLogWindow();
+         var rows = GameAppUi.Timeline(logLines.Skip(window.From).Take(window.To - window.From), false).Where(r => r.Kind != GameAppUi.LogKind.Stage).ToList();
+@@ -1391,13 +1401,19 @@
+             game != null ? GameAppUi.DisplayName(game) : "Build",
+             entry?.Icon ?? (game != null ? CoverOf(game, facts) : null),
+             meta, steps, at, fraction, running, failedRun,
+-            running ? GameAppUi.LeftText(GameAppUi.TimeLeft(lastStage, stepStarts, DateTime.Now, DateTime.Now - startedAt)) : failedRun ? "stopped" : "done",
++            running ? GameAppUi.LeftText(GameAppUi.TimeLeft(lastStage, stepStarts, DateTime.Now, DateTime.Now - startedAt)) : EndedByUser ? (stop.State == StopState.Paused ? "paused" : "cancelled") : failedRun ? "stopped" : "done",
+             (running ? GameAppUi.FormatElapsed(DateTime.Now - startedAt) + " so far" : startedAt == default ? "" : "took " + GameAppUi.FormatElapsed(lastRunEnd - startedAt)),
+             facts.IncreasedMemory == 1 || facts.AvailableMiB > 4500, facts.ExtendedAddressing == 1, ((left > 0 ? $"{left:N0} MiB free" : "") + HeatSuffix()).TrimStart(' ', '·'),
+             live, notifyWhenDone,
+-            running ? "Play when it is done" : failedRun ? "See what stopped it" : primary?.Title ?? "Close",
+-            !running,
+-            currentTint ?? Theme.DefaultTint));
++            running ? "Play when it is done" : stop.State == StopState.Paused ? "Resume" : failedRun ? "See what stopped it" : primary?.Title ?? "Close",
++            !running && stop.State != StopState.Cancelling,
++            currentTint ?? Theme.DefaultTint,
++            // the stop state (GameAppStopUi.cs): what the ring says instead of "BUILT", and the Pause / Cancel buttons
++            running ? (stop.State == StopState.Pausing ? StopText.Pausing(stop.Phase, lastStage) : stop.State == StopState.Cancelling ? StopText.Cancelling() : null)
++                    : stop.State == StopState.Paused ? StopText.PausedLine(lastStage) : stop.State == StopState.Cancelled ? StopText.Cancelled() : stop.State == StopState.Cancelling ? StopText.Cancelling() : null,
++            !running ? (stop.State == StopState.Paused ? "paused" : stop.State == StopState.Cancelled || stop.State == StopState.Cancelling ? "cancelled" : null) : null,
++            running && stop.Stoppable && stop.State == StopState.Running,
++            (running && stop.Stoppable && stop.State == StopState.Running) || stop.State == StopState.Paused));
+     }
+ 
+     // ---- "Notify me": a notification when the build ends (the app may be in the background meanwhile) ------------
+@@ -2232,9 +2248,10 @@
+ {
+     public sealed record Model(string Name, UIImage Icon, string Meta, List<GameAppUi.BuildStep> Steps, int Current, double Fraction,
+                                bool Running, bool Failed, string TimeLeft, string Clock, bool RamUnlocked, bool Extended, string MemoryLine,
+-                               List<(string Text, GameAppUi.LogKind Kind)> Live, bool Notify, string PrimaryTitle, bool PrimaryEnabled, UIColor Tint);
++                               List<(string Text, GameAppUi.LogKind Kind)> Live, bool Notify, string PrimaryTitle, bool PrimaryEnabled, UIColor Tint,
++                               string StopLine = null, string Stopped = null, bool CanPause = false, bool CanCancel = false);
+ 
+-    public Action OnLog, OnPrimary, OnNotify;
++    public Action OnLog, OnPrimary, OnNotify, OnPause, OnCancel;
+     private readonly AmbientView ambient = new AmbientView();
+     private readonly UIImageView icon = new UIImageView { ContentMode = UIViewContentMode.ScaleAspectFill, ClipsToBounds = true };
+     private readonly UILabel name = new UILabel(), meta = new UILabel();
+@@ -2244,7 +2261,8 @@
+     private readonly UIStackView chips = new UIStackView { Axis = UILayoutConstraintAxis.Horizontal, Spacing = 8, Alignment = UIStackViewAlignment.Center };
+     private readonly UILabel leftValue = new UILabel(), leftNote = new UILabel(), ramLine = new UILabel(), extLine = new UILabel(), memNote = new UILabel();
+     private readonly UIStackView liveLines = new UIStackView { Axis = UILayoutConstraintAxis.Vertical, Spacing = 4 };
+-    private UIButton primary, notify;
++    private UIButton primary, notify, pauseButton, cancelButton;
++    private UIStackView stopRow;
+     private Model last;
+ 
+     public override UIInterfaceOrientationMask GetSupportedInterfaceOrientations() => Theme.IsPad ? UIInterfaceOrientationMask.All : UIInterfaceOrientationMask.Portrait;
+@@ -2350,7 +2368,15 @@
+         // The ring and its steps, then the time, the memory and the live log: under each other on a phone and in a narrow window, side by
+         // side in a wide one (ViewDidLayoutSubviews). The two stacks are one column with the same 18 pt gaps until they are separated.
+         var ringStack = Theme.Column(18, ringRow, chipsRow);
+-        var infoStack = Theme.Column(18, cards, liveButton);
++        // Pause and Cancel of the build (GameAppStopUi.cs), under the live log
++        pauseButton = Theme.Pill("Pause", "pause.fill", false, 48);
++        pauseButton.AccessibilityIdentifier = "build-screen-pause";
++        pauseButton.TouchUpInside += (_, __) => OnPause?.Invoke();
++        cancelButton = Theme.Pill("Cancel", "xmark", false, 48);
++        cancelButton.AccessibilityIdentifier = "build-screen-cancel";
++        cancelButton.TouchUpInside += (_, __) => OnCancel?.Invoke();
++        stopRow = new UIStackView(new UIView[] { pauseButton, cancelButton }) { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = 10, Hidden = true };
++        var infoStack = Theme.Column(18, cards, liveButton, stopRow);
+         body = new UIStackView(new UIView[] { ringStack, infoStack }) { Axis = UILayoutConstraintAxis.Vertical, Spacing = 18 };
+         var column = Theme.Column(18, top, body);
+         var scroll = new UIScrollView { AlwaysBounceVertical = true, ShowsVerticalScrollIndicator = false };
+@@ -2444,11 +2470,11 @@
+         name.Text = m.Name;
+         meta.Text = m.Meta;
+         var step = m.Steps[Math.Max(0, Math.Min(m.Current, m.Steps.Count - 1))];
+-        stepOf.Text = m.Running ? $"STEP {m.Current + 1} OF {m.Steps.Count}" : m.Failed ? "STOPPED" : "BUILT";
++        stepOf.Text = m.Running ? $"STEP {m.Current + 1} OF {m.Steps.Count}" : m.Stopped != null ? m.Stopped.ToUpperInvariant() : m.Failed ? "STOPPED" : "BUILT";
+         percent.Text = $"{Math.Round(m.Fraction * 100):0}%";
+         stepName.Text = m.Running ? step.Name switch { "Translate the shaders" => "Shaders", "Rewrite the code for iPhone" => "Rewrite", "Prepare the profile" => "Profile", "Read the game" => "Reading", "Sign the game" => "Signing", _ => step.Name }
+-                                  : m.Failed ? step.Name : "Ready to play";
+-        stepDetail.Text = m.Running ? step.Detail : "";
++                                  : m.Stopped != null ? step.Name : m.Failed ? step.Name : "Ready to play";
++        stepDetail.Text = m.StopLine != null ? m.StopLine : m.Running ? step.Detail : "";
+         stepDetail.Hidden = string.IsNullOrEmpty(stepDetail.Text);
+         ring.StrokeEnd = (nfloat) Math.Max(0.01, Math.Min(1, m.Fraction));
+         ring.StrokeColor = (m.Failed ? Theme.Error : UIColor.White).CGColor;
+@@ -2485,6 +2511,14 @@
+         pc.Image = m.Running || m.Failed ? null : UIImage.GetSystemImage("play.fill");
+         primary.Configuration = pc;
+         primary.Enabled = m.PrimaryEnabled;
++        // Pause (while it runs), Cancel (while it runs or is paused)
++        pauseButton.Hidden = !m.CanPause;
++        cancelButton.Hidden = !m.CanCancel;
++        pauseButton.Enabled = m.CanPause;
++        stopRow.Hidden = !m.CanPause && !m.CanCancel;
++        pc = primary.Configuration;
++        pc.Image = m.Running || m.Failed || m.Stopped != null && m.Stopped != "paused" ? null : UIImage.GetSystemImage("play.fill");
++        primary.Configuration = pc;
+     }
+ 
+     private static NSAttributedString Check(bool ok, string yes, string no)
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -873,7 +873,8 @@
+ 
+     /// A copy, a download or an export writes <name>.part and renames it when it is whole (patches 0040, 0041, 0063's exports; GameAppNas.cs); a kill or a power loss in the middle leaves that .part, possibly
+     /// gigabytes, for good. At launch, before anything can start a copy, the .part files of OUR families are deleted, at fixed places and no deeper, by exact name:
+-    ///   Documents/                     <name>.nsp|.xci|.nsz|.nup|.ipa|.romfs.part (an import or a download), prod.keys.part, .titleids.tsv.part
++    ///   Documents/                     <name>.nsp|.xci|.nsz|.nup|.ipa|.romfs.part (an import or a download), prod.keys.part, .titleids.tsv.part, gameapp.paused.tsv.part
++    ///   Documents/games/<folder>/      cover.jpg.part, icon.jpg.part, <hash>.cover.jpg.part (a cover or an icon written through .part: GameAppCoverUi.cs)
+     ///   Documents/Exports/             <name>.ipa.part (an export, a downloaded app)
+     ///   Documents/Exports/<folder>/    <name> [<title id>].romfs.part (a slim export's game files)
+     ///   Documents/SaveBackups/<folder>/ <date time kind>.zip.part (a save copy: the name has the shape GameSaves.ParseCopyName reads)
+@@ -883,7 +884,7 @@
+         if (partsSwept) return;
+         partsSwept = true;
+         var documents = GameAppMain.Documents;
+-        SweepPartsIn(documents, "Documents", name => name == "prod.keys.part" || name == ".titleids.tsv.part" || IsPartOf(name, OurPartExtensions), log);
++        SweepPartsIn(documents, "Documents", name => name == "prod.keys.part" || name == ".titleids.tsv.part" || name == "gameapp.paused.tsv.part" || IsPartOf(name, OurPartExtensions), log);
+         var exports = Path.Combine(documents, "Exports");
+         if (Directory.Exists(exports) && new DirectoryInfo(exports).LinkTarget == null)
+         {
+@@ -891,6 +892,11 @@
+             foreach (var folder in RealSubfolders(exports))
+                 SweepPartsIn(folder, "Documents/Exports/" + Path.GetFileName(folder), name => IsPartOf(name, ".romfs"), log);
+         }
++        // a cover or an icon written through <name>.part (GameAppCoverUi.cs): games/<id>/cover.jpg.part, icon.jpg.part, games/_unresolved/<hash>.cover.jpg.part; one level of each game's folder, by exact name
++        var gamesRoot = Path.Combine(documents, "games");
++        if (Directory.Exists(gamesRoot) && new DirectoryInfo(gamesRoot).LinkTarget == null)
++            foreach (var folder in RealSubfolders(gamesRoot))
++                SweepPartsIn(folder, "Documents/games/" + Path.GetFileName(folder), GameCover.IsOurPart, log);
+         var backups = Path.Combine(documents, GameSaves.Root);
+         if (Directory.Exists(backups) && new DirectoryInfo(backups).LinkTarget == null)
+             foreach (var folder in RealSubfolders(backups))
+@@ -947,6 +953,7 @@
+         bool hadArgs = File.Exists(argsPath);
+         bool interrupted = Timed("ReportInterruptedRunIfAny", ReportInterruptedRunIfAny);
+         Timed("RefreshGames", RefreshGames);
++        Timed("RecoverStoppedBuilds", RecoverStoppedBuilds);   // GameAppStopUi.cs: the builds the person paused (and the work folder a cancel left), from the files
+         RefreshScreenNow();   // synchronous: the first frame has the shelf in it (every other refresh is coalesced, RefreshScreen)
+         StartWarmAtLaunch();   // GameAppWarm.cs: starts nothing by itself (only a debug launch argument); the shaders are prepared when the player asks
+         // Back from the Files app or the background, Documents may have gained a game or a key: say so -- on the next turn of the run loop, never inside the notification (OnWillEnterForeground).
+@@ -1635,9 +1642,11 @@
+             // An exported player has no dump in Documents to read a title id from the file name of: its manifest names the title, and its icon is the one the export carried (games/<id>/icon.jpg).
+             if (GameExport.IsPlayer && string.Equals(fileName, GameExport.PlayerDump, StringComparison.Ordinal)
+                 && GameExport.PlayerManifest.TryGetValue("title_id", out var playerTitle) && !string.IsNullOrEmpty(playerTitle))
+-                foreach (var candidate in new[] { Path.Combine(GameAppMain.Documents, "games", playerTitle, "icon.jpg"),
+-                                                  Path.Combine(GameExport.BundleGame, "documents", "games", playerTitle, "icon.jpg") })
++                foreach (var candidate in GameCover.PlayerCandidates(GameAppMain.Documents, GameExport.BundleGame, playerTitle))   // the cover first (it travels in games/<id>/ of the export), then the icon
+                     if (File.Exists(candidate)) return CoverFile(fileName, candidate);
++            // The person's own cover (GameAppCover.cs: games/<id>/cover.jpg) wins over the icon the chain and the package gave; no cover: the icon, then the initials
++            var custom = GameCover.Resolve(fileName, relative => File.Exists(Path.Combine(GameAppMain.Documents, relative.Replace('/', Path.DirectorySeparatorChar))));
++            if (custom != null) return CoverFile(fileName, Path.Combine(GameAppMain.Documents, custom.Replace('/', Path.DirectorySeparatorChar)));
+             var rel = GameAppUi.IconRelativePath(fileName);
+             if (rel != null)
+             {
+@@ -1810,6 +1819,7 @@
+             Guarded("settings", () => RefreshSettingsPage(facts));
+             Guarded("storage", RefreshCacheSize);
+             Guarded("icons", () => FetchMissingIcons(facts));
++            Guarded("nup icons", () => FetchMissingNupIcons(facts));   // GameAppCoverUi.cs: a Switch 2 package's icon, read from the head of the file (no keys)
+             if (firstFrameDone) Guarded("cloud icons", FetchCloudIcons);
+             var games = facts.Games ?? new List<string>();
+             Guarded("selection", () => { if (!IsCloudOnly(selected)) selected = GameAppUi.SelectGame(games, selected, facts); });
+@@ -2227,6 +2237,7 @@
+             foreach (var note in notes) Write(note);
+             Write($"deleted {GameAppUi.DisplayName(game)}: {removed} item(s), {GameAppUi.SizeText(freed)} freed" + (failed > 0 ? $", {failed} could not be removed" : ""));
+             if (selected == game) selected = null;
++            if (pausedBuilds.Any(r => r.Game == game)) { pausedBuilds = PausedStore.Remove(pausedBuilds, game); SavePaused(); stop.Forget(); }   // a deleted game has no paused build
+             sizes.Invalidate();
+             RefreshScreen();
+         });
+@@ -2554,6 +2565,7 @@
+         }
+         running = true;
+         chosen = name;
++        StopBegin(name, bootOnly, extracting: !skipExtract && arguments != null);   // GameAppStopUi.cs: Pause / Cancel / Resume of this run
+         // The library's selected game follows the run: the game being built, or the one whose framework is being booted.
+         var runFacts = GatherFacts();
+         var runGame = runFacts.Games != null && runFacts.Games.Contains(name) ? name
+@@ -2668,7 +2680,7 @@
+                     Write($"memory after extraction: {GameAppMain.MemLine()}");
+                     Write($"free space after extraction: {GameAppMain.FreeSpace()}");
+                 }
+-                if (code != 0) { Write("the extraction failed; the chain is not started"); failedRun = true; }
++                if (code != 0) { Write("the extraction failed; the chain is not started"); failedRun = true; runOutcome = stop.ExtractionFailed(); }
+             });
+             if (code != 0)
+             {
+@@ -2682,6 +2694,20 @@
+             BeginInvokeOnMainThread(() => Write(bootOnly
+                 ? "\n--- boot only (same pid, off the main thread): dlopen → nnMain, in a process that ran no stage of the chain"
+                 : "\n--- chain (same pid, off the main thread): profile → rewrite → assemble → zsign → dlopen → nnMain"));
++            // A Pause or Cancel pressed during the extraction waits in the StopMachine: the library clears a request when the chain starts, so the chain is not started at all (GameAppStop.cs).
++            var decision = stop.ChainStarting();
++            if (!decision.Start)
++            {
++                var early = stop.StoppedBeforeChain();
++                runOutcome = early;
++                BeginInvokeOnMainThread(() =>
++                {
++                    Write(early == StopOutcome.Cancelled ? "\n--- cancelled before the chain started (the extraction had to finish first): the chain is not started"
++                                                         : "\n--- paused before the chain started (the extraction finished and is kept): the chain is not started");
++                    Finish();
++                });
++                return;
++            }
+             var chainStarted = DateTime.Now;
+             int rc = -1;
+             string chainError = null;
+@@ -2689,11 +2715,17 @@
+             try { rc = GameAppMain.gameapp_run_chain(); }
+             catch (Exception error) { chainError = $"{error.GetType().FullName}: {error.Message}"; }
+             var chainTook = DateTime.Now - chainStarted;
++            // 131 = paused, 130 = cancelled: not failures (no "stopped at" line, no notification, no gameapp.killed). The chain is not left on the stack, so a Resume may run it again in this process.
++            bool askedBefore = stop.State is StopState.Pausing or StopState.Cancelling;
++            var outcome = stop.ChainReturned(rc, chainError != null);
++            runOutcome = outcome;
++            if (StopCodes.IsStop(rc)) pythonRanThisProcess = false;
+             BeginInvokeOnMainThread(() =>
+             {
+                 if (chainError != null) Write($"chain exception: {chainError}");
+                 Write($"chain returned {rc} after {Took(chainTook)}");
+-                failedRun = rc != 0 || chainError != null;
++                if (askedBefore && outcome is StopOutcome.Finished or StopOutcome.Failed) Write("the stop came too late: the chain had already ended");
++                failedRun = outcome == StopOutcome.Failed;
+                 Write($"memory at the end: {GameAppMain.MemLine()}");
+                 Write($"free space at the end: {GameAppMain.FreeSpace()}");
+                 if (!RestartForStage3(rc, chainError)) Finish();   // GameAppResume.cs: the chain may end on purpose before stage 3
+@@ -2710,9 +2742,10 @@
+         lastRunEnd = DateTime.Now;
+         StopTicker();
+         buildFinished = true;
+-        BackgroundEnd(!failedRun);   // GameAppBackground.cs
++        bool byUser = StopEnding();   // GameAppStopUi.cs: a pause is kept (record, queue), a cancel cleans up in the background; neither is a failure
++        BackgroundEnd(!failedRun, paused: byUser && stop.State == StopState.Paused);   // GameAppBackground.cs
+         StopThermalFile();
+-        NotifyBuildEnded();
++        if (!byUser) NotifyBuildEnded();   // "Built" / "stopped: see why": a pause or a cancel is neither
+         QueueBuildEnded();
+         RefreshRunLine();
+         RefreshBuildScreen();
+@@ -2763,6 +2796,7 @@
+             // (docs/PROFILE-DERIVED.md).
+             RefreshBuildScreen();
+             RefreshRunLine();
++            UpdateNowCard(null);   // the Build tab's card: the clock, the percentage, "Pausing…"
+             sizes.Request();   // the shader cache grows while a build runs: measured again at most every 60 s, off the main thread (FolderSizes), the bars drawn again when it is in
+             // The bar follows the stage and never goes back inside one run.
+             BackgroundTick();   // GameAppBackground.cs: the system's progress UI
+diff -ruN a/GameAppQueue.cs b/GameAppQueue.cs
+--- a/GameAppQueue.cs
++++ b/GameAppQueue.cs
+@@ -23,7 +23,7 @@
+ 
+ public static class BuildQueue
+ {
+-    public const string Queued = "queued", Running = "running", Failed = "failed";
++    public const string Queued = "queued", Running = "running", Failed = "failed", Paused = "paused";
+ 
+     public static BuildQueueState Parse(string text)
+     {
+@@ -39,7 +39,7 @@
+             }
+             var p = line.Split('\t');
+             var kind = p.Length > 1 ? p[1] : Queued;
+-            if (kind != Queued && kind != Running && kind != Failed) kind = Queued;
++            if (kind != Queued && kind != Running && kind != Failed && kind != Paused) kind = Queued;
+             if (p[0].Length > 0 && !state.Items.Any(i => i.Game == p[0])) state.Items.Add(new QueueItem(p[0], kind, p.Length > 2 ? p[2] : ""));
+         }
+         return state;
+@@ -67,6 +67,20 @@
+     public static QueueItem Next(BuildQueueState state) => state.Items.FirstOrDefault(i => i.State == Queued);
+ 
+     public static void MarkRunning(BuildQueueState state, string game) => Replace(state, game, Running, "");
++
++    /// The person paused the build of this game: it stays in the queue as paused (Next skips it: nothing restarts it by itself), and the queue stops going on by itself.
++    public static void Pause(BuildQueueState state, string game, string note)
++    {
++        Replace(state, game, Paused, note ?? "");
++        state.AutoStart = false;
++    }
++
++    /// The person cancelled the build of this game: it leaves the queue and the queue stops.
++    public static void Cancelled(BuildQueueState state, string game)
++    {
++        Remove(state, game);
++        state.AutoStart = false;
++    }
+ 
+     /// A queued build ended: a good one leaves the queue; a failed one stays with the reason, and the queue goes on.
+     public static void Ended(BuildQueueState state, string game, bool ok, string note)
+diff -ruN a/GameAppQueueUi.cs b/GameAppQueueUi.cs
+--- a/GameAppQueueUi.cs
++++ b/GameAppQueueUi.cs
+@@ -105,6 +105,7 @@
+         {
+             var game = item.Game;
+             string sub = item.State == BuildQueue.Running ? "Building now"
++                       : item.State == BuildQueue.Paused ? (string.IsNullOrEmpty(item.Note) ? "Paused" : item.Note) + " · Resume it in the Build tab"
+                        : item.State == BuildQueue.Failed ? "Stopped: " + (string.IsNullOrEmpty(item.Note) ? "see the log" : item.Note)
+                        : first ? "Next" : "Waiting";
+             if (item.State == BuildQueue.Queued) first = false;
+@@ -125,15 +126,17 @@
+         c.AttributedTitle = new Foundation.NSAttributedString(text, new UIStringAttributes { Font = Theme.Font(16, UIFontWeight.Semibold) });
+         c.Image = UIImage.GetSystemImage(queueWanted ? "stop.fill" : "play.fill");
+         queueStart.Configuration = c;
+-        queueStart.Enabled = queueWanted || BuildQueue.Next(buildQueue) != null;
++        queueStart.Enabled = queueWanted || BuildQueue.Next(buildQueue) != null || QueueStartPlan.For(buildQueue).PausedFirst != null;
+         queueStatus.Text = buildQueue.Items.Count == 0 ? "Nothing queued: a game's ··· menu in the library has Add to the build queue."
+                          : coolWaiter != null ? $"Waiting for the {GameAppUi.DeviceName} to cool down: the next build starts by itself."
+                          : queueWanted && running ? "Building. The next game starts after this one."
++                         : QueueStartPlan.For(buildQueue).PausedFirst is QueueItem pausedItem ? $"{GameAppUi.DisplayName(pausedItem.Game)} is paused: the queue asks before it starts anything."
+                          : "";
+     }
+ 
+-    private void ToggleQueue()
++    private void ToggleQueue(bool skipPausedQuestion = false)
+     {
++        if (!queueWanted && !skipPausedQuestion && AskAboutPausedInQueue()) return;   // GameAppStopUi.cs: a paused build is never restarted behind the person's back
+         if (queueWanted)
+         {
+             queueWanted = false;
+@@ -206,6 +209,7 @@
+     /// turn goes to the next game (a launch of its own) or, with none left, the queue is done.
+     private void QueueBuildEnded()
+     {
++        if (runOutcome == StopOutcome.Paused || runOutcome == StopOutcome.Cancelled) return;   // the person stopped it: StopEnding() already moved the queue (QueuePaused / QueueCancelled)
+         if (queueGame != null)
+         {
+             BuildQueue.Ended(buildQueue, queueGame, !failedRun, failedRun ? "the build stopped: see the log" : "");
+diff -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs
++++ b/GameAppShelf.cs
+@@ -86,7 +86,7 @@
+ 
+ public sealed partial class GameAppViewController
+ {
+-    private sealed record ShelfAct(string Title, string Symbol, bool Primary, Action Do, UIMenu Menu = null);
++    private sealed record ShelfAct(string Title, string Symbol, bool Primary, Action Do, UIMenu Menu = null, string Id = null);
+ 
+     // ---- Library -----------------------------------------------------------------------------------------------
+ 
+@@ -148,6 +148,7 @@
+     private static UIButton ShelfActButton(ShelfAct a, bool compact, bool enabled, UIColor tint = null)
+     {
+         var b = ShelfButton(a.Title, a.Symbol, a.Primary, compact || a.Symbol == "ellipsis", enabled, tint);   // the "more" menu is an icon
++        if (a.Id != null) b.AccessibilityIdentifier = a.Id;
+         if (a.Menu != null) { b.Menu = a.Menu; b.ShowsMenuAsPrimaryAction = true; }
+         else b.TouchUpInside += (_, __) => a.Do();
+         return b;
+@@ -236,6 +237,14 @@
+             acts.Add(new ShelfAct("Watch the build", "list.bullet.rectangle", false, ShowBuildScreen));
+             return acts;
+         }
++        // A build the person paused: its chip says so with the progress, and Resume is the button (Cancel is in the long-press menu and on the Build tab)
++        var pausedBuild = PausedOf(name, facts);
++        if (pausedBuild != null)
++        {
++            chip = StopText.PausedChip(pausedBuild.StageLine); tone = Theme.Warn;
++            acts.Add(new ShelfAct("Resume", "play.fill", true, () => ResumePaused(name), null, "game-resume"));
++            return acts;
++        }
+         var next = GameAppUi.GameAction(name, facts);
+         var names = Dumps().Select(Path.GetFileName).ToList();
+         bool ready = GameAppUi.GameStatusOf(name, facts) == GameAppUi.GameStatus.Ready;
+@@ -281,7 +290,10 @@
+         bool ready = GameAppUi.GameStatusOf(e.Name, facts) == GameAppUi.GameStatus.Ready;
+         if (ready && !acts.Any(a => a.Title == "Export IPA") && !facts.Running)
+             items.Add(UIAction.Create("Export as IPA…", UIImage.GetSystemImage("square.and.arrow.up"), null, _ => { selected = e.Name; ConfirmExport(e.Name); }));
++        if (PausedOf(e.Name, facts) != null)
++            items.Add(UIAction.Create("Cancel the paused build…", UIImage.GetSystemImage("xmark"), "build-cancel", _ => AskCancel(e.Name)));
+         items.Add(UIAction.Create("Game settings", UIImage.GetSystemImage("gearshape"), null, _ => ShowGameSheet(e, true)));
++        if (e.Cloud == null || File.Exists(Path.Combine(GameAppMain.Documents, e.Name))) items.Add(CoverMenu(e.Name));   // GameAppCoverUi.cs: Photo Library…, Files…, Remove custom cover
+         var path = Path.Combine(GameAppMain.Documents, e.Name);
+         items.Add(UIAction.Create("Add to the build queue", UIImage.GetSystemImage("list.number"), null, _ => AddToBuildQueue(e.Name)));
+         foreach (var target in UploadTargets())
+@@ -500,7 +512,9 @@
+         buildNowBar = new UIProgressView(UIProgressViewStyle.Default) { ProgressTintColor = Theme.Accent, TrackTintColor = UIColor.FromWhiteAlpha(1f, 0.14f) };
+         var watch = Theme.Pill("Watch the build", "list.bullet.rectangle", false, 44);
+         watch.TouchUpInside += (_, __) => ShowBuildScreen();
+-        buildNowCard = Theme.Wrap(Theme.Column(8, buildNowLine, buildNowBar, watch), 20, 14);
++        buildWatch = watch;
++        BuildStopButtons();   // GameAppStopUi.cs: Pause, Resume, Cancel
++        buildNowCard = Theme.Wrap(Theme.Column(8, buildNowLine, buildNowBar, buildStopRow, watch), 20, 14);
+         buildNowCard.Hidden = true;
+ 
+         // The queue's own views (BuildQueuePage made them): the list, its note and Start/Stop
+@@ -607,15 +621,8 @@
+         var cloud = GameExport.IsPlayer ? new List<CloudFile>() : Cloud.CloudOnlyGames(localNames, cloudFiles);
+         buildSub.Text = $"{phone.Count} on this {GameAppUi.DeviceName}" + (cloud.Count > 0 ? $" · {cloud.Count} in the cloud" : "") + (buildQueue.Items.Count > 0 ? $" · {buildQueue.Items.Count} queued" : "");
+ 
+-        // Now: the build that is running
+-        buildNowCard.Hidden = !running;
+-        if (running)
+-        {
+-            var s = GameAppUi.ParseStage(lastStage);
+-            var step = GameAppUi.BuildSteps(lastStage, stepStarts, DateTime.Now).FirstOrDefault(r => r.State == GameAppUi.StepState.Now);
+-            buildNowLine.Text = $"{GameAppUi.DisplayName(selected ?? "")} · {Math.Round(s.Fraction * 100):0}% · {step?.Name ?? "Starting"} · {GameAppUi.FormatElapsed(DateTime.Now - startedAt)}";
+-            buildNowBar.Progress = (float) Math.Max(0.02, s.Fraction);
+-        }
++        // Now: the build that is running (Pause, Cancel), being stopped, or paused (Resume, Cancel): GameAppStopUi.cs
++        UpdateNowCard(facts);
+         buildQueueSection.Hidden = buildQueue.Items.Count == 0 && !queueWanted;
+ 
+         // On this phone
+@@ -630,6 +637,13 @@
+             var frac = CoverFraction(name, facts);
+             string chip; UIColor tone;
+             if (running && frac != null) { chip = $"Building {Math.Round(frac.Value * 100):0}%"; tone = Theme.Accent; }
++            else if (PausedOf(name, facts) is PausedBuild pausedRow)
++            {
++                chip = StopText.PausedLine(pausedRow.StageLine); tone = Theme.Warn;
++                acts.Add(new ShelfAct("Resume", "play.fill", true, () => ResumePaused(name), null, "build-row-resume"));
++                acts.Add(new ShelfAct("Cancel", "xmark", false, () => AskCancel(name), null, "build-row-cancel"));
++                acts.Add(new ShelfAct("More", "ellipsis", false, null, UIMenu.Create(new UIMenuElement[] { CoverMenu(name) })));
++            }
+             else
+             {
+                 var more = new List<UIMenuElement>();
+@@ -637,8 +651,10 @@
+                 else if (update) { chip = "Update available"; tone = Theme.Accent; acts.Add(new ShelfAct("Update", "arrow.triangle.2.circlepath", true, () => DoUpdate(name))); }
+                 else { chip = "Built"; tone = Theme.Ok; acts.Add(new ShelfAct("Rebuild", "arrow.clockwise", false, () => ConfirmRebuild(name))); }
+                 if (isBase) more.Add(UIMenu.Create("Update & DLC", UIImage.GetSystemImage("plus"), UIMenuIdentifier.None, UIMenuOptions.DisplayInline, ContentMenu(name, facts).Children));
++                more.Add(CoverMenu(name));   // GameAppCoverUi.cs
+                 if (more.Count > 0) acts.Add(new ShelfAct("More", "ellipsis", false, null, UIMenu.Create(more.ToArray())));
+             }
++            if (stop.State == StopState.Cancelled && stop.Game == name && chip == "Not built yet") { chip = StopText.Cancelled(); tone = Theme.Muted; }   // "Cancelled" until the next run or launch
+             var cloudCopy = Cloud.CloudCopyOf(name, cloudFiles);
+             phoneList.AddArrangedSubview(BuildRow(CoverOf(name, facts), GameAppUi.DisplayName(name), GameAppUi.SizeText(SafeLength(Path.Combine(GameAppMain.Documents, name))) + (cloudCopy != null ? " · also in the cloud" : ""),
+                                                   false, frac, chip, tone, acts, !facts.Running, i == 0));
+@@ -984,6 +1000,7 @@
+         // GAME
+         var gameRows = new List<UIView>();
+         gameRows.Add(SettingsRow("Game settings", () => nav.PushViewController(SettingsPage(), true), true, false, -1, "sheet-game-settings").Button);
++        if (!GameExport.IsPlayer) gameRows.Add(SettingsRow("Choose a cover…", () => Then(() => ShowCoverChooser(game)), true, false, -1, "cover-choose").Button);   // GameAppCoverUi.cs
+         if (tid != null) gameRows.Add(SettingsRow("Saves", () => Then(() => ShowSaves(game)), true, false).Button);
+         if (tid != null && !GameExport.IsPlayer) gameRows.Add(SettingsRow("Mods and cheats", () => Then(() => ShowMods(game, ready)), true, false).Button);
+         bool isBase = GameAppUi.ContentKindOf(game) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(game);
+@@ -1034,6 +1051,7 @@
+         var logs = SettingsRow("Logs", () => Then(() => ShareGameLogs(game, View)), true, false);
+         more.Add(logs.Button);
+         more.Add(SettingsRow("Show in Files", () => ShowInFiles(Path.Combine(docs, game)), true, false).Button);
++        if (PausedOf(game, facts) != null) more.Add(SettingsRow("Cancel the paused build…", () => Then(() => AskCancel(game)), false, false, -1, "sheet-cancel-build").Button);
+         more.Add(SettingsRow("Add to the build queue", () => Then(() => AddToBuildQueue(game)), true, false).Button);
+         bool canRebuild = !GameExport.IsPlayer && GameAppUi.ShowRebuild(facts) && ready;
+         if (canRebuild) more.Add(SettingsRow("Rebuild from scratch…", () => Then(() => ConfirmRebuild(game)), false, false).Button);
+diff -ruN a/GameAppStop.cs b/GameAppStop.cs
+--- a/GameAppStop.cs
++++ b/GameAppStop.cs
+@@ -0,0 +1,461 @@
++// gameapp/GameAppStop.cs -- Pause, Cancel and Resume of a running build: the state machine and the decisions, with no UIKit (the host harness compiles this file as it is; patch 0065).
++//
++// What the Rust chain gives (app/gameapp_shim_rust.c, docs/chain/PIPELINE-RUST.md):
++//   gameapp_request_stop(kind)   1 = pause, 2 = cancel, anything else withdraws; thread-safe, needs no handle; a cancel overrides a pause. The request is CLEARED when a run starts, so it is raised only while
++//                                gameapp_run_chain is on the stack; a Pause or Cancel pressed before that (the C# extraction of an NSP/XCI runs first, in the same process) is kept here (Pending) and applied
++//                                before the chain is called: nothing is started, the run ends as paused / cancelled at once.
++//   gameapp_run_chain() -> 131   paused: extract/, the rewrite cache, every finished shader in shadercache/ and the shader build's .work folder are kept, nothing is half written.
++//                       130      cancelled: the same state; the app decides what to delete (CancelPlan).
++//   Documents/shaders/<id>.work/stopped.by.user   "pause|cancel <iso time>", written only when stage 3 was cut; no gameapp.continue, no gameapp.killed: the app says "Paused" itself (Recovery).
++//   Resume = the chain called again with the same config (ResumePlan; a Switch 2 game also needs Documents/gameapp.continue.run or its 26 GB package is read again).
++//
++// The states (StopMachine):  Idle -> Running -> Pausing -> Paused -> Running (resume)
++//                                      Running|Pausing -> Cancelling -> Cancelled        Paused -> Cancelling -> Cancelled (no chain on the stack: only the cleanup)
++// Everything here is a function of plain values; GameAppStopUi.cs (the view controller's half) calls it and draws what comes back.
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Linq;
++using System.Text;
++using System.Text.RegularExpressions;
++
++public enum StopState { Idle, Running, Pausing, Paused, Cancelling, Cancelled }
++
++/// The request, as gameapp_request_stop takes it.
++public enum StopKind { None = 0, Pause = 1, Cancel = 2 }
++
++/// Where a run is: the app's own extraction of an NSP/XCI (it cannot be interrupted: a stop waits for its end) or the chain (it stops at the next shader).
++public enum StopPhase { Extracting, Chain }
++
++/// What a run's end means.
++public enum StopOutcome { Finished, Failed, Paused, Cancelled }
++
++/// "Cancel and keep the extracted game (next build starts faster)" or "Cancel and free the space".
++public enum CancelChoice { KeepExtracted, FreeSpace }
++
++/// What a button press asks the app to do: Native = call gameapp_request_stop(Kind) now (off the main thread); Remembered = the chain is not running yet, the request waits for it; NoChain = nothing runs, the
++/// cleanup alone; Ignored = nothing (a second tap, a pause over a cancel, a stop of something that is not a build).
++public enum StopAct { Ignored, Native, Remembered, NoChain }
++
++public sealed record StopStep(StopAct Act, StopKind Kind);
++
++/// What to do just before gameapp_run_chain: Start it, or do not (a stop was asked for during the extraction).
++public sealed record ChainDecision(bool Start, StopKind Pending);
++
++public static class StopCodes
++{
++    /// gameapp_run_chain's results for a stop (passed through unchanged by the shim).
++    public const int Cancelled = 130, Paused = 131;
++    public static bool IsStop(int rc) => rc == Cancelled || rc == Paused;
++}
++
++/// The state of the build the user can stop. Thread-safe: the buttons are on the main thread, the chain's start and return are on the run's worker thread. Methods return what the caller must DO; they never
++/// call the library themselves (so the harness can run every transition).
++public sealed class StopMachine
++{
++    private readonly object gate = new object();
++    private StopState state = StopState.Idle;
++    private string game;
++    private StopPhase phase = StopPhase.Extracting;
++    private bool chainOnStack, stoppable = true, extracted;
++    private StopKind pending = StopKind.None;
++    private CancelChoice choice = CancelChoice.KeepExtracted;
++    private bool chainRan;
++
++    public StopState State { get { lock (gate) return state; } }
++    public string Game { get { lock (gate) return game; } }
++    public StopPhase Phase { get { lock (gate) return phase; } }
++    public bool ChainOnStack { get { lock (gate) return chainOnStack; } }
++    /// A request made before the chain was on the stack, waiting for it.
++    public StopKind Pending { get { lock (gate) return pending; } }
++    public CancelChoice Choice { get { lock (gate) return choice; } }
++    /// The app's extraction of this run ended well (or the run has none): extract/ holds this game.
++    public bool Extracted { get { lock (gate) return extracted; } }
++    /// The chain was entered in this run (it clears the previous build's stamp when it starts).
++    public bool ChainRan { get { lock (gate) return chainRan; } }
++
++    /// A run is going, a stop is being honoured, or a cleanup is going on: nothing else may start.
++    public bool Busy { get { lock (gate) return state is StopState.Running or StopState.Pausing or StopState.Cancelling; } }
++    /// The Pause / Cancel buttons of the running-build card.
++    public bool Stoppable { get { lock (gate) return stoppable && state is StopState.Running or StopState.Pausing or StopState.Cancelling; } }
++
++    /// A run starts (BeginRun: a new build, or the resume of a paused one). False when one is still going (the caller does not start another).
++    /// `stoppable`: a build (a boot of a built game is not stopped by Pause); `extracting`: the app's own extraction comes first.
++    public bool Begin(string gameFile, bool stoppable, bool extracting)
++    {
++        lock (gate)
++        {
++            if (state is StopState.Running or StopState.Pausing or StopState.Cancelling) return false;
++            state = StopState.Running;
++            game = gameFile;
++            this.stoppable = stoppable;
++            phase = extracting ? StopPhase.Extracting : StopPhase.Chain;
++            extracted = !extracting;
++            chainOnStack = false;
++            chainRan = false;
++            pending = StopKind.None;
++            choice = CancelChoice.KeepExtracted;
++            return true;
++        }
++    }
++
++    /// The Pause button (or the system ending the continued-processing task, which is a pause).
++    public StopStep Pause()
++    {
++        lock (gate)
++        {
++            if (state != StopState.Running || !stoppable) return new StopStep(StopAct.Ignored, StopKind.None);
++            state = StopState.Pausing;
++            if (chainOnStack) return new StopStep(StopAct.Native, StopKind.Pause);
++            pending = StopKind.Pause;
++            return new StopStep(StopAct.Remembered, StopKind.Pause);
++        }
++    }
++
++    /// The Cancel button, after the confirmation, with the choice of what to keep. A cancel overrides a pause. From Paused nothing runs: NoChain (the cleanup only).
++    public StopStep Cancel(CancelChoice what)
++    {
++        lock (gate)
++        {
++            if (state == StopState.Paused)
++            {
++                state = StopState.Cancelling;
++                choice = what;
++                chainOnStack = false;
++                return new StopStep(StopAct.NoChain, StopKind.Cancel);
++            }
++            if ((state != StopState.Running && state != StopState.Pausing) || !stoppable) return new StopStep(StopAct.Ignored, StopKind.None);
++            state = StopState.Cancelling;
++            choice = what;
++            if (chainOnStack) return new StopStep(StopAct.Native, StopKind.Cancel);
++            pending = StopKind.Cancel;
++            return new StopStep(StopAct.Remembered, StopKind.Cancel);
++        }
++    }
++
++    /// Just before gameapp_run_chain, on the worker thread: with a request waiting the chain is NOT started. Otherwise the chain is on the stack from here on (a button now raises the request itself).
++    public ChainDecision ChainStarting()
++    {
++        lock (gate)
++        {
++            if (pending != StopKind.None) return new ChainDecision(false, pending);
++            chainOnStack = true;
++            chainRan = true;
++            phase = StopPhase.Chain;
++            return new ChainDecision(true, StopKind.None);
++        }
++    }
++
++    /// The request to raise AGAIN, or None: the library clears a request at the start of its run, so one raised in the microseconds around that start would be lost. The app calls this every
++    /// two seconds while a stop is being honoured and raises what it says (raising twice is harmless: a cancel stays a cancel).
++    public StopKind Reassert()
++    {
++        lock (gate)
++        {
++            if (!chainOnStack) return StopKind.None;
++            return state == StopState.Cancelling ? StopKind.Cancel : state == StopState.Pausing ? StopKind.Pause : StopKind.None;
++        }
++    }
++
++    /// The extraction failed (the chain is not started): the run ends as a failure, whatever was asked.
++    public StopOutcome ExtractionFailed()
++    {
++        lock (gate) { Clear(); return StopOutcome.Failed; }
++    }
++
++    /// The chain was not started because a request was waiting: the run ends as paused (the extraction is done and kept) or cancelled (the cleanup follows; CleanupDone ends it).
++    public StopOutcome StoppedBeforeChain()
++    {
++        lock (gate)
++        {
++            extracted = true;
++            var kind = pending;
++            pending = StopKind.None;
++            if (kind == StopKind.Cancel || state == StopState.Cancelling) { state = StopState.Cancelling; return StopOutcome.Cancelled; }
++            state = StopState.Paused;
++            return StopOutcome.Paused;
++        }
++    }
++
++    /// gameapp_run_chain returned `rc` (or threw). 130 and 131 are not failures. A cancel wins over a pause that crossed it; a stop that came too late (the chain finished) is no stop.
++    public StopOutcome ChainReturned(int rc, bool threw)
++    {
++        lock (gate)
++        {
++            chainOnStack = false;
++            pending = StopKind.None;
++            if (threw) { Clear(); return StopOutcome.Failed; }
++            if (rc == StopCodes.Paused)
++            {
++                extracted = true;
++                if (state == StopState.Cancelling) return StopOutcome.Cancelled;
++                state = StopState.Paused;
++                return StopOutcome.Paused;
++            }
++            if (rc == StopCodes.Cancelled)
++            {
++                extracted = true;
++                state = StopState.Cancelling;   // the cleanup (the default choice when nobody chose) follows; CleanupDone ends it
++                return StopOutcome.Cancelled;
++            }
++            Clear();
++            return rc == 0 ? StopOutcome.Finished : StopOutcome.Failed;
++        }
++    }
++
++    /// The cleanup of a cancel is done (or there was none to do).
++    public bool CleanupDone()
++    {
++        lock (gate)
++        {
++            if (state != StopState.Cancelling || chainOnStack) return false;
++            state = StopState.Cancelled;
++            return true;
++        }
++    }
++
++    /// Forget a Paused / Cancelled state (another game was chosen, the build was deleted).
++    public void Forget()
++    {
++        lock (gate) if (state is StopState.Paused or StopState.Cancelled) Clear();
++    }
++
++    private void Clear() { state = StopState.Idle; chainOnStack = false; pending = StopKind.None; }
++}
++
++/// The words of the screen.
++public static class StopText
++{
++    private static readonly Regex Shaders = new Regex(@"\((\d+)/(\d+) shaders\)");
++
++    private static string Inv(FormattableString text) => text.ToString(CultureInfo.InvariantCulture);
++
++    /// "14,990 of 21,990 shaders" for the shader step, else the step in words ("rewrite the code for iPhone"), else null.
++    public static string Progress(string stageLine)
++    {
++        if (string.IsNullOrWhiteSpace(stageLine)) return null;
++        var s = GameAppUi.ParseStage(stageLine);
++        if (!s.Valid) return null;
++        var m = Shaders.Match(s.Text);
++        if (m.Success && long.TryParse(m.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var done) && long.TryParse(m.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var total))
++            return Inv($"{done:N0} of {total:N0} shaders");
++        if (s.Of == 5 && s.Step >= 0 && s.Step < GameAppUi.StepNames.Length) return char.ToLowerInvariant(GameAppUi.StepNames[s.Step][0]) + GameAppUi.StepNames[s.Step].Substring(1);
++        return null;
++    }
++
++    /// "Paused · 14,990 of 21,990 shaders" (the card), "Paused" alone when nothing is known of the progress.
++    public static string PausedLine(string stageLine, bool extractedOnly = false)
++    {
++        var progress = Progress(stageLine);
++        if (progress == null) progress = extractedOnly ? "the game is read" : null;
++        return progress == null ? "Paused" : "Paused · " + progress;
++    }
++
++    /// "Paused · 68%" (the chip on a library tile, which has no room for the line); "Paused" when the progress is not known.
++    public static string PausedChip(string stageLine)
++    {
++        var s = GameAppUi.ParseStage(stageLine);
++        return s.Valid && s.Fraction > 0 ? Inv($"Paused · {Math.Round(s.Fraction * 100):0}%") : "Paused";
++    }
++
++    /// The card's line while a stop is being honoured. The extraction cannot be cut: it is finished first; the chain stops after the shader it is on.
++    public static string Pausing(StopPhase phase, string stageLine)
++    {
++        if (phase == StopPhase.Extracting) return "Pausing… (finishes reading the game)";
++        var s = GameAppUi.ParseStage(stageLine);
++        return s.Valid && s.Of == 5 && s.Step == 3 ? "Pausing… (finishes the current shader)" : "Pausing… (finishes the current step)";
++    }
++
++    public static string Cancelling() => "Cancelling…";
++
++    public static string Cancelled() => "Cancelled";
++
++    /// The dialog's second choice: "Cancel and free the space (4.2 GB)", the size from the cached folder sizes (-1 = not known yet); with a part not known it says "about", with none it says no number.
++    public static string FreeChoice(long extractBytes, long workBytes)
++    {
++        long known = Math.Max(0, extractBytes) + Math.Max(0, workBytes);
++        bool all = extractBytes >= 0 && workBytes >= 0;
++        if (extractBytes < 0 && workBytes < 0) return "Cancel and free the space";
++        return "Cancel and free the space (" + (all ? "" : "at least ") + GameAppUi.SizeText(known) + ")";
++    }
++
++    public const string KeepChoice = "Cancel and keep the extracted game (next build starts faster)";
++}
++
++/// What a cancel deletes: only what the build made, never the shader cache (every finished shader), games/<id>/ (settings, saves, icon, cover, mods, rewrite cache) or the game file.
++public sealed record CancelPlan(IReadOnlyList<string> Folders, IReadOnlyList<string> Files)
++{
++    public const string Extract = "extract", Framework = "DmGameProbe.framework", FrameworkStamp = "gameapp.framework";
++
++    /// Paths relative to Documents. `tid`: the game's id (null when the file name has none and it was never read: its .work folder cannot be named, and is not guessed).
++    /// `extractIsThis`: extract/ still holds THIS game's extraction (a paused build whose extraction another game's build replaced has no extract/ to delete: that is the other game's). `frameworkIsPartial`: a framework folder is on disk and no finished build of ANOTHER game owns it (the stamp is absent or names this game). `chainRan`: the chain started in this run (it removed the previous
++    /// build's stamp itself); when it did not, the previous build's stamp is removed here, because the extraction has already replaced that build's extract/.
++    public static CancelPlan For(CancelChoice choice, string tid, bool frameworkIsPartial, bool chainRan, bool extractIsThis = true)
++    {
++        var folders = new List<string>();
++        var files = new List<string>();
++        if (!string.IsNullOrEmpty(tid)) folders.Add(StopFiles.WorkFolder(tid));
++        if (!extractIsThis) return new CancelPlan(folders, files);   // extract/ and the framework are another game's now (a later build replaced this game's extraction): only this game's own work folder goes
++        if (choice == CancelChoice.FreeSpace)
++        {
++            folders.Add(Extract);
++            if (frameworkIsPartial) folders.Add(Framework);
++        }
++        if (choice == CancelChoice.FreeSpace || !chainRan) files.Add(FrameworkStamp);
++        return new CancelPlan(folders, files);
++    }
++
++    /// The paths that must never be in a plan (the tests check every plan against them): the shader cache, games/, the game file.
++    public static bool Forbidden(string relative, string gameFile)
++    {
++        if (string.IsNullOrEmpty(relative)) return true;
++        var p = relative.Replace('\\', '/').Trim('/');
++        return p == "shadercache" || p.StartsWith("shadercache/", StringComparison.Ordinal)
++            || p == "games" || p.StartsWith("games/", StringComparison.Ordinal)
++            || p == "Documents" || p == "." || p.Contains("..")
++            || (gameFile != null && p == gameFile)
++            || p == "prod.keys" || p == "shaders" || (p.StartsWith("shaders/", StringComparison.Ordinal) && !p.EndsWith(".work", StringComparison.Ordinal));
++    }
++}
++
++/// The names of what the chain leaves.
++public static class StopFiles
++{
++    public const string Marker = "stopped.by.user";
++
++    /// `shaders/<id>.work`, relative to Documents.
++    public static string WorkFolder(string tid) => "shaders/" + tid + ".work";
++
++    public static string MarkerPath(string tid) => WorkFolder(tid) + "/" + Marker;
++
++    /// The marker's text: "pause 2026-11-20T01:02:03Z" or "cancel ...". Null kind for anything else.
++    public static (StopKind Kind, string At) ParseMarker(string text)
++    {
++        if (string.IsNullOrWhiteSpace(text)) return (StopKind.None, null);
++        var parts = text.Trim().Split(new[] { ' ', '\t', '\n' }, 2, StringSplitOptions.RemoveEmptyEntries);
++        var kind = parts[0] == "pause" ? StopKind.Pause : parts[0] == "cancel" ? StopKind.Cancel : StopKind.None;
++        return (kind, parts.Length > 1 ? parts[1].Trim() : null);
++    }
++
++    /// Documents/gameapp.continue.run for a Switch 2 or an already extracted game: the chain reads it once (take_continue). NEVER gameapp.continue: a launch would continue that by itself.
++    public static string ContinueRunText(string game, int stage, string why) => Inv($"game={game}\nstage={stage}\nwhy={why}\n");
++
++    private static string Inv(FormattableString text) => text.ToString(CultureInfo.InvariantCulture);
++}
++
++/// A build paused by the person: what Resume needs and what the cards say.
++public sealed record PausedBuild(string Game, string Tid, bool Extracted, int StageNumber, string StageLine, string At);
++
++/// Documents/gameapp.paused.tsv: the paused builds, one line each (game, id, extracted 0/1, stage number, time, the last stage line). The chain writes a marker only when stage 3 was cut; a pause during the
++/// extraction or the rewrite leaves none, and the progress ("14,990 of 21,990 shaders") is the app's to remember.
++public static class PausedStore
++{
++    public static List<PausedBuild> Parse(string text)
++    {
++        var list = new List<PausedBuild>();
++        foreach (var raw in (text ?? "").Split('\n'))
++        {
++            var line = raw.TrimEnd('\r');
++            if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
++            var p = line.Split('\t');
++            if (p.Length < 6 || p[0].Length == 0 || list.Any(r => r.Game == p[0])) continue;
++            int.TryParse(p[3], NumberStyles.None, CultureInfo.InvariantCulture, out var n);
++            list.Add(new PausedBuild(p[0], p[1].Length == 0 ? null : p[1], p[2] == "1", n, p[5].Length == 0 ? null : p[5], p[4]));
++        }
++        return list;
++    }
++
++    public static string Format(IEnumerable<PausedBuild> list)
++    {
++        var sb = new StringBuilder("# paused builds: game, title id, extract/ holds it (0/1), stage number, paused at, last stage line\n");
++        foreach (var r in list)
++            sb.Append(Clean(r.Game)).Append('\t').Append(Clean(r.Tid)).Append('\t').Append(r.Extracted ? '1' : '0').Append('\t').Append(r.StageNumber.ToString(CultureInfo.InvariantCulture))
++              .Append('\t').Append(Clean(r.At)).Append('\t').Append(Clean(r.StageLine)).Append('\n');
++        return sb.ToString();
++    }
++
++    private static string Clean(string s) => (s ?? "").Replace('\t', ' ').Replace('\n', ' ').Replace('\r', ' ');
++
++    /// Adds or replaces the game's record.
++    public static List<PausedBuild> Upsert(IEnumerable<PausedBuild> list, PausedBuild record)
++    {
++        var next = list.Where(r => r.Game != record.Game).ToList();
++        next.Add(record);
++        return next;
++    }
++
++    public static List<PausedBuild> Remove(IEnumerable<PausedBuild> list, string game) => list.Where(r => r.Game != game).ToList();
++
++    /// Another game's run replaced extract/: the others' extraction is gone, a resume of them reads their game again (their shaders are kept all the same).
++    public static List<PausedBuild> ExtractReplacedBy(IEnumerable<PausedBuild> list, string game) =>
++        list.Select(r => r.Game == game || !r.Extracted ? r : r with { Extracted = false }).ToList();
++
++    /// A pause pressed before the RESUMED run wrote a stage line of its own (it is in the seconds the chain skips what is done) knows nothing new: it keeps what the earlier pause knew, as long as extract/
++    /// was still that game's (a Switch 2 package is not read again for it).
++    public static PausedBuild Inherit(PausedBuild fresh, PausedBuild previous)
++    {
++        if (previous == null || !previous.Extracted || fresh.StageNumber > 0 || fresh.Game != previous.Game) return fresh;
++        return fresh with { Extracted = true, StageNumber = previous.StageNumber, StageLine = previous.StageLine };
++    }
++
++    /// The record a pause leaves.
++    public static PausedBuild For(string game, string tid, bool extracted, string stageLine, DateTime now)
++    {
++        var s = GameAppUi.ParseStage(stageLine);
++        return new PausedBuild(game, tid, extracted, s.Valid ? s.Step : 0, string.IsNullOrWhiteSpace(stageLine) ? null : stageLine.Trim(), now.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture));
++    }
++}
++
++/// One game of the library as the launch finds it on disk.
++public sealed record RecoveryGame(string Game, string Tid, string MarkerText);
++
++/// What the launch can see: gameapp.killed (the game iOS ended: that flow is not a pause), the game whose finished framework is on disk, the paused list's text, the games with their markers.
++public sealed record RecoveryFacts(string KilledGame, string FreshFrameworkGame, string PausedText, IReadOnlyList<RecoveryGame> Games);
++
++public sealed record Recovery(List<PausedBuild> Paused, List<string> CancelledWork, bool StoreChanged);
++
++public static class StopRecovery
++{
++    /// The paused builds after a launch, from the files: a game is paused when the shader build's marker says "pause" (or the app's own list says so: a pause before stage 3), gameapp.killed does not name it (iOS
++    /// ended that run: the "interrupted, resume" flow stays as it is) and its framework is not built. A marker that says "cancel" is a cancel whose cleanup never finished: its .work folder is to be removed
++    /// (the one part both choices have in common).
++    public static Recovery Rebuild(RecoveryFacts f)
++    {
++        var records = PausedStore.Parse(f.PausedText);
++        var paused = new List<PausedBuild>();
++        var cancelled = new List<string>();
++        foreach (var g in f.Games ?? Array.Empty<RecoveryGame>())
++        {
++            var record = records.FirstOrDefault(r => r.Game == g.Game);
++            var (kind, at) = string.IsNullOrEmpty(g.Tid) ? (StopKind.None, null) : StopFiles.ParseMarker(g.MarkerText);
++            if (kind == StopKind.Cancel) { cancelled.Add(g.Tid); continue; }
++            if (f.KilledGame == g.Game || f.FreshFrameworkGame == g.Game) continue;
++            if (kind != StopKind.Pause && record == null) continue;
++            paused.Add(record != null ? record with { Tid = string.IsNullOrEmpty(g.Tid) ? record.Tid : g.Tid } : new PausedBuild(g.Game, g.Tid, false, 0, null, at));
++        }
++        bool changed = !PausedStore.Format(paused).Equals(PausedStore.Format(records), StringComparison.Ordinal);
++        return new Recovery(paused, cancelled, changed);
++    }
++}
++
++public enum ResumeKind { Fresh, Continue }
++
++/// How a paused build starts again.
++public sealed record ResumePlan(ResumeKind Kind, int Stage)
++{
++    /// Fresh: the whole run again (the extraction, or the package read; the shaders already built still come from the cache and the .work folder). Continue: the chain on the files already in extract/, with the
++    /// continuation file for a Switch 2 package (stage 2 or later: the chain does not read it again when ExeFS/main and RomFS.img are there; a stage below 1 means the read itself was cut: it is done again).
++    public static ResumePlan Decide(bool isNup, PausedBuild p)
++    {
++        if (p == null || !p.Extracted) return new ResumePlan(ResumeKind.Fresh, 0);
++        if (isNup) return p.StageNumber >= 1 ? new ResumePlan(ResumeKind.Continue, Math.Max(2, p.StageNumber)) : new ResumePlan(ResumeKind.Fresh, 0);
++        return new ResumePlan(ResumeKind.Continue, Math.Max(1, p.StageNumber));
++    }
++}
++
++/// What "Start the queue" does about a paused build: it is never restarted behind the person's back.
++public sealed record QueueStartPlan(QueueItem PausedFirst, QueueItem NextQueued)
++{
++    public static QueueStartPlan For(BuildQueueState state) =>
++        new QueueStartPlan(state.Items.FirstOrDefault(i => i.State == BuildQueue.Paused), BuildQueue.Next(state));
++}
+diff -ruN a/GameAppStopUi.cs b/GameAppStopUi.cs
+--- a/GameAppStopUi.cs
++++ b/GameAppStopUi.cs
+@@ -0,0 +1,467 @@
++// gameapp/GameAppStopUi.cs -- Pause, Cancel and Resume of a running build: the view controller's half (patch 0065). The state machine and every decision are in GameAppStop.cs (no UIKit, run by the host harness).
++//
++//   * Pause / Cancel on the Build tab's running-build card (and the build screen); the card says "Pausing… (finishes the current shader)" / "Cancelling…" and its buttons are disabled while a stop is honoured.
++//   * A paused build keeps a card ("Paused · 14,990 of 21,990 shaders", Resume, Cancel), a chip on its library tile / row and its Build tab row, and survives a relaunch (Documents/gameapp.paused.tsv, the chain's
++//     marker Documents/shaders/<id>.work/stopped.by.user; StopRecovery): a relaunch shows "Paused", not the OS-kill "interrupted, resume" flow, which stays as it is for real kills.
++//   * Nothing here walks or deletes a folder on the main thread: a cancel's cleanup goes to DeleteFolderInBackground (patch 0064), the sizes in the dialog come from the cached FolderSizes, the native request is
++//     raised from a pool thread.
++//   * The request (gameapp_request_stop) is cleared by the chain when a run starts: a Pause or Cancel pressed before the chain is on the stack (the extraction of an NSP/XCI runs first) is kept in the StopMachine
++//     and applied before the chain is called; one raised in the microseconds around the chain's own clear is raised again every 2 s while the stop is honoured.
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Runtime.InteropServices;
++using System.Threading;
++using System.Threading.Tasks;
++
++using BackgroundTasks;
++using Foundation;
++using UIKit;
++
++internal static class GameStopNative
++{
++    /// 1 = pause, 2 = cancel, anything else withdraws; returns the request in effect. Thread-safe, needs no handle (app/gameapp_shim_rust.c).
++    [DllImport("__Internal")] internal static extern int gameapp_request_stop(int kind);
++}
++
++public sealed partial class GameAppViewController
++{
++    private readonly StopMachine stop = new StopMachine();
++    private List<PausedBuild> pausedBuilds = new List<PausedBuild>();
++    private StopOutcome runOutcome = StopOutcome.Finished;   // how the run that just ended ended (set by its worker, read by Finish)
++    private volatile bool pauseRecorded;                     // the paused record is on disk (the system's task waits for it)
++    private PausedBuild resumedFrom;                         // the record of the pause this run resumes (PausedStore.Inherit)
++    private Timer stopNag;
++    private UIButton buildPause, buildResume, buildCancel, buildWatch;
++    private UIView buildStopRow;
++
++    private static string PausedPath => Path.Combine(GameAppMain.Documents, "gameapp.paused.tsv");
++
++    private void SavePaused()
++    {
++        try
++        {
++            if (pausedBuilds.Count == 0) { if (File.Exists(PausedPath)) File.Delete(PausedPath); return; }
++            var part = PausedPath + ".part";
++            File.WriteAllText(part, PausedStore.Format(pausedBuilds));
++            File.Move(part, PausedPath, true);
++        }
++        catch (Exception error) { Write($"paused builds: could not be saved ({error.Message})"); }
++    }
++
++    /// The paused build of this game, or null: none, or its game was built since (a finished framework of this very game is on disk).
++    private PausedBuild PausedOf(string game, UiFacts facts)
++    {
++        if (pausedBuilds.Count == 0 || game == null || (running && stop.Game == game)) return null;
++        var p = pausedBuilds.FirstOrDefault(r => r.Game == game);
++        if (p == null) return null;
++        if (facts != null && facts.Framework == FrameworkState.Fresh && facts.FrameworkGame == game) return null;
++        return p;
++    }
++
++    /// The build screen is showing a stopped build.
++    private bool EndedByUser => stop.State is StopState.Paused or StopState.Cancelling or StopState.Cancelled;
++
++    // ---- launch -------------------------------------------------------------------------------------------------------------
++
++    /// From the files: which builds are paused (and which cancel left its work folder behind). Before the first screen is drawn; a few small reads, one stat a game.
++    private void RecoverStoppedBuilds()
++    {
++        if (GameExport.IsPlayer || running) return;
++        try
++        {
++            var docs = GameAppMain.Documents;
++            string killed = null;
++            try { if (File.Exists(KilledPath)) killed = KeyOf(File.ReadAllText(KilledPath), "game"); } catch (Exception) { }
++            var facts = GatherFacts();
++            var games = (facts.Games ?? new List<string>()).Select(g =>
++            {
++                var tid = GameAppUi.BaseTitleIdOf(g);
++                string marker = null;
++                if (tid != null)
++                    try { var p = Path.Combine(docs, StopFiles.MarkerPath(tid)); if (File.Exists(p)) marker = File.ReadAllText(p); } catch (Exception) { }
++                return new RecoveryGame(g, tid, marker);
++            }).ToList();
++            string text = null;
++            try { if (File.Exists(PausedPath)) text = File.ReadAllText(PausedPath); } catch (Exception) { }
++            var found = StopRecovery.Rebuild(new RecoveryFacts(string.IsNullOrEmpty(killed) ? null : killed, facts.Framework == FrameworkState.Fresh ? facts.FrameworkGame : null, text, games));
++            pausedBuilds = found.Paused;
++            if (found.StoreChanged) SavePaused();
++            foreach (var p in found.Paused) Write($"paused build: {GameAppUi.DisplayName(p.Game)}: {StopText.PausedLine(p.StageLine)} (Resume is on the Build tab)");
++            foreach (var tid in found.CancelledWork)
++            {
++                Write($"cancelled build: removing the work folder it left ({StopFiles.WorkFolder(tid)}) in the background");
++                DeleteFolderInBackground(Path.Combine(docs, StopFiles.WorkFolder(tid)), error => { if (error != null) Write($"cancelled build: the work folder could not be removed: {error}"); });
++            }
++        }
++        catch (Exception error) { Write($"paused builds: could not be read ({error.GetType().Name}: {error.Message})"); }
++    }
++
++    // ---- the run ------------------------------------------------------------------------------------------------------------
++
++    /// BeginRun: a run starts (a new build or a resume). The game's pause is over; extract/ is this game's now, so another paused game's extraction is gone.
++    private void StopBegin(string name, bool bootOnly, bool extracting)
++    {
++        runOutcome = StopOutcome.Finished;
++        pauseRecorded = false;
++        resumedFrom = bootOnly ? null : pausedBuilds.FirstOrDefault(r => r.Game == name);
++        stop.Begin(name, stoppable: !bootOnly, extracting);
++        if (bootOnly) return;
++        var next = PausedStore.ExtractReplacedBy(PausedStore.Remove(pausedBuilds, name), name);
++        if (PausedStore.Format(next) != PausedStore.Format(pausedBuilds)) { pausedBuilds = next; SavePaused(); }
++    }
++
++    /// Finish(): true when the run ended because the person stopped it. A pause is kept (the record, the queue, the system's task), a cancel does its cleanup; neither is a failure.
++    private bool StopEnding()
++    {
++        stopNag?.Dispose();
++        stopNag = null;
++        switch (runOutcome)
++        {
++            case StopOutcome.Paused: RecordPaused(); return true;
++            case StopOutcome.Cancelled: ApplyCancel(stop.Game ?? lastRunGame, stop.Choice, stop.ChainRan); return true;
++            default: return false;
++        }
++    }
++
++    private void RecordPaused()
++    {
++        var game = stop.Game ?? lastRunGame;
++        var tid = GameAppUi.BaseTitleIdOf(game);
++        var record = PausedStore.Inherit(PausedStore.For(game, tid, stop.Extracted, lastStage, DateTime.UtcNow), resumedFrom);
++        if (GameAppUi.IsNup(game)) record = record with { Extracted = record.StageNumber >= 1 };   // a Switch 2 package is read by the chain itself: it was read when the chain got to a stage of its own
++        pausedBuilds = PausedStore.Upsert(pausedBuilds, record);
++        SavePaused();
++        Write($"build paused: {GameAppUi.DisplayName(game)} · {StopText.PausedLine(lastStage)}. What was finished is kept (the extraction, the rewrite, every finished shader); Resume continues from it.");
++        QueuePaused(game, StopText.PausedLine(lastStage));
++        pauseRecorded = true;
++    }
++
++    private bool FrameworkIsPartial(string game)
++    {
++        if (!Directory.Exists(Path.Combine(GameAppMain.Documents, CancelPlan.Framework))) return false;
++        try
++        {
++            var stamp = GameAppUi.ParseFrameworkStamp(File.ReadAllText(FrameworkStampPath));
++            return stamp == null || string.IsNullOrEmpty(stamp.Game) || stamp.Game == game;
++        }
++        catch (Exception) { return true; }   // no stamp: nobody's finished build
++    }
++
++    /// A cancel: the run was cancelled (or a paused build is). What goes depends on the person's choice (CancelPlan); shadercache/, games/<id>/ and the game file never.
++    private void ApplyCancel(string game, CancelChoice choice, bool chainRan, bool extractIsThis = true)
++    {
++        var tid = GameAppUi.BaseTitleIdOf(game);
++        var plan = CancelPlan.For(choice, tid, FrameworkIsPartial(game), chainRan, extractIsThis);
++        pausedBuilds = PausedStore.Remove(pausedBuilds, game);
++        SavePaused();
++        QueueCancelled(game);
++        foreach (var rel in plan.Files)
++            try { var path = Path.Combine(GameAppMain.Documents, rel); if (File.Exists(path)) File.Delete(path); } catch (Exception) { }
++        Write($"build cancelled: {GameAppUi.DisplayName(game)} · {(choice == CancelChoice.FreeSpace ? "freeing the space: " : "keeping the extracted game: ")}{(plan.Folders.Count == 0 ? "nothing to remove" : string.Join(", ", plan.Folders))} (removed in the background)");
++        if (plan.Folders.Count == 0) { CancelCleanupFinished(game); return; }
++        int left = plan.Folders.Count;
++        foreach (var rel in plan.Folders)
++            DeleteFolderInBackground(Path.Combine(GameAppMain.Documents, rel), error =>
++            {
++                if (error != null) Write($"cancel: {rel} could not be removed: {error}");
++                if (--left == 0) CancelCleanupFinished(game);
++            });
++    }
++
++    private void CancelCleanupFinished(string game)
++    {
++        stop.CleanupDone();   // Cancelling -> Cancelled
++        Write($"cancelled: {GameAppUi.DisplayName(game)}");
++        RefreshScreen();
++        UpdateNowCard(null);
++    }
++
++    // ---- the queue ----------------------------------------------------------------------------------------------------------
++
++    /// Pausing stops the queue's auto start and keeps the item queued, as paused.
++    private void QueuePaused(string game, string note)
++    {
++        if (buildQueue.Items.Any(i => i.Game == game)) BuildQueue.Pause(buildQueue, game, note);
++        queueGame = null;
++        queueWanted = false;
++        buildQueue.AutoStart = false;
++        UIApplication.SharedApplication.IdleTimerDisabled = false;
++        SaveBuildQueue();
++    }
++
++    /// Cancelling removes the item from the queue and stops the queue.
++    private void QueueCancelled(string game)
++    {
++        BuildQueue.Cancelled(buildQueue, game);
++        queueGame = null;
++        queueWanted = false;
++        UIApplication.SharedApplication.IdleTimerDisabled = false;
++        SaveBuildQueue();
++    }
++
++    /// "Start the queue" with a paused build in it: it is not restarted behind the person's back. Asks; true when it did (the caller stops).
++    private bool AskAboutPausedInQueue()
++    {
++        var plan = QueueStartPlan.For(buildQueue);
++        if (plan.PausedFirst == null) return false;
++        var game = plan.PausedFirst.Game;
++        var name = GameAppUi.DisplayName(game);
++        var a = UIAlertController.Create($"{name} is paused",
++            $"{StopText.PausedLine(pausedBuilds.FirstOrDefault(r => r.Game == game)?.StageLine)}. Resume it now, and the queue goes on after it" + (plan.NextQueued != null ? ", or start the queue without it." : "."),
++            UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create("Resume " + name, UIAlertActionStyle.Default, _ => ResumePaused(game)));
++        if (plan.NextQueued != null)
++            a.AddAction(UIAlertAction.Create("Start without it", UIAlertActionStyle.Default, _ => ToggleQueue(skipPausedQuestion: true)));
++        a.AddAction(UIAlertAction.Create("Not now", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(a);
++        return true;
++    }
++
++    // ---- the buttons --------------------------------------------------------------------------------------------------------
++
++    private void RaiseStop(StopKind kind)
++    {
++        Task.Run(() =>
++        {
++            try { GameStopNative.gameapp_request_stop((int) kind); }
++            catch (Exception error) { BeginInvokeOnMainThread(() => Write($"stop: the request could not be raised ({error.GetType().Name}: {error.Message})")); }
++        });
++    }
++
++    private void StartStopNag()
++    {
++        stopNag?.Dispose();
++        stopNag = new Timer(_ =>
++        {
++            var kind = stop.Reassert();
++            if (kind != StopKind.None) RaiseStop(kind);
++        }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
++    }
++
++    private void PausePressed()
++    {
++        var step = stop.Pause();
++        if (step.Act == StopAct.Ignored) return;
++        if (step.Act == StopAct.Native) RaiseStop(step.Kind);
++        StartStopNag();
++        Write(step.Act == StopAct.Native ? "pause asked for: the build stops after the shader it is on, and keeps what it finished"
++                                         : "pause asked for: the game is still being read; the build stops as soon as that is done (the chain is not started)");
++        RefreshStopViews();
++    }
++
++    private void RefreshStopViews()
++    {
++        UpdateNowCard(null);
++        RefreshBuildScreen();
++    }
++
++    /// The dialog of a cancel: what to keep. The space it frees is from the cached folder sizes (the extraction and the shader build's work folders), never a walk.
++    private void AskCancel(string game)
++    {
++        if (game == null) return;
++        bool live = running && stop.Game == game;
++        if (live && !stop.Stoppable) return;
++        var paused = live ? null : PausedOf(game, null);
++        if (!live && paused == null) return;
++        if (!live && running) { Write("cancel: another build is running: its extraction is in extract/; cancel this one when that has ended"); return; }
++        sizes.Request();
++        var name = GameAppUi.DisplayName(game);
++        bool extractIsThis = live || paused.Extracted;   // a paused build whose extraction another game's build replaced has no extract/ of its own to keep or free
++        var a = UIAlertController.Create($"Cancel the build of {name}?",
++            (live ? "The build stops after the shader it is on. " : "") + "Every shader already finished stays in the shader cache; the game's settings, saves, cover and mods are never touched. "
++            + (extractIsThis ? "Choose what happens to the files this build made." : "The extracted game belongs to another build now and is not touched: only this game's shader work folder goes."),
++            UIAlertControllerStyle.Alert);
++        if (extractIsThis)
++        {
++            a.AddAction(UIAlertAction.Create(StopText.KeepChoice, UIAlertActionStyle.Default, _ => CancelChosen(game, CancelChoice.KeepExtracted)));
++            a.AddAction(UIAlertAction.Create(StopText.FreeChoice(sizes.Get(FolderSizes.Extract), sizes.Get(FolderSizes.ShaderWork)), UIAlertActionStyle.Destructive, _ => CancelChosen(game, CancelChoice.FreeSpace)));
++        }
++        else a.AddAction(UIAlertAction.Create(StopText.FreeChoice(0, sizes.Get(FolderSizes.ShaderWork)), UIAlertActionStyle.Destructive, _ => CancelChosen(game, CancelChoice.KeepExtracted)));
++        a.AddAction(UIAlertAction.Create(live ? "Keep building" : "Not now", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(a);
++    }
++
++    private void CancelChosen(string game, CancelChoice choice)
++    {
++        if (running && stop.Game == game)
++        {
++            var step = stop.Cancel(choice);
++            if (step.Act == StopAct.Ignored) return;
++            if (step.Act == StopAct.Native) RaiseStop(StopKind.Cancel);
++            StartStopNag();
++            Write("cancel asked for: the build stops after the shader it is on" + (step.Act == StopAct.Remembered ? " (the game is still being read; the chain is not started)" : ""));
++            RefreshStopViews();
++            return;
++        }
++        var record = pausedBuilds.FirstOrDefault(r => r.Game == game);
++        if (record == null || running) return;
++        bool inSession = stop.State == StopState.Paused && stop.Game == game;
++        if (inSession) stop.Cancel(choice);   // Paused -> Cancelling: nothing runs, only the cleanup
++        ApplyCancel(game, choice, inSession ? stop.ChainRan : record.StageNumber >= 1, extractIsThis: inSession || record.Extracted);
++        UpdateNowCard(null);
++        RefreshScreen();
++    }
++
++    /// Resume: the chain again on what was kept. The queue goes on after it when the game was queued.
++    private void ResumePaused(string game)
++    {
++        if (running) return;
++        if (deletes.Busy) { Write("a delete is still going: try again in a moment"); return; }
++        var record = pausedBuilds.FirstOrDefault(r => r.Game == game);
++        if (record == null) { selected = game; PrimaryTapped(); return; }
++        if (AskIfHot(() => ResumePaused(game))) return;
++        selected = game;
++        var plan = ResumePlan.Decide(GameAppUi.IsNup(game), record);
++        if (pythonRanThisProcess)   // a run already came back in this process: the existing restart flows do it (gameapp.args for a build from the start, gameapp.continue for a continuation)
++        {
++            if (plan.Kind == ResumeKind.Continue) AskToRestartToResume(game, plan); else SetUpAndPlay(game);
++            return;
++        }
++        if (buildQueue.Items.Any(i => i.Game == game && i.State == BuildQueue.Paused))
++        {
++            BuildQueue.MarkRunning(buildQueue, game);
++            queueGame = game;
++            queueWanted = true;
++            UIApplication.SharedApplication.IdleTimerDisabled = true;
++            SaveBuildQueue();
++            Write("build queue: continues with the resumed build");
++        }
++        Write($"resuming the build of {GameAppUi.DisplayName(game)} ({(plan.Kind == ResumeKind.Continue ? "on the files kept in Documents/extract" : "from the start: the shaders already finished come from the cache")})");
++        if (plan.Kind == ResumeKind.Continue) StartContinuedBuild(game, plan.Stage, "paused");
++        else SetUpAndPlay(game);
++        RefreshScreen();
++    }
++
++    /// A build already ran in this process (the runtime is started once per process): the app closes, and the next launch resumes by itself (gameapp.continue, the file the launch already reads).
++    private void AskToRestartToResume(string game, ResumePlan plan)
++    {
++        var a = UIAlertController.Create("GameApp starts again", "A run already happened in this session. GameApp closes; open it again and the build resumes by itself.", UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create("Close", UIAlertActionStyle.Default, _ =>
++        {
++            try
++            {
++                File.WriteAllText(ContinuePath, $"game={game}\nstage={plan.Stage}\n");   // the file the launch reads (ContinueBuildAtLaunch): the person asked for it just now
++                Write($"resume of {game}: the app closes and the next launch does it");
++            }
++            catch (Exception error) { Write($"could not record the request: {error.Message}"); return; }
++            kill(getpid(), 15);
++        }));
++        a.AddAction(UIAlertAction.Create("Not now", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(a);
++    }
++
++    // ---- the Build tab's card ------------------------------------------------------------------------------------------------
++
++    /// The card at the top of the Build tab: the running build (Pause, Cancel), a build being stopped (the same, disabled, with the words), or the paused one (Resume, Cancel). `facts` may be null.
++    private void UpdateNowCard(UiFacts facts)
++    {
++        if (buildNowCard == null || buildNowLine == null) return;
++        if (running)
++        {
++            var s = GameAppUi.ParseStage(lastStage);
++            var name = GameAppUi.DisplayName(selected ?? "");
++            var state = stop.State;
++            if (state == StopState.Pausing) buildNowLine.Text = name + "\n" + StopText.Pausing(stop.Phase, lastStage);
++            else if (state == StopState.Cancelling) buildNowLine.Text = name + "\n" + StopText.Cancelling();
++            else
++            {
++                var step = GameAppUi.BuildSteps(lastStage, stepStarts, DateTime.Now).FirstOrDefault(r => r.State == GameAppUi.StepState.Now);
++                buildNowLine.Text = $"{name} · {Math.Round(s.Fraction * 100):0}% · {step?.Name ?? "Starting"} · {GameAppUi.FormatElapsed(DateTime.Now - startedAt)}";
++            }
++            buildNowBar.Progress = (float) Math.Max(0.02, s.Fraction);
++            buildNowCard.Hidden = false;
++            bool stoppable = stop.Stoppable;
++            buildStopRow.Hidden = !stoppable;
++            buildPause.Hidden = false; buildResume.Hidden = true; buildCancel.Hidden = false;
++            buildPause.Enabled = buildCancel.Enabled = state == StopState.Running;   // while a stop is being honoured both are off: 'Pausing…' / 'Cancelling…' is the answer
++            buildWatch.Hidden = false;
++            return;
++        }
++        if (stop.State == StopState.Cancelling)
++        {
++            buildNowCard.Hidden = false;
++            buildNowLine.Text = GameAppUi.DisplayName(stop.Game ?? "") + "\n" + StopText.Cancelling();
++            buildStopRow.Hidden = true; buildWatch.Hidden = true;
++            return;
++        }
++        var paused = CardPaused(facts ?? GatherFacts());
++        buildNowCard.Hidden = paused == null;
++        if (paused == null) return;
++        var ps = GameAppUi.ParseStage(paused.StageLine);
++        buildNowLine.Text = GameAppUi.DisplayName(paused.Game) + "\n" + StopText.PausedLine(paused.StageLine);
++        buildNowBar.Progress = (float) Math.Max(0.02, ps.Valid ? ps.Fraction : 0);
++        buildStopRow.Hidden = false;
++        buildPause.Hidden = true; buildResume.Hidden = false; buildCancel.Hidden = false;
++        buildResume.Enabled = buildCancel.Enabled = !deletes.Busy;
++        buildWatch.Hidden = true;
++    }
++
++    /// The paused build the card shows: the one that was just paused, else the latest.
++    private PausedBuild CardPaused(UiFacts facts)
++    {
++        PausedBuild best = null;
++        foreach (var r in pausedBuilds)
++        {
++            if (PausedOf(r.Game, facts) == null) continue;
++            if (stop.State == StopState.Paused && stop.Game == r.Game) return r;
++            if (best == null || string.CompareOrdinal(r.At, best.At) > 0) best = r;
++        }
++        return best;
++    }
++
++    private void BuildStopButtons()
++    {
++        buildPause = Theme.Pill("Pause", "pause.fill", false, 44);
++        buildPause.AccessibilityIdentifier = "build-pause";
++        buildPause.TouchUpInside += (_, __) => PausePressed();
++        buildResume = Theme.Pill("Resume", "play.fill", true, 44);
++        buildResume.AccessibilityIdentifier = "build-resume";
++        buildResume.Hidden = true;
++        buildResume.TouchUpInside += (_, __) => { var g = CardPaused(GatherFacts())?.Game; if (g != null) ResumePaused(g); };
++        buildCancel = Theme.Pill("Cancel", "xmark", false, 44);
++        buildCancel.AccessibilityIdentifier = "build-cancel";
++        buildCancel.TouchUpInside += (_, __) =>
++        {
++            var g = running ? stop.Game : CardPaused(GatherFacts())?.Game;
++            if (g != null) AskCancel(g);
++        };
++        var row = Theme.Row(8, buildPause, buildResume, buildCancel);
++        row.Distribution = UIStackViewDistribution.FillEqually;
++        buildStopRow = row;
++    }
++
++    // ---- the system's own task (GameAppBackground.cs) ------------------------------------------------------------------------
++
++    /// iOS ended the continued-processing task, or the person tapped its stop button in the Dynamic Island: a PAUSE of the build. Runs on the system's queue. The request goes to the chain, the wait for its return is
++    /// bounded (about 5 s) and off the main thread, the paused record is written by Finish on the main thread (waited for the same way), then the task is completed. Never blocks the main thread.
++    private void PauseFromTheSystem(BGTask task)
++    {
++        Task.Run(() =>
++        {
++            var step = stop.Pause();
++            if (step.Act == StopAct.Native) { try { GameStopNative.gameapp_request_stop((int) StopKind.Pause); } catch (Exception) { } }
++            var until = DateTime.UtcNow + TimeSpan.FromSeconds(5);
++            bool Waiting() { var s = stop.State; return s == StopState.Running || s == StopState.Pausing || (s == StopState.Paused && !pauseRecorded); }
++            while (DateTime.UtcNow < until && Waiting()) Thread.Sleep(50);
++            bool paused = stop.State == StopState.Paused && pauseRecorded;
++            BeginInvokeOnMainThread(() => Write(paused
++                ? "background: the system ended the background task: the build is paused (Resume is on the Build tab)"
++                : "background: the system ended the background task before the build could stop (a build that reads the game cannot be paused until it is read); it goes on while iOS lets this process live"));
++            lock (backgroundLock)
++            {
++                if (backgroundTask != null && ReferenceEquals(backgroundTask, task))
++                {
++                    backgroundTask = null;
++                    if (paused)
++                    {
++                        // a pause is a completed task, not a failure: its title says so for the Dynamic Island and the lock screen
++                        try { if (task is BGContinuedProcessingTask continued) continued.UpdateTitle("Paused: " + GameAppUi.DisplayName(stop.Game ?? ""), StopText.PausedLine(lastStage)); } catch (Exception) { }
++                        try { task.SetTaskCompleted(true); } catch (Exception) { }
++                    }
++                }
++            }
++        });
++    }
++}
+diff -ruN a/GameAppUi.cs b/GameAppUi.cs
+--- a/GameAppUi.cs
++++ b/GameAppUi.cs
+@@ -601,6 +601,7 @@
+             }
+             else folders.Add("games/" + id);
+         }
++        files.AddRange(GameCover.DeletionFiles(fileName));   // the person's own cover (GameAppCover.cs): games/<id>/cover.jpg, or the file name's key before the id was known
+         var buildToo = string.Equals(builtGame, fileName, StringComparison.Ordinal)
+                        || (id != null && string.Equals(builtTitleId, id, StringComparison.OrdinalIgnoreCase));
+         if (buildToo)

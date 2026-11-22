@@ -1,0 +1,531 @@
+# 0091-updates-and-dlc-under-their-game.patch -- the owner's point R: updates and DLC detected automatically, shown under their base game, never as games. Applies after 0090.
+# UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# R. ContentSet (GameAppAttach.cs, pure): every package is a game, an update or a DLC by its title id. From the file name's tag ("[0100…800][v327680]", now also "(0100…800) (v327680)",
+#    "[V65536]", any bracket after it such as "[US]" or "(14.10 GB)"), else from the PACKAGE: the cover pass (NAS, Files folders, this iPhone) now reads the content meta NCA's header
+#    (*.cnmt.nca, GameIconsStream: a DLC has no control data at all) and keeps an update's or a DLC's own id in .titleids.tsv (KeepTitle: a base control NCA wins; an .xci is always a
+#    game), so ContentKindOf says what it is; a name with no id is read by the NAS/Files cover pass too (it was skipped). The rules are the existing helpers' (GameAppUi.BaseTitleIdOf /
+#    ContentKindOf), checked against the extractor (nx_extract opens the update as `app | 0x800`) and hactool's/nxdumptool's: base low 12 bits 000, update base | 0x800, DLC
+#    AddOnContentBaseId (base + 0x1000) + index 1..0x7FF, so its base is (id - 0x1000) & ~0xFFF.
+#    - Never a game of its own: the library and the Build tab list base games only (Cloud.CloudOnlyGames / PlayableGames, already; an untagged update is now recognised); under each game
+#      its extras: the Library's card ("update v327680 · 2 DLC", muted, under its status), the cover flow and the iPad's hero ("On the NAS · update v327680 · 1 DLC · 20.0 GB · not on
+#      this iPhone yet"), the Build tab's rows (local and cloud). A cloud game's size is its whole download (Cloud.DownloadSet: the game, its NEWEST update, all its DLC from the same
+#      source, minus what this iPhone has: one download, one progress, as 0079 already did).
+#    - "Updates and DLC without their game (N)": an update or DLC whose base game is nowhere (this iPhone, any cloud source), once, collapsed, "· waiting for its game", at the end of the
+#      Build tab.
+#    - A file that ARRIVES (Import, Open in, a folder import, Files): at the refresh of Documents each new update or DLC is said once, in the log ("content: …") and in one alert:
+#      "Update v327680 attached to South Park The Fractured but Whole: rebuild to include it" (built) / "…: its build will include it" (not built) / "Update v65536 (<file>): kept, waiting
+#      for its game". A download and "Add an update or DLC…" say theirs themselves (not twice). The build already takes the newest update and every DLC (UpdateFor / DlcFor); a newer
+#      one makes a built game "Update available" (ContentChangedSinceBuild, 0086's "Queue a rebuild").
+#    - Several updates: the newest is used; each older one is a row of the game's sheet and of the not-built sheet: "Older update v65536: remove to save 5.9 GB…" (RemoveAttached, the
+#      app's own question). The log's "games found: 1 (+1 update, 0 DLC)".
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile (-t:Compile):
+#   0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness91: … P90;P91): 322 of 322 checks (19 new: names with and without tags, US/EU tags, [v0][US],
+#   parentheses, an upper-case V, DLC ranges, an untagged update read from its package, KeepTitle, newest/older updates, the extras' lines, the cloud card, the cloud's games, the
+#   download set, the orphans, the arrival words, "games found", the cover pass's reads, the wiring); 12 of 12 mutations killed.
+# NOT VERIFIED: nothing ran on a device: a real content meta NCA read (NAS, Files, this iPhone), the alert at a real import, the look of the extras line and of the collapsed section.
+# NEW UI STRINGS: "Updates and DLC without their game", " · waiting for its game", " attached to ", ": rebuild to include it", ": its build will include it", "): kept, waiting for its
+#   game", "Older update v", ": remove to save ", "Added to its game", "Updates and DLC"; log lines "games found: ", "content: ", ": shown under its game, never as a game".
+diff -ruN l/GameAppAttach.cs m/GameAppAttach.cs
+--- l/GameAppAttach.cs	2026-11-22 01:09:59
++++ m/GameAppAttach.cs	2026-11-22 01:20:18
+@@ -93,7 +93,8 @@
+     public static Do Decide(string name, bool hasKeys, bool iconHere, bool cached, bool failedNow, bool placeholder)
+     {
+         if (!Cloud.IsGameFile(name) || iconHere || failedNow || cached || placeholder) return Do.Skip;
+-        if (GameAppUi.ContentKindOf(name) != GameAppUi.ContentKind.Base) return Do.Skip;   // an update / DLC shows its base game
++        // an update / DLC shows its base game; patch 0091: a name with NO title id is read too: the package says what it is (a game, an update, a DLC: ContentSet.KeepTitle)
++        if (GameAppUi.ContentKindOf(name) is GameAppUi.ContentKind.Update or GameAppUi.ContentKind.AddOn) return Do.Skip;
+         if (GameAppUi.IsNup(name)) return Do.Nup;                                         // not encrypted: no keys
+         return hasKeys ? Do.Package : Do.NeedsKeys;                                        // .nsp .xci .nsz: the control NCA needs prod.keys
+     }
+@@ -138,4 +139,95 @@
+         "keys" => $"cover: {name} ({where}): needs prod.keys (an .nsp, .xci or .nsz cover is read with them)",
+         _ => $"cover: {name} ({where}): read failed: {why ?? "no answer"} (tried again at the next launch)",
+     };
++}
++
++/// Patch 0091 (the owner: updates and DLC detected automatically): every package is a game, an update or a DLC by its title id, from the file name's tag ("[0100…800][v327680]",
++/// "(0100…)", any other bracket after it such as "[US]") or, with none, from the package itself (its content meta NCA's title id, read by the cover pass, kept in .titleids.tsv). The
++/// rules are the extractor's and hactool's / nxdumptool's: a base game's id has its low 12 bits 000; its update is base | 0x800 (nx_extract opens the update as `app | 0x800`); a DLC
++/// is AddOnContentBaseId (base + 0x1000 unless the NACP says otherwise) + its index 1..0x7FF, so its base is (id - 0x1000) & ~0xFFF (GameAppUi.BaseTitleIdOf / ContentKindOf).
++/// An update or a DLC is never a game of its own: it is shown under its base game, downloaded with it, merged by its build; one whose base game is nowhere (on this iPhone or in any
++/// cloud source) is listed once in "Updates and DLC without their game".
++public static class ContentSet
++{
++    public enum Kind { Game, Update, Dlc }
++
++    /// A name with no title id is a game (the extractor decides), as the library has always treated it.
++    public static Kind Of(string name) => GameAppUi.ContentKindOf(name) switch
++    {
++        GameAppUi.ContentKind.Update => Kind.Update,
++        GameAppUi.ContentKind.AddOn => Kind.Dlc,
++        _ => Kind.Game,
++    };
++
++    /// The title the cover pass keeps for a name with no id: a base game's control NCA wins (an .xci may hold the game, its update and DLC: it is the game); else the content's own id
++    /// when the package is an update or a DLC (its meta NCA's: …800, or a DLC's), so ContentKindOf says what it is; else nothing (0).
++    public static ulong KeepTitle(ulong controlTitleId, ulong contentTitleId, bool cartridge = false)
++    {
++        if (CoverPass.BaseIdFromControl(controlTitleId) is ulong b && b != 0) return b;
++        if (cartridge) return CoverPass.BaseIdFromControl(contentTitleId);   // a cartridge image is a game, never an update or a DLC of one
++        if (contentTitleId != 0 && (contentTitleId & 0xFFFUL) != 0) return contentTitleId;
++        return CoverPass.BaseIdFromControl(contentTitleId);
++    }
++
++    /// The update and DLC of `game` among `names` (the files of this iPhone, or of a source and this iPhone): the newest update, the older ones (newest first), the DLC (one per id).
++    public static (string Update, List<string> Older, List<string> Dlc) ExtrasOf(string game, IEnumerable<string> names)
++    {
++        var list = (names ?? Enumerable.Empty<string>()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
++        if (GameAppUi.IsNup(game) || GameAppUi.ContentKindOf(game) != GameAppUi.ContentKind.Base) return (null, new List<string>(), new List<string>());
++        var update = GameAppUi.UpdateFor(game, list);
++        var id = GameAppUi.BaseTitleIdOf(game);
++        var older = list.Where(n => GameAppUi.ContentKindOf(n) == GameAppUi.ContentKind.Update && GameAppUi.BaseTitleIdOf(n) == id && !string.Equals(n, update, StringComparison.OrdinalIgnoreCase))
++                        .OrderByDescending(GameAppUi.VersionOf).ToList();
++        return (update, older, GameAppUi.DlcFor(game, list));
++    }
++
++    /// "update v327680 · 2 DLC", "1 DLC", "".
++    public static string Summary(string update, int dlc)
++    {
++        var parts = new List<string>();
++        if (update != null) { long v = GameAppUi.VersionOf(update); parts.Add(v > 0 ? "update v" + v.ToString(CultureInfo.InvariantCulture) : "update"); }
++        if (dlc > 0) parts.Add(dlc + " DLC");
++        return string.Join(" · ", parts);
++    }
++
++    /// A cloud game's: what its download brings (the source's files and this iPhone's): "update v327680 · 2 DLC".
++    public static string CloudSummary(string game, IEnumerable<string> sourceNames, IEnumerable<string> localNames)
++    {
++        var x = ExtrasOf(game, (sourceNames ?? Enumerable.Empty<string>()).Concat(localNames ?? Enumerable.Empty<string>()));
++        return Summary(x.Update, x.Dlc.Count);
++    }
++
++    /// The updates and DLC whose base game is in none of `games` (this iPhone's and every cloud source's): listed once, not as games. A name with no id is a game, never one of them.
++    public static List<string> Orphans(IEnumerable<string> names, IEnumerable<string> games)
++    {
++        var bases = new HashSet<string>((games ?? Enumerable.Empty<string>()).Where(g => GameAppUi.ContentKindOf(g) == GameAppUi.ContentKind.Base).Select(GameAppUi.BaseTitleIdOf).Where(i => i != null),
++                                        StringComparer.OrdinalIgnoreCase);
++        return (names ?? Enumerable.Empty<string>()).Where(n => Of(n) != Kind.Game && GameAppUi.BaseTitleIdOf(n) is string b && !bases.Contains(b))
++                                                     .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
++    }
++
++    public const string OrphansTitle = "Updates and DLC without their game";
++
++    /// "update v327680", "DLC Danger Deck".
++    public static string Label(string file) => Of(file) == Kind.Update ? "update v" + GameAppUi.VersionOf(file).ToString(CultureInfo.InvariantCulture) : "DLC " + GameAppUi.DlcLabel(file);
++
++    /// A file that arrived (picked, opened in, imported): "Update v327680 attached to South Park: rebuild to include it" / "…: its build will include it".
++    public static string Arrived(string file, string baseGame, bool built)
++    {
++        var what = Label(file);
++        what = char.ToUpperInvariant(what[0]) + what.Substring(1);
++        return baseGame == null ? what + " (" + file + "): kept, waiting for its game"
++             : what + " attached to " + GameAppUi.DisplayName(baseGame) + (built ? ": rebuild to include it" : ": its build will include it");
++    }
++
++    /// "Older update v65536: remove to save 5.9 GB".
++    public static string OlderRow(string file, long bytes) => "Older update v" + GameAppUi.VersionOf(file).ToString(CultureInfo.InvariantCulture) + ": remove to save " + GameAppUi.SizeText(bytes);
++
++    /// "games found: 1 (+1 update, 2 DLC)" (the log at every refresh).
++    public static string FoundLine(IEnumerable<string> names)
++    {
++        var l = (names ?? Enumerable.Empty<string>()).ToList();
++        int u = l.Count(n => Of(n) == Kind.Update), d = l.Count(n => Of(n) == Kind.Dlc);
++        return "games found: " + (l.Count - u - d) + (u + d > 0 ? $" (+{u} update{(u == 1 ? "" : "s")}, {d} DLC)" : "");
++    }
+ }
+diff -ruN l/GameAppAttachUi.cs m/GameAppAttachUi.cs
+--- l/GameAppAttachUi.cs	2026-11-22 01:10:22
++++ m/GameAppAttachUi.cs	2026-11-22 01:22:19
+@@ -156,6 +156,7 @@
+         var d = new AttachDelegate(urls => BeginInvokeOnMainThread(() =>
+         {
+             var picks = ContentAttach.Classify(game, urls.Select(u => u.LastPathComponent));
++            KnowExtras(picks.Where(p => p.Kind != ContentAttach.Kind.Refused).Select(p => p.Name));   // patch 0091: this flow says it itself
+             foreach (var url in urls)
+             {
+                 var p = picks.FirstOrDefault(x => string.Equals(x.Name, url.LastPathComponent, StringComparison.OrdinalIgnoreCase));
+@@ -191,6 +192,83 @@
+         RemoveFiles(new List<string> { path }, Cloud.CloudCopyOf(file, cloudFiles) != null);   // the app's own question (it says whether it stays in the cloud)
+     }
+ 
++    // ---- patch 0091: updates and DLC under their game (ContentSet, GameAppAttach.cs) --------------------------------------------------------------
++
++    /// What goes with a game: this iPhone's update and DLC ("update v327680 · 2 DLC"); for a cloud game, what its download brings (its source's files and this iPhone's).
++    private string ExtrasLine(LibraryEntry e, LibState state)
++    {
++        if (e == null || GameExport.IsPlayer) return "";
++        var local = libNames ?? Dumps().Select(Path.GetFileName).ToList();
++        if ((state == LibState.CloudOnly || state == LibState.Downloading) && e.Cloud != null)
++            return ContentSet.CloudSummary(e.Name, cloudFiles.Where(f => f.SourceId == e.Cloud.SourceId).Select(f => f.Name), local);
++        return ContentAttach.Summary(e.Name, local);
++    }
++
++    /// The bytes a cloud game's download takes: the game, its newest update and its DLC from the same source, minus what this iPhone has (Cloud.DownloadSet, what Download fetches).
++    private long CloudSetBytes(LibraryEntry e)
++    {
++        if (e?.Cloud == null) return 0;
++        var set = Cloud.DownloadSet(e.Name, e.Cloud.SourceId, cloudFiles, libNames ?? Dumps().Select(Path.GetFileName).ToList());
++        return set.Count == 0 ? e.Cloud.Size : set.Sum(f => Math.Max(0, f.Size));
++    }
++
++    private HashSet<string> knownExtras;   // the updates and DLC of Documents already seen (the first refresh only learns them)
++
++    /// After a refresh of Documents (an import, Open in, a folder import, a download): each update or DLC that arrived is attached to its game, said once ("Update v327680 attached to
++    /// South Park: rebuild to include it"), or kept and listed as waiting for its game. The flows that say it themselves (a download, "Add an update or DLC…") mark theirs as known first.
++    private void NoteArrivedExtras(List<string> names)
++    {
++        var extras = names.Where(n => ContentSet.Of(n) != ContentSet.Kind.Game).ToList();
++        if (knownExtras == null) { knownExtras = new HashSet<string>(extras, StringComparer.OrdinalIgnoreCase); return; }
++        var fresh = extras.Where(n => knownExtras.Add(n)).ToList();
++        if (fresh.Count == 0 || GameExport.IsPlayer) return;
++        UiFacts facts;
++        try { facts = GatherFacts(); } catch (Exception) { return; }
++        var games = GameAppUi.PlayableGames(names);
++        var lines = new List<string>();
++        foreach (var f in fresh)
++        {
++            var id = GameAppUi.BaseTitleIdOf(f);
++            var b = games.FirstOrDefault(g => GameAppUi.ContentKindOf(g) == GameAppUi.ContentKind.Base && string.Equals(GameAppUi.BaseTitleIdOf(g), id, StringComparison.OrdinalIgnoreCase));
++            lines.Add(ContentSet.Arrived(f, b, b != null && GameAppUi.GameStatusOf(b, facts) == GameAppUi.GameStatus.Ready));
++        }
++        foreach (var l in lines) Write("content: " + l);
++        var a = UIAlertController.Create(fresh.Count == 1 ? "Added to its game" : "Updates and DLC", string.Join("\n", lines), UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(a);
++    }
++
++    /// The flows that announce their own files: what they bring is not "arrived" again.
++    private void KnowExtras(IEnumerable<string> names) { if (knownExtras != null) foreach (var n in names ?? Enumerable.Empty<string>()) knownExtras.Add(Path.GetFileName(n)); }
++
++    private bool orphansOpen;
++
++    /// "Updates and DLC without their game (N)": collapsed; open, one line each with where it is. Null when there are none.
++    private UIView OrphansSection(List<(string Name, string Where)> orphans)
++    {
++        if (orphans.Count == 0) return null;
++        var head = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "build-orphans" };
++        var c = UIButtonConfiguration.PlainButtonConfiguration;
++        c.AttributedTitle = new NSAttributedString($"{ContentSet.OrphansTitle} ({orphans.Count})", new UIStringAttributes { Font = Theme.Font(13, UIFontWeight.Semibold), ForegroundColor = Theme.Muted });
++        c.Image = UIImage.GetSystemImage(orphansOpen ? "chevron.down" : "chevron.right");
++        c.ImagePlacement = NSDirectionalRectEdge.Trailing;
++        c.ImagePadding = 6;
++        c.BaseForegroundColor = Theme.Muted;
++        c.ContentInsets = new NSDirectionalEdgeInsets(0, 0, 0, 0);
++        head.Configuration = c;
++        head.HorizontalAlignment = UIControlContentHorizontalAlignment.Leading;
++        head.AccessibilityValue = orphansOpen ? "open" : "closed";
++        head.TouchUpInside += (_, __) => { orphansOpen = !orphansOpen; buildKey = null; RefreshScreen(); };
++        var views = new List<UIView> { head };
++        if (orphansOpen)
++        {
++            var rows = orphans.Select(o => (UIView) Theme.Label(GameAppUi.DisplayName(o.Name) + " · " + ContentSet.Label(o.Name) + " · " + o.Where + " · waiting for its game",
++                                                               Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 2)).ToArray();
++            views.Add(Look.Card(Theme.Column(8, rows), 12, 14));
++        }
++        return Theme.Column(8, views.ToArray());
++    }
++
+     // ---- covers before the download --------------------------------------------------------------------------------
+ 
+     private readonly HashSet<string> coverKeysNoted = new HashSet<string>(StringComparer.Ordinal);
+@@ -247,13 +325,13 @@
+             var lines = new List<string>();
+             void Post() { var l = lines.ToList(); lines.Clear(); if (l.Count > 0) BeginInvokeOnMainThread(() => { foreach (var x in l) Write(x); }); }
+             // one result: the icon, the title the package names, why there is none, whether the read failed
+-            (byte[] Jpeg, ulong Title, string Why, bool Failed) ReadOne(CloudCovers.Do how, Stream stream, long size)
++            (byte[] Jpeg, ulong Title, string Why, bool Failed) ReadOne(CloudCovers.Do how, Stream stream, long size, string name)
+             {
+                 try
+                 {
+                     if (how == CloudCovers.Do.Nup) { var r = NupRemote.Icon(stream, size); return (r.Icon, r.TitleId & ~0xFFFUL, r.Why, r.Why != null && r.Why.StartsWith("not a readable", StringComparison.Ordinal)); }
+-                    var jpeg = GameIconsStream.Read(keys, stream, out var control, out var why);
+-                    return (jpeg, CoverPass.BaseIdFromControl(control), why, false);
++                    var jpeg = GameIconsStream.Read(keys, stream, out var control, out var why, out var content);
++                    return (jpeg, ContentSet.KeepTitle(control, content, (name ?? "").EndsWith(".xci", StringComparison.OrdinalIgnoreCase)), why, false);   // patch 0091: an update's or a DLC's own id (its meta NCA), so it is classified
+                 }
+                 catch (Exception e) { return (null, 0, (e.InnerException ?? e).Message, true); }
+             }
+@@ -309,7 +387,7 @@
+                                     try
+                                     {
+                                         var (stream, size) = open(f.Remote);
+-                                        using (stream) r = ReadOne(how, stream, size);
++                                        using (stream) r = ReadOne(how, stream, size, f.Name);
+                                         if (stream is RemoteReadStream rs) lines.Add(RemoteReadStream.Line(f.Name, CloudWords(f).Where, rs.Requests, rs.Fetched));   // patch 0090: its cost
+                                     }
+                                     catch (Exception e) { r = (null, 0, (e.InnerException ?? e).Message, true); }
+@@ -341,7 +419,7 @@
+                                     else
+                                     {
+                                         using var stream = File.OpenRead(path);
+-                                        Land(f, ReadOne(how, stream, stream.Length));
++                                        Land(f, ReadOne(how, stream, stream.Length, f.Name));
+                                     }
+                                     Post();
+                                 }
+diff -ruN l/GameAppIcons.cs m/GameAppIcons.cs
+--- l/GameAppIcons.cs	2026-11-22 01:09:59
++++ m/GameAppIcons.cs	2026-11-22 01:20:00
+@@ -44,14 +44,20 @@
+     /// The same, and the title id of the control NCA the icon came from (0 when there is none): patch 0079 names a game only in the cloud whose file name has no id by it, as 0051 does for a local
+     /// one (CoverPass.BaseIdFromControl keeps a base game's only).
+     [System.Diagnostics.CodeAnalysis.DynamicDependency(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods, typeof(P))]
+-    internal static byte[] Read(string keysPath, Stream stream, out ulong controlTitleId) => Read(keysPath, stream, out controlTitleId, out _);
++    internal static byte[] Read(string keysPath, Stream stream, out ulong controlTitleId) => Read(keysPath, stream, out controlTitleId, out _, out _);
+ 
++    [System.Diagnostics.CodeAnalysis.DynamicDependency(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods, typeof(P))]
++    internal static byte[] Read(string keysPath, Stream stream, out ulong controlTitleId, out string why) => Read(keysPath, stream, out controlTitleId, out why, out _);
++
+     /// Patch 0084: the same, and why there is no icon when there is none (said in the log, one line per game): no control NCA, a compressed one (.ncz: an .nsz that compressed it too), a
+     /// personalised ticket (no title key here), no icon in the control data.
+     [System.Diagnostics.CodeAnalysis.DynamicDependency(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods, typeof(P))]
+-    internal static byte[] Read(string keysPath, Stream stream, out ulong controlTitleId, out string why)
++    /// Patch 0091: `contentTitleId`: the title id of the package's content meta NCA (*.cnmt.nca): what the package IS (a game, its update …800, a DLC), read before its control data;
++    /// a DLC has no control data at all, so its meta is all that says whose it is. 0 when there is none.
++    internal static byte[] Read(string keysPath, Stream stream, out ulong controlTitleId, out string why, out ulong contentTitleId)
+     {
+         controlTitleId = 0;
++        contentTitleId = 0;
+         why = null;
+         bool personal = false, ncz = false;
+         const System.Reflection.BindingFlags Any = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+@@ -84,6 +90,18 @@
+             f.Get.Read(out _, 0, t, ReadOption.None).ThrowIfFailure();
+             if (t[0x281] != 0) { personal = true; continue; }   // a personalised ticket: no title key here
+             ks.ExternalKeySet.Add(new RightsId(t.AsSpan(0x2a0, 0x10)), new AccessKey(t.AsSpan(0x180, 0x10))).ThrowIfFailure();
++        }
++        foreach (DirectoryEntryEx e in pfs.EnumerateEntries("*", SearchOptions.Default))   // patch 0091: the content meta first (its header only)
++        {
++            if (!e.Name.EndsWith(".cnmt.nca", StringComparison.OrdinalIgnoreCase) || e.Size > 16L << 20) continue;
++            try
++            {
++                using var f = new UniqueRef<IFile>();
++                pfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
++                var meta = new Nca(ks, f.Release().AsStorage());
++                if (meta.Header.ContentType == NcaContentType.Meta) { contentTitleId = meta.Header.TitleId; break; }
++            }
++            catch (Exception) { }   // a meta NCA that cannot be opened says nothing; the control data still may
+         }
+         foreach (DirectoryEntryEx e in pfs.EnumerateEntries("*", SearchOptions.Default))
+         {
+diff -ruN l/GameAppLibrary.cs m/GameAppLibrary.cs
+--- l/GameAppLibrary.cs	2026-11-22 01:09:59
++++ m/GameAppLibrary.cs	2026-11-22 01:22:19
+@@ -1765,6 +1765,7 @@
+                     errors.Count == 0 ? $"{paths.Count} file(s) added. Rebuild the game (its settings › Rebuild) to include them." : string.Join("\n", errors), UIAlertControllerStyle.Alert);
+                 done.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
+                 PresentWhenFree(done);
++                KnowExtras(paths);   // patch 0091: said above
+                 RefreshGames();
+                 RefreshScreen();
+             });
+@@ -2077,6 +2078,7 @@
+                     a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
+                     PresentWhenFree(a);
+                 }
++                KnowExtras(files.Select(f => f.Name));   // patch 0091: a download's update and DLC came with their game: not announced again
+                 RefreshGames();
+                 RefreshScreen();
+                 if (error == null && !cancelled) done?.Invoke(key);
+diff -ruN l/GameAppMain.cs m/GameAppMain.cs
+--- l/GameAppMain.cs	2026-11-22 01:09:59
++++ m/GameAppMain.cs	2026-11-22 01:22:19
+@@ -1217,8 +1217,10 @@
+         Write(File.Exists(keys) ? "prod.keys: found in Documents"
+                                 : "prod.keys: MISSING. Use Import (or the Files app) to put it in Documents.");
+         var found = Dumps().ToList();
+-        Write($"games found: {found.Count}");
++        var foundNames = found.Select(Path.GetFileName).ToList();
++        Write(ContentSet.FoundLine(foundNames));   // patch 0091: "games found: 1 (+1 update, 0 DLC)"
+         foreach (var game in found) Write($"  {Path.GetFileName(game)}");
++        NoteArrivedExtras(foundNames);   // patch 0091 (GameAppAttachUi.cs): an update or DLC that arrived is attached to its game, said once
+     }
+ 
+     /// What the screen's decisions depend on, read from Documents and the Keychain right now. Everything that
+@@ -1818,7 +1820,22 @@
+                         got++;   // the game has its id now: the screen is drawn again even when there is no cover
+                         GameAppDiag.Event("title-from-content", $"{fileName}: {id:X16}");
+                     }
+-                    else why = "the application's control NCA names no title id";
++                    else
++                    {
++                        // patch 0091: an update or a DLC whose name carries no id: its content meta NCA says whose it is (a DLC has no control data at all); kept as its own id
++                        ulong content = 0, ctl = 0;
++                        try { using var fs = File.OpenRead(dump); GameIconsStream.Read(keys, fs, out ctl, out _, out content); } catch (Exception) { }
++                        var keep = ContentSet.KeepTitle(ctl, content, fileName.EndsWith(".xci", StringComparison.OrdinalIgnoreCase));
++                        if (keep != 0 && (keep & 0xFFFUL) != 0)
++                        {
++                            GameAppUi.SetTitleFromContent(fileName, keep);
++                            GameAppUi.SaveTitlesFromContent(documents);
++                            got++;   // no icon is written for it (games/<base>/ is its game's): it leaves the games and shows under its game
++                            why = ContentSet.Label(fileName) + " of " + GameAppUi.BaseTitleIdOf(fileName) + ": shown under its game, never as a game";
++                            GameAppDiag.Event("title-from-content", $"{fileName}: {keep:X16} ({ContentSet.Label(fileName)})");
++                        }
++                        else why = "the application's control NCA names no title id";
++                    }
+                 }
+                 else jpeg = GameIcons.Read(keys, dump);
+             }
+diff -ruN l/GameAppPadUi.cs m/GameAppPadUi.cs
+--- l/GameAppPadUi.cs	2026-11-22 01:09:59
++++ m/GameAppPadUi.cs	2026-11-22 01:22:19
+@@ -212,8 +212,8 @@
+         heroPill = Look.Pill(status.Text, status.Tone, grey);
+         heroPillRow.AddArrangedSubview(heroPill);
+         heroTitle.Text = GameAppUi.DisplayName(e.Name);
+-        long size = e.Cloud != null && grey ? e.Cloud.Size : 0;
+-        heroMeta.Text = LibraryStatus.Meta(state, e.Name, size > 0 ? GameAppUi.SizeText(size) : ShelfMeta(e), CloudWords(e.Cloud).Long, canRun, GameAppUi.DeviceName);
++        long size = e.Cloud != null && grey ? CloudSetBytes(e) : 0;   // patch 0091: with its update and DLC
++        heroMeta.Text = LibraryStatus.Meta(state, e.Name, size > 0 ? GameAppUi.SizeText(size) : ShelfMeta(e), CloudWords(e.Cloud).Long, canRun, GameAppUi.DeviceName, ExtrasLine(e, state));
+         foreach (var v in heroButtons.ArrangedSubviews.ToArray()) { heroButtons.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+         var accent = Look.AccentOf(e.Icon, grey);
+         foreach (var b in LibraryActions.For(state, canRun))
+diff -ruN l/GameAppRedesign.cs m/GameAppRedesign.cs
+--- l/GameAppRedesign.cs	2026-11-22 01:09:59
++++ m/GameAppRedesign.cs	2026-11-22 01:21:29
+@@ -95,11 +95,13 @@
+         GameAppUi.IsNup(fileName) ? "Switch 2 · .nup" : "Switch · " + Path.GetExtension(fileName ?? "").ToLowerInvariant();
+ 
+     /// The carousel's line under the title.
+-    public static string Meta(LibState state, string fileName, string size, string cloudLong, bool canRunHere, string device)
++    /// `extras` (patch 0091): what goes with the game, "update v327680 · 2 DLC" (ContentSet), after where it is.
++    public static string Meta(LibState state, string fileName, string size, string cloudLong, bool canRunHere, string device, string extras = null)
+     {
+         var parts = new List<string>();
+         bool cloud = state == LibState.CloudOnly || state == LibState.Downloading;
+         parts.Add(cloud ? cloudLong ?? "In the cloud" : KindText(fileName));
++        if (!string.IsNullOrEmpty(extras)) parts.Add(extras);
+         if (!string.IsNullOrEmpty(size)) parts.Add(size);
+         parts.Add(state switch
+         {
+diff -ruN l/GameAppRedesignUi.cs m/GameAppRedesignUi.cs
+--- l/GameAppRedesignUi.cs	2026-11-22 01:09:59
++++ m/GameAppRedesignUi.cs	2026-11-22 01:21:29
+@@ -861,7 +861,7 @@
+ 
+         // patch 0082 (review M3): the grid is built again only when its key changes (names, states, labels, what is on); else its bars and words are updated in place
+         var gridKeyNow = RedrawKey.Of(new[] { grid ? "g" : "c", GridColumns.ToString(), padWide ? "p" : "", WarmShownTitle() ?? "", warmQueue.Paused ? "wp" : "" }
+-            .Concat(libShown.Select(e => { var s = LibStateOf(e, facts, out _); return RedrawKey.Card(e.Name, s, s == LibState.Built && GameAppUi.ContentChangedSinceBuild(e.Name, libNames, facts), facts.Running, CanRunHere(facts), e.Icon != null, false); })));
++            .Concat(libShown.Select(e => { var s = LibStateOf(e, facts, out _); return RedrawKey.Card(e.Name, s, s == LibState.Built && GameAppUi.ContentChangedSinceBuild(e.Name, libNames, facts), facts.Running, CanRunHere(facts), e.Icon != null, false) + ExtrasLine(e, s); })));   // + patch 0091
+         bool rebuildGrid = gridKeyNow != gridKey;
+         if (rebuildGrid)
+         {
+@@ -947,9 +947,9 @@
+             foreach (var v in flowButtons.ArrangedSubviews.ToArray()) { flowButtons.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+         }
+         flowTitle.Text = GameAppUi.DisplayName(e.Name);
+-        long size = e.Cloud != null && (state == LibState.CloudOnly || state == LibState.Downloading) ? e.Cloud.Size : 0;
++        long size = e.Cloud != null && (state == LibState.CloudOnly || state == LibState.Downloading) ? CloudSetBytes(e) : 0;   // patch 0091: the game with its update and DLC
+         var sizeText = size > 0 ? GameAppUi.SizeText(size) : ShelfMeta(e);
+-        flowMeta.Text = LibraryStatus.Meta(state, e.Name, sizeText, CloudWords(e.Cloud).Long, canRun, GameAppUi.DeviceName);
++        flowMeta.Text = LibraryStatus.Meta(state, e.Name, sizeText, CloudWords(e.Cloud).Long, canRun, GameAppUi.DeviceName, ExtrasLine(e, state));
+         if (state == LibState.Downloading && MeterLong(e.Name) is { Length: > 0 } meter) flowMeta.Text = CloudWords(e.Cloud).Long + " · " + meter;   // patch 0085: "1.2 of 4.8 GB · 38 MB/s · 1 min 35 s left"
+         int shown = rebuildFlow ? Math.Min(libShown.Count, 15) : 0;
+         int first = Math.Max(0, Math.Min(fi - shown / 2, libShown.Count - shown));
+@@ -1035,6 +1035,12 @@
+         name.LineBreakMode = UILineBreakMode.TailTruncation;   // one line, with an ellipsis
+         var line = Theme.Label(status.Text, Theme.Font(12, UIFontWeight.Regular), Look.ToneColor(status.Tone), 2);
+         var texts = new List<UIView> { art, name, line };
++        if (ExtrasLine(e, state) is { Length: > 0 } extras)   // patch 0091: its update and DLC, under it (never cards of their own)
++        {
++            var x = Theme.Label(extras, Theme.Font(11, UIFontWeight.Regular), Theme.Muted, 1);
++            x.AccessibilityIdentifier = "game-extras";
++            texts.Add(x);
++        }
+         var info = Theme.Column(0, texts.ToArray());
+         info.SetCustomSpacing(8, art);
+         info.UserInteractionEnabled = false;
+diff -ruN l/GameAppShelf.cs m/GameAppShelf.cs
+--- l/GameAppShelf.cs	2026-11-22 01:09:59
++++ m/GameAppShelf.cs	2026-11-22 01:22:30
+@@ -294,8 +294,14 @@
+             var e = entries.FirstOrDefault(x => x.Name == f.Name) ?? new LibraryEntry(f.Name, f, CoverOf(f.Name, facts));
+             var state = LibStateOf(e, facts, out var fraction);
+             rowsOf[f.Name] = e;
+-            games.Add(new BuildGame(f.Name, state, f.Size > 0 ? GameAppUi.SizeText(f.Size) : null, CloudWords(f).Where, false, fraction));
++            long setBytes = CloudSetBytes(e);   // patch 0091: the game with its update and DLC, as its download takes them
++            games.Add(new BuildGame(f.Name, state, setBytes > 0 ? GameAppUi.SizeText(setBytes) : null, CloudWords(f).Where, false, fraction,
++                                    ContentSet.CloudSummary(f.Name, cloudFiles.Where(x => x.SourceId == f.SourceId).Select(x => x.Name), localNames)));
+         }
++        // patch 0091: the updates and DLC whose game is nowhere (this iPhone, any cloud source): listed once, collapsed, never as games
++        var everyGame = GameAppUi.PlayableGames(localNames.Concat(cloudFiles.Where(x => Cloud.IsGameFile(x.Name)).Select(x => x.Name))).ToList();
++        var orphans = ContentSet.Orphans(localNames.Concat(cloudFiles.Where(x => Cloud.IsGameFile(x.Name)).Select(x => x.Name)), everyGame)
++                                .Select(n => (n, localNames.Contains(n, StringComparer.OrdinalIgnoreCase) ? "on this " + GameAppUi.DeviceName : CloudWords(Cloud.CloudCopyOf(n, cloudFiles)).Where)).ToList();
+ 
+         // Now: the build that is running (Pause, Cancel), being stopped, or paused (Resume, Cancel): GameAppStopUi.cs
+         UpdateNowCard(facts);
+@@ -306,7 +312,8 @@
+ 
+         // review M3: the rows are built again only when their key changes (a download's percentage is updated in place: its Cancel is not lost under the finger)
+         var sections = BuildList.Sections(games);
+-        var key = RedrawKey.Of(sections.Select(s => s.Title + ":" + s.Count + ":" + RedrawKey.Of(s.Rows.Select(RedrawKey.Row))).Append(facts.Running ? "b" : ""));
++        var key = RedrawKey.Of(sections.Select(s => s.Title + ":" + s.Count + ":" + RedrawKey.Of(s.Rows.Select(RedrawKey.Row))).Append(facts.Running ? "b" : "")
++                                       .Append("o" + (orphansOpen ? "+" : "-") + string.Join("|", orphans.Select(o => o.Item1))));   // patch 0091
+         if (key == buildKey)
+         {
+             foreach (var r in sections.SelectMany(s => s.Rows))
+@@ -330,6 +337,7 @@
+             foreach (var r in section.Rows) rows.Add(BuildGameRow(r, rowsOf[r.Name], facts));
+             buildSections.AddArrangedSubview(Theme.Column(8, head, Look.Group(rows.ToArray())));
+         }
++        if (OrphansSection(orphans) is UIView lone) buildSections.AddArrangedSubview(lone);   // patch 0091
+         buildSections.Hidden = buildSections.ArrangedSubviews.Length == 0;
+         buildSub.Text = BuildList.Header(games, buildQueue.Items.Count, GameAppUi.DeviceName);   // from the very list the rows were drawn from
+     }
+@@ -416,11 +424,15 @@
+         if (GameAppUi.ContentKindOf(name) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(name))
+         {
+             sheet.AddAction(UIAlertAction.Create("Add an update or DLC…", UIAlertActionStyle.Default, _ => ShowContentChooser(name, source)));
+-            foreach (var file in ContentAttach.Attached(name, Dumps().Select(Path.GetFileName)))
++            var here = Dumps().Select(Path.GetFileName).ToList();
++            var older = ContentSet.ExtrasOf(name, here).Older;
++            foreach (var file in ContentAttach.Attached(name, here))
+             {
+                 var f = file;
+                 var label = GameAppUi.ContentKindOf(f) == GameAppUi.ContentKind.Update ? GameAppUi.UpdateLabel(f) : "DLC " + GameAppUi.DlcLabel(f);
+-                sheet.AddAction(UIAlertAction.Create("Remove " + label + "…", UIAlertActionStyle.Destructive, _ => RemoveAttached(f)));
++                // patch 0091: an older update is not used (the newest is): it says what removing it saves
++                var words = older.Contains(f, StringComparer.OrdinalIgnoreCase) ? ContentSet.OlderRow(f, SafeLength(Path.Combine(GameAppMain.Documents, f))) + "…" : "Remove " + label + "…";
++                sheet.AddAction(UIAlertAction.Create(words, UIAlertActionStyle.Destructive, _ => RemoveAttached(f)));
+             }
+         }
+         if (!running) sheet.AddAction(UIAlertAction.Create("Delete the game file", UIAlertActionStyle.Destructive, _ => ConfirmDelete(name)));   // 0064's question, with what it frees
+@@ -982,6 +994,13 @@
+         // patch 0086: a built game is queued only when its build is out of date, as a rebuild with a question (QueuePlan); up to date: no queue entry
+         if (local && QueuePlan.For(state, GameAppUi.ContentChangedSinceBuild(game, names, facts) || (tid != null && GameMods.ExefsChangedSinceBuild(docs, tid))) == QueuePlan.Entry.Rebuild)
+             more.Add(SettingsRow("Queue a rebuild…", () => Then(() => AskQueueRebuild(game)), true, false).Button);
++        // patch 0091: an older update the build does not use (it takes the newest): removable, with what it saves
++        if (local)
++            foreach (var old in ContentSet.ExtrasOf(game, names).Older)
++            {
++                var o = old;
++                more.Add(SettingsRow(ContentSet.OlderRow(o, SafeLength(Path.Combine(docs, o))) + "…", () => Then(() => RemoveAttached(o)), false, false, -1, "sheet-older-update").Button);
++            }
+         if (local && DownloadPairing.SameFile(SafeLength(Path.Combine(docs, game)), e.Cloud, ImportLedger.Find(ImportLedger.Load(docs), game)))   // patch 0082 (review L7)
+             more.Add(SettingsRow("Remove download (stays in the cloud)", () => Then(() => RemoveGameDownload(game)), true, false).Button);
+         bool canRebuild = !GameExport.IsPlayer && GameAppUi.ShowRebuild(facts) && ready;
+diff -ruN l/GameAppUi.cs m/GameAppUi.cs
+--- l/GameAppUi.cs	2026-11-22 01:09:59
++++ m/GameAppUi.cs	2026-11-22 01:19:28
+@@ -201,7 +201,8 @@
+         return rows;
+     }
+ 
+-    private static readonly Regex TitleIdInName = new Regex(@"\[([0-9A-Fa-f]{16})\]");
++    // patch 0091: "[0100…800]" or "(0100…800)" (some dumps put the id in parentheses)
++    private static readonly Regex TitleIdInName = new Regex(@"(?:\[|\()([0-9A-Fa-f]{16})(?:\]|\))");
+ 
+     /// The base game's title id named in a dump's file name (`… [0100DFA027504000][v0].nsp`), which is the id the
+     /// profile and the shader pack carry. A base game's id ends in 000, its update's in 800 (same block), an add-on's
+@@ -281,7 +282,7 @@
+         return low == 0 ? ContentKind.Base : low == 0x800 ? ContentKind.Update : ContentKind.AddOn;
+     }
+ 
+-    private static readonly Regex VersionInName = new Regex(@"\[v(\d+)\]");
++    private static readonly Regex VersionInName = new Regex(@"(?:\[|\()v(\d+)(?:\]|\))", RegexOptions.IgnoreCase);   // patch 0091: "[v327680]", "(v327680)", "[V327680]"
+ 
+     /// The games the library shows: base games and dumps with no id. An update or an add-on is not a game of its own
+     /// (extracting an update as a base game fails); the update rides with its base game (UpdateFor).

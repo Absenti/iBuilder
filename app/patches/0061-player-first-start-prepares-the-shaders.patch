@@ -1,0 +1,293 @@
+# The exported player's first start: the shaders the game needs are prepared ONCE, as a step of its own, instead of in front of the game's progress screen at the first boot (268 s on an iPhone 15 Pro for Mario Kart 8
+# Deluxe, shown as "Preparing the game" and, with a short list, as a freeze of 85 s at 0 fps in the first race: device tests 2026-11-19). A player has its own bundle id and so an empty Metal cache, which cannot be
+# shipped (a cache copied from the player into iBuilder gave no hit). So the player compiles, at its first launch, exactly the libraries the host prepares at a boot (the pack's seed list, this phone's learned list
+# pso_user.tsv, what was used) with the same options as the host (GameAppWarm.cs), four workers at UserInitiated QoS, waiting only at thermal Serious; a progress bar and the status line on its title screen; the
+# continued-processing task keeps it going when the player leaves the app; it does not wait for the game files (the .romfs can be copied meanwhile); prepared.tsv (app build + chain) says it is done; a Play pressed
+# meanwhile asks "Wait" or "Play anyway". Only an exported player does it (the main app has the manual "Prepare the shaders…"). Applies after 0060.
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -614,10 +614,16 @@
+ 
+         playerPlay = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "primary-action" };
+         playerPlay.HeightAnchor.ConstraintEqualTo(64).Active = true;
+-        playerPlay.TouchUpInside += (_, __) => { if (PlayerNeedsGameFiles) ShowInFiles(Path.Combine(GameAppMain.Documents, "x")); else PrimaryTapped(); };
++        playerPlay.TouchUpInside += (_, __) =>
++        {
++            if (PlayerNeedsGameFiles) ShowInFiles(Path.Combine(GameAppMain.Documents, "x"));
++            else if (GameWarm.FirstStart) AskPlayDuringPrepare();
++            else PrimaryTapped();
++        };
+         playerStatus = Theme.Label("", Theme.Font(13, UIFontWeight.Medium), Theme.Muted, 0);
+         playerStatus.TextAlignment = UITextAlignment.Center;
+         // The picker stays as a second way: it does not complete in a player installed by FlareStore (iOS 27.0.1: "Open" never returns, cable test 2026-11-19), where the copy in Files is the way.
++        playerProgress = new UIProgressView(UIProgressViewStyle.Default) { Hidden = true, AccessibilityIdentifier = "player-prepare-progress", TintColor = UIColor.White, TrackTintColor = Theme.Glass };
+         playerPick = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "player-pick-folder" };
+         playerPick.SetTitle("Pick the folder from iBuilder instead", UIControlState.Normal);
+         playerPick.TitleLabel.Font = Theme.Font(13, UIFontWeight.Medium);
+@@ -655,7 +661,7 @@
+         var footer = Theme.Label("Made with iBuilder", Theme.Font(12, UIFontWeight.Regular), Theme.Dim);
+         footer.TextAlignment = UITextAlignment.Center;
+ 
+-        var column = Theme.Column(18, coverRow, title, playerLast, playerPlay, playerStatus, playerPick, tiles);
++        var column = Theme.Column(18, coverRow, title, playerLast, playerPlay, playerProgress, playerStatus, playerPick, tiles);
+         column.SetCustomSpacing(6, title);
+         column.SetCustomSpacing(26, playerLast);
+         column.SetCustomSpacing(8, playerPlay);
+@@ -676,6 +682,7 @@
+         });
+         Theme.PinColumn(scroll, column, 48, 16, 24, 520);   // an iPad keeps the title screen a phone's width
+         RefreshPlayer(facts);
++        StartFirstStartPrepare();   // GameAppWarm.cs: the shaders the game needs, once, with a bar; it does not wait for the game files
+     }
+ 
+     /// A slim export not yet shown its game files (GameExport.PlayerRomfs).
+@@ -683,6 +690,7 @@
+ 
+     private FolderPickerDelegate gameFilesPicker;
+     private UIButton playerPick;
++    private UIProgressView playerProgress;
+ 
+     /// Files, filtered to game files (.romfs, declared in Info.plist): the player picks its game's, opened in place.
+     private void FindGameFiles()
+@@ -729,10 +737,11 @@
+         c.BaseForegroundColor = Theme.Ground;
+         playerPlay.Configuration = c;
+         playerPlay.Enabled = needFiles || next.Enabled;
++        var prep = GameWarm.Active && !facts.Running ? GameWarm.Status : "";
+         playerStatus.Text = facts.Running ? "Starting the game…"
+-            : needFiles ? $"Once: in Files, open On My iPhone › iBuilder › Exports › “{GameAppUi.ExportFileName(GameAppUi.DisplayName(game))}”, touch and hold “{GameExport.PlayerRomfsName}”, Copy. "
++            : needFiles ? (prep.Length > 0 ? prep + "\n\n" : "") + $"Once: in Files, open On My iPhone › iBuilder › Exports › “{GameAppUi.ExportFileName(GameAppUi.DisplayName(game))}”, touch and hold “{GameExport.PlayerRomfsName}”, Copy. "
+                           + $"Then open On My iPhone › “{GameAppUi.DisplayName(game)}” (this app's folder: the button opens it), touch and hold, Paste. A copy inside the phone takes no extra space. Come back here: Play appears."
+-            : "";
++            : prep;
+         playerStatus.Hidden = playerStatus.Text.Length == 0;
+         playerPick.Hidden = !needFiles || facts.Running;
+ 
+diff -ruN a/GameAppWarm.cs b/GameAppWarm.cs
+--- a/GameAppWarm.cs
++++ b/GameAppWarm.cs
+@@ -17,7 +17,11 @@
+ // What is kept: Documents/games/<id>/warmed.tsv, one row per library compiled (name, a digest of its text, ms), under a header naming
+ // this app build and chain: another build of the app (the OS or the host may differ, the cache may be gone) starts it again.
+ //
+-// MANUAL ONLY (app/patches/0020-warm-up-manual-only.patch): nothing here starts by itself. Not at a launch (an exported player used to prepare ALL its libraries at EVERY launch:
++// FIRST START OF AN EXPORTED PLAYER (app/patches/0061): the one run that starts by itself. A player has its own bundle id, so its Metal cache is empty, and a boot would stop to compile the libraries of the
++// game's prewarm list in front of a progress screen (268 s on an iPhone 15 Pro for Mario Kart 8 Deluxe). The player prepares exactly those libraries (the pack's seed list, this phone's learned list and what
++// was used) at its first launch instead, as a step of its own with a progress bar and the continued-processing task, once: GameWarm.Start(.., firstStart: true), ended by prepared.tsv.
++//
++// MANUAL ONLY (app/patches/0020-warm-up-manual-only.patch): nothing else here starts by itself. Not at a launch (an exported player used to prepare ALL its libraries at EVERY launch:
+ // it read and hashed the whole library image each time, and compiled it all on the first), not after a build. The player starts it from the game's settings sheet ("Prepare the
+ // shaders…", GameAppSettingsViewController.PrepareShaders) and can stop it there; it also stops when a build or a boot starts. The one other way in is the debug launch argument.
+ //
+@@ -275,6 +279,24 @@
+         return outList;
+     }
+ 
++    /// What an exported player's first start prepares: the keys of its pack's seed list (pso_manifest.tsv) and of this phone's learned list (pso_user.tsv), then the ones used before (same key
++    /// rules as the used file). The host prepares exactly these at a boot, so what is warmed here is what the boot would otherwise compile in front of its progress screen.
++    public static List<string> NeededKeys(string manifestText, string userText, IReadOnlyList<string> usedKeys)
++    {
++        var keys = new List<string>(); var seen = new HashSet<string>(StringComparer.Ordinal);
++        foreach (var k in KeysFromPsoRows(manifestText)) if (seen.Add(k)) keys.Add(k);
++        foreach (var k in KeysFromPsoRows(userText)) if (seen.Add(k)) keys.Add(k);
++        foreach (var k in usedKeys ?? new List<string>()) if (seen.Add(k)) keys.Add(k);
++        return keys;
++    }
++
++    /// prepared.tsv: the first line names the app build and the chain (the same header as warmed.tsv); present and equal, the first-start preparation was done for this build.
++    public static bool PreparedMatches(string preparedText, string header) =>
++        !string.IsNullOrEmpty(preparedText) && preparedText.Split('\n')[0].TrimEnd('\r') == header;
++
++    /// "Preparing the game… 120 of 900", the line of the first-start preparation.
++    public static string FirstStartText(int done, int total) => $"Preparing the game (once)… {done} of {total}";
++
+     /// "Preparing the shaders… the ones you played: 120 of 140" while the used libraries are being done, then the plain count.
+     public static string StatusText(int done, int total, int usedDone, int usedTotal) =>
+         usedTotal > 0 && usedDone < usedTotal ? $"Preparing the shaders… the ones you played: {usedDone} of {usedTotal}" : StatusText(done, total);
+@@ -293,8 +315,26 @@
+     /// Fired from a worker thread whenever the status moved (the screen hops to the main thread itself).
+     public static event Action Changed;
+ 
++    private static volatile bool firstStartRun;
++    private static int progressDone, progressTotal;
+     public static bool Active => active;
++    /// The run is an exported player's first-start preparation (the title screen offers "play anyway" while it goes).
++    public static bool FirstStart => active && firstStartRun;
++    /// 0..1 of the run's libraries done (0 before the count is known).
++    public static float Fraction => progressTotal > 0 ? Math.Min(1f, (float)Volatile.Read(ref progressDone) / progressTotal) : 0f;
+     public static string Status => active ? status : "";
++
++    /// Whether an exported player still owes its first-start preparation: it has a library to compile and no prepared.tsv for this app build and chain.
++    public static bool FirstStartPending(string titleId, string packRoot)
++    {
++        try
++        {
++            if (!HasLibrary(titleId, packRoot)) return false;
++            var marker = Path.Combine(GameAppMain.Documents, "games", titleId.ToUpperInvariant(), "prepared.tsv");
++            return !GameWarmLogic.PreparedMatches(File.Exists(marker) ? File.ReadAllText(marker) : "", GameWarmLogic.Header(GameAppBuild.Id, GameAppBuild.ShaderChain));
++        }
++        catch (Exception) { return false; }
++    }
+     public static string ActiveGame => active ? activeGame : null;
+ 
+     /// Whether there is anything to prepare: the pack's library image of this host's chain (a Mac-made pack holds .metallib files: nothing to compile). A cheap look, no parsing: it
+@@ -338,12 +378,12 @@
+     private sealed record Item(string Name, string Path, long Offset, long Size);
+ 
+     /// Starts preparing `titleId`'s libraries from `packRoot` (Documents/shaders, or the player's bundle copy). Returns at once. Only the player's tap calls it.
+-    public static void Start(string titleId, string packRoot)
++    public static void Start(string titleId, string packRoot, bool firstStart = false)
+     {
+         if (string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(packRoot)) return;
+         int mine;
+-        lock (gate) { mine = ++generation; active = true; activeGame = titleId; status = ""; }
+-        var t = new Thread(() => { try { Run(titleId, packRoot, mine); } catch (Exception error) { Log("shader warm-up: [ORANGE] " + error.Message); } finally { lock (gate) { if (generation == mine) active = false; } Changed?.Invoke(); } })
++        lock (gate) { mine = ++generation; active = true; activeGame = titleId; status = ""; firstStartRun = firstStart; progressDone = 0; progressTotal = 0; }
++        var t = new Thread(() => { try { Run(titleId, packRoot, mine, firstStart); } catch (Exception error) { Log("shader warm-up: [ORANGE] " + error.Message); } finally { lock (gate) { if (generation == mine) active = false; } Changed?.Invoke(); } })
+         { IsBackground = true, Name = "shader-warm-up" };
+         t.Start();
+     }
+@@ -363,9 +403,9 @@
+ 
+     private static bool Current(int mine) => Volatile.Read(ref generation) == mine;
+ 
+-    private static void Run(string titleId, string packRoot, int mine)
++    private static void Run(string titleId, string packRoot, int mine, bool firstStart)
+     {
+-        NSThread.Current.QualityOfService = NSQualityOfService.Utility;
++        NSThread.Current.QualityOfService = firstStart ? NSQualityOfService.UserInitiated : NSQualityOfService.Utility;
+         var documents = GameAppMain.Documents;
+         var chain = GameAppBuild.ShaderChain;
+         var pack = Directory.Exists(packRoot)
+@@ -388,8 +428,15 @@
+         // What the player used first (pso_user.tsv, kept across sessions in used_shaders.tsv), then what the game learned while it ran (the
+         // library's are 100 to 22,000, most never used), then the rest in pack order
+         var usedKeys = GameWarmLogic.IngestUsedFile(documents, titleId);
++        if (firstStart)
++        {
++            // The first start prepares what the host would prepare at a boot: the seed list of the pack, this phone's learned list, what was used (and nothing else: not the pack's other libraries)
++            string Read(string path) { try { return File.Exists(path) ? File.ReadAllText(path) : ""; } catch (Exception) { return ""; } }
++            usedKeys = GameWarmLogic.NeededKeys(Read(Path.Combine(pack ?? "", "pso_manifest.tsv")), Read(Path.Combine(documents, "games", titleId.ToUpperInvariant(), "pso_user.tsv")), usedKeys);
++        }
+         var items = GameWarmLogic.Order(packNames, learnedNames, usedKeys, out int usedCount, out int learnedCount).Select(n => byName[n]).ToList();
+-        int played = usedCount, front = usedCount + learnedCount;   // the first `front` are what a session needs; the rest waits for a charger or a cool phone
++        int played = firstStart ? 0 : usedCount, front = usedCount + learnedCount;   // the first `front` are what a session needs; the rest waits for a charger or a cool phone
++        if (firstStart) items = items.Take(front).ToList();
+         if (items.Count == 0) { Log($"shader warm-up: nothing to compile for {titleId} (no .metal source in its pack: a Mac-made pack holds .metallib)"); return; }
+ 
+         var gameDir = Path.Combine(documents, "games", titleId.ToUpperInvariant());
+@@ -404,13 +451,15 @@
+         if (device == null) { Log("shader warm-up: no Metal device"); return; }
+ 
+         int total = items.Count, usedDone = 0, done = 0, compiled = 0, failed = 0, skipped = 0, next = -1;
++        Volatile.Write(ref progressTotal, total);
+         var digests = new ConcurrentDictionary<string, byte>();   // the same text compiles once (a cut unit's _b/_bx/_bf share one library in the host)
+         var rows = new StringBuilder();
+         var sw = Stopwatch.StartNew();
+         long compileMs = 0;
+         void Report()
+         {
+-            status = GameWarmLogic.StatusText(Volatile.Read(ref done), total, Volatile.Read(ref usedDone), played);
++            Volatile.Write(ref progressDone, Volatile.Read(ref done));
++            status = firstStart ? GameWarmLogic.FirstStartText(Volatile.Read(ref done), total) : GameWarmLogic.StatusText(Volatile.Read(ref done), total, Volatile.Read(ref usedDone), played);
+             Changed?.Invoke();
+         }
+         void Flush(bool force)
+@@ -422,23 +471,24 @@
+         Log($"shader warm-up: {total} librar{(total == 1 ? "y" : "ies")} of {titleId} to prepare so the first session finds them in Metal's cache ({played} used in earlier sessions, {learnedCount} learned while it ran; the other {total - front} wait for a charger or a cool phone)");
+         Report();
+ 
+-        int workers = Math.Min(2, Math.Max(1, Environment.ProcessorCount / 2));
++        // The first start is the step the player waits for: four workers (the boot's own prepare used six), at the usual QoS above Utility. A manual run stays at two, in the background
++        int workers = firstStart ? Math.Min(4, Math.Max(1, Environment.ProcessorCount - 2)) : Math.Min(2, Math.Max(1, Environment.ProcessorCount / 2));
+         var threads = new List<Thread>();
+         for (int w = 0; w < workers; w++)
+         {
+             int id = w;
+             var th = new Thread(() =>
+             {
+-                NSThread.Current.QualityOfService = NSQualityOfService.Utility;
++                NSThread.Current.QualityOfService = firstStart ? NSQualityOfService.UserInitiated : NSQualityOfService.Utility;
+                 while (Current(mine))
+                 {
+-                    // Heat: Fair keeps one worker, Serious and Critical none, until the phone cools (or the run is stopped)
++                    // Heat: Fair keeps one worker, Serious and Critical none, until the phone cools (or the run is stopped). The first start waits for Serious only: at Fair it keeps every worker
+                     var thermal = NSProcessInfo.ProcessInfo.ThermalState;
+-                    if (thermal >= NSProcessInfoThermalState.Serious || (thermal >= NSProcessInfoThermalState.Fair && id > 0)) { Thread.Sleep(3000); continue; }
++                    if (thermal >= NSProcessInfoThermalState.Serious || (!firstStart && thermal >= NSProcessInfoThermalState.Fair && id > 0)) { Thread.Sleep(3000); continue; }
+                     // Memory: the ceiling iOS grants is shared with a build or a game; stay out of the way below 700 MiB (a simulator answers none)
+                     if (GameAppMain.AvailableMiBValue() is long left && left > 0 && left < 700) { Thread.Sleep(3000); continue; }
+                     // After what a session needs: the rest only on a charger or while the phone is not warm (thermal <= Fair), to spare the battery
+-                    if (Volatile.Read(ref next) + 1 >= front && !RestAllowed()) { Thread.Sleep(5000); continue; }
++                    if (!firstStart && Volatile.Read(ref next) + 1 >= front && !RestAllowed()) { Thread.Sleep(5000); continue; }
+                     int i = Interlocked.Increment(ref next);
+                     if (i >= total) return;
+                     var item = items[i];
+@@ -486,6 +536,11 @@
+         foreach (var th in threads) th.Join();
+         Flush(true);
+         int finished = Volatile.Read(ref done);
++        if (firstStart && Current(mine) && finished >= total)
++        {
++            try { File.WriteAllText(Path.Combine(gameDir, "prepared.tsv"), header + "\n" + total + "\t" + DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ") + "\n"); }
++            catch (Exception) { }
++        }
+         if (Current(mine))
+             Log($"shader warm-up: {titleId} done, {compiled} compiled in {sw.Elapsed.TotalSeconds:F0} s ({compileMs / 1000.0:F0} s of compile time summed over {workers} thread(s)), {skipped} already warm or shared a source, {failed} did not compile ({finished} of {total})");
+         else
+@@ -500,14 +555,14 @@
+ 
+     private NSTimer warmTicker;
+ 
+-    private void StartWarmTitle(string tid, string game = null)
++    private void StartWarmTitle(string tid, string game = null, bool firstStart = false)
+     {
+         if (tid == null) return;
+         GameWarm.Sink = line => BeginInvokeOnMainThread(() => Write(line));
+         var root = GameExport.IsPlayer ? Path.Combine(GameExport.BundleGame, "shaders") : Path.Combine(GameAppMain.Documents, "shaders");
+         GameWarm.Changed -= WarmChanged;
+         GameWarm.Changed += WarmChanged;
+-        GameWarm.Start(tid, root);
++        GameWarm.Start(tid, root, firstStart);
+         // The warm-up keeps going when the player leaves the app: a continued-processing task (iOS 26) with its own progress on the lock screen, fed once a second by its status
+         BackgroundBegin(game ?? tid, warm: true);
+         warmTicker?.Invalidate();
+@@ -520,6 +575,27 @@
+         });
+     }
+ 
++    /// An exported player's first launch: prepare the shaders the game needs, once (GameWarm.FirstStartPending says whether it is owed), with the bar and the background task. Nothing for the main app.
++    private void StartFirstStartPrepare()
++    {
++        if (!GameExport.IsPlayer || GameWarm.Active) return;
++        var tid = WarmTitleOf(GameExport.PlayerDump);
++        if (tid == null || !GameWarm.FirstStartPending(tid, WarmPackRoot())) return;
++        Write("shader warm-up: first start of this app: preparing the shaders the game needs, once (its prewarm list, the learned list, what was used)");
++        StartWarmTitle(tid, GameExport.PlayerDump, firstStart: true);
++    }
++
++    /// The player pressed Play while the first-start preparation goes: say what it costs to go on, and let the player choose.
++    private void AskPlayDuringPrepare()
++    {
++        var a = UIAlertController.Create("Still preparing the game",
++            $"{GameWarm.Status} It is done once, then the game starts in seconds. If you play now, the game stops to compile what is missing, in the first minutes of a race.",
++            UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create("Wait", UIAlertActionStyle.Cancel, null));
++        a.AddAction(UIAlertAction.Create("Play anyway", UIAlertActionStyle.Destructive, _ => { GameWarm.Stop("the player chose to play"); PrimaryTapped(); }));
++        PresentWhenFree(a);
++    }
++
+     /// A run (a build or a boot) starts: the warm-up gives the phone back.
+     private void StopWarm(string why) => GameWarm.Stop(why);
+ 
+@@ -531,7 +607,8 @@
+         if (GameExport.IsPlayer)
+         {
+             if (playerStatus == null) return;
+-            if (GameWarm.Active) { playerStatus.Text = GameWarm.Status; playerStatus.Hidden = false; }
++            if (playerProgress != null) { playerProgress.Hidden = !GameWarm.FirstStart; playerProgress.Progress = GameWarm.Fraction; }
++            if (GameWarm.Active) RefreshScreen();   // the player's status line is composed there (the files to copy, then this status)
+             else RefreshScreen();   // done: the screen says what it says
+             return;
+         }

@@ -1,0 +1,454 @@
+# 0088-discard-the-partial-build.patch -- the owner's point P: "a game whose build was PAUSED part-way cannot be deleted". Applies after 0087. UNTESTED ON DEVICE AND IN THE SIMULATOR:
+# compiled, and its pure part ran in the host harness (below).
+#
+# P. "Discard the partial build" (red, trash icon), wherever the paused game shows: its touch-and-hold menu (right after "Cancel the paused build…"), the Build tab's card under Resume and
+#    Cancel (its words do not fit a third of the card), and the iPad's hero beside Resume (a paused game has no inspector: only a built game has settings, 0082). It works on the game it is
+#    shown for, whichever game is selected (the card's paused game: CardPaused).
+#    - The rule (GameAppField.cs PartialDiscard.For): offered for a paused build; REFUSED, greyed with its reason under the title (and as the VoiceOver hint; a tap in the menu shows it), while
+#      that build runs or pauses ("It is building: pause it first, then discard it."), while another build or a game runs (extract/ may be that one's), and when the game file is a stub
+#      (Optimize storage: the extraction is all that is left to build it from). Built, not built, cloud and downloading games: not offered.
+#    - The question (sizes measured off the main thread, FolderWalk): "Discard the partial build of <game>?" / "Removes the extracted game (13.0 GB), the rewrite and the 1,234 shaders
+#      translated so far; the game file itself stays." (the count from the paused build's stage line; none before the shader step; "the extracted game is another build's now: it stays"
+#      when a later build replaced it) + "Every finished shader stays in the shader cache (a new build reuses it); the game's settings, saves, cover and mods are not touched. The game is
+#      "Not built" again." Buttons "Discard (13.4 GB)" (destructive) / "Keep it".
+#    - The discard (asked again at the confirmation: a Resume may have started): 0065's cancel cleanup with PartialDiscard.Plan: extract/ (when it is this game's: the paused record and the
+#      slot say so), shaders/<id>.work with its pause marker, the partial DmGameProbe.framework and gameapp.framework, AND the extraction marker gameapp.extracted and profile.tsv (a cancel
+#      kept them); the folders on the delete worker, never the main thread; the paused record goes (gameapp.paused.tsv), the queue entry too; never shadercache/, games/<id>/ or the game
+#      file, its update or DLC (CancelPlan.Forbidden, checked). Then the free space is read again (DiskFreeNow), the sizes and the slot refreshed, the game is "Not built", and the log says
+#      "partial build discarded: <title>, 13.4 GB freed".
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile (-t:Compile):
+#   0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness88: … P87;P88): 288 of 288 checks (18 new: which states offer it, refuse it or not, the menu,
+#   the question's words, the shader count, the plan and what it never touches, the log line, the wiring); 13 of 13 mutations killed.
+# NOT VERIFIED: nothing ran on a device: the real sizes and the free space after a discard, the greyed rows' look, a discard of a game other than the selected one.
+# NEW UI STRINGS: "Discard the partial build", "Discard the partial build of ", "the extracted game (", " translated so far", "; the game file itself stays.", "Discard (", "Discard",
+#   "Keep it", the three reasons (PartialDiscard.RunningWhy, OtherWhy, StubWhy), PartialDiscard.Keeps, "The build is no longer paused."; log lines "partial build discarded: ",
+#   "partial build: discarding ", "partial build: not discarded: ".
+diff -ruN i/GameAppField.cs j/GameAppField.cs
+--- i/GameAppField.cs	2026-11-21 23:54:53
++++ j/GameAppField.cs	2026-11-22 00:05:08
+@@ -359,3 +359,66 @@
+                                                                                  && string.Equals(GameAppUi.BaseTitleIdOf(n), id, StringComparison.OrdinalIgnoreCase));
+     }
+ }
++
++/// Patch 0088 (the owner: "a game whose build was PAUSED part-way cannot be deleted"): "Discard the partial build", wherever the paused game shows (its touch-and-hold menu, the Build tab's
++/// card beside Resume, the iPad's hero). It asks first, with what goes and its size, then removes what the paused build made (extract/, the rewrite's partial framework and stamp, the shader
++/// work folder with its pause marker, the extraction marker, profile.tsv), off the main thread; the paused record goes, the game is "Not built" again. Never the shader cache, games/<id>/
++/// (settings, saves, cover, mods), the game file, its update or DLC. Refused, greyed with the reason, while that build runs (pause it first), while another build runs (extract/ may be
++/// that one's), and when the game file is a stub (Optimize storage: the extraction is all that is left to build it from).
++public static class PartialDiscard
++{
++    public enum Offer { None, Offered, Refused }
++
++    public const string Title = "Discard the partial build";
++    public const string RunningWhy = "It is building: pause it first, then discard it.";
++    public const string OtherWhy = "Another build is running: discard this one once it has ended.";
++    public const string StubWhy = "Its game file has no content (Optimize storage removed it): the extracted game is all that is left to build it from.";
++    public const string Keeps = "Every finished shader stays in the shader cache (a new build reuses it); the game's settings, saves, cover and mods are not touched. The game is \"Not built\" again.";
++
++    /// `busy`: a build runs (for a paused game: another game's); `contentMissing`: the game file is a stub (patch 0073).
++    public static (Offer Offer, string Why) For(LibState state, bool busy, bool contentMissing)
++    {
++        if (state == LibState.Building) return (Offer.Refused, RunningWhy);
++        if (state != LibState.Paused) return (Offer.None, null);
++        if (busy) return (Offer.Refused, OtherWhy);
++        if (contentMissing) return (Offer.Refused, StubWhy);
++        return (Offer.Offered, null);
++    }
++
++    private static readonly Regex Shaders = new Regex(@"\((\d+)/(\d+) shaders\)");
++
++    /// The shaders the paused build translated, from its stage line ("… (1234/5009 shaders)"); 0 before the shader step; -1 when its line says nothing.
++    public static long ShadersDone(string stageLine)
++    {
++        if (string.IsNullOrWhiteSpace(stageLine)) return -1;
++        var s = GameAppUi.ParseStage(stageLine);
++        if (!s.Valid) return -1;
++        var m = Shaders.Match(s.Text ?? "");
++        if (m.Success && long.TryParse(m.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var done)) return done;
++        return s.Of == 5 && s.Step >= 1 && s.Step < 3 ? 0 : -1;   // stage 1 (reading) or 2 (the rewrite): no shader yet
++    }
++
++    /// The question's text: "Removes the extracted game (13.0 GB), the rewrite and the 1,234 shaders translated so far; the game file itself stays." then what stays.
++    public static string Note(long extractBytes, long shaders, bool extractIsThis)
++    {
++        var parts = new List<string>();
++        if (extractIsThis) parts.Add(extractBytes >= 0 ? "the extracted game (" + GameAppUi.SizeText(extractBytes) + ")" : "the extracted game");
++        parts.Add("the rewrite");
++        if (shaders > 0) parts.Add("the " + shaders.ToString("N0", CultureInfo.InvariantCulture) + (shaders == 1 ? " shader" : " shaders") + " translated so far");
++        else if (shaders < 0) parts.Add("the shaders translated so far");
++        var list = parts.Count == 1 ? parts[0] : string.Join(", ", parts.Take(parts.Count - 1)) + " and " + parts[parts.Count - 1];
++        return "Removes " + list + (extractIsThis ? "" : " (the extracted game is another build's now: it stays)") + "; the game file itself stays.\n" + Keeps;
++    }
++
++    /// What goes: a cancel that frees the space (CancelPlan, the chain having run), and the extraction marker and profile.tsv when extract/ is this game's.
++    public static CancelPlan Plan(string tid, bool frameworkIsPartial, bool extractIsThis)
++    {
++        var p = CancelPlan.For(CancelChoice.FreeSpace, tid, frameworkIsPartial, chainRan: true, extractIsThis);
++        var files = p.Files.ToList();
++        if (extractIsThis) files.AddRange(new[] { "gameapp.extracted", "profile.tsv" });
++        return new CancelPlan(p.Folders, files);
++    }
++
++    /// The log line: "partial build discarded: South Park, 13.4 GB freed".
++    public static string Line(string name, long freedBytes) => "partial build discarded: " + name + ", " + GameAppUi.SizeText(Math.Max(0, freedBytes)) + " freed";
++}
+diff -ruN i/GameAppPadUi.cs j/GameAppPadUi.cs
+--- i/GameAppPadUi.cs	2026-11-21 23:49:11
++++ j/GameAppPadUi.cs	2026-11-22 00:04:02
+@@ -232,6 +232,17 @@
+             settings.TouchUpInside += (_, __) => ShowGameSheet(e);
+             heroButtons.AddArrangedSubview(settings);
+         }
++        // patch 0088: a paused build's "Discard the partial build" beside Resume (greyed with its reason while it builds)
++        var discard = PartialDiscard.For(state, facts.Running, state == LibState.Paused && ContentMissing(e.Name).Count > 0);
++        if (discard.Offer != PartialDiscard.Offer.None)
++        {
++            var b = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "hero-discard" };
++            StyleDiscardButton(b, discard.Offer, discard.Why);
++            b.HeightAnchor.ConstraintGreaterThanOrEqualTo(52).Active = true;
++            var game = e.Name;
++            b.TouchUpInside += (_, __) => AskDiscardPartial(game);
++            heroButtons.AddArrangedSubview(b);
++        }
+         heroNote.Hidden = !LibraryActions.ShowsNote(state, canRun);
+         ambient.SetHue(e.Icon != null ? Look.HueOf(e.Icon) : -1, true);
+     }
+diff -ruN i/GameAppRedesign.cs j/GameAppRedesign.cs
+--- i/GameAppRedesign.cs	2026-11-21 23:49:11
++++ j/GameAppRedesign.cs	2026-11-22 00:02:09
+@@ -187,9 +187,10 @@
+ /// Play with a development certificate), Export IPA for a built game, Settings, Choose a cover… (not for a game only in the cloud), then the long-press menu's items of the patches before
+ /// where they apply (Update, 0076 the shader preparation's Pause / Resume and "Prepare the shaders now", 0065 the paused build's Cancel, the queue, the uploads, Remove download), and last
+ /// Delete… (a game on this iPhone) or Hide from the library (a game only in the cloud).
+-public enum HoldItem { Primary, Settings, ChooseCover, Export, Update, WarmToggle, WarmNow, CancelPaused, AddToQueue, Upload, RemoveDownload, Delete, Hide, AddContent, Mods, QueueRebuild }
++public enum HoldItem { Primary, Settings, ChooseCover, Export, Update, WarmToggle, WarmNow, CancelPaused, AddToQueue, Upload, RemoveDownload, Delete, Hide, AddContent, Mods, QueueRebuild, Discard }
+ 
+-public sealed record HoldFacts(LibState State, bool CanRunHere, bool Update, bool LocalFile, bool Busy, bool WarmShown, bool WarmQueued, int UploadTargets, bool HasCloudCopy, bool CanAttach = false, bool HasTitle = false, bool ModsChanged = false);
++public sealed record HoldFacts(LibState State, bool CanRunHere, bool Update, bool LocalFile, bool Busy, bool WarmShown, bool WarmQueued, int UploadTargets, bool HasCloudCopy, bool CanAttach = false, bool HasTitle = false, bool ModsChanged = false,
++                               bool ContentMissing = false);
+ 
+ public static class HoldMenuPlan
+ {
+@@ -209,6 +210,7 @@
+         if (built && !f.Busy && f.WarmShown) items.Add(HoldItem.WarmToggle);
+         else if (built && !f.Busy && f.WarmQueued) items.Add(HoldItem.WarmNow);
+         if (f.State == LibState.Paused) items.Add(HoldItem.CancelPaused);
++        if (PartialDiscard.For(f.State, f.Busy, f.ContentMissing).Offer != PartialDiscard.Offer.None) items.Add(HoldItem.Discard);   // patch 0088: greyed with its reason while it builds
+         // patch 0086 (the owner: "Add to the build queue" on a BUILT game rebuilt it from scratch, why?): the queue builds; a game that is not built is added, a built one only when its build is
+         // out of date (an update or DLC added since, the code mods changed), as "Queue a rebuild" with a question; a built, up-to-date game has no queue entry at all
+         var queue = QueuePlan.For(f.State, f.Update || f.ModsChanged);
+diff -ruN i/GameAppRedesignUi.cs j/GameAppRedesignUi.cs
+--- i/GameAppRedesignUi.cs	2026-11-21 23:56:39
++++ j/GameAppRedesignUi.cs	2026-11-22 00:04:02
+@@ -497,7 +497,8 @@
+ /// anchored to it (HoldMenuLayout). A tap outside closes it. It is a layer over the screen, not a page.
+ internal sealed class HoldOverlay : UIView
+ {
+-    public sealed record Entry(string Title, string Symbol, bool Destructive, Action Run, string Id);
++    /// `Refused` (patch 0088): the entry is greyed and says why under its title; a tap shows the reason (Run).
++    public sealed record Entry(string Title, string Symbol, bool Destructive, Action Run, string Id, string Refused = null);
+     private readonly UIView menu = new UIView();
+     private readonly Action closed;
+     private bool closing;
+@@ -532,9 +533,12 @@
+         {
+             var e = entries[i];
+             if (i > 0) { var rule = new UIView { BackgroundColor = UIColor.FromWhiteAlpha(1f, 0.07f) }; rule.HeightAnchor.ConstraintEqualTo(1).Active = true; stack.AddArrangedSubview(rule); }
+-            var ink = e.Destructive ? Theme.Error : Theme.Text;
++            bool refused = e.Refused != null;
++            var ink = refused ? Theme.Text.ColorWithAlpha(0.38f) : e.Destructive ? Theme.Error : Theme.Text;
+             var b = new UIButton(UIButtonType.System) { AccessibilityLabel = e.Title, AccessibilityIdentifier = e.Id };
+-            var title = Theme.Label(e.Title, Theme.Font(15, UIFontWeight.Regular), ink);
++            if (refused) { b.AccessibilityHint = e.Refused; b.AccessibilityTraits |= UIAccessibilityTrait.NotEnabled; }
++            UIView title = Theme.Label(e.Title, Theme.Font(15, UIFontWeight.Regular), ink);
++            if (refused) title = Theme.Column(2, title, Theme.Label(e.Refused, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 2));   // patch 0088: greyed, with its reason
+             var row = Theme.Row(10, title, new UIView(), Theme.Symbol(e.Symbol ?? "circle", 17, ink));
+             row.UserInteractionEnabled = false;
+             row.TranslatesAutoresizingMaskIntoConstraints = false;
+@@ -542,7 +546,7 @@
+             NSLayoutConstraint.ActivateConstraints(new[]
+             {
+                 row.LeadingAnchor.ConstraintEqualTo(b.LeadingAnchor, 12), row.TrailingAnchor.ConstraintEqualTo(b.TrailingAnchor, -12),
+-                row.CenterYAnchor.ConstraintEqualTo(b.CenterYAnchor), b.HeightAnchor.ConstraintEqualTo(44),
++                row.CenterYAnchor.ConstraintEqualTo(b.CenterYAnchor), b.HeightAnchor.ConstraintEqualTo(refused ? 62 : 44),
+             });
+             var run = e.Run;
+             b.TouchUpInside += (_, __) => Close(run);
+@@ -561,7 +565,7 @@
+             stack.TopAnchor.ConstraintEqualTo(menu.TopAnchor, 2), stack.BottomAnchor.ConstraintEqualTo(menu.BottomAnchor, -2),
+             stack.LeadingAnchor.ConstraintEqualTo(menu.LeadingAnchor, 4), stack.TrailingAnchor.ConstraintEqualTo(menu.TrailingAnchor, -4),
+         });
+-        double height = 4 + entries.Count * 44 + Math.Max(0, entries.Count - 1);
++        double height = 4 + entries.Sum(x => x.Refused != null ? 62 : 44) + Math.Max(0, entries.Count - 1);
+         var safe = host.SafeAreaLayoutGuide.LayoutFrame;
+         var visible = new Box((double) safe.X, (double) safe.Y, (double) safe.Width, (double) safe.Height - 70);   // above the tab bar
+         var place = HoldMenuLayout.Place(new Box((double) frame.X, (double) frame.Y, (double) frame.Width, (double) frame.Height), index, count, height, visible, columns);
+@@ -1116,7 +1120,8 @@
+         bool downloaded = local && e.Cloud != null && DownloadPairing.SameFile(SafeLength(path), e.Cloud, ImportLedger.Find(libLedger ?? ImportLedger.Load(GameAppMain.Documents), name));
+         bool canAttach = GameAppUi.ContentKindOf(name) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(name);   // patch 0084
+         bool modsChanged = state == LibState.Built && tid != null && GameMods.ExefsChangedSinceBuild(GameAppMain.Documents, tid);   // patch 0086: a code mod changed since the build
+-        var plan = HoldMenuPlan.Items(new HoldFacts(state, canRun, update, local, facts.Running, warmShown, warmQueued, targets.Count, downloaded, canAttach, tid != null, modsChanged));
++        var plan = HoldMenuPlan.Items(new HoldFacts(state, canRun, update, local, facts.Running, warmShown, warmQueued, targets.Count, downloaded, canAttach, tid != null, modsChanged,
++                                                    ContentMissing: state == LibState.Paused && ContentMissing(name).Count > 0));   // patch 0088
+         var list = new List<HoldOverlay.Entry>();
+         var primary = LibraryActions.For(state, canRun)[0];
+         foreach (var item in plan)
+@@ -1134,6 +1139,13 @@
+                 case HoldItem.WarmToggle: list.Add(new HoldOverlay.Entry(warmQueue.Paused ? "Resume the shader preparation" : "Pause the shader preparation", warmQueue.Paused ? "play.fill" : "pause.fill", false, ToggleWarmPause, "hold-warm")); break;
+                 case HoldItem.WarmNow: list.Add(new HoldOverlay.Entry("Prepare the shaders now", "bolt.fill", false, () => PrepareNow(name), "hold-warm-now")); break;
+                 case HoldItem.CancelPaused: list.Add(new HoldOverlay.Entry("Cancel the paused build…", "xmark", false, () => AskCancel(name), "build-cancel")); break;
++                case HoldItem.Discard:   // patch 0088: the paused game's (any game, not only the selected one); greyed with its reason while it builds
++                {
++                    var d = PartialDiscard.For(state, facts.Running, state == LibState.Paused && ContentMissing(name).Count > 0);
++                    bool ok = d.Offer == PartialDiscard.Offer.Offered;
++                    list.Add(new HoldOverlay.Entry(PartialDiscard.Title, "trash", true, ok ? () => AskDiscardPartial(name) : () => ShowDiscardRefused(d.Why), "hold-discard", ok ? null : d.Why));
++                    break;
++                }
+                 case HoldItem.AddToQueue: list.Add(new HoldOverlay.Entry("Add to the build queue", "list.number", false, () => AddToBuildQueue(name), "hold-queue")); break;
+                 case HoldItem.Upload:
+                     foreach (var t in targets) { var target = t; list.Add(new HoldOverlay.Entry("Upload to " + target.Name, "icloud.and.arrow.up", false, () => UploadTo(target, path, false), "hold-upload")); }
+@@ -1350,8 +1362,9 @@
+         buildWatch = watch;
+         head.AddArrangedSubview(watch);
+         nowNote = Theme.Label(BuildList.RunningNote, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
+-        var column = Theme.Column(14, head, stages, buildNowBar, buildStopRow, nowNote);
++        var column = Theme.Column(14, head, stages, buildNowBar, buildStopRow, buildDiscard, nowNote);   // buildDiscard: patch 0088 (GameAppStopUi.cs)
+         column.SetCustomSpacing(10, buildStopRow);
++        column.SetCustomSpacing(10, buildDiscard);
+         buildNowCard = Look.Card(column, 16, 16);
+         buildNowCard.AccessibilityIdentifier = "build-now-card";
+         buildNowCard.Hidden = true;
+diff -ruN i/GameAppStopUi.cs j/GameAppStopUi.cs
+--- i/GameAppStopUi.cs	2026-11-21 23:49:11
++++ j/GameAppStopUi.cs	2026-11-22 00:03:45
+@@ -33,7 +33,7 @@
+     private volatile bool pauseRecorded;                     // the paused record is on disk (the system's task waits for it)
+     private PausedBuild resumedFrom;                         // the record of the pause this run resumes (PausedStore.Inherit)
+     private Timer stopNag;
+-    private UIButton buildPause, buildResume, buildCancel, buildWatch;
++    private UIButton buildPause, buildResume, buildCancel, buildWatch, buildDiscard;   // buildDiscard: patch 0088
+     private UIView buildStopRow;
+ 
+     private static string PausedPath => Path.Combine(GameAppMain.Documents, "gameapp.paused.tsv");
+@@ -153,13 +153,15 @@
+     }
+ 
+     /// A cancel: the run was cancelled (or a paused build is). What goes depends on the person's choice (CancelPlan); shadercache/, games/<id>/ and the game file never.
+-    private void ApplyCancel(string game, CancelChoice choice, bool chainRan, bool extractIsThis = true)
++    /// `discard` (patch 0088): "Discard the partial build": the space freed, plus the extraction marker and profile.tsv (PartialDiscard.Plan); `freed`: the bytes measured for its question.
++    private void ApplyCancel(string game, CancelChoice choice, bool chainRan, bool extractIsThis = true, bool discard = false, long freed = 0)
+     {
+         var tid = GameAppUi.BaseTitleIdOf(game);
+         // patch 0073: a game whose file has no content ("Optimize storage" replaced it by a stub after its extraction) keeps its extraction: it is all that is left to build it from
+         if (choice == CancelChoice.FreeSpace && ContentMissing(game).Count > 0)
+         {
+             choice = CancelChoice.KeepExtracted;
++            discard = false;   // patch 0088: refused before its question (PartialDiscard.StubWhy); never here
+             Write($"build cancelled: {GameAppUi.DisplayName(game)}: its extraction is kept (the game file has no content: Optimize storage removed it, a rebuild starts from the extraction)");
+         }
+         // patch 0073: freeing the space also removes this game's extraction parked while another game had the slot (never a finished build of it: that one is still Ready)
+@@ -175,27 +177,37 @@
+             var inSlot = SlotStore.Read(GameAppMain.Documents);
+             if (inSlot.Tid != null && !inSlot.BelongsTo(game, tid)) extractIsThis = false;
+         }
+-        var plan = CancelPlan.For(choice, tid, FrameworkIsPartial(game), chainRan, extractIsThis);
++        var plan = discard ? PartialDiscard.Plan(tid, FrameworkIsPartial(game), extractIsThis) : CancelPlan.For(choice, tid, FrameworkIsPartial(game), chainRan, extractIsThis);
+         pausedBuilds = PausedStore.Remove(pausedBuilds, game);
+         SavePaused();
+         QueueCancelled(game);
+         foreach (var rel in plan.Files)
+             try { var path = Path.Combine(GameAppMain.Documents, rel); if (File.Exists(path)) File.Delete(path); } catch (Exception) { }
+-        Write($"build cancelled: {GameAppUi.DisplayName(game)} · {(choice == CancelChoice.FreeSpace ? "freeing the space: " : "keeping the extracted game: ")}{(plan.Folders.Count == 0 ? "nothing to remove" : string.Join(", ", plan.Folders))} (removed in the background)");
+-        if (plan.Folders.Count == 0) { CancelCleanupFinished(game); return; }
++        Write(discard ? $"partial build: discarding {GameAppUi.DisplayName(game)}: {string.Join(", ", plan.Folders.Concat(plan.Files))} (the folders in the background; the shader cache, games/<id>/ and the game file stay)"
++                      : $"build cancelled: {GameAppUi.DisplayName(game)} · {(choice == CancelChoice.FreeSpace ? "freeing the space: " : "keeping the extracted game: ")}{(plan.Folders.Count == 0 ? "nothing to remove" : string.Join(", ", plan.Folders))} (removed in the background)");
++        long discarded = discard ? freed : -1;
++        if (plan.Folders.Count == 0) { CancelCleanupFinished(game, discarded); return; }
+         int left = plan.Folders.Count;
+         foreach (var rel in plan.Folders)
+             DeleteFolderInBackground(Path.Combine(GameAppMain.Documents, rel), error =>
+             {
+                 if (error != null) Write($"cancel: {rel} could not be removed: {error}");
+-                if (--left == 0) CancelCleanupFinished(game);
++                if (--left == 0) CancelCleanupFinished(game, discarded);
+             });
+     }
+ 
+-    private void CancelCleanupFinished(string game)
++    /// `discarded` >= 0 (patch 0088): a discarded partial build: its line, the free space read again.
++    private void CancelCleanupFinished(string game, long discarded = -1)
+     {
+         stop.CleanupDone();   // Cancelling -> Cancelled
+-        Write($"cancelled: {GameAppUi.DisplayName(game)}");
++        if (discarded >= 0)
++        {
++            DiskFreeNow.Invalidate();   // GameAppFieldUi.cs: the free-space figure is read again
++            sizes.Invalidate();
++            SlotsChanged();             // the extraction marker went
++            Write(PartialDiscard.Line(GameAppUi.DisplayName(game), discarded));
++        }
++        else Write($"cancelled: {GameAppUi.DisplayName(game)}");
+         RefreshScreen();
+         UpdateNowCard(null);
+     }
+@@ -306,7 +318,7 @@
+         PresentWhenFree(a);
+     }
+ 
+-    private void CancelChosen(string game, CancelChoice choice)
++    private void CancelChosen(string game, CancelChoice choice, bool discard = false, long freed = 0)
+     {
+         if (running && stop.Game == game)
+         {
+@@ -322,11 +334,108 @@
+         if (record == null || running) return;
+         bool inSession = stop.State == StopState.Paused && stop.Game == game;
+         if (inSession) stop.Cancel(choice);   // Paused -> Cancelling: nothing runs, only the cleanup
+-        ApplyCancel(game, choice, inSession ? stop.ChainRan : record.StageNumber >= 1, extractIsThis: inSession || record.Extracted);
++        ApplyCancel(game, choice, inSession ? stop.ChainRan : record.StageNumber >= 1, extractIsThis: inSession || record.Extracted, discard: discard, freed: freed);
+         UpdateNowCard(null);
+         RefreshScreen();
+     }
+ 
++    // ---- patch 0088: "Discard the partial build" (GameAppField.cs PartialDiscard) -------------------------------------------------
++
++    private bool discardSizing;
++
++    /// The rule for `game` now: offered for its paused build; refused, with the reason, while it builds, while another build or a game runs, or when its file is a stub. Any game, not
++    /// only the selected one.
++    private (PartialDiscard.Offer Offer, string Why) DiscardOfferFor(string game)
++    {
++        if (game == null) return (PartialDiscard.Offer.None, null);
++        bool paused = pausedBuilds.Any(r => r.Game == game);
++        var state = running && stop.Game == game ? LibState.Building : paused ? LibState.Paused : LibState.NotBuilt;
++        return PartialDiscard.For(state, running, state == LibState.Paused && ContentMissing(game).Count > 0);
++    }
++
++    private void ShowDiscardRefused(string why)
++    {
++        if (why == null) return;
++        Write("partial build: not discarded: " + why);
++        var a = UIAlertController.Create(PartialDiscard.Title, why, UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(a);
++    }
++
++    /// Whether extract/ holds THIS game's extraction (ApplyCancel decides the same way): the paused record says it was extracted, and the slot in Documents is not another game's.
++    private bool DiscardExtractIsThis(string game, PausedBuild record)
++    {
++        bool mine = (stop.State == StopState.Paused && stop.Game == game) || record.Extracted;
++        if (!mine) return false;
++        var inSlot = SlotStore.Read(GameAppMain.Documents);
++        return inSlot.Tid == null || inSlot.BelongsTo(game, GameAppUi.BaseTitleIdOf(game));
++    }
++
++    /// The question, with what goes and its size (the folders measured off the main thread), then the discard.
++    private void AskDiscardPartial(string game)
++    {
++        var offer = DiscardOfferFor(game);
++        if (offer.Offer == PartialDiscard.Offer.Refused) { ShowDiscardRefused(offer.Why); return; }
++        var record = pausedBuilds.FirstOrDefault(r => r.Game == game);
++        if (offer.Offer != PartialDiscard.Offer.Offered || record == null || discardSizing) return;
++        bool extractIsThis = DiscardExtractIsThis(game, record);
++        var plan = PartialDiscard.Plan(GameAppUi.BaseTitleIdOf(game), FrameworkIsPartial(game), extractIsThis);
++        long shaders = PartialDiscard.ShadersDone(record.StageLine);
++        var docs = GameAppMain.Documents;
++        discardSizing = true;
++        Task.Run(() =>
++        {
++            long extract = -1, total = 0;
++            foreach (var rel in plan.Folders)
++            {
++                long b = 0;
++                try { b = FolderWalk.Bytes(Path.Combine(docs, rel)); } catch (Exception) { }
++                if (rel == CancelPlan.Extract) extract = b;
++                total += b;
++            }
++            foreach (var rel in plan.Files)
++                try { var f = new FileInfo(Path.Combine(docs, rel)); if (f.Exists) total += f.Length; } catch (Exception) { }
++            BeginInvokeOnMainThread(() =>
++            {
++                discardSizing = false;
++                var name = GameAppUi.DisplayName(game);
++                var a = UIAlertController.Create($"Discard the partial build of {name}?", PartialDiscard.Note(extract, shaders, extractIsThis), UIAlertControllerStyle.Alert);
++                a.AddAction(UIAlertAction.Create(total > 0 ? $"Discard ({GameAppUi.SizeText(total)})" : "Discard", UIAlertActionStyle.Destructive, _ => DiscardPartial(game, total)));
++                a.AddAction(UIAlertAction.Create("Keep it", UIAlertActionStyle.Cancel, null));
++                PresentWhenFree(a);
++            });
++        });
++    }
++
++    private void DiscardPartial(string game, long bytes)
++    {
++        var offer = DiscardOfferFor(game);   // asked again: a Resume or another build may have started while the question was up
++        if (offer.Offer != PartialDiscard.Offer.Offered) { ShowDiscardRefused(offer.Why ?? "The build is no longer paused."); return; }
++        CancelChosen(game, CancelChoice.FreeSpace, discard: true, freed: bytes);
++    }
++
++    /// The red "Discard the partial build" button (trash), greyed with its reason as a subtitle when refused, hidden when there is nothing to discard. The Build tab's card and the iPad's hero.
++    private static void StyleDiscardButton(UIButton b, PartialDiscard.Offer offer, string why)
++    {
++        var c = UIButtonConfiguration.FilledButtonConfiguration;
++        c.AttributedTitle = new NSAttributedString(PartialDiscard.Title, new UIStringAttributes { Font = Theme.Font(15, UIFontWeight.Medium) });
++        c.Image = UIImage.GetSystemImage("trash");
++        c.ImagePadding = 8;
++        c.BaseBackgroundColor = Look.Raised;
++        c.BaseForegroundColor = offer == PartialDiscard.Offer.Offered ? Theme.Error : Theme.Text.ColorWithAlpha(0.38f);
++        if (offer == PartialDiscard.Offer.Refused && why != null)
++        {
++            c.AttributedSubtitle = new NSAttributedString(why, new UIStringAttributes { Font = Theme.Font(11, UIFontWeight.Regular), ForegroundColor = Theme.Muted });
++            c.TitleAlignment = UIButtonConfigurationTitleAlignment.Center;
++        }
++        var bg = c.Background; bg.CornerRadius = 12; c.Background = bg;
++        b.Configuration = c;
++        b.Enabled = offer == PartialDiscard.Offer.Offered;
++        b.AccessibilityLabel = PartialDiscard.Title;
++        b.AccessibilityHint = offer == PartialDiscard.Offer.Refused ? why : null;
++        b.Hidden = offer == PartialDiscard.Offer.None;
++    }
++
+     /// Resume: the chain again on what was kept. The queue goes on after it when the game was queued.
+     private void ResumePaused(string game)
+     {
+@@ -399,6 +508,7 @@
+             buildStopRow.Hidden = !stoppable;
+             buildPause.Hidden = false; buildResume.Hidden = true; buildCancel.Hidden = false;
+             buildPause.Enabled = buildCancel.Enabled = state == StopState.Running;   // while a stop is being honoured both are off: 'Pausing…' / 'Cancelling…' is the answer
++            if (buildDiscard != null) StyleDiscardButton(buildDiscard, state == StopState.Cancelling ? PartialDiscard.Offer.None : PartialDiscard.Offer.Refused, PartialDiscard.RunningWhy);   // patch 0088
+             buildWatch.Hidden = false;
+             return;
+         }
+@@ -407,10 +517,12 @@
+             buildNowCard.Hidden = false;
+             buildNowLine.Text = GameAppUi.DisplayName(stop.Game ?? "") + "\n" + StopText.Cancelling();
+             buildStopRow.Hidden = true; buildWatch.Hidden = true;
++            if (buildDiscard != null) buildDiscard.Hidden = true;
+             return;
+         }
+         var paused = CardPaused(facts ?? GatherFacts());
+         buildNowCard.Hidden = paused == null;
++        if (buildDiscard != null) buildDiscard.Hidden = true;
+         if (paused == null) return;
+         var ps = GameAppUi.ParseStage(paused.StageLine);
+         buildNowLine.Text = GameAppUi.DisplayName(paused.Game) + "\n" + StopText.PausedLine(paused.StageLine);
+@@ -418,6 +530,7 @@
+         buildStopRow.Hidden = false;
+         buildPause.Hidden = true; buildResume.Hidden = false; buildCancel.Hidden = false;
+         buildResume.Enabled = buildCancel.Enabled = !deletes.Busy;
++        if (buildDiscard != null) { var d = DiscardOfferFor(paused.Game); StyleDiscardButton(buildDiscard, d.Offer, d.Why); }   // patch 0088: beside Resume, for the paused game (whichever is selected)
+         buildWatch.Hidden = true;
+     }
+ 
+@@ -453,6 +566,10 @@
+         var row = Theme.Row(8, buildPause, buildResume, buildCancel);
+         row.Distribution = UIStackViewDistribution.FillEqually;
+         buildStopRow = row;
++        // patch 0088: "Discard the partial build", under Resume and Cancel (its words do not fit a third of the card): the card's paused game, any game
++        buildDiscard = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "build-discard", Hidden = true };
++        buildDiscard.HeightAnchor.ConstraintGreaterThanOrEqualTo(44).Active = true;
++        buildDiscard.TouchUpInside += (_, __) => { var g = CardPaused(GatherFacts())?.Game; if (g != null) AskDiscardPartial(g); };
+     }
+ 
+     // ---- the system's own task (GameAppBackground.cs) ------------------------------------------------------------------------

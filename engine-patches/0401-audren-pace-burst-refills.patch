@@ -1,0 +1,395 @@
+# host/audren: pace burst refills and preserve PCM order (PR #2983)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/79f28b0678e563c7770b98acc6dfeb2a4faf424e  (PR #2983, fixes #2981)
+# Author:    seedds, 2026-11-19 01:43:27 +0800
+# Co-authors:
+#   Co-authored-by: Hibimono Create
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# Why it matters here: see docs/UPSTREAM-AUDIT.md (section 5).
+#
+# Re-done by hand on this tree: 3 hunks of hle_audren.c conflicted with NX2Apple patch 0048 (pcmout / render_active teardown); resolved by keeping 0048's
+# teardown and taking upstream's pacing (cq_mu held across the render, 4.5 ms spacing, prefill, catch-up recheck). The test file's pcm-output stubs are upstream's plus
+# 0048's dm_pcmout_wake stub.
+#
+# Apply with: patch -p1 (tools/patched_engine.sh) or git apply -p1, to the tree out-nx2apple/engine + paches/engine/0103..0301 (the tree out-stage/out-engine/engine
+# is made of), in the order of the numbers of this folder. Checked on a COPY of the needed files only (git apply --check, then applied in series, then
+# paches/0002 0004 0005 0006 0007 0008 0009 0012 0013 still apply on top); NOT compiled, NOT run on a device.
+# Left out of the upstream diff: docs/, dm/games/ notes, and test files that conflict.
+
+--- a/dm/host/hle_audren.c
++++ b/dm/host/hle_audren.c
+@@ -8,7 +8,7 @@
+ // The host does three things:
+ //   1. Takes over GetAudioRendererWorkBufferSize / OpenAudioRenderer: preserves the DSP service's work-buffer requirement, then runs the SDK's CPU + manual renderer.
+ //      The local SDK uses a different command format whose storage can exceed the service's budget; that backend storage is supplied by the host. Explicit CPU renderers keep the SDK contract;
+-//   2. A render thread (a guest thread started by the host): renders one frame whenever the output hands back a 5 ms buffer, so pacing follows the sound card clock;
++//   2. A render thread (a guest thread started by the host): fills each returned 5 ms buffer, spacing fresh renders if the output returns several buffers together;
+ //   3. Takes over AudioRendererImpl::ExecuteAudioRendererRendering (reached through the PLT): generates commands and runs CommandListProcessor like the original,
+ //      then finds the DeviceSink command in the command list (a no-op for the CPU processor) and queues its six channels and a stereo fold, each clamped after mixing, for AudioOut to select for the current route (hle_audio.c).
+ // Command list format (SDK 16): header +0x04 command count, +0x08 mix buffer address, +0x10 buffer count, +0x14 samples per frame, +0x18 sample rate, commands from +0x20;
+@@ -100,7 +100,7 @@
+ // ---------- rendering and output ----------
+ // One renderer's state. Only the render thread and the updates of this renderer touch it, apart from the one lock over all renderers' rendering (g_render_mu). Until 2026-11-04 this was one set of
+ // globals: a second renderer's updates rendered catch-up frames into the first one's output queue, about 10% of its frames (Mario & Luigi: Brothership), and its own frames were never rendered otherwise
+-enum { CQ = 4, AR_MAX = 4 };   // AR_MAX as g_rev below
++enum { CQ = 4, AR_MAX = 4, RENDER_MIN_NS = 4500000 };   // AR_MAX as g_rev below
+ typedef struct {
+     pthread_mutex_t cq_mu; pthread_cond_t cq_cv; int cq_init;   // kept across slot reuse so a late render_main exit never locks a zeroed mutex
+     void *handle[2];                         // AudioRendererHandle (renderer object, client state); handle[0] NULL: a free slot
+@@ -111,7 +111,7 @@
+     int16_t frame[FRAME_MAX * DM_AUDIO_SINK_CHANNELS]; int frame_n;   // the latest frame (six channels plus their stereo fold)
+     _Atomic uint64_t frames, nonsilent, updates, renders, catchups;
+     uint64_t last_r; int updated;            // the render count at the last update, once there was one
+-    int16_t cq[CQ][FRAME_MAX * DM_AUDIO_SINK_CHANNELS]; int cq_n[CQ]; _Atomic uint32_t cq_head, cq_tail;   // output queue of catch-up frames
++    int16_t cq[CQ][FRAME_MAX * DM_AUDIO_SINK_CHANNELS]; int cq_n[CQ]; uint32_t cq_head, cq_tail;   // output queue of catch-up frames (under cq_mu)
+     int sink_logged;
+     int32_t up_buf[DM_AUDIO_SINK_CHANNELS * (15 + FRAME_MAX)]; uint32_t up_pos;   // up_3_2's last samples and position
+     int16_t pcm[NBUF][FRAME_MAX * DM_AUDIO_SINK_CHANNELS]; aout_buf bufs[NBUF];   // the blocks its output plays from (six channels plus their stereo fold): AudioOut queues only the pointer and copies the samples when the sound card asks (issue #1336)
+@@ -120,7 +120,6 @@
+ static pthread_mutex_t g_ar_mu = PTHREAD_MUTEX_INITIALIZER;   // the slots' handle and sys fields
+ static __thread ar_t *t_ar;                  // the renderer this render thread drives
+ static int ar_index(const ar_t *a) { return (int)(a - g_ar); }
+-static void cq_popped(ar_t *a) { pthread_mutex_lock(&a->cq_mu); pthread_cond_broadcast(&a->cq_cv); pthread_mutex_unlock(&a->cq_mu); }
+ // The renderer an AudioRenderSystem belongs to, for the SDK's calls that name only that. A system not seen yet belongs to the one open renderer whose system is not known: the render thread
+ // names its system at its first render, right after the open, and a game's first updates can come before that (two updates 0.04 ms apart at start-up, below)
+ static ar_t *ar_of_sys(uint8_t *sys) {
+@@ -147,6 +146,8 @@
+     pthread_mutex_unlock(&a->cq_mu);
+     if (start_ok) dm_pcmout_start(out);
+     LOG("audren: render thread %d started (%d buffers in flight, paced by the output)", ar_index(a), NBUF);
++    uint64_t next_exec = 0;
++    int prefill = NBUF;
+     while (atomic_load(&a->open)) {
+         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card, one every 5 ms); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
+             if (!atomic_load(&a->open)) break;
+@@ -157,16 +158,37 @@
+             if (!atomic_load(&a->open)) break;
+         }
+         if (!nfree) break;
++        pthread_mutex_lock(&a->cq_mu);
++        // Leave some slack below the 5 ms block duration. Device callbacks can return several blocks at once,
++        // but back-to-back SDK renders can coalesce their events before the game can update.
++        while (!prefill && a->cq_head == a->cq_tail && atomic_load(&a->open)) {
++            uint64_t now = now_ns();
++            if (now >= next_exec) break;
++            struct timespec delay = { .tv_nsec = (long)(next_exec - now) };
++            pthread_cond_timedwait_relative_np(&a->cq_cv, &a->cq_mu, &delay);
++        }
++        if (!atomic_load(&a->open)) { pthread_mutex_unlock(&a->cq_mu); break; }
++
+         const int16_t *src; int got;
+-        uint32_t h = atomic_load(&a->cq_head);
+-        if (h != atomic_load(&a->cq_tail)) { src = a->cq[h % CQ]; got = a->cq_n[h % CQ]; atomic_store(&a->cq_head, h + 1); cq_popped(a); }   // play queued catch-up output first
+-        else { a->frame_n = 0; exec(a->handle[0], a->handle[1]); src = a->frame; got = a->frame_n; }   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event
++        int queued = a->cq_head != a->cq_tail;
++        if (queued) {   // recheck after waiting, before executing a newer frame
++            uint32_t slot = a->cq_head % CQ;
++            src = a->cq[slot]; got = a->cq_n[slot];
++        } else {
++            next_exec = now_ns() + RENDER_MIN_NS;
++            a->frame_n = 0;
++            exec(a->handle[0], a->handle[1]);   // SDK: generate commands → CPU processing → signal the game's renderer event
++            src = a->frame; got = a->frame_n;
++        }
+         int n = got ? got : 240;
+         aout_buf *b = free_list[--nfree];
+         size_t bytes = (size_t)n * DM_AUDIO_SINK_CHANNELS * sizeof(int16_t);
+         if (got) memcpy(b->ptr, src, bytes); else memset(b->ptr, 0, bytes);
+         b->size = bytes;
++        if (queued) { a->cq_head++; pthread_cond_broadcast(&a->cq_cv); }   // the producer can reuse the slot after the copy
++        pthread_mutex_unlock(&a->cq_mu);
+         if (!atomic_load(&a->open) || !dm_pcmout_append(out, b)) free_list[nfree++] = b;
++        else if (prefill) prefill--;
+     }
+     pthread_mutex_lock(&a->cq_mu);
+     void *owned_out = a->pcmout;
+@@ -286,8 +308,9 @@
+     for (int i = 0; i < AR_MAX && !a; i++) if (g_ar[i].handle[0] == obj) a = &g_ar[i];
+     pthread_mutex_unlock(&g_ar_mu);
+     if (a && a->render_tt) {
+-        atomic_store(&a->open, 0);
+         pthread_mutex_lock(&a->cq_mu);
++        atomic_store(&a->open, 0);
++        pthread_cond_broadcast(&a->cq_cv);   // the render thread may sit in the pacing wait (upstream 79f28b06)
+         if (a->pcmout) dm_pcmout_wake(a->pcmout);
+         pthread_mutex_unlock(&a->cq_mu);
+         dm_guest_thread_join(a->render_tt);
+@@ -602,24 +625,30 @@
+     static Result (*orig)(void *, void *, size_t, void *, size_t, const void *, size_t); if (!orig) orig = gsym("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm");
+     ar_t *a = ar_of_sys(sys);
+     if (!a) return orig(sys, o, on, p, pn, in, inn);   // two renderers just opened, neither has rendered: at most one catch-up frame less
+-    uint64_t u = atomic_fetch_add(&a->updates, 1) + 1, r = atomic_load(&a->renders);
+-    if (a->updated && r == a->last_r) {
++    uint64_t u = atomic_fetch_add(&a->updates, 1) + 1;
++    pthread_mutex_lock(&a->cq_mu);
++    if (atomic_load(&a->open) && a->updated && atomic_load(&a->renders) == a->last_r) {
+         uint64_t c = atomic_fetch_add(&a->catchups, 1) + 1;
+         if (c <= 3) LOG("audren: renderer %d: no frame rendered before update %llu, rendering a catch-up frame first (%llu so far)", ar_index(a), (unsigned long long)u, (unsigned long long)c);
+-        uint32_t t = atomic_load(&a->cq_tail);
+-        if (t - atomic_load(&a->cq_head) >= CQ) {   // queue full: wait for the render thread to play one (every 5 ms), so catch-up frames keep real time; at most 50 ms (an output that stopped)
++        if (a->cq_tail - a->cq_head >= CQ) {   // queue full: wait for the render thread to play one (every 5 ms), so catch-up frames keep real time; at most 50 ms (an output that stopped)
+             struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 50000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+-            pthread_mutex_lock(&a->cq_mu);
+-            while (atomic_load(&a->open) && t - atomic_load(&a->cq_head) >= CQ && !pthread_cond_timedwait(&a->cq_cv, &a->cq_mu, &dl)) {}
+-            pthread_mutex_unlock(&a->cq_mu);
+-        }
+-        if (t - atomic_load(&a->cq_head) < CQ) { render_once(a, sys, a->cq[t % CQ], &a->cq_n[t % CQ]); atomic_store(&a->cq_tail, t + 1); }
+-        else render_once(a, sys, NULL, NULL);   // still full (the output stopped): render anyway, output discarded
++            while (atomic_load(&a->open) && a->cq_tail - a->cq_head >= CQ && !pthread_cond_timedwait(&a->cq_cv, &a->cq_mu, &dl)) {}
++        }
++        if (atomic_load(&a->open)) {
++            if (a->cq_tail - a->cq_head < CQ) {
++                uint32_t slot = a->cq_tail % CQ;
++                render_once(a, sys, a->cq[slot], &a->cq_n[slot]);
++                a->cq_tail++;
++                pthread_cond_broadcast(&a->cq_cv);
++            } else render_once(a, sys, NULL, NULL);   // still full (the output stopped): render anyway, output discarded
++        }
+     }
+-    static int tr = -1; if (tr < 0) tr = getenv("DM_AUDREN_TRACE") != NULL;
+-    if (tr && u < 200) LOG("audren update #%llu t=%.3f ms, %llu frames rendered since the last update", (unsigned long long)u, now_ns() / 1e6, (unsigned long long)(atomic_load(&a->renders) - (a->updated ? a->last_r : 0)));
++    if (u < 200 && getenv("DM_AUDREN_TRACE")) LOG("audren update #%llu t=%.3f ms, %llu frames rendered since the last update", (unsigned long long)u, now_ns() / 1e6, (unsigned long long)(atomic_load(&a->renders) - (a->updated ? a->last_r : 0)));
++    pthread_mutex_unlock(&a->cq_mu);
+     Result res = orig(sys, o, on, p, pn, in, inn);
++    pthread_mutex_lock(&a->cq_mu);
+     a->last_r = atomic_load(&a->renders); a->updated = 1;
++    pthread_mutex_unlock(&a->cq_mu);
+     return res;
+ }
+ 
+--- a/dm/host/tests/t_audren_layout.c
++++ b/dm/host/tests/t_audren_layout.c
+@@ -4,11 +4,24 @@
+ // Bastion (SDK 5.4.0): its first list, two commands with the SDK 6 header whose first has ID 0x14 and 0x14 bytes, walks in the SDK 8–20 layout too and must decide nothing.
+ #include "../hle.h"
+ #include <assert.h>
++#include <errno.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
++static int wait_for_render(pthread_cond_t *, pthread_mutex_t *, const struct timespec *);
++#define pthread_cond_timedwait_relative_np wait_for_render
+ #include "../hle_audren.c"
++#undef pthread_cond_timedwait_relative_np
+ 
+ enum { SAMPLES = 240, NMIX = 8, NCMD = 6 };
++enum { PACE_BLOCKS = 2000 };
++static struct {
++    int rate, device_frames, callbacks, played, released, appended, rendered, bursts, waits;
++    uint64_t now, last_exec, min_spacing;
++    aout_buf *output[NBUF];
++    pthread_t catchup;
++} pace;
++static _Alignas(8) uint8_t pace_sys[0x300];
++static void *pace_sym(const char *name);
+ // test_renderer_blocks: the renderer each appended block came from; the output holds what it is given and plays none of it
+ static int blocks_on; static aout_buf *blocks[AR_MAX][NBUF]; static int blocks_n[AR_MAX];
+ static void blocks_exec(void *obj, void *state);
+@@ -16,6 +29,7 @@
+ static struct { const char *name; void *p; } lock_syms[4];
+ void *guest_sym(const char *name) {
+     for (size_t i = 0; i < sizeof lock_syms / sizeof *lock_syms; i++) if (lock_syms[i].name && !strcmp(lock_syms[i].name, name)) return lock_syms[i].p;
++    if (pace.rate) return pace_sym(name);
+     return blocks_on && strstr(name, "ExecuteAudioRendererRendering") ? (void *)blocks_exec : NULL;
+ }
+ void *objmap_get(const void *key) { (void)key; return NULL; }
+@@ -23,7 +37,7 @@
+ void *objmap_del(const void *key) { (void)key; return NULL; }
+ void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack) { (void)fn; (void)arg; (void)prio; (void)stack; return NULL; }
+ void dm_guest_thread_join(void *tt) { (void)tt; }
+-uint64_t now_ns(void) { return 0; }
++uint64_t now_ns(void) { return pace.now; }
+ module_t *module_of(const void *p) { (void)p; return NULL; }
+ void *dm_pcmout_open_sink(void) { return NULL; }
+ int dm_audio_output_channels(void) { return 2; }   // the stereo route; the six-channel resampler is checked directly below
+@@ -32,14 +46,48 @@
+ void dm_pcmout_start(void *k) { (void)k; }
+ int dm_pcmout_append(void *k, void *b) {
+     (void)k;
++    if (pace.rate) {
++        const aout_buf *block = b;
++        const int16_t *pcm = block->ptr;
++        assert(block->size == SAMPLES * DM_AUDIO_SINK_CHANNELS * sizeof *pcm);
++        int expected = pace.appended + 1;
++        for (int i = 0; i < SAMPLES; i++, pcm += DM_AUDIO_SINK_CHANNELS)
++            assert(pcm[0] == expected && pcm[1] == -expected && pcm[6] == expected && pcm[7] == -expected);
++        assert(pace.appended - pace.released < NBUF);
++        pace.output[pace.appended++ % NBUF] = b;
++        if (pace.appended == PACE_BLOCKS) atomic_store(&t_ar->open, 0);
++        return 1;
++    }
+     if (!blocks_on) return 0;
+     int r = ar_index(t_ar); blocks[r][blocks_n[r]++] = b;
+     if (blocks_n[r] == NBUF) atomic_store(&t_ar->open, 0);
+     return 1;
+ }
+-void *dm_pcmout_released(void *k) { (void)k; return NULL; }
+-void dm_pcmout_wait(void *k, int ms) { (void)k; (void)ms; }
+-void dm_pcmout_wake(void *k) { (void)k; }
++// Advance by whole device callbacks. Fractional resampling is carried across callbacks,
++// so 44.1 kHz consumes alternating counts of 48 kHz samples as CoreAudio does.
++static uint64_t next_callback(void) { return (uint64_t)(pace.callbacks + 1) * pace.device_frames * 1000000000ull / pace.rate; }
++static void pace_advance(uint64_t until) {
++    while (next_callback() <= until) {
++        int before = pace.played / SAMPLES;
++        pace.played = (int)((uint64_t)++pace.callbacks * pace.device_frames * 48000 / pace.rate);
++        assert(pace.played <= pace.appended * SAMPLES);   // no zero-fill needed
++        if (pace.played / SAMPLES - before > 1) pace.bursts++;
++    }
++    pace.now = until;
++}
++void *dm_pcmout_released(void *k) {
++    (void)k;
++    return pace.released < pace.played / SAMPLES ? pace.output[pace.released++ % NBUF] : NULL;
++}
++void dm_pcmout_wait(void *k, int ms) {
++    (void)k;
++    if (pace.rate) {
++        uint64_t timeout = pace.now + (uint64_t)ms * 1000000;
++        uint64_t callback = next_callback();
++        pace_advance(callback < timeout ? callback : timeout);
++    }
++}
++void dm_pcmout_wake(void *k) { (void)k; }   // the NX2Apple 0048 teardown calls it (kept from this tree)
+ void hle_bind_system_event(void *ev, int ac) { (void)ev; (void)ac; }
+ uint32_t hle_dup_readable_handle(uint32_t h) { return h; }
+ 
+@@ -60,7 +108,7 @@
+     *(uint32_t *)(list + 4) = (uint32_t)ncmd; *(const int32_t **)(list + 8) = mix; *(uint32_t *)(list + 0x14) = SAMPLES; *(uint32_t *)(list + 0x18) = 48000;
+     uint8_t *q = list + 0x20;
+     for (int i = 0; i < ncmd - 1; i++) q = put(q, sdk, 6, 0x40);
+-    int id = sdk <= 5 ? 0xf : sdk == 6 ? 0x10 : sdk == 21 ? 0x14 : 0x13;
++    int id = sdk <= 5 ? 0xf : sdk == 6 ? 0x10 : sdk >= 20 ? 0x14 : 0x13;
+     uint8_t *sink = q; q = put(q, sdk, id, sdk == 4 ? 0x130 : sdk == 5 ? 0x138 : sdk == 21 ? 0x140 : 0x148);
+     int count = sdk <= 5 ? 0x120 : sdk == 21 ? 0x128 : 0x130;
+     *(uint32_t *)(sink + count) = 2;
+@@ -274,7 +322,12 @@
+ }
+ static void test_renderer_blocks(void) {
+     blocks_on = 1;
+-    for (int r = 0; r < 2; r++) { atomic_store(&g_ar[r].open, 1); render_main(&g_ar[r]); }
++    for (int r = 0; r < 2; r++) {
++        ar_t *a = &g_ar[r];
++        pthread_mutex_init(&a->cq_mu, NULL); pthread_cond_init(&a->cq_cv, NULL);
++        atomic_store(&a->open, 1); render_main(a);
++        pthread_cond_destroy(&a->cq_cv); pthread_mutex_destroy(&a->cq_mu);
++    }
+     blocks_on = 0;
+     for (int r = 0; r < 2; r++) {
+         assert(blocks_n[r] == NBUF);
+@@ -304,11 +357,14 @@
+     fflush(stderr); dup2(saved, 2); close(saved); assert(!fseek(t, 0, SEEK_SET)); assert(fread(log, 1, sizeof log - 1, t) < sizeof log); fclose(t);
+     *red = strstr(log, "[RED] audren: no update lock"); return r;
+ }
+-static void test_update_lock(void) {
++static void lock_plt_stub(void) {
+     const uint64_t got = (uint64_t)&lock_got, stub = (uint64_t)(lock_code + F_STUB);
+     const uint64_t pages = ((got & ~0xfffull) - (stub & ~0xfffull)) >> 12;
+     lock_code[F_STUB] = 0x90000010u | (uint32_t)(pages & 3) << 29 | (uint32_t)((pages >> 2) & 0x7ffff) << 5;   // adrp x16, the GOT's page
+     lock_code[F_STUB + 1] = 0xf9400211u | (uint32_t)(got & 0xfff) / 8 << 10;   // ldr x17, [x16, #the slot]
++}
++static void test_update_lock(void) {
++    lock_plt_stub();
+     lock_got = lock_code + F_SDK_LOCK;
+     lock_syms[0].name = "_ZN2nn2os12SdkMutexType4LockEv"; lock_syms[0].p = lock_code + F_SDK_LOCK;
+     lock_syms[1].name = "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE"; lock_syms[1].p = lock_code + F_OS_LOCK;
+@@ -334,7 +390,90 @@
+     memset(lock_syms, 0, sizeof lock_syms);
+ }
+ 
++static span_t pace_generate(void *sys, void *cl, size_t n) {
++    (void)sys; (void)cl; (void)n;
++    int frame = ++pace.rendered;
++    for (int i = 0; i < SAMPLES; i++) { mix[i] = frame; mix[SAMPLES + i] = -frame; }
++    return (span_t){list, build(20, NCMD)};
++}
++static void pace_noop(void *p) { (void)p; }
++static void pace_tmax(void *p, uint32_t n) { (void)p; (void)n; }
++static void pace_setup(void *p, const void *cl, size_t n) { (void)p; (void)cl; (void)n; }
++static Result pace_update(void *sys, void *o, size_t on, void *p, size_t pn, const void *in, size_t inn) {
++    (void)sys; (void)o; (void)on; (void)p; (void)pn; (void)in; (void)inn;
++    return RES_OK;
++}
++static void pace_exec(void *sys, void *state) {
++    (void)state;
++    if (pace.appended >= NBUF) {
++        uint64_t gap = pace.now - pace.last_exec;
++        assert(gap >= 4500000);
++        if (gap < pace.min_spacing) pace.min_spacing = gap;
++    }
++    pace.last_exec = pace.now;
++    assert(h_ars_Exec(sys) == RES_OK);
++}
++static void *pace_sym(const char *name) {
++    if (strstr(name, "ExecuteAudioRendererRendering")) return pace_exec;
++    if (strstr(name, "AudioRenderSystem6Update")) return pace_update;
++    if (strstr(name, "GenerateCommandENS_4Span")) return pace_generate;
++    if (strstr(name, "SdkMutexType6Unlock") || strstr(name, "Processor7Process")) return pace_noop;
++    if (strstr(name, "Processor17SetProcessTimeMax")) return pace_tmax;
++    if (strstr(name, "Processor5Setup")) return pace_setup;
++    return NULL;
++}
++static void *pace_catchup(void *arg) {
++    assert(h_ars_Update(arg, NULL, 0, NULL, 0, NULL, 0) == RES_OK);
++    return NULL;
++}
++static int wait_for_render(pthread_cond_t *cv, pthread_mutex_t *mu, const struct timespec *delay) {
++    if (!pace.rate) return pthread_cond_timedwait_relative_np(cv, mu, delay);
++    if (!pace.waits++) {
++        // The first paced wait gets a real wake from a second RequestUpdate.
++        // The wait and publication use the production queue mutex and condition variable.
++        pthread_mutex_unlock(mu);
++        pace_catchup(pace_sys);   // record the latest render as the preceding update
++        pthread_mutex_lock(mu);
++        ar_t *a = &g_ar[0];
++        assert(a->cq_head == a->cq_tail);
++        assert(!pthread_create(&pace.catchup, NULL, pace_catchup, pace_sys));
++        struct timespec timeout = { .tv_sec = 1 };
++        while (a->cq_head == a->cq_tail) assert(!pthread_cond_timedwait_relative_np(cv, mu, &timeout));
++        return 0;
++    }
++    pace_advance(pace.now + (uint64_t)delay->tv_nsec);
++    return ETIMEDOUT;
++}
++static void test_render_cadence(int rate, int frames) {
++    ar_t *a = &g_ar[0];
++    memset(a, 0, sizeof *a);
++    pace.rate = rate; pace.device_frames = frames; pace.min_spacing = UINT64_MAX;
++    *(int32_t *)(pace_sys + 0x48) = *(int32_t *)(pace_sys + 0x4c) = 1;
++    a->sys = pace_sys; a->handle[0] = pace_sys;
++    lock_plt_stub();
++    lock_got = (void *)pace_noop;
++    lock_fn(F_IMPL, 0x2d0, F_STUB);
++    lock_syms[0].name = "_ZN2nn2os12SdkMutexType4LockEv"; lock_syms[0].p = (void *)pace_noop;
++    lock_syms[1].name = "_ZN2nn5audio6server17AudioRenderSystem10UpdateImplEPvmS3_mPKvm"; lock_syms[1].p = lock_code + F_IMPL;
++    pthread_mutex_init(&a->cq_mu, NULL); pthread_cond_init(&a->cq_cv, NULL);
++    atomic_store(&a->open, 1);
++    render_main(a);
++    assert(!pthread_join(pace.catchup, NULL));
++    assert(pace.waits > 1 && pace.bursts > 1);
++    assert(atomic_load(&a->catchups) == 1 && a->cq_head == a->cq_tail);
++    assert(pace.appended == PACE_BLOCKS && pace.rendered == PACE_BLOCKS);
++    printf("audren cadence: %d Hz/%d device frames, %d callbacks (%d burst releases), %d PCM blocks in order, min exec spacing %.2f ms, no underruns\n",
++           rate, frames, pace.callbacks, pace.bursts, pace.appended, pace.min_spacing / 1e6);
++    pthread_cond_destroy(&a->cq_cv); pthread_mutex_destroy(&a->cq_mu);
++    memset(&pace, 0, sizeof pace);
++}
++
+ int main(int argc, char **argv) {
++    if (argc == 2 && !strcmp(argv[1], "--cadence")) {
++        test_render_cadence(44100, 256);
++        test_render_cadence(48000, 512);
++        return 0;
++    }
+     test_update_lock();
+     test_two_renderers();
+     test_renderer_blocks();
+@@ -357,6 +496,8 @@
+     if (!six) { test_six_channels(); fflush(stdout); _exit(0); }
+     int status6; assert(waitpid(six, &status6, 0) == six && WIFEXITED(status6) && WEXITSTATUS(status6) == 0);
+     test_histogram();
++    test_render_cadence(44100, 256);
++    test_render_cadence(48000, 512);
+     puts("audren layout: update lock read off Update or UpdateImpl, renderers' own blocks, bounded histograms, malformed-list rejection, unaligned and truncated headers, SDK 4/5/6/16/21 stereo PCM and empty/incomplete startup recovery passed");
+     return 0;
+ }

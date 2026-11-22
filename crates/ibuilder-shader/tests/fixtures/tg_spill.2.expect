@@ -1,0 +1,15 @@
+OK
+{"total":0}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+kernel void main0()
+{
+    threadgroup spvUnsafeArray<half, 1> _33; 
+	threadgroup spvUnsafeArray<uint, 1> _35;
+    float _9 = 1.0;
+}

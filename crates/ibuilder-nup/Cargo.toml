@@ -1,0 +1,28 @@
+[package]
+name = "ibuilder-nup"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Reader of the NUP container (Switch 2 games, one .nup file): Rust port of the engine's scripts/pack_nup.py, streaming zstd, SHA-256 of every file, the RomFS image written straight from the container"
+
+[features]
+default = ["native-zstd"]
+# the C libzstd (crate `zstd`, built by `cc`, builds for aarch64-apple-ios): the default decoder, several times faster than the pure-Rust one
+native-zstd = ["dep:zstd"]
+
+[dependencies]
+sha2 = { workspace = true }
+rayon = { workspace = true }
+libc = { workspace = true }
+serde_json = "1"
+# pure-Rust zstd decoder, already in the lock through ibuilder-shadersplit: the fallback backend (no C), and the oracle of the C one in the tests
+ruzstd = { version = "0.8", default-features = false, features = ["std", "hash"] }
+zstd = { version = "0.13", optional = true, default-features = false }
+
+[dev-dependencies]
+# the test containers' zstd frames are made by the C library (the readers under test: libzstd and ruzstd)
+zstd = { version = "0.13", default-features = false }
+
+[[bin]]
+name = "ibuilder-nup"
+path = "src/bin/ibuilder-nup.rs"

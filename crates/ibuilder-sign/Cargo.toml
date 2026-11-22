@@ -1,0 +1,22 @@
+[package]
+name = "ibuilder-sign"
+description = "In-process ad-hoc Mach-O code signature (port of iOSBuilder pipeline/adhoc_sign.py) behind a swappable Signer trait"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+sha2 = { workspace = true }
+
+[lib]
+name = "ibuilder_sign"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ibuilder-sign"
+path = "src/bin/ibuilder-sign.rs"

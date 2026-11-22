@@ -1,0 +1,13 @@
+[package]
+name = "ibuilder-alloc"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "A global allocator that gives big blocks straight back to the kernel when they are freed (macOS / iOS: malloc keeps freed big blocks in the footprint)"
+
+[dependencies]
+libc = { workspace = true }
+
+[features]
+# the allocation profiler (`ibuilder_alloc::prof`): for the examples that measure memory, never for a product build
+profile = []

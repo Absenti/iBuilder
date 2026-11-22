@@ -1,0 +1,24 @@
+[package]
+name = "ibuilder-profile"
+description = "Port of iOSBuilder gameapp/profile_derive.py (+ the engine's profile_guess / game.py profile / nacp it runs) and compare_profile.py"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+rayon = { workspace = true }
+lz4_flex = { workspace = true }
+# the ZBIC decoder (NSO flag bit 7): one implementation for the toolchain
+ibuilder-nso = { path = "../ibuilder-nso" }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+
+[lib]
+name = "ibuilder_profile"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ibuilder-profile"
+path = "src/bin/ibuilder-profile.rs"

@@ -1,0 +1,102 @@
+# nvn/pso: the device pipeline archive's timed write no longer holds the compile gate while the game presents (idea of nxnative f539b2dc, new code on 0414)
+#
+# Origin:  written in this repository from the idea and the measurement of nxnative f539b2dc "nvn/pso: defer timed archive writes during play (PR #3060)" (seedds; co-author Arthur tinseau).
+#          f539b2dc itself changes the Metal 4 archive (ArchEpoch), which is OFF on this phone (pso4 0) and so would be inert; the same hazard is in the archive the phone really uses,
+#          dva_write of engine-patches/0414 (formerly paches/0009's pa_serialize). Licence: MIT, Copyright (c) 2026 seedds (nxnative LICENSE) for the idea; the code is new.
+#
+# WHAT IT FIXES (read from 0414's code; the Ocarina log: 942 s of host-blocked frames from pipeline / library compiles)
+#   dva_write (every DM_PSO_ARCHIVE_SECS, or the file size at 512 KB/s when longer) does: write-lock g_dva_rw, ser_begin() = g_ser_want++ then WAIT up to SER_WAIT_MS (2 s) for every compile under
+#   way, and from then on ser_compile_enter() holds EVERY new compile (dev_rps / dev_cps / dev_mps / dev_fn / dev_lib, the submit thread's on-demand ones too) until ser_end(), i.e. until
+#   serializeToURL of a file of up to 256 MB has finished on flash; and when compiles are still under way after the 2 s, ser_begin returns anyway and the write goes ahead BESIDE them
+#   (upstream GitHub #2513: Metal crashes in its compiled-binary cache). A cold Ocarina start keeps hw.activecpu compiles in flight, so that case is the normal one.
+#   Now a TIMED write (dva_write(0); the writes at the ends the host controls, dva_write(1), are untouched) is (1) put off while a frame was presented in the last DVA_QUIET_S = 10 s,
+#   (2) given the gate by ser_try_begin() (no wait: only when no compile is under way and no other serialization is wanted), else retried DVA_RETRY_S = 10 s later, (3) allowed to go ahead as before
+#   once DVA_DEFER_MAX_S = 300 s have passed since the last write (a run that never stops presenting still persists; jetsam can end it at any time; nothing is dropped, only delayed).
+#   Log: the "written, ..." line ends with ", N timed writes deferred (frames presented or compiles under way)". Default: on, no switch (DVA_* are enum constants).
+#
+# TRADE-OFF / RISK: medium. In continuous play the archive is written at most every 5 minutes instead of every DM_PSO_ARCHIVE_SECS; a run killed in between loses that stretch (0414 already
+#   writes at every end the host controls). The on-demand compile path itself is untouched. NOT compiled on a device, NOT run. nvn_mtl.m is not an input of the shader chain id.
+#
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0415 and the candidates numbered below this one, in the order of the numbers of this folder.
+
+# REBASED 2026-11-21 onto engine-patches/0414 revision 2 (no change of behaviour): its write now also raises 0414's g_dva_writing flag, which this patch's deferral clears on its early
+#   return; the success path's log line is the same. Applies after 0461, as before.
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -176,9 +176,11 @@
+ // The three device wrappers below take the place of dev_rps / dev_cps / dev_mps for every caller after this point (the #defines): paches/0009's code above stays compiled but is never
+ // reached (its pa_on is called only from its own dev_rps / dev_cps), so the two never write the same file. DM_PSO_BINARY_ARCHIVE=0 (or off) turns this one off, as it did 0009's.
+ // It is a cache, never a condition of drawing: a lookup that misses (or finds the archive busy) is the compile made before, and any failure but a write turns it off for the run.
+-enum { DVA_PENDING_MAX = 512, DVA_TICK_MS = 2000, DVA_HOT_BATCH = 8, DVA_FAIL_MAX = 3, DVA_BG_ADD_MS = 4000 };
++enum { DVA_PENDING_MAX = 512, DVA_TICK_MS = 2000, DVA_HOT_BATCH = 8, DVA_FAIL_MAX = 3, DVA_BG_ADD_MS = 4000, DVA_QUIET_S = 10, DVA_RETRY_S = 10, DVA_DEFER_MAX_S = 300 };
+ static int pso4_on(void);
+ static int ser_begin(void); static void ser_end(void);
++static int ser_try_begin(void);   // the serialization gate only when no compile is under way and no other serialization wants it (no wait)
++extern _Atomic uint64_t dm_present_ns;   // hle_thread.c, set by present_enqueue: when the last frame was presented (host monotonic ns)
+ static uint64_t bp_now(void);
+ static _Atomic int g_dva_state;   // 0 not tried, 1 on, 2 off
+ // Read with acquire, written with release (review L2): a thread that sees 1 sees the queue, the waiting list and the archive that were made before it. Plain reads are seq_cst loads too; the named
+@@ -189,7 +191,7 @@
+ static pthread_rwlock_t g_dva_rw = PTHREAD_RWLOCK_INITIALIZER;   // lookups try-read (a miss while an add or the write holds it: the compile that follows is today's); adds, the write and a reopen take it
+ static id<MTLBinaryArchive> g_dva_ar; static NSString *g_dva_path, *g_dva_hdr_path, *g_dva_hdr; static dispatch_queue_t g_dva_q; static dispatch_group_t g_dva_saves;   // g_dva_saves: dva_save's blocks
+ static NSMutableArray<NSArray *> *g_dva_pend; static int g_dva_tick_set, g_dva_dirty, g_dva_capped, g_dva_fails; static uint64_t g_dva_cap, g_dva_last_ser_ns, g_dva_secs;
+-static _Atomic uint64_t g_dva_hits, g_dva_miss, g_dva_added, g_dva_dropped, g_dva_wr, g_dva_size, g_dva_held;
++static _Atomic uint64_t g_dva_hits, g_dva_miss, g_dva_added, g_dva_dropped, g_dva_wr, g_dva_size, g_dva_held, g_dva_deferred;
+ static int (*g_dva_thermal)(void);   // the thermal state (NSProcessInfoThermalState's values); tests set it, NULL: the system's
+ static uint64_t (*g_dva_avail)(void);   // available memory in bytes; tests set it, NULL: os_proc_available_memory on iOS, unlimited on the Mac
+ static int g_dva_fail_next;   // tests: the next write fails as a failed serialization would
+@@ -374,11 +376,26 @@
+     if (!dirty) return;
+     uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), iv = dva_interval_ns();
+     if (!now && t - g_dva_last_ser_ns < iv) { os_unfair_lock_lock(&g_dva_lk); dva_schedule((iv - (t - g_dva_last_ser_ns)) / 1000000ull + 50); os_unfair_lock_unlock(&g_dva_lk); return; }
++    // A TIMED write (now == 0; the ends the host controls pass now = 1) must not hold the serialization gate while the game needs a pipeline: the gate holds every new compile back until the
++    // file is written (up to DM_PSO_ARCHIVE_MB), after waiting up to SER_WAIT_MS for the compiles under way, beside which the write then went ahead (Metal may crash on that, see ser_begin).
++    // So a timed write is put off while a frame was presented in the last DVA_QUIET_S seconds, and takes the gate with ser_try_begin() (no wait: only when no compile is under way); else it
++    // is retried DVA_RETRY_S later. Only delayed, never dropped: DVA_DEFER_MAX_S after the last write it goes ahead as before (jetsam can end the process at any time). Idea and measurement:
++    // nxnative f539b2dc (the same hazard in the Metal 4 archive: longest frames 1,340 / 1,609 ms -> 158 / 91 ms on a Mac).
++    int gate_held = 0;
++    if (!now) {
++        const uint64_t last = atomic_load_explicit(&dm_present_ns, memory_order_relaxed);
++        const int presenting = last && now_ns() - last < DVA_QUIET_S * 1000000000ull;
++        const int late = t - g_dva_last_ser_ns >= DVA_DEFER_MAX_S * 1000000000ull;
++        if (presenting && !late) { atomic_fetch_add(&g_dva_deferred, 1); os_unfair_lock_lock(&g_dva_lk); dva_schedule(DVA_RETRY_S * 1000ull); os_unfair_lock_unlock(&g_dva_lk); return; }
++    }
+     NSString *tmp = [g_dva_path stringByAppendingString:@".tmp"]; NSError *err = nil; BOOL ok;
+     uint64_t t0 = bp_now();
+-    atomic_store(&g_dva_writing, 1);   // lookups miss at once from here (M1)
++    atomic_store(&g_dva_writing, 1);   // lookups miss at once from here (0414's M1)
+     pthread_rwlock_wrlock(&g_dva_rw);
+-    ser_begin();   // not beside a compile: the host's serialization gate (Metal frees entries a compile reads while an archive is written)
++    if (!now && !(gate_held = ser_try_begin()) && t - g_dva_last_ser_ns < DVA_DEFER_MAX_S * 1000000000ull) {
++        pthread_rwlock_unlock(&g_dva_rw); atomic_store(&g_dva_writing, 0); atomic_fetch_add(&g_dva_deferred, 1); os_unfair_lock_lock(&g_dva_lk); dva_schedule(DVA_RETRY_S * 1000ull); os_unfair_lock_unlock(&g_dva_lk); return;
++    }
++    if (!gate_held) ser_begin();   // not beside a compile: the host's serialization gate (Metal frees entries a compile reads while an archive is written)
+     @autoreleasepool { ok = !g_dva_fail_next && [g_dva_ar serializeToURL:[NSURL fileURLWithPath:tmp] error:&err]; }
+     if (g_dva_fail_next) { g_dva_fail_next = 0; err = [NSError errorWithDomain:@"dm" code:1 userInfo:@{NSLocalizedDescriptionKey: @"a test's failed write"}]; }
+     ser_end();
+@@ -392,8 +409,8 @@
+         os_unfair_lock_lock(&g_dva_lk); g_dva_dirty = 0; unsigned waiting = (unsigned)g_dva_pend.count;
+         if (sz >= g_dva_cap && !g_dva_capped) { g_dva_capped = 1; atomic_fetch_add(&g_dva_dropped, g_dva_pend.count); [g_dva_pend removeAllObjects]; MLOG("pipeline binary archive: %.1f MB reached the %.0f MB cap: nothing more is added, the archive stays in use", sz / 1048576.0, g_dva_cap / 1048576.0); }
+         os_unfair_lock_unlock(&g_dva_lk);
+-        MLOG("pipeline binary archive: written, %.1f MB in %.0f ms: %llu pipelines taken from it, %llu built, %llu added, %u waiting, %llu dropped (queue full), %llu adds held back for heat or memory",
+-             sz / 1048576.0, (bp_now() - t0) / 1e6, (unsigned long long)g_dva_hits, (unsigned long long)g_dva_miss, (unsigned long long)g_dva_added, waiting, (unsigned long long)g_dva_dropped, (unsigned long long)g_dva_held);
++        MLOG("pipeline binary archive: written, %.1f MB in %.0f ms: %llu pipelines taken from it, %llu built, %llu added, %u waiting, %llu dropped (queue full), %llu adds held back for heat or memory, %llu timed writes deferred (frames presented or compiles under way)",
++             sz / 1048576.0, (bp_now() - t0) / 1e6, (unsigned long long)g_dva_hits, (unsigned long long)g_dva_miss, (unsigned long long)g_dva_added, waiting, (unsigned long long)g_dva_dropped, (unsigned long long)g_dva_held, (unsigned long long)g_dva_deferred);
+         return;
+     }
+     remove(tmp.fileSystemRepresentation); atomic_store(&g_dva_writing, 0);
+@@ -10754,6 +10771,14 @@
+     return plain;
+ }
+ static void ser_end(void) { pthread_mutex_lock(&g_ser_mu); g_ser_want--; pthread_cond_broadcast(&g_ser_cv); pthread_mutex_unlock(&g_ser_mu); }
++// The gate without waiting: 1 (held, to be released by ser_end) when no compile is under way and no other serialization is waiting or writing; 0 otherwise (nothing taken)
++static int ser_try_begin(void) {
++    pthread_mutex_lock(&g_ser_mu);
++    int ready = !g_ser_compiles && !g_ser_want;
++    if (ready) g_ser_want++;
++    pthread_mutex_unlock(&g_ser_mu);
++    return ready;
++}
+ // A flush period's size. Metal keeps each serializer's state in an LMDB environment of fixed map size (10 MB, in its own com.apple.gpuarchiver/gpuarchiver-* folder under the
+ // user cache folder, PersistentState), and once that is full every compile through the period's compiler fails ("cannot commit transaction …: MDB_MAP_FULL", "cannot write
+ // 'UNITSMAPPINGS' database"), not only its capture. Periods of 3,508 bases were written whole; Ocarina of Time's compacting prewarm of a 40,000-row list, whose flushes waited

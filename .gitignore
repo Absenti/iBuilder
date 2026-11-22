@@ -1,0 +1,238 @@
+# =============================================================================
+# .gitignore of iBuilder
+#
+# Three goals, in this order:
+#   1. NEVER let a secret, a key, a certificate, a game file or a file derived from a game be committed by accident
+#      (section 6 and 7). The project ships none of them and never will.
+#   2. Keep build output and local artefacts out of the repository (sections 1 to 5).
+#   3. Keep every tracked TEST FIXTURE trackable (section 8). The fixtures are synthetic and small; several of them
+#      carry names that the rules above would otherwise hide (`*.nso`, `main`, `games/`, `bin/`, `shaders/`).
+#
+# How the rules are kept narrow: a generic directory name (`bin/`, `obj/`, `games/`, `shaders/`, `dist/`, `tmp/`,
+# `Documents/`) is anchored with a leading slash (repository root) or to a named parent, never written bare, because
+# `crates/*/src/bin/`, `docs/shaders/` and `crates/ibuilder-shadersplit/tests/data/games/` are real source folders.
+# Only names that exist for one reason (`ExeFS/`, `extract/`, `shadercache/`, `.diag/`, `*.keys`, `*.p12`) are unanchored.
+# A later rule wins over an earlier one: the re-inclusions (`!`) of section 8 must stay at the end.
+# Verify after any change with:   git status --ignored   and   git ls-files --others --ignored --exclude-standard
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. Rust / Cargo
+# -----------------------------------------------------------------------------
+# `Cargo.lock` stays TRACKED on purpose: the workspace builds binaries and a static library for the app.
+target/
+/target-*/
+**/*.rs.bk
+*.profraw
+*.profdata
+lcov.info
+perf.data
+perf.data.*
+flamegraph*.svg
+
+
+# -----------------------------------------------------------------------------
+# 2. Build output and local artefacts
+# -----------------------------------------------------------------------------
+# `scripts/build-app.sh` writes the IPA, its checksum and the manifests into dist/ (and the work tree into target/);
+# `scripts/build-host.sh` writes the rebuilt engine host into dist/host/. All of it is output, not source.
+/dist/
+*.ipa
+*.ipa.sha256
+*.dylib
+*.a
+*.o
+*.xcarchive
+*.xcframework
+*.framework
+*.dSYM
+*.app
+*.nxgame
+*.patched.bin
+# leftovers of `patch` (scripts/check-patches-apply.sh and scripts/build-app.sh apply app/patches and engine-patches)
+*.orig
+*.rej
+
+# .NET (the iOS app of app/ is built by `dotnet publish`; Rust's `src/bin/` is NOT touched: the rules are anchored)
+/app/**/bin/
+/app/**/obj/
+/bin/
+/obj/
+/.dotnet/
+/.nuget/
+*.nupkg
+*.binlog
+
+# Xcode
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+
+# -----------------------------------------------------------------------------
+# 3. macOS, editors, IDEs, agents
+# -----------------------------------------------------------------------------
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.history/
+# local state of coding agents and personal notes
+.claude/
+CLAUDE.local.md
+# scratch space
+/tmp/
+/scratch/
+
+
+# -----------------------------------------------------------------------------
+# 4. Logs and diagnostics (what a phone or a Mac run leaves behind)
+# -----------------------------------------------------------------------------
+# The hidden diagnostics folder of the app (docs/DIAGNOSTICS.md) and anything pulled from a phone's container.
+# These files contain paths, device names and timings: never commit one by accident.
+*.log
+*.stage
+# stray tool output (a redirected cargo error once landed at the root as meta.err)
+*.err
+gameapp.*.log
+.diag/
+/Documents/
+# crash reports and Instruments / Xcode result bundles
+*.ips
+*.crash
+*.trace
+*.xcresult
+
+
+# -----------------------------------------------------------------------------
+# 5. Python (the oracle and measurement tools under crates/*/tools/ run on a Mac)
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+fontvenv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+
+# -----------------------------------------------------------------------------
+# 6. SECRETS and signing material: never committed, never published
+# -----------------------------------------------------------------------------
+# Console keys
+prod.keys
+title.keys
+*.keys
+# Certificates, private keys, provisioning (the app imports them on the phone; they do not belong in a repository)
+*.p12
+*.pfx
+*.cer
+*.csr
+*.certSigningRequest
+*.p8
+*.pem
+*.key
+*.keychain
+*.keychain-db
+*.mobileprovision
+*.provisionprofile
+ALTCertificate.p12
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+# Environment and credential files. The template stays tracked: scripts/local.env.example
+.env
+.env.*
+!.env.example
+secrets.json
+secrets.yaml
+secrets.yml
+secrets.toml
+secrets.env
+secrets.txt
+*.secret
+*.secrets
+/scripts/local.env
+
+
+# -----------------------------------------------------------------------------
+# 7. GAME-DERIVED and CONSOLE-DERIVED files: never committed (no dump, no firmware, no font, no shader)
+# -----------------------------------------------------------------------------
+# Containers and content (Switch and Switch 2)
+*.nsp
+*.xci
+*.xcz
+*.nsz
+*.ncz
+*.nup
+*.nca
+*.nacp
+*.tik
+*.nso
+*.nro
+*.npdm
+*.romfs
+RomFS.img
+# A dump or an extraction folder. `ExeFS/` and `extract/` exist for no other reason; the loose module names are
+# anchored to the repository root so they cannot hide a fixture called `main` (see section 8).
+ExeFS/
+extract/
+/main
+/sdk
+/subsdk[0-9]
+/rtld
+/firmware/
+/Firmware/
+/out/
+/out-*/
+/games/
+# Output of the rewriter and of the shader chain (they are the game's code and shaders, transformed)
+*.fixups.tsv
+*.sites.tsv
+*.gates.tsv
+*.cuts.tsv
+*.obs.tsv
+*.changed.tsv
+*.match.tsv
+*.dmsb
+*.spv
+*.metallib
+shadercache/
+/shaders/
+**/shaders/*.work
+# Saves
+*.sav
+# Fonts. The console's shared fonts are Nintendo's, macOS's Arial Unicode and Arial Rounded Bold are proprietary:
+# no font file is tracked (NOTICE.md, "Fonts"). If a freely licensed font is added on purpose, re-include it by name.
+*.bfttf
+*.bfotf
+*.ttf
+*.otf
+*.ttc
+*.woff
+*.woff2
+
+
+# -----------------------------------------------------------------------------
+# 8. RE-INCLUSIONS: the repository's own fixtures stay trackable
+# -----------------------------------------------------------------------------
+# The synthetic NSO modules of ibuilder-rewrite (crates/ibuilder-rewrite/tests/fixtures/{select,stubs,synth}/*.nso)
+# are small hand-made files, not game modules. Only the fixture folders of a crate are re-included, so a real NSO
+# anywhere else (for example next to the sources) stays ignored.
+!/crates/*/tests/fixtures/**/*.nso
+!/crates/*/tests/data/**/*.nso
+# a future fixture that mimics a dump folder
+!/crates/*/tests/**/ExeFS/

@@ -1,0 +1,531 @@
+# GameAppDiag.cs: hidden diagnostics (Documents/.diag): how the previous launch ended, launch context, lifecycle, memory warnings, thermal, stage changes, every UI log line with its time, the guest's error lines,
+# a 5 s memory/thermal sampler, MetricKit crash/hang/exit payloads. Hooks: GameAppMain.Main / FinishedLaunching / launch lines, GameAppLibrary.Append, GameAppLogs.LogFiles (the log share).
+# Applies after 0042. Compiled alone in a scratch net11.0-ios library; the whole app is compiled by scripts/build-app.sh.
+diff --color -ruN csp.orig/GameAppDiag.cs csp/GameAppDiag.cs
+--- a/GameAppDiag.cs
++++ b/GameAppDiag.cs
+@@ -0,0 +1,469 @@
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using System.Runtime.InteropServices;
++using System.Text;
++using System.Text.RegularExpressions;
++using System.Threading;
++using System.Threading.Tasks;
++using Foundation;
++using MetricKit;
++using UIKit;
++
++/// Hidden diagnostics: Documents/.diag/ (a folder whose name starts with a dot is not shown by the Files app; `devicectl device copy from
++/// --domain-type appDataContainer --source Documents/.diag` and the app's log share read it).
++///
++///   events-<session>.tsv     one line per event: UTC time, seconds since the launch, phase, kind, detail. Launch context (OS, model, RAM, entitlements, build id, env.txt),
++///                            the app's lifecycle (active / resign / background / foreground / terminate), memory warnings, thermal and low-power changes, the stage the
++///                            build is at, every line of the UI log (so a line carries its time), unhandled exceptions, the guest's own error lines.
++///   samples-<session>.tsv    every 5 s: phase, thermal state, low-power mode, free disk, the kernel's memory line (resident, peak, footprint, available).
++///   pipeline-<session>.jsonl the Rust chain's own events (ibuilder-pipeline/src/diag.rs): stage begin/end with times and memory, failures, the game's environment, the boot.
++///   memstat-<session>.tsv    the host's per-second memory accounting while a game runs (DM_MEMSTAT).
++///   previous-run.txt         what the PREVIOUS launch left: how it ended (clean, killed in the background, killed in the foreground after memory pressure, crashed), its last events.
++///   metrickit/               the payloads iOS delivers through MetricKit: crash, hang, CPU and disk-write diagnostics with their call stacks, and the exit reasons it counted.
++///   session.live             exists while a session runs; found at the next launch it means the previous one did not end by `terminate`.
++///
++/// The files are small (the newest six sessions are kept, 48 MB at most) and nothing here changes how the app behaves: a failure to write is swallowed.
++internal static class GameAppDiag
++{
++    internal const string DirName = ".diag";
++    private const int KeepSessions = 6;
++    private const long KeepBytes = 48L << 20;
++    private const long EventsCap = 16L << 20;
++    private const int SampleSeconds = 5;
++
++    [DllImport("__Internal")] private static extern int gameapp_increased_memory();
++    [DllImport("__Internal")] private static extern int gameapp_extended_va();
++    [DllImport("__Internal")] private static extern int gameapp_get_task_allow();
++    [DllImport("libc", EntryPoint = "sysctlbyname")] private static extern int SysctlString(string name, byte[] oldp, ref nuint oldlen, IntPtr newp, nuint newlen);
++    [DllImport("libc", EntryPoint = "sysctlbyname")] private static extern int SysctlU64(string name, out ulong oldp, ref nuint oldlen, IntPtr newp, nuint newlen);
++
++    private static readonly object gate = new();
++    private static readonly DateTime t0 = DateTime.UtcNow;
++    private static readonly List<NSObject> observers = new();
++    private static readonly Dictionary<string, int> guestSeen = new();
++    private static string dir, session = "none", phase = "launch", appState = "launching", lastStageKey = "";
++    private static StreamWriter events, samples;
++    private static Timer sampler;
++    private static long guestOffset, sampleCount, metricFiles;
++    private static DateTime lastDisk = DateTime.MinValue, lastStageLine = DateTime.MinValue;
++    private static bool started, lifecycleOn;
++    private static string lastDisk_mb = "-";
++    private static GameAppMetricSubscriber metricSubscriber;
++
++    internal static string Dir => dir;
++    internal static string Session => session;
++
++    /// The first call of the process (GameAppMain.Main): opens the session, says how the previous one ended, starts the sampler.
++    internal static void Start()
++    {
++        lock (gate)
++        {
++            if (started) return;
++            started = true;
++            try
++            {
++                dir = Path.Combine(GameAppMain.Documents, DirName);
++                Directory.CreateDirectory(dir);
++                var live = Path.Combine(dir, "session.live");
++                string previous = null;
++                try { if (File.Exists(live)) previous = File.ReadAllText(live).Split('\n')[0].Trim(); } catch (Exception) { }
++                session = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + "-" + Environment.ProcessId.ToString(CultureInfo.InvariantCulture);
++                File.WriteAllText(live, session + "\n");
++                if (!string.IsNullOrEmpty(previous)) PostMortem(previous);
++                Rotate();
++                events = Open("events-" + session + ".tsv");
++                samples = Open("samples-" + session + ".tsv");
++                samples.WriteLine("t_s\tphase\tapp\tthermal\tlowpower\tfree_disk_mb\tmem");
++                try { File.WriteAllText(Path.Combine(dir, "README.txt"), Readme); } catch (Exception) { }
++                AppDomain.CurrentDomain.UnhandledException += (_, e) => Write("unhandled", (e.IsTerminating ? "terminating: " : "") + e.ExceptionObject, true);
++                TaskScheduler.UnobservedTaskException += (_, e) => Write("unobserved-task", e.Exception?.ToString() ?? "", false);
++            }
++            catch (Exception) { events = null; samples = null; }
++        }
++        try { LaunchContext(); } catch (Exception error) { Write("launch-context-failed", error.Message, false); }
++        sampler = new Timer(Sample, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(SampleSeconds));
++    }
++
++    /// From the app delegate's didFinishLaunching: the notifications that say what the system does to this process.
++    internal static void Lifecycle()
++    {
++        if (lifecycleOn) return;
++        lifecycleOn = true;
++        try
++        {
++            var centre = NSNotificationCenter.DefaultCenter;
++            lock (observers)
++            {
++                observers.Add(centre.AddObserver(UIApplication.DidReceiveMemoryWarningNotification, _ =>
++                    Write("memory-warning", GameAppMain.MemLine() + " | available MiB " + GameAppMain.AvailableMiBValue(), true)));
++                observers.Add(centre.AddObserver(UIApplication.DidBecomeActiveNotification, _ => AppState("active")));
++                observers.Add(centre.AddObserver(UIApplication.WillResignActiveNotification, _ => AppState("resign-active")));
++                observers.Add(centre.AddObserver(UIApplication.DidEnterBackgroundNotification, _ => AppState("background")));
++                observers.Add(centre.AddObserver(UIApplication.WillEnterForegroundNotification, _ => AppState("foreground")));
++                observers.Add(centre.AddObserver(UIApplication.WillTerminateNotification, _ => { AppState("terminate"); Write("exit", "terminate notification", true); }));
++                observers.Add(centre.AddObserver(NSProcessInfo.ThermalStateDidChangeNotification, _ => Write("thermal", ThermalName(), true)));
++            }
++        }
++        catch (Exception error) { Write("lifecycle-failed", error.Message, false); }
++        try
++        {
++            metricSubscriber = new GameAppMetricSubscriber();
++            var manager = MXMetricManager.SharedManager;
++            manager.Add(metricSubscriber);
++            // what iOS kept for the previous launches (crashes, hangs, exit reasons): written once, beside the live ones
++            var diagnostics = manager.PastDiagnosticPayloads;
++            if (diagnostics != null) foreach (var p in diagnostics) SaveMetric("past-diagnostics", p.JsonRepresentation);
++            var metrics = manager.PastPayloads;
++            if (metrics != null) foreach (var p in metrics) SaveMetric("past-metrics", p.JsonRepresentation);
++        }
++        catch (Exception error) { Write("metrickit-failed", error.Message, false); }
++    }
++
++    private static void AppState(string state)
++    {
++        appState = state;
++        Write("app", state + " | " + GameAppMain.MemLine(), true);
++    }
++
++    /// One event line. `important` ones are written even when the events file reached its cap.
++    internal static void Event(string kind, string detail = "") => Write(kind, detail, false);
++
++    internal static void Write(string kind, string detail, bool important)
++    {
++        try
++        {
++            lock (gate)
++            {
++                if (events == null) return;
++                if (!important && events.BaseStream.Length > EventsCap) return;
++                var now = DateTime.UtcNow;
++                events.WriteLine(string.Create(CultureInfo.InvariantCulture,
++                    $"{now:yyyy-MM-ddTHH:mm:ss.fffZ}\t{(now - t0).TotalSeconds:F3}\t{phase}\t{kind}\t{Clean(detail)}"));
++            }
++        }
++        catch (Exception) { }
++    }
++
++    /// A line of the UI log (the chain's, the pipeline's, the build's), with its time.
++    internal static void Ui(string line) => Write("ui", line, false);
++
++    private static string Clean(string text)
++    {
++        if (string.IsNullOrEmpty(text)) return "";
++        var s = text.Replace('\t', ' ').Replace("\r", "").Replace("\n", " | ");
++        return s.Length > 6000 ? s.Substring(0, 6000) + "...[cut]" : s;
++    }
++
++    private static StreamWriter Open(string name) =>
++        new StreamWriter(new FileStream(Path.Combine(dir, name), FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false)) { AutoFlush = true };
++
++    private static string ThermalName()
++    {
++        try { return NSProcessInfo.ProcessInfo.ThermalState.ToString(); } catch (Exception) { return "?"; }
++    }
++
++    private static string Sysctl(string name)
++    {
++        try
++        {
++            nuint n = 0;
++            if (SysctlString(name, null, ref n, IntPtr.Zero, 0) != 0 || n == 0) return "?";
++            var buffer = new byte[(int) n];
++            if (SysctlString(name, buffer, ref n, IntPtr.Zero, 0) != 0) return "?";
++            return Encoding.UTF8.GetString(buffer, 0, Math.Max(0, (int) n - 1));
++        }
++        catch (Exception) { return "?"; }
++    }
++
++    private static string RamBytes()
++    {
++        try { nuint n = 8; return SysctlU64("hw.memsize", out ulong v, ref n, IntPtr.Zero, 0) == 0 ? (v >> 20).ToString(CultureInfo.InvariantCulture) + " MiB" : "?"; }
++        catch (Exception) { return "?"; }
++    }
++
++    private static string FreeDiskMiB()
++    {
++        try
++        {
++            var attrs = NSFileManager.DefaultManager.GetFileSystemAttributes(GameAppMain.Documents);
++            return attrs == null ? "?" : (attrs.FreeSize >> 20).ToString(CultureInfo.InvariantCulture);
++        }
++        catch (Exception) { return "?"; }
++    }
++
++    private static string Entitlement(Func<int> read)
++    {
++        try { return read().ToString(CultureInfo.InvariantCulture); } catch (Exception) { return "n/a"; }
++    }
++
++    private static void LaunchContext()
++    {
++        string bundle = "?", version = "?";
++        try { bundle = NSBundle.MainBundle.BundleIdentifier ?? "?"; version = NSBundle.MainBundle.ObjectForInfoDictionary("CFBundleShortVersionString")?.ToString() ?? "?"; } catch (Exception) { }
++        string os = "?";
++        try { os = UIDevice.CurrentDevice.SystemVersion; } catch (Exception) { }
++        Write("launch", $"session {session} | build {GameAppBuild.Id} | shader chain {GameAppBuild.ShaderChain} | bundle {bundle} {version} | iOS {os} | {Sysctl("hw.machine")} kernel {Sysctl("kern.osversion")}" +
++            $" | RAM {RamBytes()} | cores {Environment.ProcessorCount} | thermal {ThermalName()} | low power {SafeLowPower()} | free disk {FreeDiskMiB()} MiB" +
++            $" | increased-memory {Entitlement(gameapp_increased_memory)} extended-va {Entitlement(gameapp_extended_va)} get-task-allow {Entitlement(gameapp_get_task_allow)}" +
++            $" | pid {Environment.ProcessId}", true);
++        Write("memory", GameAppMain.MemLine() + " | available MiB " + GameAppMain.AvailableMiBValue(), true);
++        // the player's own settings files, as they are now: what a run is configured with
++        foreach (var name in new[] { "env.txt", "gameapp.config", "gameapp.settings" })
++        {
++            try
++            {
++                var path = Path.Combine(GameAppMain.Documents, name);
++                if (!File.Exists(path)) continue;
++                var text = File.ReadAllText(path);
++                if (text.Length > 4000) text = text.Substring(0, 4000);
++                var kept = string.Join(" ; ", text.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0 && !Regex.IsMatch(l, "pass|secret|token|p12|key", RegexOptions.IgnoreCase)));
++                Write("file", name + ": " + kept, true);
++            }
++            catch (Exception) { }
++        }
++    }
++
++    private static string SafeLowPower()
++    {
++        try { return NSProcessInfo.ProcessInfo.LowPowerModeEnabled ? "on" : "off"; } catch (Exception) { return "?"; }
++    }
++
++    private static readonly Regex Notable = new("\\[RED\\]|FATAL|panic|Assertion|assert |SIGSEGV|SIGABRT|SIGBUS|SIGKILL|abort\\(|out of memory|OOM|GPU .*(lost|error|hang)|Metal .*(error|fail)|stall|hitch|crash", RegexOptions.Compiled | RegexOptions.IgnoreCase);
++    private static readonly Regex Digits = new("[0-9a-fA-F]{6,}|[0-9]+", RegexOptions.Compiled);
++
++    /// The sampler: memory, thermal, the stage the build is at, and the lines the guest printed since the last sample that look like trouble.
++    private static void Sample(object _)
++    {
++        try
++        {
++            if (!started) return;
++            var n = Interlocked.Increment(ref sampleCount);
++            if ((DateTime.UtcNow - lastDisk).TotalSeconds > 60) { lastDisk = DateTime.UtcNow; lastDisk_mb = FreeDiskMiB(); }
++            StageWatch();
++            var line = string.Create(CultureInfo.InvariantCulture,
++                $"{(DateTime.UtcNow - t0).TotalSeconds:F1}\t{phase}\t{appState}\t{ThermalName()}\t{SafeLowPower()}\t{lastDisk_mb}\t{Clean(GameAppMain.MemLine())}");
++            lock (gate) { samples?.WriteLine(line); }
++            ScanGuestLog();
++        }
++        catch (Exception) { }
++    }
++
++    private static void StageWatch()
++    {
++        try
++        {
++            var path = Path.Combine(GameAppMain.Documents, "gameapp.stage");
++            if (!File.Exists(path)) return;
++            var text = File.ReadAllText(path).Trim();
++            if (text.Length == 0) return;
++            var key = text.Contains('(') ? text.Substring(0, text.IndexOf('(')).Trim() : text;
++            var next = text.StartsWith("stage 5/5", StringComparison.Ordinal) ? "game" : text.StartsWith("stage ", StringComparison.Ordinal) ? "build" : phase;
++            if (next != phase) { var old = phase; phase = next; Write("phase", old + " -> " + next, true); }
++            var now = DateTime.UtcNow;
++            if (key != lastStageKey) { lastStageKey = key; lastStageLine = now; Write("stage", text, true); }
++            else if ((now - lastStageLine).TotalSeconds >= 60) { lastStageLine = now; Write("stage-progress", text, true); }
++        }
++        catch (Exception) { }
++    }
++
++    private static void ScanGuestLog()
++    {
++        try
++        {
++            var path = Path.Combine(GameAppMain.Documents, "gameapp.guest.log");
++            if (!File.Exists(path)) return;
++            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
++            if (fs.Length < guestOffset) guestOffset = 0;                      // the log was rotated or restarted
++            if (fs.Length - guestOffset > (1 << 20)) guestOffset = fs.Length - (1 << 20);
++            fs.Seek(guestOffset, SeekOrigin.Begin);
++            var buffer = new byte[fs.Length - guestOffset];
++            int read = 0;
++            while (read < buffer.Length) { int got = fs.Read(buffer, read, buffer.Length - read); if (got <= 0) break; read += got; }
++            // only whole lines: the writer may be in the middle of one
++            int end = Array.LastIndexOf(buffer, (byte) '\n', Math.Max(0, read - 1));
++            if (end < 0) return;
++            guestOffset += end + 1;
++            foreach (var line in Encoding.UTF8.GetString(buffer, 0, end).Split('\n'))
++            {
++                if (line.Length == 0 || !Notable.IsMatch(line)) continue;
++                var key = Digits.Replace(line.Length > 120 ? line.Substring(0, 120) : line, "#");
++                guestSeen.TryGetValue(key, out int seen);
++                guestSeen[key] = ++seen;
++                if (guestSeen.Count > 4000) guestSeen.Clear();
++                // the first 20 of each kind, then every 200th (a log that repeats a line 50,000 times says so once in a while)
++                if (seen <= 20 || seen % 200 == 0) Write("guest", (seen > 20 ? $"x{seen} " : "") + line, true);
++            }
++        }
++        catch (Exception) { }
++    }
++
++    // ---- MetricKit -----------------------------------------------------------------------------------------------------------------------
++
++    internal static void SaveMetric(string kind, NSData json)
++    {
++        try
++        {
++            if (json == null || dir == null) return;
++            var folder = Path.Combine(dir, "metrickit");
++            Directory.CreateDirectory(folder);
++            var n = Interlocked.Increment(ref metricFiles);
++            var name = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{kind}-{n}.json";
++            File.WriteAllBytes(Path.Combine(folder, name), json.ToArray());
++            Write("metrickit", $"{kind}: metrickit/{name} ({json.Length} bytes)", true);
++            var files = new DirectoryInfo(folder).GetFiles().OrderByDescending(f => f.LastWriteTimeUtc).ToList();
++            foreach (var old in files.Skip(40)) { try { old.Delete(); } catch (Exception) { } }
++        }
++        catch (Exception) { }
++    }
++
++    // ---- the previous run, and what it leaves ---------------------------------------------------------------------------------------------
++
++    private static string[] Tail(string path, int lines)
++    {
++        try
++        {
++            if (!File.Exists(path)) return Array.Empty<string>();
++            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
++            var take = (int) Math.Min(fs.Length, 256 * 1024);
++            fs.Seek(-take, SeekOrigin.End);
++            var buffer = new byte[take];
++            int read = 0;
++            while (read < take) { int got = fs.Read(buffer, read, take - read); if (got <= 0) break; read += got; }
++            var all = Encoding.UTF8.GetString(buffer, 0, read).Split('\n').Where(l => l.Length > 0).ToArray();
++            return all.Length <= lines ? all : all.Skip(all.Length - lines).ToArray();
++        }
++        catch (Exception) { return Array.Empty<string>(); }
++    }
++
++    /// How the previous launch ended, from what it left. Written to previous-run.txt and as an event.
++    private static void PostMortem(string previous)
++    {
++        try
++        {
++            var ev = Tail(Path.Combine(dir, "events-" + previous + ".tsv"), 400);
++            var sm = Tail(Path.Combine(dir, "samples-" + previous + ".tsv"), 400);
++            string kindOf(string l) { var p = l.Split('\t'); return p.Length > 3 ? p[3] : ""; }
++            var last = ev.LastOrDefault() ?? "";
++            var lastApp = ev.Where(l => kindOf(l) == "app").Select(l => l.Split('\t')[4]).LastOrDefault() ?? "(none)";
++            var state = lastApp.Split('|')[0].Trim();
++            var lastStage = ev.Where(l => kindOf(l) == "stage" || kindOf(l) == "stage-progress").Select(l => l.Split('\t')[4]).LastOrDefault() ?? "(none)";
++            var lastPhase = last.Split('\t').Length > 2 ? last.Split('\t')[2] : "?";
++            long minAvail = long.MaxValue, maxFoot = 0;
++            string maxThermal = "Nominal";
++            foreach (var l in sm)
++            {
++                var p = l.Split('\t');
++                if (p.Length < 7) continue;
++                var a = Regex.Match(p[6], "available\\s+(-?\\d+)");
++                if (a.Success && long.TryParse(a.Groups[1].Value, out var av) && av >= 0) minAvail = Math.Min(minAvail, av);
++                var f = Regex.Match(p[6], "footprint\\s+(\\d+)");
++                if (f.Success && long.TryParse(f.Groups[1].Value, out var fp)) maxFoot = Math.Max(maxFoot, fp);
++                if (p[3] == "Serious" || p[3] == "Critical") maxThermal = p[3];
++            }
++            var memWarnings = ev.Count(l => kindOf(l) == "memory-warning");
++            var cleanExit = ev.Any(l => kindOf(l) == "exit");
++            var unhandled = ev.Where(l => kindOf(l) == "unhandled").Select(l => l.Split('\t')[4]).LastOrDefault();
++            string verdict;
++            if (cleanExit) verdict = "clean exit (the app was told to terminate)";
++            else if (unhandled != null) verdict = "an unhandled managed exception ended it: " + (unhandled.Length > 300 ? unhandled.Substring(0, 300) : unhandled);
++            else if (state == "background") verdict = "ended while in the BACKGROUND with no terminate: iOS reclaimed the memory of a suspended app, or the player closed it from the app switcher (not a fault of the app)";
++            else if (memWarnings > 0 || (minAvail != long.MaxValue && minAvail < 350)) verdict = $"ended in the FOREGROUND after memory pressure ({memWarnings} memory warning(s), lowest available {(minAvail == long.MaxValue ? "?" : minAvail.ToString(CultureInfo.InvariantCulture))} MiB): most likely a memory kill (jetsam)";
++            else if (maxThermal != "Nominal") verdict = $"ended in the FOREGROUND, thermal state reached {maxThermal}: heat may be involved (a thermal shutdown looks like this too)";
++            else verdict = "ended in the FOREGROUND with no terminate, no memory warning and memory not low: a crash (native fault) or a kill the app was not told about; MetricKit diagnostics of the next launch (metrickit/) and Settings > Privacy > Analytics > Analytics Data (GameApp .ips) hold the stack";
++            var text = new StringBuilder();
++            text.AppendLine($"previous run {previous}");
++            text.AppendLine($"verdict: {verdict}");
++            text.AppendLine($"last app state: {state}; last phase: {lastPhase}; last stage: {lastStage}");
++            text.AppendLine($"memory: lowest available {(minAvail == long.MaxValue ? "?" : minAvail.ToString(CultureInfo.InvariantCulture))} MiB, highest footprint {maxFoot} MiB, memory warnings {memWarnings}, thermal worst {maxThermal}");
++            text.AppendLine($"last sample: {sm.LastOrDefault() ?? "(none)"}");
++            text.AppendLine("last events:");
++            foreach (var l in ev.Skip(Math.Max(0, ev.Length - 60))) text.AppendLine("  " + l);
++            File.WriteAllText(Path.Combine(dir, "previous-run.txt"), text.ToString());
++            File.WriteAllText(Path.Combine(dir, "previous-run-" + previous + ".txt"), text.ToString());
++            PendingPrevious = "previous run " + previous + ": " + verdict;
++        }
++        catch (Exception) { }
++    }
++
++    private static string PendingPrevious;
++
++    /// Keep the newest sessions and 48 MB.
++    private static void Rotate()
++    {
++        try
++        {
++            var files = new DirectoryInfo(dir).GetFiles().Where(f => f.Name != "README.txt" && f.Name != "session.live" && f.Name != "previous-run.txt").ToList();
++            var sessions = files.Select(f => Regex.Match(f.Name, "(\\d{8}-\\d{6}-\\d+)")).Where(m => m.Success).Select(m => m.Groups[1].Value).Distinct().OrderByDescending(s => s, StringComparer.Ordinal).ToList();
++            foreach (var old in sessions.Skip(KeepSessions - 1))     // room for the session about to start
++                foreach (var f in files.Where(f => f.Name.Contains(old))) { try { f.Delete(); } catch (Exception) { } }
++            var left = new DirectoryInfo(dir).GetFiles().OrderBy(f => f.LastWriteTimeUtc).ToList();
++            long total = left.Sum(f => f.Length);
++            foreach (var f in left)
++            {
++                if (total <= KeepBytes) break;
++                if (f.Name == "README.txt" || f.Name == "session.live" || f.Name == "previous-run.txt") continue;
++                total -= f.Length;
++                try { f.Delete(); } catch (Exception) { }
++            }
++        }
++        catch (Exception) { }
++    }
++
++    /// Said once in the UI log by the first caller that asks (GameAppMain's launch lines).
++    internal static string TakePrevious()
++    {
++        var p = PendingPrevious;
++        PendingPrevious = null;
++        return p;
++    }
++
++    /// The files a log share should carry: this and the last two sessions, previous-run.txt, the MetricKit payloads of the last launches. Relative to Documents.
++    internal static List<string> ShareFiles(string documents)
++    {
++        var found = new List<string>();
++        try
++        {
++            var root = Path.Combine(documents, DirName);
++            if (!Directory.Exists(root)) return found;
++            var info = new DirectoryInfo(root);
++            var sessions = info.GetFiles().Select(f => Regex.Match(f.Name, "(\\d{8}-\\d{6}-\\d+)")).Where(m => m.Success).Select(m => m.Groups[1].Value).Distinct().OrderByDescending(s => s, StringComparer.Ordinal).Take(3).ToList();
++            foreach (var f in info.GetFiles().OrderBy(f => f.Name, StringComparer.Ordinal))
++                if (f.Name == "README.txt" || f.Name == "previous-run.txt" || sessions.Any(s => f.Name.Contains(s))) found.Add(DirName + "/" + f.Name);
++            var metric = Path.Combine(root, "metrickit");
++            if (Directory.Exists(metric))
++                foreach (var f in new DirectoryInfo(metric).GetFiles().OrderByDescending(f => f.LastWriteTimeUtc).Take(10)) found.Add(DirName + "/metrickit/" + f.Name);
++        }
++        catch (Exception) { }
++        return found;
++    }
++
++    private const string Readme =
++        "Hidden diagnostics of the app (Documents/.diag). Nothing here is sent anywhere.\n\n" +
++        "previous-run.txt   how the previous launch ended (clean / killed in the background / memory kill / crash) and its last events\n" +
++        "events-*.tsv       utc, seconds since launch, phase, kind, detail: launch context, lifecycle, memory warnings, thermal, stage changes, every UI log line, the guest's error lines\n" +
++        "samples-*.tsv      every 5 s: phase, app state, thermal, low-power, free disk, resident/peak/footprint/available memory\n" +
++        "pipeline-*.jsonl   the Rust chain: stage begin/end with times and memory, failures, the game's environment, the boot\n" +
++        "memstat-*.tsv      the host's per-second memory accounting while a game runs\n" +
++        "metrickit/         what iOS delivers through MetricKit: crash/hang/CPU/disk diagnostics with call stacks, exit reasons\n" +
++        "session.live       present while a session runs; found at the next launch it means the previous one did not terminate normally\n\n" +
++        "Copy it from a Mac:  xcrun devicectl device copy from --device <udid> --domain-type appDataContainer --domain-identifier <bundle id> --source Documents/.diag --destination <folder>\n";
++}
++
++/// MetricKit's callbacks: the diagnostics (a crash with its call stack, a hang, a CPU or disk-write exception) and the daily metrics (with the exit reasons: memory limit, watchdog, ...).
++internal sealed class GameAppMetricSubscriber : NSObject, IMXMetricManagerSubscriber
++{
++    [Export("didReceiveMetricPayloads:")]
++    public void DidReceiveMetricPayloads(MXMetricPayload[] payloads)
++    {
++        foreach (var p in payloads) GameAppDiag.SaveMetric("metrics", p.JsonRepresentation);
++    }
++
++    [Export("didReceiveDiagnosticPayloads:")]
++    public void DidReceiveDiagnosticPayloads(MXDiagnosticPayload[] payloads)
++    {
++        foreach (var p in payloads) GameAppDiag.SaveMetric("diagnostics", p.JsonRepresentation);
++    }
++}
+diff --color -ruN csp.orig/GameAppLibrary.cs csp/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -1196,6 +1196,7 @@
+             var line = logPartial.Substring(0, nl).TrimEnd('\r');
+             logPartial = logPartial.Substring(nl + 1);
+             if (line.Trim().Length == 0) continue;
++            GameAppDiag.Ui(line);
+             var kind = GameAppUi.KindOfLine(line);
+             logLines.Add((time, line, kind));
+             added++;
+diff --color -ruN csp.orig/GameAppLogs.cs csp/GameAppLogs.cs
+--- a/GameAppLogs.cs
++++ b/GameAppLogs.cs
+@@ -42,6 +42,7 @@
+                     found.Add("logs/" + f);
+         }
+         catch (Exception) { }
++        found.AddRange(GameAppDiag.ShareFiles(documents));   // Documents/.diag: the hidden diagnostics
+         return found;
+     }
+ 
+diff --color -ruN csp.orig/GameAppMain.cs csp/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -66,6 +66,8 @@
+ 
+     public static void Main(string[] args)
+     {
++        GameAppDiag.Start();   // the hidden diagnostics (Documents/.diag): how the last launch ended, this one's context, the sampler
++        GameAppDiag.Event("main", string.Join(" ", args ?? Array.Empty<string>()));
+         RegisterShaderTranslator();
+         // The library's icons are read through the extractor's private functions: say once whether trimming kept them.
+         try { GameIcons.Read(null, null); Console.Error.WriteLine("[gameapp] icon reader: the extractor's OpenNsp / Pick / Icon are here"); }
+@@ -328,7 +330,11 @@
+ public class GameAppAppDelegate : UIResponder, IUIApplicationDelegate
+ {
+     [Export("application:didFinishLaunchingWithOptions:")]
+-    public bool FinishedLaunching(UIApplication application, NSDictionary launchOptions) => true;
++    public bool FinishedLaunching(UIApplication application, NSDictionary launchOptions)
++    {
++        GameAppDiag.Lifecycle();
++        return true;
++    }
+ 
+     [Export("application:configurationForConnectingSceneSession:options:")]
+     public UISceneConfiguration GetConfiguration(UIApplication application, UISceneSession session,
+@@ -842,6 +848,7 @@
+ 
+         Write($"device: {UIDevice.CurrentDevice.Model} — {UIDevice.CurrentDevice.SystemName} {UIDevice.CurrentDevice.SystemVersion}");
+         Write($"memory at launch: {GameAppMain.MemLine()}");
++        if (GameAppDiag.TakePrevious() is string previousRun) Write(previousRun);
+         Write($"memory ceiling at launch: available {GameAppMain.AvailableMiB()} MiB (os_proc_available_memory — the number jetsam enforces; it rises only if the increased-memory-limit entitlement is applied)");
+         Write($"free space: {GameAppMain.FreeSpace()} — Documents: {GameAppMain.Documents}");
+         Write(GameAppMain.IdentityLine());

@@ -1,0 +1,12 @@
+using namespace metal;
+struct main0_out
+{
+    float4 gl_Position [[position]];
+};
+
+kernel void main0()
+{
+    int _51 = x & y & 1;
+        bool _16 = _51 != 0;
+int _35 = _16 ? (-1) : 0;
+}

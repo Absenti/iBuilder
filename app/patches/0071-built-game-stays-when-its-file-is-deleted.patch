@@ -1,0 +1,467 @@
+# 0071-built-game-stays-when-its-file-is-deleted.patch -- a game the app built stays in the library when its game file (.nsp .xci .nsz .nup) is deleted by hand in the Files app: an empty placeholder of the same
+#   name is put back and marked "removed", so it is a 0068 stub ("File removed", name, cover, settings, saves, mods, Play and Export IPA when it is the build on disk; "Add it again" for everything that needs the content).
+# Applies after 0069 (the tree with 0010..0069 applied; 0070 is written in parallel and touches none of the hunks below, but GameAppMain.cs hunks may then apply with an offset). UNTESTED ON DEVICE: compiled
+#   (dotnet build gameapp.csproj -c Release -r ios-arm64 -t:Compile: rc 0, 0 errors, 38 warnings: the same 38 (file and code) as the same project with the 0069 sources, none new) and the pure classes run in a host
+#   harness (a net11 console program built from the real source text of GameAppSourceRemoval.cs and the files 0068's harness compiles: 55 checks, all pass; 7 mutations of the new logic, each caught; 0068's own
+#   harness, built from this tree, still passes 341 of 341, as it does on the 0069 tree). No iPhone run.
+#
+# WHY (the owner): "If I delete the game's .nup / .xci etc. directly in the app's folder (Files app) to save space, the game disappears from the app even though it was built." The library is made from the game files
+#   in Documents (Dumps()); 0068 keeps a game whose file the APP removed (a zero-byte stub + a "removed" ledger record), but a file deleted by hand left nothing.
+#
+# WHAT
+#   * THE RECORD -- Documents/gameapp.built.tsv (BuiltRecord / BuiltLedger in GameAppSourceRemoval.cs, no UIKit): one line per base game file the app built: name, title id (GameAppUi.BaseTitleIdOf, "" when unknown),
+#     size at the build, UTC time. Written like the import ledger: under one lock, through gameapp.built.tsv.part and one rename, only when it changes; an unreadable file reads as empty (no placeholder is made).
+#     Only game files are recorded (never prod.keys, a path, anything else). Only the BASE game file: an update or DLC is not recorded on purpose (a placeholder of an update deleted by hand would block every rebuild
+#     with "add it again" and there is no in-app way to drop an update, so it would come back forever).
+#   * WRITTEN at the end of a build: RemoveSourceAfterBuild (0068's hook, called for non-boot-only runs after Finish) now calls RecordBuiltGame(game) first, when the outcome is StopOutcome.Finished and the run did not
+#     fail, WHATEVER the 0068 toggle says, and only when the framework stamp's game= names this file (else `library: <game>: the build ended but the build stamp names <x>: not recorded as built`). The stamp and the
+#     size are read on the main thread (one small file and one stat, before 0068's worker can replace the file by its stub); the write is on a worker.
+#   * SEEDED for games built before this patch: the stamp's game= (Documents/gameapp.framework, as GameStatusOf reads it) is added when it has no record (size: the file's, else the import record's for a 0068 stub,
+#     else 0), log `library: <name> recorded as built (the build on disk names it)`.
+#   * KEPT (BuiltKeep.Decide / Plan / Execute; KeepBuiltGames in GameAppSourceUi.cs): at launch (RefreshGames calls it once; RefreshGames runs at launch before the first full frame) and every time the app comes back
+#     to the foreground (its own WillEnterForeground observer), on a worker thread: seed, then for each record: not a game file -> nothing / the file is there (content, a 0068 stub, or an empty file put by hand:
+#     each stays what 0068 says it is) -> nothing / missing but another game file in Documents has exactly the recorded size (> 0) -> taken as renamed: the record follows that name, no placeholder, log
+#     `library: <name> is not in Documents but <other> has the size it had at its build: taken as the same game renamed, no placeholder` / missing -> a placeholder: the import ledger FIRST (the app's own record of
+#     the file when it has one, its source kept so "Add it again from <source>" still works, marked removed now; a record already removed stays as it is; else a new record: how "deleted", source "Files", the
+#     built size), then SourceStub.Replace with a rename that NEVER replaces a file (File.Move overwrite:false: a file that appeared meanwhile, an import, is left intact and the ledger is put back), log
+#     `library: <name> was deleted from Documents after its build: an empty placeholder keeps it in the library (put the file back to rebuild it)`. When a placeholder was made: sizes.Invalidate + RefreshScreen.
+#     A pass already running makes a second one return (Interlocked). The exported player does none of this.
+#   * NEVER for a game deleted FROM THE APP: PerformDelete's delete worker removes the game's built records FIRST (before any file goes, so a kill in the middle cannot bring it back as a placeholder); if that write
+#     fails the delete goes on and logs `delete: the built record could not be updated (...): the game may come back as an empty placeholder`. Never for a non-game file. A zero-byte file the player put by hand
+#     with no record stays "Empty file", as 0068 treats it.
+#   * 0068 SEMANTICS KEPT: the toggle off still keeps files; ShouldRemove / Plan / Execute / IsStub unchanged, except one line: Execute's "first removal ever" test ignores records with how "deleted" (a placeholder is
+#     not a removal by the app), so 0068's one-time line is still said before its first real removal. ImportHow.DeletedByHand = "deleted" and SourceText.HowText("deleted") = "deleted in Files" are new.
+#     A placeholder is AlreadyRemoved for 0068; the file put back BY HAND (content under a removed record) is never removed by 0068; put back by an import it gets a fresh record and 0068 may remove it again.
+#
+# LIMIT (by design, not fixed here): only ONE game is built at a time (one Documents/DmGameProbe.framework and one Documents/extract/RomFS.img). A placeholder keeps a game VISIBLE with its data; only the game the
+#   build on disk belongs to can still be played from it. Any other placeholder game, and every game after an app update withdraws the framework, needs its file again to be rebuilt (0068's "The game file was removed"
+#   alert offers to add it again).
+#
+# SEMANTICS TO KNOW: the placeholder is recreated each launch / return to the foreground while the game has a built record, so deleting the placeholder in Files does not remove the game; the app's Delete does.
+#   0066's "Delete the build" keeps the record (the game file stays; if it is deleted by hand later the game comes back as a placeholder that needs its file to be rebuilt).
+# "Remove download (stays in the cloud)" / "Delete" (RemoveFiles in GameAppLibrary.cs) drop the files' built records before deleting them, so no placeholder brings such a game back
+#   (added by the orchestrator after review: one line; applies after 0070, whose tree this patch is now made against).
+#   The launch sweep of leftover .part files (SweepLeftoverParts, GameAppMain.cs) does not know gameapp.built.tsv.part: a kill during that write leaves a small .part that the next write overwrites.
+#
+# NEW STRINGS (log only, no UI text): the `library: ...` lines above, `library: <name> was deleted from Documents after its build and no placeholder could be made (<why>): it is not in the library`,
+#   `library: the built record of <name> could not follow <other> (...)`, `library: <game> could not be recorded as built (...)`, `library: the built games could not be checked (...)`. No accessibility id.
+#
+# MEASURED (host harness, .NET 11, Apple silicon Mac, APFS): the record (round trip, garbage lines, a name twice in any case, tabs and newlines in a field, prod.keys / .txt / a path never recorded, Seed leaves an
+#   existing record, 64 records from 16 threads: a whole file, no .part, an unreadable file is empty); Decide over missing / present / empty / renamed / the own name in another case / unknown size / 6 non-game names /
+#   5 game extensions; StubRecord (new, from an import record with its source, an already removed one); EXECUTED on a real folder tree: two deleted games become 0-byte stubs (IsStub true) with the right records, a
+#   present game, a 0068 stub, prod.keys, a hand-placed game and a renamed game's file keep their SHA-256, a damaged record naming prod.keys / a .txt makes nothing, no .part, one log line per game, a second pass does
+#   nothing, a placeholder deleted by hand comes back; a file that appears between the plan and the placeholder keeps its content and the ledger is unchanged; a rename that fails leaves no file, no .part, the import
+#   record as it was; PerformDelete's step: the deleted game stays gone, another missing built game gets its placeholder; with 0068: AlreadyRemoved, put back by hand never removed, re-imported removable, 0068's
+#   one-time line still said. Mutations caught (each by >= 1 failing check): Present test weakened, an overwriting rename, the removed-record branch, the size guard of a rename, Seed overwriting, no ledger roll-back, the
+#   "first removal" filter removed.
+# NOT EXERCISED / ASSUMED (no device run): everything UIKit (the WillEnterForeground observer, RefreshScreen after a placeholder, the shelf showing it as "File removed"); that the worker's placeholder lands before or
+#   just after the first frame (a game may appear a moment after launch); that BeginRun's chain-return callback reaches RemoveSourceAfterBuild with Finished after a real build (as 0068 assumes); File.Move with
+#   overwrite:false on the phone's APFS; the Files app deleting a file while iBuilder is suspended and the foreground pass seeing it; RecoverStoppedBuilds / the build queue meeting a game whose file is missing at the
+#   instant before its placeholder exists.
+diff --color -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs	2026-11-20 16:23:09
++++ b/GameAppLibrary.cs	2026-11-20 16:23:09
+@@ -2203,6 +2203,8 @@
+         a.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
+         a.AddAction(UIAlertAction.Create(inCloud ? "Remove" : "Delete", UIAlertActionStyle.Destructive, _ =>
+         {
++            // Patch 0071: a file the player removes from the app is not a "deleted by hand" game: its built record goes first, so no placeholder brings it back (the cloud's greyed entry stays)
++            try { BuiltLedger.Update(GameAppMain.Documents, list => BuiltLedger.Remove(list, paths.Select(Path.GetFileName))); } catch (Exception) { }
+             foreach (var p in paths)
+                 try { File.Delete(p); Write($"removed from this iPhone: {Path.GetFileName(p)}" + (inCloud ? " (still in the cloud)" : "")); }
+                 catch (Exception e) { Write($"not removed: {Path.GetFileName(p)}: {e.Message}"); }
+diff --color -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs	2026-11-20 16:23:09
++++ b/GameAppMain.cs	2026-11-20 16:23:09
+@@ -1157,6 +1157,8 @@
+             $"layout: view {View.Bounds.Width:F0}x{View.Bounds.Height:F0}, safe insets t{safe.Top:F0} l{safe.Left:F0} b{safe.Bottom:F0} r{safe.Right:F0}"));
+     }
+ 
++    private bool builtGamesKept;
++
+     private IEnumerable<string> Dumps()
+     {
+         var documents = GameAppMain.Documents;
+@@ -1169,6 +1171,7 @@
+ 
+     private void RefreshGames()
+     {
++        if (!builtGamesKept) { builtGamesKept = true; KeepBuiltGames(); }   // patch 0071 (GameAppSourceUi.cs): once, at launch; a placeholder made on its worker refreshes the screen
+         var keys = Path.Combine(GameAppMain.Documents, "prod.keys");
+         Write(File.Exists(keys) ? "prod.keys: found in Documents"
+                                 : "prod.keys: MISSING. Use Import (or the Files app) to put it in Documents.");
+@@ -2240,6 +2243,9 @@
+         var notes = new List<string>();
+         deletes.Enqueue(() =>
+         {
++            // a game deleted here gets no placeholder (patch 0071): its built record goes FIRST, so a kill in the middle of the delete cannot bring it back as one
++            try { BuiltLedger.Update(GameAppMain.Documents, list => BuiltLedger.Remove(list, plan.Files.Where(f => f.IndexOf('/') < 0))); }
++            catch (Exception error) { notes.Add($"delete: the built record could not be updated ({error.Message}): the game may come back as an empty placeholder"); }
+             freed = PlanBytes(plan);
+             foreach (var rel in plan.Files)
+             {
+diff --color -ruN a/GameAppSourceRemoval.cs b/GameAppSourceRemoval.cs
+--- a/GameAppSourceRemoval.cs	2026-11-20 16:23:09
++++ b/GameAppSourceRemoval.cs	2026-11-20 16:23:09
+@@ -12,6 +12,9 @@
+ //   SourceStub                    IsStub, and the stub itself: written as <name>.part and renamed over the file in one step (atomic); a failure leaves the file as it was.
+ //   SourceReAdd                   whether a Files-folder source that the file came from still lists it (an instant clone to add it again).
+ //   SourceText                    the words.
++//   BuiltRecord / BuiltLedger     (patch 0071) Documents/gameapp.built.tsv: the base game files the app built (name, title id, size, when). Written when a build ends with StopOutcome.Finished.
++//   BuiltKeep                     (patch 0071) a built game whose file was deleted by hand (the Files app) gets an empty placeholder of the same name and a "removed" import record: it is a stub (IsStub), so it stays in
++//                                 the library with everything 0068 keeps for a stub. Never for a game deleted from the app (PerformDelete drops its built record) and never for anything but a game file.
+ using System;
+ using System.Collections.Generic;
+ using System.Globalization;
+@@ -30,6 +33,7 @@
+ public static class ImportHow
+ {
+     public const string Clone = "clone", Copy = "copy", Download = "download";
++    public const string DeletedByHand = "deleted";   // patch 0071: not an import: the record of a built game whose file was deleted by hand (an empty placeholder stands in for it)
+ }
+ 
+ public static class ImportLedger
+@@ -184,7 +188,7 @@
+     public static long Execute(string documents, IEnumerable<SourceDecision> decisions, Action<string> log, Action<string, string> move = null)
+     {
+         long freed = 0;
+-        bool first = !ImportLedger.Load(documents).Any(r => r.Removed);
++        bool first = !ImportLedger.Load(documents).Any(r => r.Removed && r.How != ImportHow.DeletedByHand);   // a placeholder of a file deleted by hand (patch 0071) is not a removal by the app
+         foreach (var d in decisions.Where(d => d.Why == RemoveWhy.Remove))
+         {
+             var path = Path.Combine(documents, d.File);
+@@ -283,7 +287,7 @@
+     public static string Removed(string name, long size, string how, string source) =>
+         Inv($"source: removed {name} ({GameAppUi.SizeText(size)}) after the build (it was {HowText(how)}, from {(string.IsNullOrEmpty(source) ? "a file picker" : source)})");
+ 
+-    public static string HowText(string how) => how switch { ImportHow.Clone => "cloned", ImportHow.Copy => "copied", ImportHow.Download => "downloaded", _ => string.IsNullOrEmpty(how) ? "imported" : how };
++    public static string HowText(string how) => how switch { ImportHow.Clone => "cloned", ImportHow.Copy => "copied", ImportHow.Download => "downloaded", ImportHow.DeletedByHand => "deleted in Files", _ => string.IsNullOrEmpty(how) ? "imported" : how };
+ 
+     public static string ReAdd(string source) => "Add it again from " + source;
+ 
+@@ -302,4 +306,212 @@
+         RemoveWhy.Missing => null,
+         _ => null,
+     };
++}
++
++// ---- patch 0071: a built game stays in the library when its file is deleted by hand ----------------------------------------------------------------------------------------
++//
++// The library is made from the game files in Documents (Dumps()). A file the owner deletes in the Files app to save space leaves nothing, so a built game vanished with its name, cover, settings and saves. The app now
++// records the games it built; at launch (and back from the background) a recorded game whose file is not in Documents gets an empty placeholder of the same name (SourceStub.Replace, never over an existing file) and a
++// "removed" import record, which makes it a stub for 0068: "File removed", Play and Export IPA when it is the build on disk, and "Add it again" for everything that needs the content.
++// LIMIT: one game is built at a time (one Documents/DmGameProbe.framework and one extract/): a placeholder keeps a game VISIBLE with its data; only the last built game can still be played from it, any other needs its file again.
++
++/// One game the app built: its base game file's name, its title id ("" when unknown), the file's size when it was built (0 when unknown) and when (UTC "yyyy-MM-ddTHH:mm:ssZ").
++public sealed record BuiltRecord(string Name, string TitleId, long Size, string At);
++
++public static class BuiltLedger
++{
++    public const string FileName = "gameapp.built.tsv";
++
++    private static readonly object gate = new object();
++
++    public static string PathIn(string documents) => System.IO.Path.Combine(documents, FileName);
++
++    private static string Clean(string s) => (s ?? "").Replace('\t', ' ').Replace('\n', ' ').Replace('\r', ' ');
++
++    /// A game file the library lists (.nsp .xci .nsz .nup, a plain name), never prod.keys or anything else.
++    public static bool IsGameFile(string name) => InPlaceImport.Accepts(name) && !string.Equals(name, InPlaceImport.Keys, StringComparison.OrdinalIgnoreCase);
++
++    public static List<BuiltRecord> Parse(string text)
++    {
++        var list = new List<BuiltRecord>();
++        foreach (var raw in (text ?? "").Split('\n'))
++        {
++            var line = raw.TrimEnd('\r');
++            if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
++            var p = line.Split('\t');
++            if (p.Length < 4 || p[0].Length == 0) continue;
++            long.TryParse(p[2], NumberStyles.None, CultureInfo.InvariantCulture, out var size);
++            var record = new BuiltRecord(p[0], p[1], size, p[3]);
++            list.RemoveAll(r => string.Equals(r.Name, record.Name, StringComparison.OrdinalIgnoreCase));   // one record per name (case-insensitive file system), the last wins
++            list.Add(record);
++        }
++        return list;
++    }
++
++    public static string Format(IEnumerable<BuiltRecord> list)
++    {
++        var sb = new StringBuilder("# the games this app built (a game whose file is deleted by hand keeps an empty placeholder in the library): file name, title id, size at the build, built at\n");
++        foreach (var r in list)
++            sb.Append(Clean(r.Name)).Append('\t').Append(Clean(r.TitleId)).Append('\t').Append(r.Size.ToString(CultureInfo.InvariantCulture)).Append('\t').Append(Clean(r.At)).Append('\n');
++        return sb.ToString();
++    }
++
++    public static BuiltRecord Find(IEnumerable<BuiltRecord> list, string name) =>
++        list?.FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
++
++    public static List<BuiltRecord> Upsert(IEnumerable<BuiltRecord> list, BuiltRecord record)
++    {
++        var next = list.Where(r => !string.Equals(r.Name, record.Name, StringComparison.OrdinalIgnoreCase)).ToList();
++        next.Add(record);
++        return next;
++    }
++
++    public static List<BuiltRecord> Remove(IEnumerable<BuiltRecord> list, IEnumerable<string> names)
++    {
++        var gone = new HashSet<string>(names ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
++        return list.Where(r => !gone.Contains(r.Name)).ToList();
++    }
++
++    /// The records now. Never throws (an unreadable file is an empty record: no placeholder is made).
++    public static List<BuiltRecord> Load(string documents)
++    {
++        lock (gate)
++        {
++            try { var path = PathIn(documents); return File.Exists(path) ? Parse(File.ReadAllText(path)) : new List<BuiltRecord>(); }
++            catch (Exception) { return new List<BuiltRecord>(); }
++        }
++    }
++
++    /// Changes the record: written only when it differs, through <file>.part and one rename, under one lock. Throws when it cannot be written (the callers say so in the log).
++    public static List<BuiltRecord> Update(string documents, Func<List<BuiltRecord>, List<BuiltRecord>> change)
++    {
++        var path = PathIn(documents);
++        lock (gate)
++        {
++            List<BuiltRecord> before;
++            try { before = File.Exists(path) ? Parse(File.ReadAllText(path)) : new List<BuiltRecord>(); } catch (Exception) { before = new List<BuiltRecord>(); }
++            var after = change(before.ToList());
++            if (Format(after) == Format(before)) return after.ToList();
++            Directory.CreateDirectory(documents);
++            var part = path + ".part";
++            try { File.WriteAllText(part, Format(after)); File.Move(part, path, true); }
++            catch { try { File.Delete(part); } catch (Exception) { } throw; }
++            return after.ToList();
++        }
++    }
++
++    /// A build of `name` ended with StopOutcome.Finished: the record of that name is replaced (a rebuild updates its size and time). Only game files.
++    public static void RecordBuilt(string documents, string name, string titleId, long size)
++    {
++        if (!IsGameFile(name)) return;
++        Update(documents, list => Upsert(list, new BuiltRecord(name, titleId ?? "", Math.Max(0, size), ImportLedger.Now())));
++    }
++
++    /// A game built before this record existed (the build stamp's game=): added when it has no record, an existing record is left as it is. True when it was added.
++    public static bool Seed(string documents, string name, string titleId, long size)
++    {
++        if (!IsGameFile(name)) return false;
++        bool added = false;
++        Update(documents, list =>
++        {
++            if (Find(list, name) != null) return list;
++            added = true;
++            return Upsert(list, new BuiltRecord(name, titleId ?? "", Math.Max(0, size), ImportLedger.Now()));
++        });
++        return added;
++    }
++}
++
++public enum KeepWhy { Placeholder, Present, NotAGameFile, Renamed }
++
++/// What happens to one built record now. `RenamedTo`: for Renamed, the other game file of exactly the recorded size.
++public sealed record KeepDecision(BuiltRecord Built, KeepWhy Why, string RenamedTo = null);
++
++public static class BuiltKeep
++{
++    /// The source label of the import record a placeholder gets when the app has no record of the file (it was put into Documents by hand, or before 0068 recorded imports).
++    public const string Source = "Files";
++
++    /// `actualSize`: the recorded file's length now, -1 when it is not in Documents. `others`: the game files in Documents (name, size).
++    ///   NotAGameFile  never a placeholder for anything but a game file (a damaged record, prod.keys).
++    ///   Present       the file is there (with content, a 0068 stub, or an empty file the owner put there: each is what 0068 says it is): nothing to do.
++    ///   Renamed       missing, but another game file has exactly the size recorded at the build: the owner renamed (or kept another copy of) it: the record follows that name, no placeholder.
++    ///   Placeholder   missing: an empty placeholder of the same name, and a "removed" import record (a stub).
++    public static KeepDecision Decide(BuiltRecord built, long actualSize, IReadOnlyList<(string Name, long Size)> others)
++    {
++        if (built == null || !BuiltLedger.IsGameFile(built.Name)) return new KeepDecision(built, KeepWhy.NotAGameFile);
++        if (actualSize >= 0) return new KeepDecision(built, KeepWhy.Present);
++        if (built.Size > 0)
++            foreach (var o in others ?? Array.Empty<(string, long)>())
++                if (o.Size == built.Size && !string.Equals(o.Name, built.Name, StringComparison.OrdinalIgnoreCase) && BuiltLedger.IsGameFile(o.Name))
++                    return new KeepDecision(built, KeepWhy.Renamed, o.Name);
++        return new KeepDecision(built, KeepWhy.Placeholder);
++    }
++
++    public static List<KeepDecision> Plan(IReadOnlyList<BuiltRecord> built, Func<string, long> sizeOf, IReadOnlyList<(string Name, long Size)> files) =>
++        (built ?? Array.Empty<BuiltRecord>()).Select(b => Decide(b, b != null && BuiltLedger.IsGameFile(b.Name) ? sizeOf(b.Name) : -1, files)).ToList();
++
++    /// The import record that makes the placeholder a stub (SourceStub.IsStub: size 0 and Removed). The app's own record of the file when it has one, so its source stays ("Add it again from <source>"), marked removed
++    /// now (a record already removed stays as it is: its 0068 stub was deleted by hand); else a new one: how "deleted", source "Files".
++    public static ImportRecord StubRecord(BuiltRecord built, ImportRecord existing, string now) =>
++        existing == null ? new ImportRecord(built.Name, built.Size, ImportHow.DeletedByHand, Source, "", now, now)
++        : existing.Removed ? existing
++        : existing with { RemovedAt = now };
++
++    /// Carries out `plan`: for each Placeholder the import ledger FIRST (the record says "removed"), then the placeholder: SourceStub's writer (an empty <name>.part renamed onto the name), with a rename that NEVER
++    /// replaces a file (one that appeared meanwhile, an import, stays and the import record is put back). For each Renamed the built record takes the other name. `log` gets one line per game. Returns the names of the
++    /// placeholders made. Worker threads only.
++    public static List<string> Execute(string documents, IEnumerable<KeepDecision> plan, Action<string> log, Action<string, string> move = null)
++    {
++        var made = new List<string>();
++        foreach (var d in plan ?? Array.Empty<KeepDecision>())
++        {
++            if (d.Why == KeepWhy.Placeholder)
++            {
++                var name = d.Built.Name;
++                try
++                {
++                    ImportRecord before = null;
++                    var now = ImportLedger.Now();
++                    ImportLedger.Update(documents, list => { before = ImportLedger.Find(list, name); return ImportLedger.Upsert(list, StubRecord(d.Built, before, now)); });
++                    try { SourceStub.Replace(Path.Combine(documents, name), move ?? ((from, to) => File.Move(from, to, false))); }
++                    catch
++                    {
++                        ImportLedger.Update(documents, list => before != null ? ImportLedger.Upsert(list, before) : ImportLedger.Remove(list, new[] { name }));   // no placeholder: the ledger is as it was
++                        throw;
++                    }
++                    made.Add(name);
++                    log?.Invoke(BuiltText.Placeholder(name));
++                }
++                catch (Exception e) { log?.Invoke(BuiltText.NoPlaceholder(name, e.Message)); }
++            }
++            else if (d.Why == KeepWhy.Renamed)
++            {
++                try
++                {
++                    BuiltLedger.Update(documents, list =>
++                    {
++                        var next = BuiltLedger.Remove(list, new[] { d.Built.Name });
++                        return BuiltLedger.Find(next, d.RenamedTo) != null ? next : BuiltLedger.Upsert(next, d.Built with { Name = d.RenamedTo });
++                    });
++                    log?.Invoke(BuiltText.Renamed(d.Built.Name, d.RenamedTo));
++                }
++                catch (Exception e) { log?.Invoke($"library: the built record of {d.Built.Name} could not follow {d.RenamedTo} ({e.Message})"); }
++            }
++        }
++        return made;
++    }
++}
++
++/// The words of patch 0071.
++public static class BuiltText
++{
++    public static string Placeholder(string name) =>
++        $"library: {name} was deleted from Documents after its build: an empty placeholder keeps it in the library (put the file back to rebuild it)";
++
++    public static string NoPlaceholder(string name, string why) => $"library: {name} was deleted from Documents after its build and no placeholder could be made ({why}): it is not in the library";
++
++    public static string Renamed(string name, string other) => $"library: {name} is not in Documents but {other} has the size it had at its build: taken as the same game renamed, no placeholder";
++
++    public static string Seeded(string name) => $"library: {name} recorded as built (the build on disk names it)";
+ }
+diff --color -ruN a/GameAppSourceUi.cs b/GameAppSourceUi.cs
+--- a/GameAppSourceUi.cs	2026-11-20 16:23:09
++++ b/GameAppSourceUi.cs	2026-11-20 16:23:09
+@@ -9,10 +9,14 @@
+ //   * What needs the content asks first (GameFileHasContent): Set up / Rebuild / Update, "Add to the build queue", the queue's own start (no alert there: the item fails with the reason), the icon passes (they skip it).
+ //     The message is "The game file was removed after the build to free space. Add it again to rebuild." with "Add it again from <source>" when the Files-folder source it came from still lists it (a clone: instant) and
+ //     the two ways of the + menu.
++//   * Patch 0071: a build that ends with StopOutcome.Finished records its game in Documents/gameapp.built.tsv (RecordBuiltGame, toggle on or off). At launch (RefreshGames) and back from the background
++//     (KeepBuiltGames), on a worker: the build stamp's game is added to that record when it has none (games built before 0071), and every recorded game whose file was deleted by hand gets an empty placeholder
++//     and a "removed" import record (BuiltKeep): it is a stub, so it stays in the library with everything above.
+ using System;
+ using System.Collections.Generic;
+ using System.IO;
+ using System.Linq;
++using System.Threading;
+ using System.Threading.Tasks;
+ 
+ using Foundation;
+@@ -67,6 +71,7 @@
+     private void RemoveSourceAfterBuild(string game, StopOutcome outcome)
+     {
+         if (GameExport.IsPlayer || outcome != StopOutcome.Finished || failedRun || !InPlaceImport.Accepts(game)) return;
++        RecordBuiltGame(game);   // patch 0071: before the removal below (its size is the file's, not the stub's), whatever the toggle says
+         bool toggle = SourceRemoval.ToggleOn(ReadAppSettings());
+         if (!toggle) return;
+         var documents = GameAppMain.Documents;
+@@ -96,6 +101,86 @@
+                 });
+             }
+             catch (Exception error) { BeginInvokeOnMainThread(() => Write($"source: the removal after the build failed ({error.GetType().Name}: {error.Message})")); }
++        });
++    }
++
++    // ---- patch 0071: a built game stays when its file is deleted by hand ----------------------------------------------------------------
++
++    /// A build of `game` ended with StopOutcome.Finished (not boot-only): it is recorded as built, when the build stamp names it. Main thread: the stamp and one stat (before 0068 can replace the file); the write on a worker.
++    private void RecordBuiltGame(string game)
++    {
++        if (!BuiltLedger.IsGameFile(game)) return;
++        string stampGame = null;
++        try { stampGame = GameAppUi.ParseFrameworkStamp(File.Exists(FrameworkStampPath) ? File.ReadAllText(FrameworkStampPath) : null)?.Game; } catch (Exception) { }
++        if (!string.Equals(stampGame, game, StringComparison.Ordinal))
++        {
++            Write($"library: {game}: the build ended but the build stamp names {(string.IsNullOrEmpty(stampGame) ? "no game" : stampGame)}: not recorded as built");
++            return;
++        }
++        long size = 0;
++        try { var f = new FileInfo(Path.Combine(GameAppMain.Documents, game)); if (f.Exists) size = f.Length; } catch (Exception) { }
++        var titleId = GameAppUi.BaseTitleIdOf(game) ?? "";
++        var documents = GameAppMain.Documents;
++        Task.Run(() =>
++        {
++            try { BuiltLedger.RecordBuilt(documents, game, titleId, size); }
++            catch (Exception error) { BeginInvokeOnMainThread(() => Write($"library: {game} could not be recorded as built ({error.Message}): if its file is deleted by hand it leaves the library")); }
++        });
++    }
++
++    private static int keepingBuilt;          // 1 while a pass runs (launch and foreground may overlap)
++    private static bool keepBuiltObserved;    // the foreground observer is added once
++
++    /// At launch (from RefreshGames, once) and each time the app comes back to the foreground: a built game whose file was deleted by hand gets its empty placeholder. Worker thread; the screen is refreshed when one was made.
++    private void KeepBuiltGames()
++    {
++        if (GameExport.IsPlayer) return;
++        if (!keepBuiltObserved)
++        {
++            keepBuiltObserved = true;
++            NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.WillEnterForegroundNotification, _ => BeginInvokeOnMainThread(KeepBuiltGames));   // a file deleted in Files while iBuilder was in the background
++        }
++        if (Interlocked.Exchange(ref keepingBuilt, 1) == 1) return;
++        var documents = GameAppMain.Documents;
++        var stampPath = FrameworkStampPath;
++        Task.Run(() =>
++        {
++            var lines = new List<string>();
++            int made = 0;
++            try
++            {
++                if (!Directory.Exists(documents)) return;
++                // a game built before this record existed: the build on disk names it
++                string stampGame = null;
++                try { stampGame = GameAppUi.ParseFrameworkStamp(File.Exists(stampPath) ? File.ReadAllText(stampPath) : null)?.Game; } catch (Exception) { }
++                if (BuiltLedger.IsGameFile(stampGame) && BuiltLedger.Find(BuiltLedger.Load(documents), stampGame) == null)
++                {
++                    long size = 0;
++                    try { var f = new FileInfo(Path.Combine(documents, stampGame)); if (f.Exists) size = f.Length; } catch (Exception) { }
++                    if (size == 0) size = ImportLedger.Find(ImportLedger.Load(documents), stampGame)?.Size ?? 0;   // a 0068 stub: the size the import recorded
++                    try { if (BuiltLedger.Seed(documents, stampGame, GameAppUi.BaseTitleIdOf(stampGame) ?? "", size)) lines.Add(BuiltText.Seeded(stampGame)); }
++                    catch (Exception error) { lines.Add($"library: {stampGame} could not be recorded as built ({error.Message})"); }
++                }
++                var built = BuiltLedger.Load(documents);
++                if (built.Count > 0)
++                {
++                    var files = Dumps().Select(p => { long l = -1; try { l = new FileInfo(p).Length; } catch (Exception) { } return (Name: Path.GetFileName(p), Size: l); }).Where(f => f.Size >= 0).ToList();
++                    var plan = BuiltKeep.Plan(built, n => { try { var i = new FileInfo(Path.Combine(documents, n)); return i.Exists ? i.Length : -1; } catch (Exception) { return 0; } }, files);
++                    if (plan.Any(d => d.Why is KeepWhy.Placeholder or KeepWhy.Renamed))
++                        made = BuiltKeep.Execute(documents, plan, lines.Add).Count;
++                }
++            }
++            catch (Exception error) { lines.Add($"library: the built games could not be checked ({error.GetType().Name}: {error.Message})"); }
++            finally
++            {
++                Interlocked.Exchange(ref keepingBuilt, 0);
++                if (lines.Count > 0 || made > 0)
++                    BeginInvokeOnMainThread(() =>
++                    {
++                        foreach (var line in lines) Write(line);
++                        if (made > 0) { sizes.Invalidate(); RefreshScreen(); }
++                    });
++            }
+         });
+     }
+ 

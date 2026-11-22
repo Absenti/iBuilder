@@ -1,0 +1,37 @@
+[package]
+name = "ibuilder-ffi"
+description = "Stable C ABI over ibuilder-pipeline: replaces gameapp_run_chain and the CPython host (staticlib for the iOS app, cdylib/rlib for the Mac)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+# deterministic stand-in stage workers, so the C test can run the whole chain without any game data
+mock-stages = ["ibuilder-pipeline/mock"]
+# a Mach-O initializer that takes the guest block early (always on for target_os = "ios"; this builds it elsewhere for tests)
+early-init = []
+# the real stage workers (ibuilder-profile / -rewrite / -macho / -sign through ibuilder-cli's adapters); without it the app supplies sign and tools through callbacks and the other stages are unwired
+real-stages = ["dep:ibuilder-cli", "dep:ibuilder-profile"]
+# stage 3 through ibuilder-cli's `shaders` feature (the app's xlate / spirv_cross callbacks drive ibuilder-shaderbuild; `shader-finish` joins ibuilder_shader::finish, `shadersplit` the split)
+real-shaders = ["real-stages", "ibuilder-cli/shaders"]
+real-shader-finish = ["real-shaders", "ibuilder-cli/shader-finish"]
+real-shadersplit = ["real-shaders", "ibuilder-cli/shadersplit"]
+
+[dependencies]
+ibuilder-pipeline = { path = "../ibuilder-pipeline" }
+ibuilder-cli = { path = "../ibuilder-cli", optional = true }
+# the LauncherBase adapter (src/launcher.rs) reads the game table and the header macros through ibuilder-profile
+ibuilder-profile = { path = "../ibuilder-profile", optional = true }
+# ibuilder_nup_icon: the cover of a Switch 2 `.nup`, read from the head of the file (default features: the zstd backend the real build has, which gets this crate through ibuilder-cli's `nup` feature as well)
+ibuilder-nup = { path = "../ibuilder-nup" }
+libc = { workspace = true }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+# tests/nup_icon.rs writes a small synthetic `.nup` (a SHA-256 of its table of contents and of each file)
+sha2 = { workspace = true }

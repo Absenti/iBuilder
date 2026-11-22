@@ -1,0 +1,22 @@
+[package]
+name = "ibuilder-pack"
+description = "Port of iOSBuilder tools/pack_nxgame.py + compare_nxgame.py: build and compare .nxgame packages"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+rayon = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+
+[lib]
+name = "ibuilder_pack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ibuilder-pack"
+path = "src/bin/ibuilder-pack.rs"

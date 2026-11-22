@@ -1,0 +1,129 @@
+# 0072-settings-profile-row.patch -- the game's settings sheet draws a "Profile" row (DM_PRESET: Standard / Memory saver) whose choice gives its values to several rows at once.
+# Applies after 0071 (the tree with 0010..0071 applied). UNTESTED ON DEVICE: compiled (dotnet build -t:Compile, ios-arm64, Release); no simulator or iPhone run.
+#
+# WHY (the owner's request, 2026-11-20): an Ocarina of Time profile modeled on the Apple TV port's memory settings, changeable in the app with a "profile" setting. The rows and their values come from the
+#   pipeline (crates/ibuilder-pipeline/src/settings.rs: add_preset_row writes the row into launcher.json with a `presets` map; apply_preset applies the profile at the boot for what the player, env.txt
+#   and the environment left unset). Memory saver = DM_LOW_MEMORY 1, Console mode Handheld, Dynamic resolution on, 30 fps, Render scale 0.5 (and DM_PSO_PREBUILD 0, which has no row: the boot sets it).
+#   Ocarina of Time (0400486024DEC000) starts at Memory saver (its covered rows' defaults are the memory values, so the sheet shows what the game runs with); every other game at Standard.
+#
+# WHAT
+#   * GameAppUi.cs: LauncherRow gains `Presets` (option -> {env -> value}), read from a choice row's `presets` object by ParseLauncherRow (a malformed entry is left out, a row never names itself);
+#     PresetValues(row, option) returns the map of one option (empty for any other row).
+#   * GameAppMain.cs (GameAppSettingsViewController): SetValue gives a profile row's values to the rows it covers that the sheet has, saves once, and sets every control again from the values
+#     (valueRefreshers: toggle, slider and its label, segmented control, menu button). The rows stay editable one by one; a value equal to a row's default is not written (SerializeSettingValues).
+#   A launcher.json without a profile row (a game built by an older app) draws as before; the pipeline writes the new launcher.json at the next boot (its catalogue digest changed).
+diff --color -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs	2026-11-20 16:53:21
++++ b/GameAppMain.cs	2026-11-20 16:53:21
+@@ -3279,6 +3279,8 @@
+     private readonly List<(GameAppUi.LauncherRow Row, UIView View)> launcherViews = new List<(GameAppUi.LauncherRow, UIView)>();
+     private readonly List<(string Section, UIView Header)> sectionHeaders = new List<(string, UIView)>();
+     private readonly List<Action> refreshers = new List<Action>();
++    // patch 0072: each row's control set again from `values` (after a profile row gave other rows their values)
++    private readonly List<Action> valueRefreshers = new List<Action>();
+ 
+     /// Draws the sheet from the launcher's rows instead of the four fixed ones. Call before the sheet is shown.
+     public void UseLauncher(IReadOnlyList<GameAppUi.LauncherRow> rows, Dictionary<string, string> current, Action<Dictionary<string, string>> save)
+@@ -3586,7 +3588,13 @@
+     private void SetValue(string env, string value)
+     {
+         values[env] = value;
++        // patch 0072: a profile row ("Profile": Standard / Memory saver) gives its values to the rows it covers; they stay editable one by one afterwards
++        var row = launcher?.FirstOrDefault(r => r.Env == env);
++        var preset = GameAppUi.PresetValues(row, value);
++        foreach (var kv in preset)
++            if (launcher.Any(r => r.Env == kv.Key)) values[kv.Key] = kv.Value;
+         valuesChanged?.Invoke(values);
++        if (preset.Count > 0) foreach (var refresh in valueRefreshers) refresh();
+         RefreshVisibility();
+     }
+ 
+@@ -3602,6 +3610,7 @@
+             {
+                 var toggle = new UISwitch { On = current == row.On, Enabled = enabled, AccessibilityIdentifier = id, OnTintColor = Theme.Accent };
+                 toggle.ValueChanged += (_, __) => SetValue(row.Env, toggle.On ? row.On : row.Off);
++                valueRefreshers.Add(() => toggle.On = GameAppUi.ValueOf(row, values) == row.On);
+                 parts.Add(new UIStackView(new UIView[] { title, new UIView(), toggle })
+                 {
+                     Axis = UILayoutConstraintAxis.Horizontal,
+@@ -3637,6 +3646,7 @@
+                 slider.TouchUpInside += commit;
+                 slider.TouchUpOutside += commit;
+                 if (row.Base != null) refreshers.Add(Show);
++                valueRefreshers.Add(() => { slider.Value = (float) GameAppUi.RangeValue(row, values); Show(); });
+                 Show();
+                 parts.Add(new UIStackView(new UIView[] { title, new UIView(), shown })
+                 {
+@@ -3658,6 +3668,13 @@
+                     StyleSegmented(control);
+                     control.SelectedSegment = index < 0 ? -1 : index;
+                     control.ValueChanged += (_, __) => SetValue(row.Env, options[(int) control.SelectedSegment].Value);
++                    valueRefreshers.Add(() =>
++                    {
++                        var now = GameAppUi.ValueOf(row, values);
++                        var at = -1;
++                        for (var i = 0; i < options.Count; i++) if (options[i].Value == now) at = i;
++                        control.SelectedSegment = at;
++                    });
+                     parts.Add(title);
+                     parts.Add(control);
+                 }
+@@ -3691,6 +3708,12 @@
+                         button.SetTitle(chosen, UIControlState.Normal);
+                     }
+                     Build();
++                    valueRefreshers.Add(() =>
++                    {
++                        var now = GameAppUi.ValueOf(row, values);
++                        selected = options.Any(o => o.Value == now) ? now : null;
++                        Build();
++                    });
+                     parts.Add(new UIStackView(new UIView[] { title, new UIView(), button })
+                     {
+                         Axis = UILayoutConstraintAxis.Horizontal,
+diff --color -ruN a/GameAppUi.cs b/GameAppUi.cs
+--- a/GameAppUi.cs	2026-11-20 16:53:21
++++ b/GameAppUi.cs	2026-11-20 16:53:21
+@@ -922,8 +922,17 @@
+     public sealed record LauncherRow(string Env, string Kind, string Section, string Label, string Note, string Default,
+                                      bool Basic, string NeedsVar, string NeedsValue,
+                                      IReadOnlyList<(string Value, string Label)> Options, string On, string Off,
+-                                     double Min, double Max, double Step, LauncherBase Base);
++                                     double Min, double Max, double Step, LauncherBase Base)
++    {
++        /// A "Profile" row (patch 0072, launcher.json's `presets`): for each of its options, the values it gives other rows (env -> value). Null for any other row.
++        public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> Presets { get; init; }
++    }
+ 
++    /// The values a profile row gives the other rows when the player picks `option` (patch 0072): the row's `presets` entry for it, else none. Applied by the sheet: each of those rows
++    /// takes the value (saved as any choice; one equal to the row's default is simply not written), and every row stays editable afterwards.
++    public static IReadOnlyDictionary<string, string> PresetValues(LauncherRow row, string option) =>
++        row?.Presets != null && option != null && row.Presets.TryGetValue(option, out var m) ? m : new Dictionary<string, string>();
++
+     /// Render scale only: the 3D views' size the scale multiplies.
+     public sealed record LauncherBase(int DockedW, int DockedH, int HandheldW, int HandheldH);
+ 
+@@ -1022,6 +1031,23 @@
+                 }
+                 if (list.Count == 0) return null;
+                 if (row.Default.Length == 0) row = row with { Default = list[0].Item1 };
++                // patch 0072: a profile row's values for the other rows, per option ({"memory": {"DM_FPS_TARGET": "30", ...}, ...}); a malformed entry is left out
++                if (o.TryGetProperty("presets", out var pr) && pr.ValueKind == JsonValueKind.Object)
++                {
++                    var presets = new Dictionary<string, IReadOnlyDictionary<string, string>>();
++                    foreach (var opt in pr.EnumerateObject())
++                    {
++                        if (opt.Value.ValueKind != JsonValueKind.Object) continue;
++                        var m = new Dictionary<string, string>();
++                        foreach (var kv in opt.Value.EnumerateObject())
++                        {
++                            var v = JsonText(kv.Value);
++                            if (v != null && EnvName.IsMatch(kv.Name) && kv.Name != env) m[kv.Name] = v;
++                        }
++                        presets[opt.Name] = m;
++                    }
++                    if (presets.Count > 0) row = row with { Presets = presets };
++                }
+                 return row with { Options = list };
+             }
+             case "toggle":

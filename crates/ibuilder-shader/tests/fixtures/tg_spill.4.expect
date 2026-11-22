@@ -1,0 +1,16 @@
+OK
+{"total":81920}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+kernel void main0(constant (*f)(int) {a [[buffer(1)]], uint3 dm_tgid [[threadgroup_position_in_grid]], uint3 dm_ntg [[threadgroups_per_grid]], device uchar* dm_tg [[buffer(30)]])
+{
+ulong dm_tgbase = ((ulong(dm_tgid.z) * dm_ntg.y + dm_tgid.y) * dm_ntg.x + dm_tgid.x) * 81920ul;
+device uint (&_33)[16384] = *(device uint (*)[16384])(dm_tg + dm_tgbase + 0);
+   device spvUnsafeArray<ushort, 8192>& _35 = *(device spvUnsafeArray<ushort, 8192>*)(dm_tg + dm_tgbase + 65536);
+    float _9 = 1.0;
+}

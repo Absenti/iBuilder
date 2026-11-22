@@ -1,0 +1,777 @@
+# 0079-cloud-subfolder-checks-and-cover-on-landing.patch -- the NAS / Cloud page: (1) the games of a source's subfolders get exactly the checks of the folder's own games; (2) a game added from the
+# NAS or a Files folder of the Cloud page gets its cover as soon as its file has landed, like a local import.
+# Applies after 0078. UNTESTED ON DEVICE, IN THE SIMULATOR AND AGAINST A REAL SFTP SERVER OR FILE PROVIDER: compiled, and its pure part ran in a host harness (below).
+#
+# WHY (the owner's field report on the NAS / Cloud page): "pas de vérif des jeux des sous dossiers" and "pas d'ajout de la thumbnail automatiquement".
+#   What a listed game gets, read from the code (0051, 0062, 0065, 0067, 0077): every check keys on the CloudFile's NAME and reads through its REMOTE: "In the library" / greyed (Cloud.CloudOnlyGames:
+#   the name against Documents), Download / Download and build with the update and DLC (Cloud.DownloadSet, GameAppUi.UpdateFor / DlcFor: the title id and [vN] of the NAME), "also in the cloud"
+#   (Cloud.CloudCopyOf), "In NAS · size" (the listing's size), the cover before the download (FetchCloudIcons: games/<id>/icon.jpg, the id from the NAME), after the download the local passes
+#   (FetchMissingIcons: the control NCA's icon, and the id read from the package when the name has none, 0051; FetchMissingNupIcons: a .nup's own icon, 0065), "Choose a cover…" (0065).
+#   On the NAS, 0077 gives a subfolder's file its own name and its real path, so it already goes through that same code; three things still left subfolder games without their checks:
+#   (a) a file whose name carries no [title id] (common when the game's folder carries the name: "<game>/<game>.nsz") got no id while it was only in the cloud: FetchCloudIcons skipped it,
+#       so no cover, no version, no update / DLC pairing (its update listed as a game of its own) until it was downloaded -- while a LOCAL file without an id gets it from the package (0051);
+#   (b) a Files folder of the Cloud page (iCloud Drive, ...) was read at its top level only (Directory.EnumerateFiles): the games of its subfolders were not listed at all;
+#   (c) the cover after an add: (i) "Download and build" starts its build in the same main-thread turn as the coalesced redraw, so the icon passes (never while a build runs) skipped the game
+#       for the whole build; (ii) a "no icon" marker written by the CLOUD pass (any failed remote read, a timeout included, wrote icon.none) was checked against prod.keys' time only, so the
+#       downloaded file was never read; (iii) a .nup's marker is checked against the file's modification time, which a clone keeps from the source.
+#
+# WHAT IT DOES
+#   * GameAppCover.cs, CoverPass (pure, no UIKit; the harness compiles it): ReaderFor (a .nup: its own reader, no keys; .nsp .xci .nsz: the package's, with prod.keys; an update or a DLC: none, the
+#     library shows its base game), Once (each landed name once, any case), Run (the pass over the landed files: not a game / no keys / a stub / its icon here already / a build running: no read;
+#     else ONE read by the given reader; a build that starts meanwhile stops the pass, the refresh passes read the rest after it), MarkerStands (a "no icon" marker stands only when it is not older
+#     than prod.keys -- or the .nup itself -- AND not older than the file's landing, the import ledger's time), LandedAt, BaseIdFromControl (a control NCA's id names a base game only when its low
+#     12 bits are 0), CloudOutcomeOf (a failed remote read leaves no marker), Line (the log line; a package with no icon is said once, as a fact: "... none: the package carries no icon (Choose a
+#     cover… gives it one)", no alert, no error row), Gate (the one lock every per-file read and write takes).
+#   * GameAppMain.cs: FetchMissingIcons' per-file body is now ReadPackageCover(keys, documents, name, out verdict) (same code; under the gate; an icon already there is not read again); the markers go
+#     by CoverPass.MarkerStands with the ledger's landing time.
+#   * GameAppCoverUi.cs: FetchMissingNupIcons' marker the same; ReadNupCover(documents, name, out verdict) under the gate; CoverPassForLanded(landed, how): on the WORKER that placed the files,
+#     right after the last one landed and before the main thread hears of it (so before "Download and build" starts its build), CoverPass.Run with the two per-file readers, `running || stop.Busy`
+#     asked before each read, GC.Collect after a package read (as FetchMissingIcons), the lines posted to the log. It writes games/<id>/icon.jpg or a marker, never cover.jpg (the person's cover
+#     keeps winning, GameCover.Resolve).
+#   * GameAppLibrary.cs: Download (the NAS download, the Files-folder clone or copy; used by Download, Download and build, "Download N from the cloud", "Add it again from <source>") collects each
+#     file once it is placed and recorded, and runs CoverPassForLanded after its loop (also when a later file of the set failed). RefreshCloud reads a Files folder with NasScan.ScanFolder over
+#     FolderListing.OnDisk (directory entries only, on its worker): the folder's own files exactly as before, plus the game files of its direct subfolders under the NAS's rules (one level, 200
+#     subfolders at most, the first file of a name kept, hidden / system / linked folders never looked into), Remote "Sub/X.nsp" (CopyFromFolder and the cover pass append it to the folder), the
+#     summary and the clashes in the log ("cloud: N game files in <source> and its M subfolders"). FetchCloudIcons reads the control NCA's id too (GameIconsStream.Read(keys, stream, out id)) and
+#     names an id-less game by it like 0051 (Documents/.titleids.tsv, the same games/_unresolved/<hash>.none marker), writes the icon through icon.jpg.part under the gate, and a read that FAILED
+#     leaves no marker (remembered for this session only: tried again at the next launch).
+#   * GameAppImportUi.cs: the folder flow (RunImportJobs) runs CoverPassForLanded for the files it cloned or copied (not one that was there already), on its worker, before the main thread.
+#   * GameAppNas.cs: NasScan.ScanFolder / FolderEntryAt (the Files folder through the same Scan: an iCloud placeholder ".X.nsp.icloud" under its real name, no size); Lines(r, dir, who = "NAS")
+#     (the NAS's lines unchanged; the cap's advice is "add a narrower folder" for a Files folder). GameAppIcons.cs: GameIconsStream.Read(keys, stream, out controlTitleId). GameAppUi.cs:
+#     SaveTitlesFromContent under a lock (four passes may now save). GameAppCloud.cs: the header comment.
+#   * Not changed: the old Import picker (CopyIn) and "Open in iBuilder" (they got their cover from the refresh already, which now also lets a landed file through an old marker); the cloud-only
+#     .nup covers (gameapp_nup_icon needs a path; a NAS file has none); one SFTP connection per cloud cover (as before).
+#   * New UI texts: none. New log texts (worth a marker in app/verify_ipa.sh, they are in GameApp.dll): "cover: <name> (<how>): <verdict>", "(Choose a cover… gives it one)", "read after the build",
+#     "read once prod.keys is added", "its icon is here already", "cover: the pass after the add stopped", "downloaded from the NAS", "added from the ", "cloud: N game files in ... and its M
+#     subfolders", "add a narrower folder".
+#
+# VERIFIED (2026-11-21, M1 Pro)
+#   * scripts/check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the tree the repository's patches give equals the compiled tree (diff -r).
+#   * Compile (the device project build-app.sh step 3 made on 2026-11-21 18:39, copied, sources of the tree, native references left out): `dotnet build gameapp.csproj -c Release -r ios-arm64
+#     -t:Compile`: the 0078 tree 0 errors / 40 warnings, with this patch 0 errors / 40 warnings, the same per file and code; the new log texts are in the compiled GameApp.dll. No .ipa was made.
+#   * Host harness (net11.0, the REAL text of GameAppNas.cs with NAS_LOGIC_ONLY, GameAppCloud.cs, GameAppUi.cs, GameAppCover.cs, GameAppImportFolder.cs, GameAppImport.cs, GameAppSourceRemoval.cs,
+#     ...; the UIKit files' text for the wiring): 70 of 70 checks. A game in a NAS subfolder and the same game in the sync folder give the same answer to every check (kind, id, icon and marker
+#     paths, playable, greyed, download set with update and DLC, update / DLC pairing, "In NAS · size", "also in the cloud", reader, name) for base, update and DLC; the same for a real Files
+#     folder on disk (top level vs subfolder, an iCloud placeholder, "._" files, a hidden, a system, a linked and a deeper folder, a clash); a Files folder with no subfolder lists exactly what
+#     the old code listed (names, sizes, Remote); the NAS's log lines unchanged; an id-less name gets its id from a base game's control NCA only, then its icon path and its update pairing; the
+#     landed pass: one read per landed game (a name in another case once), none for an update / DLC / .ipa / prod.keys, a stub, an icon already there, no keys (a .nup is still read), a build
+#     running (nothing more after it starts); the Ocarina-like .nup with no icon: one plain log line, no alert; the readers' targets are never the custom cover's paths and the cover wins;
+#     markers: a cloud marker older than the landing does not stand, the file's own does, no ledger record = as before, newer keys = as before; the wiring: the pass on the Download worker
+#     after the loop, before the main thread and before done (Download and build), the landed list filled after the ledger record, the folder flow's worker, `running || stop.Busy`, the shared
+#     readers, the gate in the three passes, the cloud pass's id read and its no-marker-on-failure. 23 of 23 mutations of the sources are killed (harness/mutate.py).
+#
+# NOT VERIFIED
+#   * Nothing ran on an iPhone, in the simulator, against an SFTP server or a File Provider: the time a cover read adds before a "Download and build" starts (a control NCA: a few hundred KB;
+#     a .nup head: up to ~15 MB) is not measured; that a File Provider lists a subfolder through FileSystemEnumerable as it lists the top level is assumed (0067's folder flow does the same).
+#   * That the owner's subfolder games are named without a title id (the likeliest reason, from the code, for "no checks") is an inference: his log was not read here.
+#   * GameIconsStream takes the FIRST control NCA of a package; an .xci that carries its update's control NCA first gives an update's id, which is refused (no id until the file is here).
+#   * The ledger is read on the main thread by the two refresh passes (a small file, cached by its time stamp: one stat when unchanged).
+diff -ruN a/GameAppCloud.cs b/GameAppCloud.cs
+--- a/GameAppCloud.cs	2026-11-21 19:11:26
++++ b/GameAppCloud.cs	2026-11-21 19:18:10
+@@ -2,8 +2,8 @@
+ //
+ // A source is the NAS (SFTP, gameapp/GameAppNas.cs, the folder chosen in its settings) or a folder picked in the Files
+ // app: iCloud Drive, Google Drive, OneDrive, Dropbox... any app that shows its files there (its File Provider). The app
+-// lists each source's folder (a Files folder: one level; the NAS: its folder and the games of its direct subfolders,
+-// patch 0077, GameAppNas.cs NasScan), keeps the list (Library/Application Support/gameapp.cloud.tsv, so the library
++// lists each source's folder (the NAS and a Files folder alike: the folder and the games of its direct subfolders, patch
++// 0077 for the NAS, 0079 for a Files folder, GameAppNas.cs NasScan), keeps the list (Library/Application Support/gameapp.cloud.tsv, so the library
+ // shows it at once at the next launch), and shows every game or .ipa it holds that is not in Documents greyed, with a
+ // cloud mark. A tap downloads it (with the game's update and DLC from the same source), and a game downloaded from a
+ // source can drop its download again ("Remove download"): it stays in the cloud.
+diff -ruN a/GameAppCover.cs b/GameAppCover.cs
+--- a/GameAppCover.cs	2026-11-21 19:11:26
++++ b/GameAppCover.cs	2026-11-21 19:11:56
+@@ -110,3 +110,104 @@
+         return sourceRelative == "games/" + titleId + "/" + FileName ? null : "documents/games/" + titleId + "/" + FileName;
+     }
+ }
++
++// ---- patch 0079: the cover pass of a file that has just landed ------------------------------------------------------------------------------------------------------------------------------
++//
++// A game added from the NAS (Download, Download and build), from a Files folder of the Cloud page (a clone, else a copy) or through the folder flow got its cover only from a later refresh pass, which
++// a build started at once skipped ("Download and build"), and which a "no icon" marker written while the game was only in the cloud stopped for good (FetchCloudIcons' verdict on the REMOTE copy,
++// checked against prod.keys' time only). Now the file's own cover is read on the worker that placed it, right after it landed and before anything else starts, by the same per-file readers as the
++// refresh passes; and a marker older than the file's landing (the import ledger's time) no longer stands for the file that is here now.
++
++/// Patch 0079: which landed files get the cover pass, once each, and whether a "no icon" marker still stands. It only ever leads to games/<id>/icon.jpg (or a marker) being written: the person's cover
++/// (GameCover.Candidates) is never a target, and wins over the icon (GameCover.Resolve).
++public static class CoverPass
++{
++    /// Every per-file cover read (the refresh passes, the landed pass, the cloud pass's write) holds this: one file is never read or written by two passes at once, and the second finds the icon.
++    public static readonly object Gate = new object();
++
++    public enum Reader { None, Package, Nup }
++
++    /// The reader a landed file gets: a .nup its own icon (no keys: gameapp_nup_icon), a .nsp .xci .nsz the package's control NCA (with prod.keys; the title id too when the name has none). An update
++    /// or a DLC gets none: the library shows its base game, whose icon is read from the base game's file. Anything else (an .ipa, prod.keys) gets none.
++    public static Reader ReaderFor(string fileName, bool haveKeys)
++    {
++        if (!Cloud.IsGameFile(fileName)) return Reader.None;
++        if (GameAppUi.ContentKindOf(fileName) is GameAppUi.ContentKind.Update or GameAppUi.ContentKind.AddOn) return Reader.None;
++        if (GameAppUi.IsNup(fileName)) return Reader.Nup;
++        return haveKeys ? Reader.Package : Reader.None;
++    }
++
++    /// The landed names, each once (Documents holds one file of a name, whatever its case), in the order they landed.
++    public static List<string> Once(IEnumerable<string> landed)
++    {
++        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++        return (landed ?? Enumerable.Empty<string>()).Where(n => !string.IsNullOrEmpty(n) && seen.Add(n)).ToList();
++    }
++
++    /// A "no icon" marker (games/<id>/icon.none, games/_unresolved/<hash>.none) still stands when it is not older than `sinceUtc` (prod.keys for a package, the file itself for a .nup: as before) AND not
++    /// older than the file's landing (`landedUtc`, the import ledger's time; null for a file the app did not import: as before). A marker written while the game was only in the cloud, or before the
++    /// file was added again, is the verdict on another copy: the file that is here now is read.
++    public static bool MarkerStands(DateTime markerUtc, DateTime sinceUtc, DateTime? landedUtc) =>
++        markerUtc >= sinceUtc && (landedUtc == null || markerUtc >= landedUtc.Value);
++
++    /// The import ledger's time ("yyyy-MM-ddTHH:mm:ssZ", UTC, whole seconds), or null when there is none or it cannot be read.
++    public static DateTime? LandedAt(string at) =>
++        !string.IsNullOrEmpty(at) && DateTime.TryParseExact(at, "yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture,
++            System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var t) ? t : (DateTime?) null;
++
++    /// The base game's title id a control NCA names, as 0051 keeps it (low 12 bits cleared), or 0 when it is not a base game's (an update's control NCA, ...): a file whose name has no id is then
++    /// left to the extractor's own reading once it is here, as a local one (GameIconsContent reads the application's control NCA only).
++    public static ulong BaseIdFromControl(ulong titleId) => titleId != 0 && (titleId & 0xFFFUL) == 0 ? titleId : 0;
++
++    public enum CloudOutcome { Icon, NoIcon, Retry }
++
++    /// What the cloud pass keeps from one remote read: the icon; a "no icon" marker when the package was read and has none; nothing on disk when the read failed (the network, the NAS, a password):
++    /// tried again at the next launch, not marked for good.
++    public static CloudOutcome CloudOutcomeOf(byte[] jpeg, bool failed) =>
++        failed ? CloudOutcome.Retry : jpeg != null && jpeg.Length > 0 ? CloudOutcome.Icon : CloudOutcome.NoIcon;
++
++    public enum Outcome { Read, HasIcon, NotAGame, NoKeys, NoContent, BuildRunning }
++
++    public sealed record Result(string Name, Outcome Outcome, string Verdict);
++
++    /// The pass over the files that landed, once each, in order. `hasContent`: the file is there with its content (not a stub, not empty); `iconExists`: games/<id>/icon.jpg is there already (the
++    /// cloud pass read it, or an earlier pass); `buildBusy`: asked before each read (a build that started meanwhile gets the rest after it, from the refresh passes, which the landing time now lets
++    /// through); `read`: the per-file reader, which returns its verdict. Markers are not asked: the file has just landed, its own verdict is written by the reader.
++    public static List<Result> Run(IEnumerable<string> landed, bool haveKeys, Func<string, bool> hasContent, Func<string, bool> iconExists, Func<bool> buildBusy, Func<string, Reader, string> read)
++    {
++        var results = new List<Result>();
++        bool stopped = false;
++        foreach (var name in Once(landed))
++        {
++            var reader = ReaderFor(name, haveKeys);
++            if (reader == Reader.None)
++            {
++                bool wantsKeys = !haveKeys && ReaderFor(name, true) == Reader.Package;
++                results.Add(new Result(name, wantsKeys ? Outcome.NoKeys : Outcome.NotAGame, null));
++                continue;
++            }
++            if (stopped || buildBusy()) { stopped = true; results.Add(new Result(name, Outcome.BuildRunning, null)); continue; }
++            if (!hasContent(name)) { results.Add(new Result(name, Outcome.NoContent, null)); continue; }
++            if (iconExists(name)) { results.Add(new Result(name, Outcome.HasIcon, null)); continue; }
++            results.Add(new Result(name, Outcome.Read, read(name, reader)));
++        }
++        return results;
++    }
++
++    /// The log line of one landed file (`how`: "downloaded from NAS", "added from iCloud Drive · Games", ...), or null when there is nothing to say (not a game, a stub). A package with no icon is said
++    /// once, as a fact, not an error: "Choose a cover…" stays the way to give it one.
++    public static string Line(Result r, string how)
++    {
++        var head = $"cover: {r.Name} ({how}): ";
++        switch (r.Outcome)
++        {
++            case Outcome.Read:
++                var v = string.IsNullOrEmpty(r.Verdict) ? "read" : r.Verdict;
++                return head + v + (v.StartsWith("none", StringComparison.Ordinal) || v.StartsWith("no icon", StringComparison.Ordinal) ? " (Choose a cover… gives it one)" : "");
++            case Outcome.HasIcon: return head + "its icon is here already";
++            case Outcome.NoKeys: return head + "read once prod.keys is added";
++            case Outcome.BuildRunning: return head + "read after the build";
++            default: return null;
++        }
++    }
++}
+diff -ruN a/GameAppCoverUi.cs b/GameAppCoverUi.cs
+--- a/GameAppCoverUi.cs	2026-11-21 19:11:26
++++ b/GameAppCoverUi.cs	2026-11-21 19:18:10
+@@ -6,6 +6,9 @@
+ //   * .nup icons        FetchMissingNupIcons: the icon of a Switch 2 package is read from the head of the file by the shim (gameapp_nup_icon: no keys, a few hundred KB to ~15 MB), on a background task, never while a
+ //                       build runs; the package's title id names the game when its file name has none. A package without an icon (the owner's Ocarina of Time has none: its metadata has no NACP) gets the "no icon"
+ //                       marker like the other formats, so it is not read again at every refresh; the initials stay.
++//   * patch 0079        CoverPassForLanded: a game file that has just landed (a NAS download, a Files-folder clone or copy, the folder flow) gets its cover read at once, on the worker that placed it, by the
++//                       same per-file readers (ReadNupCover, ReadPackageCover in GameAppMain.cs), before a "Download and build" starts its build; a "no icon" marker older than the file's landing no longer
++//                       stops the refresh passes (CoverPass.MarkerStands, GameAppCover.cs).
+ using System;
+ using System.Collections.Generic;
+ using System.IO;
+@@ -211,15 +214,20 @@
+         if (GameExport.IsPlayer || running || facts.Running || stop.Busy) return;
+         var documents = GameAppMain.Documents;
+         var todo = new List<string>();
++        var ledger = ImportLedger.Load(documents);   // patch 0079: when each imported file landed (a clone keeps the source's modification time: the landing is the ledger's)
+         foreach (var name in facts.Games ?? new List<string>())
+         {
+             if (!GameAppUi.IsNup(name)) continue;
+             if (GameFileContent(name) != SourceFileState.Content) continue;   // a package removed after its build has nothing to read an icon from (GameAppSourceUi.cs)
+             var rel = GameAppUi.IconRelativePath(name);
+             if (rel != null && File.Exists(CoverFileOf(name, rel))) continue;
+-            // a package that gave no icon (or could not be read) is tried again only when the file is newer than the note
++            // a package that gave no icon (or could not be read) is tried again only when the file is newer than the note, or landed after it (patch 0079)
+             var marker = CoverFileOf(name, rel != null ? GameAppUi.NoIconRelativePath(name) : GameAppUi.UnresolvedMarker(name));
+-            try { if (File.Exists(marker) && File.GetLastWriteTimeUtc(marker) >= File.GetLastWriteTimeUtc(Path.Combine(documents, name))) continue; }
++            try
++            {
++                if (File.Exists(marker) && CoverPass.MarkerStands(File.GetLastWriteTimeUtc(marker), File.GetLastWriteTimeUtc(Path.Combine(documents, name)),
++                                                                  CoverPass.LandedAt(ImportLedger.Find(ledger, name)?.At))) continue;
++            }
+             catch (Exception) { continue; }
+             todo.Add(name);
+         }
+@@ -233,7 +241,7 @@
+                 foreach (var name in todo)
+                 {
+                     if (stop.Busy) break;   // a build started meanwhile: the rest waits for the next refresh
+-                    changed += ReadNupCover(documents, name);
++                    changed += ReadNupCover(documents, name, out _);
+                 }
+             }
+             finally { Interlocked.Exchange(ref nupIconsRunning, 0); }
+@@ -242,11 +250,19 @@
+         });
+     }
+ 
+-    /// Worker thread. 1 when something the screen shows changed (an icon, or the game's id), else 0.
+-    private static int ReadNupCover(string documents, string name)
++    /// Worker thread. 1 when something the screen shows changed (an icon, or the game's id), else 0. The per-file reader of FetchMissingNupIcons and of the pass that runs as soon as a file has
++    /// landed (patch 0079, CoverPassForLanded); `verdictOut` says what came of it.
++    private static int ReadNupCover(string documents, string name, out string verdictOut)
+     {
++        lock (CoverPass.Gate) { var n = ReadNupCoverLocked(documents, name, out verdictOut); return n; }
++    }
++
++    private static int ReadNupCoverLocked(string documents, string name, out string verdictOut)
++    {
+         int changed = 0;
+         string verdict;
++        var known = GameAppUi.IconRelativePath(name);
++        if (known != null && File.Exists(CoverFileOf(name, known))) { verdictOut = "its icon is here already"; return 0; }   // another pass read it meanwhile
+         try
+         {
+             var path = Path.Combine(documents, name);
+@@ -284,6 +300,48 @@
+         catch (Exception error) { verdict = error.GetType().Name + ": " + error.Message; }
+         Console.Error.WriteLine($"[gameapp] icon of {name}: {verdict}");
+         GameAppDiag.Event("icon", $"icon of {name}: {verdict}");
++        verdictOut = verdict;
+         return changed;
++    }
++
++    // ---- patch 0079: the cover pass of a file that has just landed ------------------------------------------------------------------------------
++
++    /// Worker thread, on the worker that placed the files (a NAS download, a Files-folder clone or copy, the folder flow), right after the last one landed and before the main thread hears of it (so
++    /// before a "Download and build" starts its build): each game file that landed gets its cover read ONCE, by the same per-file readers as the refresh passes (ReadPackageCover with prod.keys: the
++    /// control NCA's icon and the title id when the name has none; ReadNupCover: a .nup's own icon). Never while a build runs (the refresh passes read it after the build: the landing time lets them
++    /// through the markers). Writes games/<id>/icon.jpg or a "no icon" marker, never the person's cover.jpg. A package with no icon at all (the owner's Ocarina of Time .nup) is said once in the log,
++    /// as a fact: no alert, "Choose a cover…" stays the way. `how` names the add in the log ("downloaded from NAS"). Returns how many things the screen shows changed.
++    private int CoverPassForLanded(IEnumerable<string> landed, string how)
++    {
++        if (GameExport.IsPlayer) return 0;
++        try
++        {
++            var documents = GameAppMain.Documents;
++            var keys = Path.Combine(documents, "prod.keys");
++            bool haveKeys = File.Exists(keys), package = false;
++            int changed = 0;
++            var clock = System.Diagnostics.Stopwatch.StartNew();
++            var results = CoverPass.Run(landed, haveKeys,
++                name => GameFileContent(name) == SourceFileState.Content,
++                name => { var rel = GameAppUi.IconRelativePath(name); return rel != null && File.Exists(CoverFileOf(name, rel)); },
++                () => running || stop.Busy,
++                (name, reader) =>
++                {
++                    string verdict;
++                    if (reader == CoverPass.Reader.Nup) changed += ReadNupCover(documents, name, out verdict);
++                    else { package = true; changed += ReadPackageCover(keys, documents, name, out verdict); }
++                    return verdict;
++                });
++            if (package) GC.Collect();   // the dumps' file handles the NCAs held
++            var ms = clock.ElapsedMilliseconds;
++            var lines = results.Select(r => CoverPass.Line(r, how)).Where(l => l != null).ToList();
++            if (lines.Count > 0) BeginInvokeOnMainThread(() => { foreach (var l in lines) Write(l); NoteTime("cover pass/landed", ms); });
++            return changed;
++        }
++        catch (Exception error)
++        {
++            BeginInvokeOnMainThread(() => Write($"cover: the pass after the add stopped ({error.GetType().Name}: {error.Message}); the next refresh reads the covers"));
++            return 0;
++        }
+     }
+ }
+diff -ruN a/GameAppIcons.cs b/GameAppIcons.cs
+--- a/GameAppIcons.cs	2026-11-21 19:11:26
++++ b/GameAppIcons.cs	2026-11-21 19:17:13
+@@ -39,8 +39,14 @@
+ internal static class GameIconsStream
+ {
+     [System.Diagnostics.CodeAnalysis.DynamicDependency(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods, typeof(P))]
+-    internal static byte[] Read(string keysPath, Stream stream)
++    internal static byte[] Read(string keysPath, Stream stream) => Read(keysPath, stream, out _);
++
++    /// The same, and the title id of the control NCA the icon came from (0 when there is none): patch 0079 names a game only in the cloud whose file name has no id by it, as 0051 does for a local
++    /// one (CoverPass.BaseIdFromControl keeps a base game's only).
++    [System.Diagnostics.CodeAnalysis.DynamicDependency(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods, typeof(P))]
++    internal static byte[] Read(string keysPath, Stream stream, out ulong controlTitleId)
+     {
++        controlTitleId = 0;
+         const System.Reflection.BindingFlags Any = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+         var icon = typeof(P).GetMethod("Icon", Any) ?? throw new MissingMethodException("P.Icon");
+         var ks = ExternalKeyReader.ReadKeyFile(keysPath);
+@@ -81,6 +87,7 @@
+             if (nca.Header.ContentType == NcaContentType.Control) { control = nca; break; }
+         }
+         if (control == null) return null;
++        controlTitleId = control.Header.TitleId;
+         var result = ((byte[], string)) icon.Invoke(null, new object[] { control });
+         return result.Item1;
+     }
+diff -ruN a/GameAppImportUi.cs b/GameAppImportUi.cs
+--- a/GameAppImportUi.cs	2026-11-21 19:11:26
++++ b/GameAppImportUi.cs	2026-11-21 19:17:19
+@@ -201,6 +201,9 @@
+                 if (error != null) log($"import: {name} could not be added: {error}");
+                 outcomes.Add(new ImportOutcome(name, placed, error));
+             }
++            // patch 0079: the cover of each game file that landed (cloned or copied; not one that was here already), read here before the main thread hears of it (GameAppCoverUi.cs)
++            var landed = outcomes.Where(o => o.Error == null && o.Placed != null && o.Placed.How != PlacedHow.AlreadyThere).Select(o => o.Name).ToList();
++            if (landed.Count > 0) CoverPassForLanded(landed, "added from the " + sourceLabel);
+             BeginInvokeOnMainThread(() =>
+             {
+                 importBusy = false;
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs	2026-11-21 19:11:26
++++ b/GameAppLibrary.cs	2026-11-21 19:17:04
+@@ -1821,14 +1821,15 @@
+                         bool scoped = url.StartAccessingSecurityScopedResource();
+                         try
+                         {
+-                            var files = Directory.EnumerateFiles(url.Path).Select(p =>
+-                            {
+-                                var name = Path.GetFileName(p);
+-                                long size = 0;
+-                                try { size = name.EndsWith(".icloud", StringComparison.OrdinalIgnoreCase) ? 0 : new FileInfo(p).Length; } catch (Exception) { }
+-                                return new CloudFile(s.Id, name, size, Cloud.RealName(name));
+-                            }).ToList();
+-                            results.Add((s.Id, files, null));
++                            // patch 0079: the folder's own files AND the game files of its direct subfolders, through the NAS's own rules (NasScan: one level, at most 200 subfolders, the first
++                            // file of a name kept, hidden / system / linked folders never looked into), so a game kept one per folder gets exactly what a game of the folder itself gets; the
++                            // directory entries only (FolderListing.OnDisk: no file is opened). Remote is the path inside the folder ("Sub/X.nsp"): CopyFromFolder and the cover pass read it.
++                            var onDisk = FolderListing.OnDisk(url.Path);
++                            var scan = NasScan.ScanFolder(s.Id, rel => onDisk(rel).Select(e => (e.Name, e.IsDirectory, e.IsLink, e.Size)));
++                            var label = s.Name;
++                            var lines = NasScan.Lines(scan, label, "cloud");
++                            BeginInvokeOnMainThread(() => { foreach (var line in lines) Write(line); });
++                            results.Add((s.Id, scan.Files, null));
+                         }
+                         finally { if (scoped) url.StopAccessingSecurityScopedResource(); }
+                     }
+@@ -1861,22 +1862,36 @@
+ 
+     private int cloudIconsRunning;
+ 
++    // patch 0079: the remote files whose read FAILED this session (the network, the NAS, the provider): not marked for good, tried again at the next launch; keyed by source and remote path
++    private readonly HashSet<string> cloudIconFailed = new HashSet<string>(StringComparer.Ordinal);
++
+     /// The covers of the games only in the cloud: read from the dump where it lies (GameAppIcons.cs: the package's
+     /// header and its control NCA, a few hundred KB over SFTP or from a Files folder; an iCloud placeholder is skipped
+     /// rather than downloaded whole), kept as games/<id>/icon.jpg like a local game's. Needs prod.keys. A dump that
+-    /// gives none gets icon.none, tried again only with newer keys.
++    /// gives none gets icon.none, tried again only with newer keys (and once the file is here: patch 0079, the marker is
++    /// older than its landing). Patch 0079: a file whose name carries no title id gets it from the package, as a local
++    /// one does (0051: kept in Documents/.titleids.tsv), so its cover, its update / DLC pairing and its version follow;
++    /// a read that FAILED (not a package without an icon) leaves no marker: it is tried again at the next launch.
+     private void FetchCloudIcons()
+     {
+         var keys = Path.Combine(GameAppMain.Documents, "prod.keys");
+         if (!File.Exists(keys) || running) return;
+         var keysTime = File.GetLastWriteTimeUtc(keys);
+         var local = Dumps().Select(Path.GetFileName).ToList();
+-        var todo = Cloud.CloudOnlyGames(local, cloudFiles).Where(f => !GameAppUi.IsNup(f.Name)).Select(f =>
++        string Doc(string rel) => Path.Combine(GameAppMain.Documents, rel.Replace('/', Path.DirectorySeparatorChar));
++        string Key(CloudFile f) => f.SourceId + "\t" + (f.Remote ?? f.Name);
++        var todo = Cloud.CloudOnlyGames(local, cloudFiles).Where(f => !GameAppUi.IsNup(f.Name) && !cloudIconFailed.Contains(Key(f))).Select(f =>
+         {
+             var rel = GameAppUi.IconRelativePath(f.Name);
+-            if (rel == null) return default;
+-            var icon = Path.Combine(GameAppMain.Documents, rel.Replace('/', Path.DirectorySeparatorChar));
+-            var none = Path.Combine(GameAppMain.Documents, GameAppUi.NoIconRelativePath(f.Name).Replace('/', Path.DirectorySeparatorChar));
++            if (rel == null)
++            {
++                // no title id in the file name: read from the package, as FetchMissingIcons does for a local file (the same marker, games/_unresolved/<hash>.none)
++                var unresolved = Doc(GameAppUi.UnresolvedMarker(f.Name));
++                if (File.Exists(unresolved) && File.GetLastWriteTimeUtc(unresolved) >= keysTime) return default;
++                return (File: f, Icon: (string) null, None: unresolved);
++            }
++            var icon = Doc(rel);
++            var none = Doc(GameAppUi.NoIconRelativePath(f.Name));
+             if (File.Exists(icon) || (File.Exists(none) && File.GetLastWriteTimeUtc(none) >= keysTime)) return default;
+             return (File: f, Icon: icon, None: none);
+         }).Where(x => x.File != null).ToList();
+@@ -1884,14 +1899,16 @@
+         var nas = LoadNas();
+         var password = NasPassword();
+         var sources = cloudSources;
++        var documents = GameAppMain.Documents;
+         System.Threading.Tasks.Task.Run(() =>
+         {
+             int got = 0;
++            var failed = new List<string>();
+             try
+             {
+-                foreach (var (f, icon, none) in todo)
++                foreach (var (f, icon0, none) in todo)
+                 {
+-                    byte[] jpeg = null; string why = null;
++                    byte[] jpeg = null; string why = null; bool threw = false; ulong controlId = 0;
+                     try
+                     {
+                         var source = sources.FirstOrDefault(s => s.Id == f.SourceId);
+@@ -1899,7 +1916,7 @@
+                         if (source.Kind == CloudKind.Nas)
+                         {
+                             if (string.IsNullOrEmpty(password)) continue;
+-                            jpeg = Nas.WithReadStream(nas, Nas.Password(nas.User, password), f.Remote, stream => GameIconsStream.Read(keys, stream));
++                            (jpeg, controlId) = Nas.WithReadStream(nas, Nas.Password(nas.User, password), f.Remote, stream => (GameIconsStream.Read(keys, stream, out var id), id));
+                         }
+                         else
+                         {
+@@ -1908,28 +1925,59 @@
+                             bool scoped = folder.StartAccessingSecurityScopedResource();
+                             try
+                             {
+-                                var path = Path.Combine(folder.Path, f.Remote ?? f.Name);
++                                var path = Path.Combine(folder.Path, f.Remote ?? f.Name);   // "X.nsp", or "Sub/X.nsp" for a game of a subfolder (patch 0079)
+                                 if (!File.Exists(path)) continue;   // only in iCloud (a placeholder): not downloaded for a cover
+                                 using var stream = File.OpenRead(path);
+-                                jpeg = GameIconsStream.Read(keys, stream);
++                                jpeg = GameIconsStream.Read(keys, stream, out controlId);
+                             }
+                             finally { if (scoped) folder.StopAccessingSecurityScopedResource(); }
+                         }
+                     }
+-                    catch (Exception error) { why = (error.InnerException ?? error).Message; }
++                    catch (Exception error) { why = (error.InnerException ?? error).Message; threw = true; }
++                    var icon = icon0;
++                    if (!threw && icon0 == null)
++                    {
++                        var baseId = CoverPass.BaseIdFromControl(controlId);
++                        if (baseId != 0)
++                        {
++                            GameAppUi.SetTitleFromContent(f.Name, baseId);
++                            GameAppUi.SaveTitlesFromContent(documents);
++                            icon = Doc(GameAppUi.IconRelativePath(f.Name));
++                            got++;   // the game has its id now: drawn again even without a cover
++                            GameAppDiag.Event("title-from-content", $"{f.Name} (in the cloud): {controlId:X16}");
++                        }
++                        else why ??= controlId == 0 ? "no control data with a title id" : $"the control data is not a base game's ({controlId:X16})";
++                    }
++                    var outcome = CoverPass.CloudOutcomeOf(jpeg, threw);
+                     try
+                     {
+-                        Directory.CreateDirectory(Path.GetDirectoryName(icon));
+-                        if (jpeg != null && jpeg.Length > 0) { File.WriteAllBytes(icon, jpeg); got++; }
+-                        else File.WriteAllText(none, (why ?? "no icon in the control data") + "\n");
++                        lock (CoverPass.Gate)
++                        {
++                            if (outcome == CoverPass.CloudOutcome.Retry) failed.Add(Key(f));
++                            else if (icon != null && File.Exists(icon)) { }   // the file landed meanwhile and its own pass read it
++                            else if (outcome == CoverPass.CloudOutcome.Icon && icon != null)
++                            {
++                                Directory.CreateDirectory(Path.GetDirectoryName(icon));
++                                var part = GameCover.PartOf(icon);
++                                File.WriteAllBytes(part, jpeg);
++                                File.Move(part, icon, true);
++                                got++;
++                            }
++                            else
++                            {
++                                var marker = icon != null ? Doc(GameAppUi.NoIconRelativePath(f.Name)) : none;
++                                Directory.CreateDirectory(Path.GetDirectoryName(marker));
++                                File.WriteAllText(marker, (why ?? "no icon in the control data") + "\n");
++                            }
++                        }
+                     }
+                     catch (Exception) { }
+-                    Console.Error.WriteLine($"[gameapp] cloud icon of {f.Name}: {(jpeg != null ? jpeg.Length + " bytes" : why ?? "none")}");
++                    Console.Error.WriteLine($"[gameapp] cloud icon of {f.Name}: {(jpeg != null ? jpeg.Length + " bytes" : why ?? "none")}{(threw ? " (tried again at the next launch)" : "")}");
+                     if (got > 0 && got % 3 == 0) BeginInvokeOnMainThread(RefreshScreen);
+                 }
+             }
+             finally { Interlocked.Exchange(ref cloudIconsRunning, 0); }
+-            if (got > 0) BeginInvokeOnMainThread(RefreshScreen);
++            BeginInvokeOnMainThread(() => { foreach (var k in failed) cloudIconFailed.Add(k); if (got > 0) RefreshScreen(); });
+         });
+     }
+ 
+@@ -2059,10 +2107,12 @@
+         Write($"\n=== download {key}" + (files.Count > 1 ? $" (+{files.Count - 1}: its update and DLC)" : "") + (need > 0 ? $", {GameAppUi.SizeText(need)}" : ""));
+         nint task = UIApplication.SharedApplication.BeginBackgroundTask("download", null);
+         UIApplication.SharedApplication.IdleTimerDisabled = true;
++        var how = sources.FirstOrDefault(s => s.Id == files[0].SourceId) is CloudSource from ? (from.Kind == CloudKind.Nas ? "downloaded from the NAS" : "added from " + from.Name) : "downloaded";
+         System.Threading.Tasks.Task.Run(() =>
+         {
+             string error = null;
+             long before = 0;
++            var landed = new List<string>();   // patch 0079: the files that are here now, for the cover pass
+             try
+             {
+                 foreach (var f in files)
+@@ -2077,19 +2127,23 @@
+                         var fraction = Math.Min(0.999, (done0 + sent) / (double) all);
+                         BeginInvokeOnMainThread(() => { if (downloads.ContainsKey(key)) downloads[key] = fraction; });
+                     };
+-                    string how;
++                    string placedHow;
+                     if (source.Kind == CloudKind.Nas)
+                     {
+                         Nas.Download(nas, Nas.Password(nas.User, password), f.Remote, dest, progress, null);
+-                        how = ImportHow.Download;
++                        placedHow = ImportHow.Download;
+                     }
+                     else
+-                        how = CopyFromFolder(source, f, dest, progress, line => BeginInvokeOnMainThread(() => Write(line))).How == PlacedHow.Cloned ? ImportHow.Clone : ImportHow.Copy;
+-                    RecordImportFile(dest, how, source.Name, source.Id);   // GameAppSourceUi.cs: the app made this file (a worker thread: a small file, under a lock)
++                        placedHow = CopyFromFolder(source, f, dest, progress, line => BeginInvokeOnMainThread(() => Write(line))).How == PlacedHow.Cloned ? ImportHow.Clone : ImportHow.Copy;
++                    RecordImportFile(dest, placedHow, source.Name, source.Id);   // GameAppSourceUi.cs: the app made this file (a worker thread: a small file, under a lock)
++                    landed.Add(f.Name);
+                     before += f.Size;
+                 }
+             }
+             catch (Exception e) { error = e.Message; }
++            // patch 0079: the cover of each game file that landed (also when a later file of the set failed), read here, before the main thread hears of it: a "Download and build" starts its
++            // build only after this (GameAppCoverUi.cs, CoverPassForLanded: never while a build runs, never the person's own cover)
++            if (landed.Count > 0) CoverPassForLanded(landed, how);
+             BeginInvokeOnMainThread(() =>
+             {
+                 downloads.Remove(key);
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs	2026-11-21 19:11:26
++++ b/GameAppMain.cs	2026-11-21 19:15:15
+@@ -1710,80 +1710,43 @@
+     /// Reads the icon of every game that has none yet, one dump after another on a background thread, through the
+     /// extractor's own functions (dm/tools/nx_extract Program.cs: OpenNsp, Pick, Icon -- only the small control NCA
+     /// is read, not the game), then redraws. Needs prod.keys (the control NCA is encrypted). A dump that gives no icon
+-    /// gets games/<id>/icon.none, tried again only with newer keys.
++    /// gets games/<id>/icon.none, tried again only with newer keys, or when the file landed after the marker (patch 0079:
++    /// a marker written while the game was only in the cloud is not this file's verdict).
+     private void FetchMissingIcons(UiFacts facts)
+     {
+         var keys = Path.Combine(GameAppMain.Documents, "prod.keys");
+         if (!facts.HasKeys || facts.Running || !File.Exists(keys)) return;
+         var keysTime = File.GetLastWriteTimeUtc(keys);
+-        var todo = new List<(string Dump, string Icon, string None)>();
++        var ledger = ImportLedger.Load(GameAppMain.Documents);   // patch 0079: when each imported file landed (a small file, read again only when it changed)
++        var todo = new List<string>();
+         foreach (var name in facts.Games ?? new List<string>())
+         {
+             if (GameAppUi.IsNup(name)) continue;   // the extractor reads NSP/XCI only: a Switch 2 game's icon comes with its build
+             if (GameFileContent(name) != SourceFileState.Content) continue;   // a game file removed after its build (or empty) has nothing to read an icon from (GameAppSourceUi.cs)
++            var landed = CoverPass.LandedAt(ImportLedger.Find(ledger, name)?.At);
+             var rel = GameAppUi.IconRelativePath(name);
+             if (rel == null)
+             {
+                 // no title id in the file name: it is read from the package (once; the answer is kept in Documents/.titleids.tsv), and the cover with it
+                 var unresolved = Path.Combine(GameAppMain.Documents, GameAppUi.UnresolvedMarker(name).Replace('/', Path.DirectorySeparatorChar));
+-                if (File.Exists(unresolved) && File.GetLastWriteTimeUtc(unresolved) >= keysTime) continue;
+-                todo.Add((Path.Combine(GameAppMain.Documents, name), null, unresolved));
++                if (File.Exists(unresolved) && CoverPass.MarkerStands(File.GetLastWriteTimeUtc(unresolved), keysTime, landed)) continue;
++                todo.Add(name);
+                 continue;
+             }
+             var icon = Path.Combine(GameAppMain.Documents, rel.Replace('/', Path.DirectorySeparatorChar));
+             var none = Path.Combine(GameAppMain.Documents, GameAppUi.NoIconRelativePath(name).Replace('/', Path.DirectorySeparatorChar));
+             if (File.Exists(icon)) continue;
+-            if (File.Exists(none) && File.GetLastWriteTimeUtc(none) >= keysTime) continue;
+-            todo.Add((Path.Combine(GameAppMain.Documents, name), icon, none));
++            if (File.Exists(none) && CoverPass.MarkerStands(File.GetLastWriteTimeUtc(none), keysTime, landed)) continue;
++            todo.Add(name);
+         }
+         if (todo.Count == 0 || Interlocked.CompareExchange(ref iconsRunning, 1, 0) != 0) return;
++        var documents = GameAppMain.Documents;
+         System.Threading.Tasks.Task.Run(() =>
+         {
+             int got = 0;
+             try
+             {
+-                foreach (var (dump, icon0, none) in todo)
+-                {
+-                    byte[] jpeg = null; string why = null; var icon = icon0;
+-                    var fileName = Path.GetFileName(dump);
+-                    try
+-                    {
+-                        if (icon == null)
+-                        {
+-                            var (read, id) = GameIconsContent.Read(keys, dump);
+-                            jpeg = read;
+-                            if (id != 0)
+-                            {
+-                                GameAppUi.SetTitleFromContent(fileName, id);
+-                                GameAppUi.SaveTitlesFromContent(GameAppMain.Documents);
+-                                icon = Path.Combine(GameAppMain.Documents, GameAppUi.IconRelativePath(fileName).Replace('/', Path.DirectorySeparatorChar));
+-                                got++;   // the game has its id now: the screen is drawn again even when there is no cover
+-                                GameAppDiag.Event("title-from-content", $"{fileName}: {id:X16}");
+-                            }
+-                            else why = "the application's control NCA names no title id";
+-                        }
+-                        else jpeg = GameIcons.Read(keys, dump);
+-                    }
+-                    catch (Exception error) { why = (error.InnerException ?? error).GetType().Name + ": " + (error.InnerException ?? error).Message; }
+-                    try
+-                    {
+-                        if (icon != null)
+-                        {
+-                            Directory.CreateDirectory(Path.GetDirectoryName(icon));
+-                            if (jpeg != null && jpeg.Length > 0) { File.WriteAllBytes(icon, jpeg); got++; }
+-                            else File.WriteAllText(icon0 == null ? icon.Replace("icon.jpg", "icon.none") : none, (why ?? "no icon in the control data") + "\n");
+-                        }
+-                        else
+-                        {
+-                            Directory.CreateDirectory(Path.GetDirectoryName(none));
+-                            File.WriteAllText(none, (why ?? "no icon in the control data") + "\n");
+-                        }
+-                    }
+-                    catch (Exception) { }
+-                    var verdict = $"icon of {fileName}: {(jpeg != null ? jpeg.Length + " bytes" : why ?? "none")}";
+-                    Console.Error.WriteLine("[gameapp] " + verdict);
+-                    GameAppDiag.Event("icon", verdict);
+-                }
++                foreach (var name in todo) got += ReadPackageCover(keys, documents, name, out _);
+             }
+             finally
+             {
+@@ -1792,6 +1755,62 @@
+             }
+             if (got > 0) InvokeOnMainThread(RefreshScreen);
+         });
++    }
++
++    /// Worker thread. One package's icon, and its title id when the file name has none (kept in Documents/.titleids.tsv): the per-file reader of FetchMissingIcons and of the pass that runs as soon
++    /// as a file has landed (patch 0079, CoverPassForLanded). Writes games/<id>/icon.jpg or a "no icon" marker, never the person's cover.jpg. Returns how many things the screen shows changed (the id,
++    /// the icon); `verdict` says what came of it.
++    private static int ReadPackageCover(string keys, string documents, string fileName, out string verdict)
++    {
++        lock (CoverPass.Gate)
++        {
++            int got = 0;
++            var dump = Path.Combine(documents, fileName);
++            string Doc(string rel) => Path.Combine(documents, rel.Replace('/', Path.DirectorySeparatorChar));
++            var rel0 = GameAppUi.IconRelativePath(fileName);
++            var icon0 = rel0 == null ? null : Doc(rel0);
++            var none = rel0 == null ? Doc(GameAppUi.UnresolvedMarker(fileName)) : Doc(GameAppUi.NoIconRelativePath(fileName));
++            if (icon0 != null && File.Exists(icon0)) { verdict = "its icon is here already"; return 0; }   // another pass read it meanwhile
++            byte[] jpeg = null; string why = null; var icon = icon0;
++            try
++            {
++                if (icon == null)
++                {
++                    var (read, id) = GameIconsContent.Read(keys, dump);
++                    jpeg = read;
++                    if (id != 0)
++                    {
++                        GameAppUi.SetTitleFromContent(fileName, id);
++                        GameAppUi.SaveTitlesFromContent(documents);
++                        icon = Doc(GameAppUi.IconRelativePath(fileName));
++                        got++;   // the game has its id now: the screen is drawn again even when there is no cover
++                        GameAppDiag.Event("title-from-content", $"{fileName}: {id:X16}");
++                    }
++                    else why = "the application's control NCA names no title id";
++                }
++                else jpeg = GameIcons.Read(keys, dump);
++            }
++            catch (Exception error) { why = (error.InnerException ?? error).GetType().Name + ": " + (error.InnerException ?? error).Message; }
++            try
++            {
++                if (icon != null)
++                {
++                    Directory.CreateDirectory(Path.GetDirectoryName(icon));
++                    if (jpeg != null && jpeg.Length > 0) { File.WriteAllBytes(icon, jpeg); got++; }
++                    else File.WriteAllText(icon0 == null ? icon.Replace("icon.jpg", "icon.none") : none, (why ?? "no icon in the control data") + "\n");
++                }
++                else
++                {
++                    Directory.CreateDirectory(Path.GetDirectoryName(none));
++                    File.WriteAllText(none, (why ?? "no icon in the control data") + "\n");
++                }
++            }
++            catch (Exception) { }
++            verdict = jpeg != null && jpeg.Length > 0 ? jpeg.Length + " bytes" : why ?? "no icon in the control data";
++            Console.Error.WriteLine($"[gameapp] icon of {fileName}: {verdict}");
++            GameAppDiag.Event("icon", $"icon of {fileName}: {verdict}");
++            return got;
++        }
+     }
+ 
+     private Coalescer refreshSoon;
+diff -ruN a/GameAppNas.cs b/GameAppNas.cs
+--- a/GameAppNas.cs	2026-11-21 19:11:26
++++ b/GameAppNas.cs	2026-11-21 19:16:30
+@@ -168,24 +168,41 @@
+         return new NasScanResult(files, listed, looked, subfolders.Count, clashes, unreadable);
+     }
+ 
++    /// Patch 0079: a Files folder of the Cloud page read like the NAS (the same Scan, so the same rules: its own files, then the game files of its direct subfolders, one level, at most
++    /// MaxSubfolders of them, the first file of a name kept). `listing(relative)`: the entries of the folder ("") or of one subfolder ("Sub") as the directory gives them (name, folder, link, size;
++    /// FolderListing.OnDisk). An iCloud file not downloaded on this phone (".X.nsp.icloud") is listed under its real name with no size, as before; Remote is the path inside the folder ("X.nsp",
++    /// "Sub/X.nsp"), which CopyFromFolder and the cover pass append to the folder.
++    public static NasScanResult ScanFolder(string sourceId, Func<string, IEnumerable<(string Name, bool IsDirectory, bool IsLink, long Size)>> listing, int maxSubfolders = MaxSubfolders) =>
++        Scan(sourceId, "", rel => (listing(rel) ?? Enumerable.Empty<(string, bool, bool, long)>()).Select(e => FolderEntryAt(rel, e.Name, e.IsDirectory, e.IsLink, e.Size)).Where(e => e != null).ToList(), maxSubfolders);
++
++    /// One directory entry of a Files folder as Scan sees it: the real name of an iCloud placeholder, the path inside the folder as FullName, no size for a placeholder or a folder.
++    public static NasEntry FolderEntryAt(string relativeDir, string name, bool isDirectory, bool isLink, long size)
++    {
++        if (string.IsNullOrEmpty(name)) return null;
++        var real = isDirectory ? name : Cloud.RealName(name);
++        bool placeholder = real != name;
++        return new NasEntry(real, string.IsNullOrEmpty(relativeDir) ? real : relativeDir.TrimEnd('/') + "/" + real, isDirectory, isLink, placeholder || isDirectory ? 0 : Math.Max(0, size));
++    }
++
+     /// The log lines of a listing: "NAS: 12 game files in /path and its 7 subfolders" (and the .ipa count when there are
+     /// some), the cap when it was hit, the clashes (at most MaxClashLines), the subfolders that could not be listed.
+-    public static List<string> Lines(NasScanResult r, string dir)
++    /// `who` starts each line: "NAS" (as before 0079), "cloud" for a Files folder of the Cloud page.
++    public static List<string> Lines(NasScanResult r, string dir, string who = "NAS")
+     {
+         var lines = new List<string>();
+         int games = r.Files.Count(f => Cloud.IsGameFile(f.Name));
+         int ipas = r.Files.Count(f => Cloud.IsIpa(f.Name));
+-        lines.Add($"NAS: {games} game file{(games == 1 ? "" : "s")}{(ipas > 0 ? $" and {ipas} .ipa file{(ipas == 1 ? "" : "s")}" : "")} in {dir} and its {r.Subfolders} subfolder{(r.Subfolders == 1 ? "" : "s")}");
++        lines.Add($"{who}: {games} game file{(games == 1 ? "" : "s")}{(ipas > 0 ? $" and {ipas} .ipa file{(ipas == 1 ? "" : "s")}" : "")} in {dir} and its {r.Subfolders} subfolder{(r.Subfolders == 1 ? "" : "s")}");
+         if (r.Capped)
+-            lines.Add($"NAS: {dir} has {r.SubfoldersFound} subfolders: only the first {r.Looked} (by name) were looked into (the limit is on subfolders, not on files: each one looked into has all its games listed); choose a narrower sync folder to see the others");
++            lines.Add($"{who}: {dir} has {r.SubfoldersFound} subfolders: only the first {r.Looked} (by name) were looked into (the limit is on subfolders, not on files: each one looked into has all its games listed); {(who == "NAS" ? "choose a narrower sync folder" : "add a narrower folder")} to see the others");
+         foreach (var c in r.Clashes.Take(MaxClashLines))
+         {
+             var cut = c.IndexOf(" -> ", StringComparison.Ordinal);
+-            lines.Add(cut < 0 ? $"NAS: skipped {c} (a file of that name is already listed)"
+-                              : $"NAS: skipped {c.Substring(0, cut)}: a file of that name is already listed ({c.Substring(cut + 4)}), the first one is kept");
++            lines.Add(cut < 0 ? $"{who}: skipped {c} (a file of that name is already listed)"
++                              : $"{who}: skipped {c.Substring(0, cut)}: a file of that name is already listed ({c.Substring(cut + 4)}), the first one is kept");
+         }
+-        if (r.Clashes.Count > MaxClashLines) lines.Add($"NAS: … and {r.Clashes.Count - MaxClashLines} more file(s) skipped for the same reason");
+-        foreach (var u in r.Unreadable) lines.Add($"NAS: could not list {u} (skipped)");
++        if (r.Clashes.Count > MaxClashLines) lines.Add($"{who}: … and {r.Clashes.Count - MaxClashLines} more file(s) skipped for the same reason");
++        foreach (var u in r.Unreadable) lines.Add($"{who}: could not list {u} (skipped)");
+         return lines;
+     }
+ }
+diff -ruN a/GameAppUi.cs b/GameAppUi.cs
+--- a/GameAppUi.cs	2026-11-21 19:11:26
++++ b/GameAppUi.cs	2026-11-21 19:17:25
+@@ -247,8 +247,11 @@
+         catch (Exception) { }
+     }
+ 
++    private static readonly object titleSaveGate = new object();   // patch 0079: the local, .nup, landed and cloud passes may save at once (one .part each time)
++
+     internal static void SaveTitlesFromContent(string documents)
+     {
++        lock (titleSaveGate)
+         try
+         {
+             var lines = titleFromContent.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => kv.Key + "\t" + kv.Value.ToString("X16", CultureInfo.InvariantCulture));

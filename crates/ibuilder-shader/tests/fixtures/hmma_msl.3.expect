@@ -1,0 +1,56 @@
+OK
+{}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+};
+
+
+static inline __attribute__((always_inline))
+uint dmsh_hmma16816_f16(thread const uint& p_lane, thread const uint& p_blk, thread const uint& p_a0, thread const uint& p_a1, thread const uint& p_a2, thread const uint& p_a3, thread const uint& p_b0, thread const uint& p_b1, thread const uint& p_acc0, thread const uint& p_acc1, thread const uint& p_fl, thread const uint& p_aaddr, thread const uint& p_ao0, thread const uint& p_ao1, thread const uint& p_ao2, thread const uint& p_ao3, thread const uint& p_astr, thread float& p_d1, threadgroup spvUnsafeArray<uint, 256>& p_scr)
+{
+    return 0u;
+}
+
+struct spvDescriptorSetBuffer0
+{
+    int x [[id(0)]];
+};
+
+kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]])
+{
+    threadgroup spvUnsafeArray<uint, 4096> _scr0;
+    threadgroup spvUnsafeArray<uint, 2112> _sh0;
+    uint _lane = uint(gl_LocalInvocationID.x);
+    if (_c)
+    {
+        uint _100 = 1u;
+        uint _101 = 2u;
+    }
+}

@@ -1,0 +1,106 @@
+name: Bug report
+description: Something does not work, crashes, or builds a game that does not run.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please read this first.
+
+        **Never attach or paste `prod.keys`, certificates, provisioning profiles, game files or unredacted logs.**
+        This project does not support piracy and will not help with it.
+        For a security problem, do not use this form: see the [security policy](https://github.com/Absenti/iBuilder/security/policy).
+  - type: input
+    id: build
+    attributes:
+      label: App build id
+      description: The build id of the iBuilder app you run (usually part of the IPA file name, `GameApp-rust-<date>-<id>.ipa`, and recorded in the diagnostics) or the commit you built.
+      placeholder: "e.g. 20261119-150707-rustd75e1943"
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: iPhone model and iOS version
+      placeholder: "e.g. iPhone 15 Pro, iOS 27.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: certificate
+    attributes:
+      label: Certificate type iBuilder was installed with
+      description: This decides whether the app can play games itself (see the README).
+      options:
+        - Development certificate (e.g. a free account through SideStore)
+        - Distribution certificate (e.g. FlareStore)
+        - Other
+        - I do not know
+    validations:
+      required: true
+  - type: input
+    id: installer
+    attributes:
+      label: Installer
+      description: SideStore, AltStore, FlareStore, Xcode, ...
+    validations:
+      required: false
+  - type: input
+    id: title_id
+    attributes:
+      label: Game title id
+      description: The 16-hex-digit title id of the game, not its files.
+      placeholder: "e.g. 0100DFA027504000"
+    validations:
+      required: true
+  - type: dropdown
+    id: file_type
+    attributes:
+      label: Game file type
+      options:
+        - ".nsp"
+        - ".xci"
+        - ".nsz"
+        - ".nup (Switch 2)"
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: Which step failed (import, build, export, play) and what you saw, with the message if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, in order. Does it happen every time?
+    validations:
+      required: false
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        The app keeps a hidden diagnostics folder: [docs/DIAGNOSTICS.md](https://github.com/Absenti/iBuilder/blob/main/docs/DIAGNOSTICS.md) explains how to get it.
+        Attach `gameapp.ui.log` and `gameapp.chain.log` (drag the files here) **after removing personal information** (name, device name, account, file paths you do not want to share).
+        Paste only the few relevant lines here if the files are large.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I did not attach prod.keys, certificates or game files.
+          required: true
+        - label: I removed personal information from the logs I attached.
+          required: true

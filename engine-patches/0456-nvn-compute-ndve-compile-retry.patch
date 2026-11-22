@@ -1,0 +1,305 @@
+# nvn/compute: keep NDVE running after a Metal compiler death (#2920)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/9df3c09fc6f231b1baac94ecb28c6db9e2618990  (issue #2920)
+# Author:    seedds, 2026-11-21 01:48:34 +0800
+# Co-authors:
+#   Co-authored-by: David Padron-Harris
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES FOR THE PHONE
+#   Ocarina of Time (Switch 2) runs a neural up-scaling / correction chain (NDVE, 37 kernels) as guest compute dispatches. When Metal's compiler service is interrupted (upstream's case: an M2
+#   MacBook Air; whether the phone's compiler service dies under its memory ceiling is NOT known, nothing in the Ocarina log says so), a compute pipeline that failed that way was latched as
+#   failed ("cps_failed") for the whole session and NDVE's sequence broke (green striped blocks in the opening movie). Now (1) NDVE gets each prepared dispatch BEFORE the translated pipeline
+#   is looked up, (2) an interrupted compile (err_compiler_died) is not latched: the dispatch is skipped and a later one retries, (3) permanent refusals are still cached. dispatch_pso() is
+#   the old lookup / build code moved out of dispatch_. Default: on, no switch.
+# Applies on top of 0455. RISK: low-medium (compute dispatch path of every game). NOT run on a device. Shader chain id untouched.
+#
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0415 and the candidates numbered below this one, in the order of the numbers of this folder.
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 407381a0..05035b33 100644
+# REVISION 2 (2026-11-21, review M4): an interrupted compute compile (XPC_ERROR_CONNECTION_INTERRUPTED) is retried at a later dispatch at most CPS_INTERRUPT_MAX (3) times per shader,
+#   then latched as failed like a refusal: the compiler service that dies on one shader dies on it again, and every retry was a synchronous compile on the submit thread plus a [RED] line
+#   at every dispatch. Logged at each of the first three and at the latch only. t_dispatch_pipeline: 10 checks, 0 failed (two interruptions leave it retryable, the third latches it:
+#   8 more dispatches compile nothing); the first case (one interruption, then the next dispatch builds the pipeline) still holds.
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -7295,7 +7295,7 @@
+     uint8_t mesh_kind, mesh_notask; uint16_t mesh_threads, mesh_payload;   // an NVN2 task (1) or mesh (2) shader, a mesh shader with no task, its workgroup's threads, its payload's bytes (dmsh_meshstage.py)
+     id<MTLFunction> mesh_obj;   // a mesh shader with no task: the object function that launches its workgroups in blocks of DMSH_MESH_GRID (dmsh_meshstage.py main0_o)
+     uint32_t tess_out_cp, tess_in_bytes, tess_md; int tess_ok;   // a hull / domain shader rewritten for replay (dmsh_tess.py, nvn_tess.inc); tess_md: a domain's mode (dmsh_tess.mode_bits)
+-    id<MTLComputePipelineState> geo_pso; int geo_pso_failed, cps_failed;   // cps_failed: Metal refused this compute shader's pipeline (dispatch): its dispatches are skipped without asking again
++    id<MTLComputePipelineState> geo_pso; int geo_pso_failed, cps_failed;   // cps_failed: the dispatch pipeline was refused or cannot run the shader's local size
+     uint64_t loop_sub, loop_gpu; _Atomic int loop_reported;   // this submission's per-kernel cap-hit state; feedback logs at most once per loaded kernel
+     int16_t *geo_slot; uint32_t geo_words;   // a lean passthrough kernel (dmsh_geometry.lean): capture word -> record slot (-1: not read), record words
+     NvShader *geo_lean_v[5]; uint8_t geo_lean_tried;   // a geometry shader's lean kernels by input topology (looked up once)
+@@ -16617,7 +16617,7 @@
+ 
+ static void dispatch(const p_dispatch *dp);
+ static int up_mfx_wanted(NvShader *cs); static int up_mfx_encode(NvShader *cs);   // a game's upscaler through MetalFX (see up_mfx_encode)
+-static int ndve_engine_dispatch(NvShader *cs, const p_dispatch *dp);   // nn::ndve's movie network as the host's kernels (DM_NDVE_ENGINE=1, nvn_ndve.inc)
++static int ndve_dispatch_index(NvShader *cs), ndve_engine_dispatch(NvShader *cs, int i);   // nn::ndve's movie network as the host's kernels (DM_NDVE_ENGINE=1, nvn_ndve.inc)
+ // ---------- Compute dispatches moved ahead of the render pass they would split (DM_NVN_CS_HOIST) ----------
+ // Metal cannot run a compute dispatch inside a render pass, so a dispatch between two draws of one pass ends it, and on a tile-based GPU every attachment is stored and loaded again:
+ // Breath of the Wild runs one GPU particle dispatch per emitter between the G-buffer's effect draws, six to eight splits of a 1600x900 G-buffer a frame (about 350 MB of attachment
+@@ -17395,41 +17395,61 @@
+     }
+     return cs->loop_gpu;
+ }
+-static void dispatch_(const p_dispatch *dp) {
+-    // An empty direct grid invokes no shader and changes no resources. Metal
+-    // rejects it; indirect counts belong to the GPU and are left untouched.
+-    if (!dp->ind && (!dp->x || !dp->y || !dp->z)) return;
+-    g_wr_epoch++; g_mdx_epoch++;
+-    if (!S.cprog) { RED_ONCE(27, "no program bound before the dispatch"); return; }
+-    // DispatchComputeIndirect: the group counts {x, y, z} at ind (MTLDispatchThreadgroupsIndirectArguments) are usually written by the GPU earlier in the frame; Metal reads them when the dispatch runs
+-    void *ib = NULL; uint64_t io = 0, ig = 0;
+-    if (dp->ind && !mtl_gpu_addr(dp->ind, 12, &ib, &io, &ig)) { RED_ONCE(94, "indirect dispatch skipped: argument address %#llx is in no memory pool", (unsigned long long)dp->ind); return; }
+-    if (dp->ind) { static int once; if (!once++) MLOG("indirect dispatch: first time (the GPU reads the threadgroup counts from %#llx)", (unsigned long long)dp->ind); }
+-    NvShader *cs = prog_get(S.cprog)->sh[5];
+-    if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
+-    if (dp->ind) ind_fly_put(cs->key, dp->ind, io, ib);
+-    if (passdump()) { uint32_t n[3] = {0, 0, 0}; if (dp->ind && nvn_host_readable(dp->ind, 12)) memcpy(n, (const void *)(uintptr_t)dp->ind, 12);
+-        PD("g %llu dispatch %s %ux%ux%u indirect=%#llx (now %u %u %u)", g_stat_pass, cs->key, dp->x, dp->y, dp->z, (unsigned long long)dp->ind, n[0], n[1], n[2]); }
++static id<MTLComputePipelineState> dispatch_pso(NvShader *cs) {
+     int off = !border_need(cs, 5);
+     cps_key k = {(__bridge const void *)cs, (uintptr_t)off};
+     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
+     if (!ps) {
+-        if (cs->cps_failed) return;   // the same function fails the same way: asked again at every dispatch, Mario Kart World's refused shaders took 3,138 pipeline builds in 60 s
++        if (cs->cps_failed) return nil;   // asked again at every dispatch, Mario Kart World's refused shaders took 3,138 pipeline builds in 60 s
+         NSError *e = nil; uint64_t bt = bp_now(); ps = cps_new_b(cs->fn, off, &e);
+         g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
+-        if (!ps) { cs->cps_failed = 1; MLOG("[RED] failed to create compute pipeline for %s: %s (its dispatches are skipped)", cs->key, e.localizedDescription.UTF8String); return; }
++        if (!ps) {
++            int interrupted = err_compiler_died(e), times = 0;
++            // An interruption is retried at a later dispatch, but at most CPS_INTERRUPT_MAX times per shader: the compiler service that dies on one shader dies on it again, and each
++            // retry is a synchronous compile on the submit thread (the review's M4). Logged for the first ones and at the latch, not at every dispatch
++            enum { CPS_INTERRUPT_MAX = 3 };
++            static NSMutableDictionary<NSString *, NSNumber *> *interrupts;   // the submit thread's
++            if (interrupted) { if (!interrupts) interrupts = [NSMutableDictionary dictionary]; NSString *k = @(cs->key); times = interrupts[k].intValue + 1; interrupts[k] = @(times); }
++            if (!interrupted || times >= CPS_INTERRUPT_MAX) cs->cps_failed = 1;
++            if (!interrupted || times <= CPS_INTERRUPT_MAX)
++                MLOG("[RED] failed to create compute pipeline for %s: %s (%s)", cs->key, e.localizedDescription.UTF8String,
++                     !interrupted ? "its dispatches are skipped" : times < CPS_INTERRUPT_MAX ? "this dispatch is skipped, a later dispatch can retry"
++                                  : "the compiler service was interrupted on it 3 times: its dispatches are skipped from now on");
++            return nil;
++        }
+         // A pipeline's thread limit falls with the kernel's registers on the M1 and M2 (dmsh_rewrite.py max_threads); a dispatch of the shader's local size past it runs no invocation
+         NSUInteger want = (NSUInteger)MAX(cs->rf.tg[0], 1) * MAX(cs->rf.tg[1], 1) * MAX(cs->rf.tg[2], 1);
+         if (!cs->builtin && cs->rf.tg[0] && want > ps.maxTotalThreadsPerThreadgroup) {
+             cs->cps_failed = 1;
+             MLOG("[RED] compute pipeline for %s allows %lu threads a threadgroup, its local size %ux%ux%u needs %lu (its dispatches are skipped)", cs->key,
+                  (unsigned long)ps.maxTotalThreadsPerThreadgroup, cs->rf.tg[0], cs->rf.tg[1], cs->rf.tg[2], (unsigned long)want);
+-            return;
++            return nil;
+         }
+         pso_record("C\t%s\n", cs->key);
+         if (cs->key[0]) pso_user_record("C\t%s\n", cs->key);
+         hm_put_id(&g_cps, &k, ps);
+     }
++    return ps;
++}
++static void dispatch_(const p_dispatch *dp) {
++    // An empty direct grid invokes no shader and changes no resources. Metal
++    // rejects it; indirect counts belong to the GPU and are left untouched.
++    if (!dp->ind && (!dp->x || !dp->y || !dp->z)) return;
++    g_wr_epoch++; g_mdx_epoch++;
++    if (!S.cprog) { RED_ONCE(27, "no program bound before the dispatch"); return; }
++    // DispatchComputeIndirect: the group counts {x, y, z} at ind (MTLDispatchThreadgroupsIndirectArguments) are usually written by the GPU earlier in the frame; Metal reads them when the dispatch runs
++    void *ib = NULL; uint64_t io = 0, ig = 0;
++    if (dp->ind && !mtl_gpu_addr(dp->ind, 12, &ib, &io, &ig)) { RED_ONCE(94, "indirect dispatch skipped: argument address %#llx is in no memory pool", (unsigned long long)dp->ind); return; }
++    if (dp->ind) { static int once; if (!once++) MLOG("indirect dispatch: first time (the GPU reads the threadgroup counts from %#llx)", (unsigned long long)dp->ind); }
++    NvProg *pr = prog_get(S.cprog);
++    NvShader *cs = pr->sh[5];
++    if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
++    if (dp->ind) ind_fly_put(cs->key, dp->ind, io, ib);
++    if (passdump()) { uint32_t n[3] = {0, 0, 0}; if (dp->ind && nvn_host_readable(dp->ind, 12)) memcpy(n, (const void *)(uintptr_t)dp->ind, 12);
++        PD("g %llu dispatch %s %ux%ux%u indirect=%#llx (now %u %u %u)", g_stat_pass, cs->key, dp->x, dp->y, dp->z, (unsigned long long)dp->ind, n[0], n[1], n[2]); }
++    int ndve = cs->builtin ? -1 : ndve_dispatch_index(cs);
++    id<MTLComputePipelineState> ps = nil;
++    if (ndve < 0 && !(ps = dispatch_pso(cs))) return;
+     if (cs->builtin) {   // Built-in compute kernel: n = uniform buffer 0, src = storage buffer 0, dst = storage buffer 1
+         const p_bind_buf *u = &S.ubo[5][0], *a0 = &S.ssbo[5][0], *a1 = &S.ssbo[5][1];
+         void *ub, *sb, *db; uint64_t uo, so, dof;
+@@ -17453,8 +17473,10 @@
+     if (dp->ind || (dp->x && dp->y && dp->z)) for (int i = 0; i < cs->rf.nfirst; i++) { const p_bind_buf *u = &S.ssbo[5][cs->rf.first[i].reg]; if (u->addr) mtl_sub_fill(u->addr + 4ull * cs->rf.first[i].word, 4, cs->rf.first[i].value); }
+     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
+     rp_flush();   // A full clear with no draw after it waits for the next pass on its targets, but it comes before this dispatch, which may read or write them as images: land it first, as copy_t2t does
+-    image_prepare(prog_get(S.cprog), 0x20);
+-    if (ndve_engine_dispatch(cs, dp)) return;   // nn::ndve's movie network as the host's kernels (DM_NDVE_ENGINE=1)
++    image_prepare(pr, 0x20);
++    // NDVE needs the prepared bindings and sees the whole sequence even when a translated pipeline is unavailable.
++    if (ndve >= 0 && ndve_engine_dispatch(cs, ndve)) return;
++    if (!ps && !(ps = dispatch_pso(cs))) return;
+     if (up_mfx_wanted(cs) && !dp->ind && up_mfx_encode(cs)) return;   // the game's upscaler, drawn by MetalFX instead (DM_UPSCALER=metalfx)
+     // Threadgroup memory past Metal's 32 KB, in a device buffer (dmsh_rewrite.py tg_spill): a slice for every workgroup of the grid. An indirect dispatch's grid is in GPU memory, written earlier
+     // in the frame: the replay waits for the GPU (as an indirect-count multi-draw does, mdi_wait) and reads it. Mario Kart World's spilled dispatches are all direct, of 1 to 3 workgroups
+--- a/dm/gfx/nvn/nvn_ndve.inc
++++ b/dm/gfx/nvn/nvn_ndve.inc
+@@ -203,11 +203,14 @@
+              slot ? "resampler" : "network", (unsigned long long)*n, c[2 * slot], (unsigned long)a.width, (unsigned long)a.height, c[2 * slot + 1]);
+     }
+ }
++static int ndve_dispatch_index(NvShader *cs) {
++    const int chk = ndve_check();
++    if ((!ndve_mode() && !chk) || g_nd.off) return -1;
++    return ndve_index(cs, 0);
++}
+ // 1 when the dispatch was taken (skipped or replaced by the engine), 0 to run it
+-static int ndve_engine_dispatch(NvShader *cs, const p_dispatch *dp) {
++static int ndve_engine_dispatch(NvShader *cs, int i) {
+     const int chk = ndve_check();
+-    if ((!ndve_mode() && !chk) || g_nd.off) return 0;
+-    int i = ndve_index(cs, 0); if (i < 0) return 0;
+     if (g_nd.state == 0) ndve_build();
+     if (!chk && !g_nd.pos && !sw_on(ndve_mode())) return 0;   // an A/B phase changes only between sequences
+     if (i == 0) {   // the colour conversion runs; a new frame's sequence may start. Under check, the game's resampled picture of the last frame is there now
+@@ -251,7 +254,7 @@
+     if (chk) g_nd.game_out = out;   // compared once the game's 5a7d69b0 has written it, at 4f41ccf2
+     g_nd.pos = 13;   // the resampler next
+     if (!g_nd.frames++) MLOG("NDVE engine: first movie frame by the engine (%llu dispatches skipped)", (unsigned long long)g_nd.skipped);
+-    (void)dp; return !chk;
++    return !chk;
+ }
+ static void ndve_teardown(void) {
+     g_nd = (typeof(g_nd)){0};
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -352,6 +352,9 @@
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_zero.m $(MTL_T_SRC) $(FW)
+ t_dispatch_own: t_dispatch_own.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_own.m $(MTL_T_SRC) $(FW)
++t_dispatch_pipeline: t_dispatch_pipeline.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_pipeline.m $(MTL_T_SRC) $(FW)
++check_t_dispatch_pipeline: RUN_ENV = MTL_DEBUG_LAYER=1 DM_NDVE_ENGINE=1
+ .PHONY: check_t_dispatch_own
+ check_t_dispatch_own: t_dispatch_own
+ 	@set -e; for own in "" --own; do for enc in 0 1; do \
+--- /dev/null
++++ b/dm/gfx/tests/t_dispatch_pipeline.m
+@@ -0,0 +1,124 @@
++// Inject a compute pipeline error at the Metal device, then drive the actual NVN dispatch path.
++#import <objc/runtime.h>
++#include "../nvn/nvn_mtl.m"
++
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++
++static int checks, failed, compile_attempts;
++static NSString *compile_error;
++#define CHECK(c, label) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s\n", label); } } while (0)
++
++static id fail_compute_pipeline(id self, SEL sel, id<MTLFunction> f, NSError **error) __attribute__((ns_returns_retained));
++static id fail_compute_pipeline(id self, SEL sel, id<MTLFunction> f, NSError **error) {
++    compile_attempts++;
++    if (error) *error = [NSError errorWithDomain:@"TestMetalCompiler" code:2 userInfo:@{NSLocalizedDescriptionKey: compile_error}];
++    return nil;
++}
++
++static NvShader *shader(id<MTLFunction> function, const char *key) {
++    NvShader *cs = [NvShader new];
++    snprintf(cs->key, sizeof cs->key, "%s", key);
++    cs->stage = 5;
++    cs->fn = function;
++    cs->ae = [function newArgumentEncoderWithBufferIndex:0];
++    cs->rf.tg[0] = cs->rf.tg[1] = cs->rf.tg[2] = 1;
++    cs->rf.nb = 1;
++    cs->rf.b[0] = (nvn_rbind){.kind=NVN_RB_SBUFP, .rw=1, .reg=0, .aid=0};
++    return cs;
++}
++
++int main(void) { @autoreleasepool {
++    mtl_init();
++    NSError *error = nil;
++    id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
++        "struct Args { device uint *out [[id(0)]]; };\n"
++        "kernel void write_value(constant Args &a [[buffer(0)]]) { a.out[0] = 42; }\n" options:nil error:&error];
++    id<MTLFunction> function = [lib newFunctionWithName:@"write_value"];
++    Method method = class_getInstanceMethod([(id)g_dev class], @selector(newComputePipelineStateWithFunction:error:));
++    if (!function || !method) { fprintf(stderr, "Cannot set up compute test: %s\n", error.localizedDescription.UTF8String); return 1; }
++
++    NvProg *program = [NvProg new];
++    prog_t pg = {.serial=960011};
++    serial_put(pg.serial, program);
++    size_t page = (size_t)getpagesize();
++    void *mem = NULL;
++    if (posix_memalign(&mem, page, page)) return 1;
++    memset(mem, 0, page);
++    mtl_pool_add(mem, page);
++    mtl_sub_begin(); state_reset(); memset(&R, 0, sizeof R);
++    S.cprog = &pg;
++    S.ssbo[5][0] = (p_bind_buf){.addr=(uint64_t)mem, .size=page};
++    p_dispatch one = {.x=1, .y=1, .z=1};
++
++    NvShader *retry = shader(function, "1111111111111111");
++    program->sh[5] = retry;
++    compile_error = @"Compilation failed: XPC_ERROR_CONNECTION_INTERRUPTED";
++    IMP original = method_setImplementation(method, (IMP)fail_compute_pipeline);
++    dispatch(&one);
++    method_setImplementation(method, original);
++    CHECK(compile_attempts == 1 && !retry->cps_failed, "a compiler-service interruption leaves the shader retryable");
++    dispatch(&one);
++    uint64_t fence = mtl_sub_commit();
++    CHECK(mtl_wait(fence, 5000000000ull), "retry submission completes");
++    mtl_drain();
++    CHECK(!mtl_last_commit_error() && *(uint32_t *)mem == 42, "the next dispatch builds the pipeline and writes the result");
++
++    mtl_sub_begin(); state_reset(); memset(&R, 0, sizeof R);
++    S.cprog = &pg;
++    S.ssbo[5][0] = (p_bind_buf){.addr=(uint64_t)mem, .size=page};
++    NvShader *refused = shader(function, "2222222222222222");
++    program->sh[5] = refused;
++    compile_attempts = 0;
++    compile_error = @"Compute pipeline refused";
++    original = method_setImplementation(method, (IMP)fail_compute_pipeline);
++    dispatch(&one);
++    dispatch(&one);
++    method_setImplementation(method, original);
++    CHECK(compile_attempts == 1 && refused->cps_failed, "a permanent refusal is cached");
++
++    // A shader the compiler service dies on every time: retried at most 3 times, then latched as failed (the review's M4)
++    {
++        NvShader *dies = shader(function, "3333333333333333");
++        program->sh[5] = dies; compile_attempts = 0;
++        compile_error = @"Compilation failed: XPC_ERROR_CONNECTION_INTERRUPTED";
++        original = method_setImplementation(method, (IMP)fail_compute_pipeline);
++        dispatch(&one); dispatch(&one);
++        CHECK(compile_attempts == 2 && !dies->cps_failed, "two interruptions: still retryable");
++        for (int i = 0; i < 6; i++) dispatch(&one);
++        method_setImplementation(method, original);
++        CHECK(compile_attempts == 3 && dies->cps_failed, "the third interruption latches it: no more compiles");
++    }
++
++    // The reported failure occurs after the first three network dispatches have been consumed.
++    CHECK(ndve_offsets(), "model weight offsets are valid");
++    g_nd.state = 2;
++    g_nd.pos = 4;
++    g_nd.w0 = 0x100000;
++    program->sh[5] = shader(function, k_ndve_keys[4]);
++    S.ssbo[5][2] = (p_bind_buf){.addr=g_nd.w0 + g_ndve_w[4], .size=1};
++    S.ssbo[5][3] = (p_bind_buf){.addr=g_nd.w0 + g_ndve_b[4], .size=1};
++    compile_attempts = 0;
++    compile_error = @"Compilation failed: XPC_ERROR_CONNECTION_INTERRUPTED";
++    original = method_setImplementation(method, (IMP)fail_compute_pipeline);
++    dispatch(&one);
++    method_setImplementation(method, original);
++    CHECK(compile_attempts == 0 && g_nd.pos == 5, "NDVE consumes the layer without asking Metal for its fallback pipeline");
++
++    program->sh[5] = shader(function, k_ndve_keys[5]);
++    S.ssbo[5][2].addr = g_nd.w0 + g_ndve_w[5];
++    S.ssbo[5][3].addr = g_nd.w0 + g_ndve_b[5];
++    dispatch(&one);
++    CHECK(g_nd.pos == 6 && !g_nd.off, "the following layer continues the network in order");
++    fence = mtl_sub_commit();
++    CHECK(mtl_wait(fence, 5000000000ull), "NDVE test submission completes");
++    mtl_drain();
++    mtl_pool_del(mem);
++    mtl_drain();
++    free(mem);
++    printf("t_dispatch_pipeline: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }

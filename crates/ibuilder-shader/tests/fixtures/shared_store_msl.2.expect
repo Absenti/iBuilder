@@ -1,0 +1,12 @@
+OK
+{}
+
+void dmsh_shared_store8_24(thread const int& a, thread const int& b, threadgroup spvUnsafeArray<uint, 4>& m)
+{
+    ((threadgroup uchar*)&m[0])[uint(a)] = uchar(uint(b));
+}
+
+kernel void main0()
+{
+    dmsh_shared_store8_1(1, 2, x);
+}

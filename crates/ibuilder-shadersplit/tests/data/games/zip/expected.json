@@ -1,0 +1,17 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/ps_data.bin": "d2ee23534a902c1d4bbb83e0d6728b2daa4db5b7f97c35dd6d3cea2927ac5e37",
+  "pkg/ps_other.bin": "0e3ce20124d07bfb769120251d435e46a116f983c1c00f859be8efb810537519",
+  "pkg/vs_other.bin": "e2772a7934dc4310bc76a5cba2e249364ec82191b09224def681f9a5cc71ff2c",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f2ba7b14c9b0912d59d94603955272d90ab8f1b5b538d5f541340e5c62f089cb",
+  "tables/shader_map.tsv": "81cab5731bd15901c7c7586bf993f6c4566131c90ef1e3e788408442413b66c3",
+  "tables/shader_pairs.tsv": "1f642cc5a36aac8b98aa844ec4e2599a21a9e2e3823c516716b49929c41f6d91"
+ },
+ "log": [
+  "shaders: 8 (pixel 5, vertex 3); sources other 6, data 2; compute shader answers 0 rows; variation pairs 3"
+ ],
+ "shaders": 8,
+ "updates": []
+}

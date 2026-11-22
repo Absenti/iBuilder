@@ -1,0 +1,101 @@
+# The player's game-files FILE picker (Open mode) does nothing on iOS 27.0.1 (a tap on the 12 GB .romfs or on a 94-byte file never reaches the delegate; the old and the content-type initialisers alike: cable tests on
+# the re-exported players, 2026-11-19), while a FOLDER picker has its blue "Open" button and works. The player now asks for the FOLDER (On My iPhone > iBuilder > Exports > <the game>) and finds the .romfs inside it,
+# read in place through the folder's security scope; the bookmark is the folder (an older bookmark of the file still works). Applies after 0057.
+diff -ruN a/GameAppExport.cs b/GameAppExport.cs
+--- a/GameAppExport.cs
++++ b/GameAppExport.cs
+@@ -128,15 +128,34 @@
+                 var url = NSUrl.FromBookmarkData(data, NSUrlBookmarkResolutionOptions.WithoutUI, null, out bool stale, out NSError error);
+                 if (url == null) return null;
+                 url.StartAccessingSecurityScopedResource();
+-                if (!File.Exists(url.Path) || Mismatch(url.Path) != null) { url.StopAccessingSecurityScopedResource(); return null; }
++                // the bookmark is the folder the player picked (or, from an earlier version, the file itself)
++                var target = Directory.Exists(url.Path) ? FindRomfsIn(url.Path) : url.Path;
++                if (target == null || !File.Exists(target) || Mismatch(target) != null) { url.StopAccessingSecurityScopedResource(); return null; }
+                 if (stale) SaveBookmark(url);
+                 romfsUrl = url;
+-                return romfsPath = url.Path;
++                return romfsPath = target;
+             }
+             catch (Exception) { return null; }
+         }
+     }
+ 
++    /// The game files inside a picked folder: the file the manifest names, else any .romfs that is this game's.
++    private static string FindRomfsIn(string folder)
++    {
++        try
++        {
++            if (PlayerManifest != null && PlayerManifest.TryGetValue("romfs_file", out var wanted) && !string.IsNullOrEmpty(wanted))
++            {
++                var exact = Path.Combine(folder, wanted);
++                if (File.Exists(exact)) return exact;
++            }
++            foreach (var f in Directory.EnumerateFiles(folder, "*" + GameAppUi.RomfsExtension))
++                if (Mismatch(f) == null) return f;
++        }
++        catch (Exception) { }
++        return null;
++    }
++
+     private static string Mismatch(string path)
+     {
+         long size = new FileInfo(path).Length;
+@@ -162,12 +181,24 @@
+         bool accessed = url.StartAccessingSecurityScopedResource();
+         try
+         {
+-            var why = Mismatch(url.Path);
++            // the folder that holds the game files (the picker of the player), or the file itself
++            var file = url.Path;
++            if (Directory.Exists(file))
++            {
++                var folder = file;
++                file = FindRomfsIn(folder);
++                if (file == null)
++                {
++                    if (accessed) url.StopAccessingSecurityScopedResource();
++                    return $"{Path.GetFileName(folder.TrimEnd('/'))} holds no game files for this app (a file named {PlayerRomfsName ?? "*" + GameAppUi.RomfsExtension}). Pick the folder in On My iPhone › iBuilder › Exports.";
++                }
++            }
++            var why = Mismatch(file);
+             if (why != null) { if (accessed) url.StopAccessingSecurityScopedResource(); return why; }
+             SaveBookmark(url);
+             romfsUrl?.StopAccessingSecurityScopedResource();
+-            romfsUrl = url;            // stays accessed: the boot opens it by path
+-            romfsPath = url.Path;
++            romfsUrl = url;            // stays accessed: the boot opens the file by path
++            romfsPath = file;
+             return null;
+         }
+         catch (Exception e)
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -683,10 +683,11 @@
+     {
+         // The custom type alone was not enough: on an iPhone 15 Pro (iOS 27.0.1) the picker showed the .romfs file as a normal, enabled item and a tap did nothing (the delegate was never called; device test
+         // 2026-11-19). Any file is offered, like the other pickers of this app (the certificate, the import): GameExport.UsePickedRomfs checks the name, the size and the content digest anyway.
+-        // The old initialiser (document types as strings, Open mode) shows the files but a tap on one does nothing on iOS 27.0.1: not the game files (12 GB) and not a 94-byte file either (tested with the
+-        // cable on the re-exported player, 2026-11-19; folders open, the delegate is never called). The content-type initialiser (iOS 14+) opens the file in place the same way and takes the tap.
+-        var picker = new UIDocumentPickerViewController(new[] { UniformTypeIdentifiers.UTTypes.Item }) { AllowsMultipleSelection = false, ShouldShowFileExtensions = true };
+-        Write("game files: the picker is open (any file; the manifest decides)");
++        // A FILE picker in Open mode does nothing on iOS 27.0.1: a tap on the game files (12 GB), on a 94-byte file, with the old or the content-type initialiser, never reaches the delegate (cable tests on the
++        // re-exported player, 2026-11-19; the folders of the same picker open, and a FOLDER picker has its blue "Open" button and works, like the one of the Cloud page). So the player picks the FOLDER that
++        // holds the game files (On My iPhone > iBuilder > Exports > <the game>), and finds the .romfs inside it, read in place through the folder's security scope.
++        var picker = new UIDocumentPickerViewController(new[] { "public.folder" }, UIDocumentPickerMode.Open);
++        Write("game files: the folder picker is open (the .romfs is looked for inside the folder; the manifest decides)");
+         gameFilesPicker = new FolderPickerDelegate(url =>
+         {
+             if (url == null) { Write("game files: the picker closed without a file"); return; }
+@@ -723,8 +724,8 @@
+         playerPlay.Configuration = c;
+         playerPlay.Enabled = needFiles || next.Enabled;
+         playerStatus.Text = facts.Running ? "Starting the game…"
+-            : needFiles ? $"Once: in On My iPhone › iBuilder › Exports › {GameAppUi.ExportFileName(GameAppUi.DisplayName(game))}, pick “{GameExport.PlayerRomfsName}” "
+-                          + $"(or search {GameAppUi.BaseTitleIdOf(game)}). The game is read from there: keep that file and iBuilder."
++            : needFiles ? $"Once: open On My iPhone › iBuilder › Exports, open the folder “{GameAppUi.ExportFileName(GameAppUi.DisplayName(game))}” (it holds “{GameExport.PlayerRomfsName}”) "
++                          + "and tap Open, the blue button at the top right. The game is read from there: keep that folder and iBuilder."
+             : "";
+         playerStatus.Hidden = playerStatus.Text.Length == 0;
+ 

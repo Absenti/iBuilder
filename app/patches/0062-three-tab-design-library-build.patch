@@ -1,0 +1,1813 @@
+# The three-tab design (design canvas "iBuilder, nouveau design", 2026-11-19): Library, Build, Settings. Library: the games of the phone as a grid or a list (toggle kept), a cover each (the icon, else the name's colour and
+# initials), Play and Export IPA with a development certificate, Export IPA alone with a distribution one (get-task-allow), Set up for a game not built, Update when an update or DLC was added since the build, a tap for the
+# game's sheet (its settings are a page of that same sheet, same theme), a long press for its menu, the exported apps below. Build: the build that runs, the queue (the queue page's own views), the games of this phone (Build, Rebuild, Update, Update and DLC) and the games only in
+# the cloud (Download and build, Download). Settings loses the two rows that moved (Exported apps, Build queue). One accent (violet) for the primary buttons and the lit tab. An export whose game has no icon gets one drawn
+# from the game's name (CoverArt). The Mods and Saves pages take the sheet's ground, accent and card colours (the Saves page too in an exported player). An exported player keeps its one screen but takes the look: the cover, a Play button in the cover's colour with the gradient, then Game settings, Saves and Logs as flat rows. The Cloud sources page is a flat list as well. Applies after 0061 (new file GameAppShelf.cs).
+diff -ruN a/GameAppExport.cs b/GameAppExport.cs
+--- a/GameAppExport.cs
++++ b/GameAppExport.cs
+@@ -285,6 +285,15 @@
+                 AddBytes(app + "GameIcon60x60" + suffix + ".png", png);
+                 hasIcon = true;
+             }
++        // A game with no icon of its own (a package without one) still gets an app icon: its name's colour and a glyph (CoverArt, GameAppShelf.cs)
++        if (!hasIcon)
++            foreach (var (size, suffix) in new[] { (120, "@2x"), (180, "@3x") })
++            {
++                var art = CoverArt.Png(name, size);
++                if (art == null) continue;
++                AddBytes(app + "GameIcon60x60" + suffix + ".png", art);
++                hasIcon = true;
++            }
+         AddBytes(app + "Info.plist", InfoPlist(Path.Combine(bundle, "Info.plist"), titleId, name, hasIcon));
+         return entries;
+     }
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -522,8 +522,9 @@
+ 
+     // ---- an exported game (.ipa): its title screen (design F1) -------------------------------------------------
+     //
+-    // The game's own icon large on the ground lit by its colour, its name and when it was last saved, one Play, then
+-    // Saves and Settings with what they hold in a line, and "Made with iBuilder". No tabs, no build, no cloud.
++    // The game's own icon on the ground lit by its colour, its name and when it was last saved, one Play in the cover's colour
++    // (the app's gradient button), then flat rows, Game settings, Saves and Logs, with what they hold on the right, and
++    // "Made with iBuilder". The look of the app's own sheet (GameAppShelf.cs). No tabs, no build, no cloud.
+ 
+     private UILabel playerSaves, playerSettings, playerLast, playerLogs;
+ 
+@@ -597,23 +598,19 @@
+         var cover = new CoverView();
+         cover.Set(icon, GameAppUi.DisplayName(game), false, null);
+         cover.TranslatesAutoresizingMaskIntoConstraints = false;
+-        cover.WidthAnchor.ConstraintEqualTo(220).Active = true;
+-        cover.HeightAnchor.ConstraintEqualTo(220).Active = true;
+-        cover.Layer.ShadowColor = UIColor.Black.CGColor;
+-        cover.Layer.ShadowOpacity = 0.5f;
+-        cover.Layer.ShadowRadius = 30;
+-        cover.Layer.ShadowOffset = new CGSize(0, 20);
++        cover.WidthAnchor.ConstraintEqualTo(148).Active = true;
++        cover.HeightAnchor.ConstraintEqualTo(148).Active = true;
+         var coverRow = Theme.Row(0, new UIView(), cover, new UIView());
+         coverRow.Distribution = UIStackViewDistribution.EqualCentering;
+ 
+         var title = Theme.Label(GameAppUi.DisplayName(game), Theme.Rounded(28, UIFontWeight.Bold), Theme.Text, 3);
+         title.TextAlignment = UITextAlignment.Center;
+         title.AccessibilityTraits = UIAccessibilityTrait.Header;
+-        playerLast = Theme.Label("", Theme.Font(14, UIFontWeight.Regular), Theme.Hex(0xC3C9E2), 2);
++        playerLast = Theme.Label("", Theme.Font(14, UIFontWeight.Regular), Theme.Muted, 2);
+         playerLast.TextAlignment = UITextAlignment.Center;
+ 
+         playerPlay = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "primary-action" };
+-        playerPlay.HeightAnchor.ConstraintEqualTo(64).Active = true;
++        playerPlay.HeightAnchor.ConstraintEqualTo(56).Active = true;
+         playerPlay.TouchUpInside += (_, __) =>
+         {
+             if (PlayerNeedsGameFiles) ShowInFiles(Path.Combine(GameAppMain.Documents, "x"));
+@@ -623,45 +620,28 @@
+         playerStatus = Theme.Label("", Theme.Font(13, UIFontWeight.Medium), Theme.Muted, 0);
+         playerStatus.TextAlignment = UITextAlignment.Center;
+         // The picker stays as a second way: it does not complete in a player installed by FlareStore (iOS 27.0.1: "Open" never returns, cable test 2026-11-19), where the copy in Files is the way.
+-        playerProgress = new UIProgressView(UIProgressViewStyle.Default) { Hidden = true, AccessibilityIdentifier = "player-prepare-progress", TintColor = UIColor.White, TrackTintColor = Theme.Glass };
++        playerProgress = new UIProgressView(UIProgressViewStyle.Default) { Hidden = true, AccessibilityIdentifier = "player-prepare-progress", TintColor = Theme.Accent, TrackTintColor = Theme.Glass };
+         playerPick = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "player-pick-folder" };
+         playerPick.SetTitle("Pick the folder from iBuilder instead", UIControlState.Normal);
+         playerPick.TitleLabel.Font = Theme.Font(13, UIFontWeight.Medium);
++        playerPick.TintColor = Theme.Accent;
+         playerPick.TouchUpInside += (_, __) => FindGameFiles();
+ 
+-        UIButton Tile(string name, out UILabel line, string id, Action tapped)
+-        {
+-            var b = new UIButton(UIButtonType.System) { AccessibilityIdentifier = id };
+-            b.BackgroundColor = Theme.Glass;
+-            b.Layer.CornerRadius = 22;
+-            b.Layer.BorderWidth = 1;
+-            b.Layer.BorderColor = Theme.GlassLine.CGColor;
+-            var head = Theme.Label(name, Theme.Font(16, UIFontWeight.Semibold), Theme.Text);
+-            line = Theme.Label("", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 2);
+-            var col = Theme.Column(3, head, line);
+-            col.UserInteractionEnabled = false;
+-            col.TranslatesAutoresizingMaskIntoConstraints = false;
+-            b.AddSubview(col);
+-            NSLayoutConstraint.ActivateConstraints(new[]
+-            {
+-                col.LeadingAnchor.ConstraintEqualTo(b.LeadingAnchor, 16), col.TrailingAnchor.ConstraintEqualTo(b.TrailingAnchor, -12),
+-                col.CenterYAnchor.ConstraintEqualTo(b.CenterYAnchor), b.HeightAnchor.ConstraintEqualTo(80),
+-            });
+-            b.AccessibilityLabel = name;
+-            b.TouchUpInside += (_, __) => tapped();
+-            return b;
+-        }
+-        var saves = Tile("Saves", out playerSaves, "player-saves", () => ShowSaves(game));
+-        var settings = Tile("Settings", out playerSettings, "player-settings", () => { selected = game; ShowSettings(); });
+-        var logs = Tile("Logs", out playerLogs, "player-logs", () => ShareGameLogs(game, logsTile));
++        // The game's own rows, flat like the app's sheet: what each holds on the right, a chevron (SettingsRow, GameAppShelf.cs).
++        var settingsRow = SettingsRow("Game settings", () => { selected = game; ShowSettings(); }, true, false, -1, "player-settings");
++        var savesRow = SettingsRow("Saves", () => ShowSaves(game), true, false, -1, "player-saves");
++        var logsRow = SettingsRow("Logs", () => ShareGameLogs(game, logsTile), true, false, -1, "player-logs");
++        playerSettings = settingsRow.Value;
++        playerSaves = savesRow.Value;
++        playerLogs = logsRow.Value;
+         playerLogs.Text = "last 10 minutes, one zip";
+-        logsTile = logs;
+-        var tiles = new UIStackView(new UIView[] { saves, settings, logs }) { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = 10 };
++        logsTile = logsRow.Button;
++        var rows = SettingsPad(Theme.Column(8, SectionLabel("GAME"), SettingsCard(settingsRow.Button, savesRow.Button, logsRow.Button)), 6);
+ 
+         var footer = Theme.Label("Made with iBuilder", Theme.Font(12, UIFontWeight.Regular), Theme.Dim);
+         footer.TextAlignment = UITextAlignment.Center;
+ 
+-        var column = Theme.Column(18, coverRow, title, playerLast, playerPlay, playerProgress, playerStatus, playerPick, tiles);
++        var column = Theme.Column(18, coverRow, title, playerLast, playerPlay, playerProgress, playerStatus, playerPick, rows);
+         column.SetCustomSpacing(6, title);
+         column.SetCustomSpacing(26, playerLast);
+         column.SetCustomSpacing(8, playerPlay);
+@@ -727,16 +707,22 @@
+         var game = GameExport.PlayerDump;
+         var next = GameAppUi.GameAction(game, facts);
+         bool needFiles = PlayerNeedsGameFiles;
+-        var c = UIButtonConfiguration.FilledButtonConfiguration;
++        // The one big button, in the colour of the game's cover with a gradient (the app's primary buttons, GameAppShelf.cs ShelfButton)
++        var c = UIButtonConfiguration.PlainButtonConfiguration;
+         c.AttributedTitle = new NSAttributedString(needFiles ? "Open Files" : next.Kind == ActionKind.Boot ? "Play" : next.Title,
+-                                                   new UIStringAttributes { Font = Theme.Font(20, UIFontWeight.Bold) });
++                                                   new UIStringAttributes { Font = Theme.Font(18, UIFontWeight.Bold) });
+         c.Image = needFiles ? UIImage.GetSystemImage("folder.fill") : next.Kind == ActionKind.Boot ? UIImage.GetSystemImage("play.fill") : null;
+-        c.ImagePadding = 10;
+-        c.CornerStyle = UIButtonConfigurationCornerStyle.Capsule;
+-        c.BaseBackgroundColor = UIColor.White;
+-        c.BaseForegroundColor = Theme.Ground;
++        c.ImagePadding = 8;
++        c.CornerStyle = UIButtonConfigurationCornerStyle.Large;
++        var back = new GradientBackView(currentTint ?? Theme.DefaultTint);
++        var background = c.Background;
++        background.CustomView = back;
++        background.CornerRadius = 16;
++        c.Background = background;
++        c.BaseForegroundColor = back.Foreground;
+         playerPlay.Configuration = c;
+         playerPlay.Enabled = needFiles || next.Enabled;
++        playerPlay.Alpha = playerPlay.Enabled ? 1f : 0.5f;
+         var prep = GameWarm.Active && !facts.Running ? GameWarm.Status : "";
+         playerStatus.Text = facts.Running ? "Starting the game…"
+             : needFiles ? (prep.Length > 0 ? prep + "\n\n" : "") + $"Once: in Files, open On My iPhone › iBuilder › Exports › “{GameAppUi.ExportFileName(GameAppUi.DisplayName(game))}”, touch and hold “{GameExport.PlayerRomfsName}”, Copy. "
+@@ -757,10 +743,10 @@
+         }
+         var v = LoadSettingValues(game);
+         string Get(string k) => v.TryGetValue(k, out var x) ? x : null;
+-        var mode = Get("DM_OPMODE") switch { "1" => "Docked", "0" => "Handheld", _ => "Auto mode" };
+-        var picture = Get("DM_PICTURE_FIT") == "fill" ? "Fill" : "Fit";
+-        var fps = Get("DM_FPS_TARGET") is string f ? f + " fps" : "game's fps";
+-        playerSettings.Text = $"{mode} · {picture} · {fps}";
++        var bits = new List<string> { Get("DM_OPMODE") switch { "1" => "Docked", "0" => "Handheld", _ => "Auto" } };
++        if (Get("DM_PICTURE_FIT") == "fill") bits.Add("Fill");
++        if (Get("DM_FPS_TARGET") is string f) bits.Add(f + " fps");
++        playerSettings.Text = string.Join(" · ", bits);   // what differs from the defaults: Fit and the game's own frame rate say nothing
+     }
+ 
+     /// "2 h ago", "yesterday", "3 days ago", "12 Nov".
+@@ -820,7 +806,7 @@
+             int index = i;
+             tabs[i].AccessibilityIdentifier = TabIds[i];
+             tabs[i].AccessibilityLabel = TabTitles[i];
+-            tabs[i].TouchUpInside += (_, __) => { logsBack = null; ShowTab(index == 0 ? 0 : 4); };
++            tabs[i].TouchUpInside += (_, __) => { logsBack = null; ShowTab(TabPages[index]); };
+         }
+         foreach (var view in new UIView[] { bar, stack }) view.TranslatesAutoresizingMaskIntoConstraints = false;
+         foreach (var page in pages)
+@@ -868,7 +854,7 @@
+         NSLayoutConstraint.ActivateConstraints(constraints.ToArray());
+     }
+ 
+-    private readonly NSLayoutConstraint[] pageLead = new NSLayoutConstraint[7], pageTrail = new NSLayoutConstraint[7];
++    private readonly NSLayoutConstraint[] pageLead = new NSLayoutConstraint[8], pageTrail = new NSLayoutConstraint[8];
+     private NSLayoutConstraint pageLeftWidth, splitDividerLead;
+     private UIView splitDivider;
+     private bool splitMode;          // a wide iPad window: Settings on the left, the page it opens on the right
+@@ -894,7 +880,7 @@
+             pageTrail[4].Active = !wide;
+             pageLeftWidth.Active = wide;
+             foreach (var i in new[] { 1, 2, 3, 5, 6 }) pageLead[i].Active = true;
+-            splitDivider.Hidden = !(wide && currentTab != 0);
++            splitDivider.Hidden = !(wide && currentTab != 0 && currentTab != 7);
+             ShowTab(currentTab);
+         }
+         if (wide)
+@@ -917,26 +903,27 @@
+     {
+         // A sub-page (Cloud, Keys, Logs) goes back where it was opened from: Settings, or the library (an export's
+         // log, the upload's cloud page, a banner); moving between sub-pages keeps the first one's way back.
+-        if (index != 0 && index != 4 && (currentTab == 0 || currentTab == 4)) subPageReturn = currentTab;
++        if (index != 0 && index != 4 && index != 7 && (currentTab == 0 || currentTab == 4 || currentTab == 7)) subPageReturn = currentTab;
+         // Beside the Settings column the tab Settings shows the page that was last open on the right
+         if (splitMode && index == 4) index = splitDetail;
+-        if (index != 0 && index != 4) splitDetail = index;
++        if (index != 0 && index != 4 && index != 7) splitDetail = index;
+         currentTab = index;
+-        bool settingsBeside = splitMode && index != 0;
++        bool settingsBeside = splitMode && index != 0 && index != 7;
+         for (int i = 0; i < pages.Length; i++) pages[i].Hidden = i != index && !(settingsBeside && i == 4);
+         if (splitDivider != null) splitDivider.Hidden = !settingsBeside;
+         foreach (var (page, row) in navRows)
+             row.BackgroundColor = settingsBeside && page == index ? UIColor.FromWhiteAlpha(1f, 0.09f) : UIColor.Clear;
+-        int lit = index == 0 ? 0 : 1;   // Cloud, Keys and Logs are Settings' pages
++        int lit = index == 0 ? 0 : index == 7 ? 1 : 2;   // Cloud, Keys and Logs are Settings' pages
+         for (int i = 0; i < tabs.Length; i++)
+         {
+             bool on = i == lit;
+             var config = on ? UIButtonConfiguration.FilledButtonConfiguration : UIButtonConfiguration.PlainButtonConfiguration;
+             config.Image = UIImage.GetSystemImage(TabIcons[i], UIImageSymbolConfiguration.Create(UIFont.SystemFontOfSize(15, UIFontWeight.Semibold)));
+-            config.ImagePadding = 8;
+-            config.AttributedTitle = new NSAttributedString(TabTitles[i], new UIStringAttributes { Font = Theme.Font(15, on ? UIFontWeight.Bold : UIFontWeight.Semibold) });
++            config.ImagePadding = 6;
++            config.ContentInsets = new NSDirectionalEdgeInsets(0, 6, 0, 6);   // three tabs share the capsule: "Settings" must not wrap
++            config.AttributedTitle = new NSAttributedString(TabTitles[i], new UIStringAttributes { Font = Theme.Font(14, on ? UIFontWeight.Bold : UIFontWeight.Semibold) });
+             config.CornerStyle = UIButtonConfigurationCornerStyle.Capsule;
+-            config.BaseBackgroundColor = UIColor.White;
++            config.BaseBackgroundColor = Theme.Accent;
+             config.BaseForegroundColor = on ? Theme.Ground : Theme.Muted;
+             tabs[i].Configuration = config;
+             tabs[i].AccessibilityTraits = on ? UIAccessibilityTrait.Button | UIAccessibilityTrait.Selected : UIAccessibilityTrait.Button;
+@@ -946,6 +933,7 @@
+         if (index == 4 || settingsBeside) RefreshSettingsPage(GatherFacts());
+         if (index == 5) RefreshAppsPage();
+         if (index == 6) RefreshQueuePage();
++        if (index == 7) RefreshBuildTab(GatherFacts());
+     }
+ 
+     /// Where the log's back button goes when the build screen opened it: that screen again. Cleared once used, and by
+@@ -986,6 +974,7 @@
+ 
+     private void BuildSettingsPage()
+     {
++        if (!GameExport.IsPlayer) { BuildSettingsShelf(); return; }   // the app's Settings are the design's cards (GameAppShelf.cs)
+         var title = Theme.Label("Settings", Theme.Rounded(34, UIFontWeight.Bold), Theme.Text);
+         title.AccessibilityTraits = UIAccessibilityTrait.Header;
+ 
+@@ -1051,8 +1040,6 @@
+         var nav = Theme.Column(0,
+             NavRow("icloud.fill", 0x3D8BFF, "Cloud", out cloudDetail, () => ShowTab(1), "settings-cloud", 1), Divider(),
+             NavRow("key.fill", 0xC99A12, "Keys and certificate", out keysDetail, () => ShowTab(2), "settings-keys", 2), Divider(),
+-            NavRow("shippingbox.fill", 0x34C77B, "Exported apps", out appsDetail, () => ShowTab(5), "settings-apps", 5), Divider(),
+-            NavRow("list.number", 0x8B6BFF, "Build queue", out queueDetail, () => ShowTab(6), "settings-queue", 6), Divider(),
+             NavRow("text.alignleft", 0xE0508F, "Logs", out logsBadge, () => ShowTab(3), "settings-logs", 3));
+         var navCard = Theme.Wrap(nav, 22, 0);
+         navCard.ClipsToBounds = true;   // the open page's row is lit beside Settings on an iPad
+@@ -1077,6 +1064,7 @@
+     /// The status banner: ready, or the first thing to fix (what the Keys page's checklist says, in one line).
+     private void RefreshSettingsPage(UiFacts facts)
+     {
++        if (settingsShelf) { RefreshSettingsShelf(facts); return; }
+         if (cloudDetail == null) return;
+         var rows = GameAppUi.Checklist(facts).Where(r => r.Label == "prod.keys" || r.Label == "Signing certificate" || r.Label == "RAM unlocked"
+                                                        || r.Label == "Extended addressing" || r.Label == "Play inside iBuilder").ToList();
+@@ -1110,7 +1098,7 @@
+         cloudDetail.Text = sources.Count == 0 ? "Not set up" : string.Join(" · ", sources.Select(x => x.Kind == CloudKind.Nas ? "NAS" : Cloud.ProviderName(x.Location)).Distinct());
+         var certificate = rows.FirstOrDefault(r => r.Label == "Signing certificate");
+         keysDetail.Text = certificate == null ? "" : certificate.Level == CheckLevel.Ok ? "ready" : "no certificate";
+-        appsDetail.Text = AppsSummary();
++        if (appsDetail != null) appsDetail.Text = AppsSummary();
+         logsBadge.Text = logErrors > 0 ? $"{logErrors} error{(logErrors == 1 ? "" : "s")}" : "";
+         logsBadge.TextColor = logErrors > 0 ? Theme.Error : Theme.Muted;
+         settingsStorage.Set(CurrentStorageSegments());
+@@ -1490,11 +1478,10 @@
+                                + "download them. Google Drive, OneDrive and Dropbox appear here once their app is installed and turned on in the Files app.",
+                                Theme.Font(13, UIFontWeight.Regular), Theme.Muted, 0);
+         cloudRows.Axis = UILayoutConstraintAxis.Vertical;
+-        cloudRows.Spacing = 10;
+-        var add = Theme.Pill("Add a folder (iCloud Drive, Google Drive, OneDrive…)", "folder.badge.plus", true, 52);
+-        add.AccessibilityIdentifier = "cloud-add-folder";
+-        add.TouchUpInside += (_, __) => AddFolderSource();
+-        var column = Theme.Column(14, header, note, cloudRows, add);
++        cloudRows.Spacing = 0;   // a flat list: the sources between hairlines, no cards (RefreshCloudPage)
++        var add = SettingsRow("Add a folder", AddFolderSource, true, false, -1, "cloud-add-folder");
++        var addHint = Theme.Label("iCloud Drive, Google Drive, OneDrive… (whatever the Files app shows).", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
++        var column = Theme.Column(14, header, note, SectionLabel("SOURCES"), cloudRows, SettingsCard(add.Button), addHint);
+         var scroll = new UIScrollView { AlwaysBounceVertical = true };
+         column.TranslatesAutoresizingMaskIntoConstraints = false;
+         scroll.AddSubview(column);
+@@ -1506,6 +1493,7 @@
+     private void RefreshCloudPage()
+     {
+         foreach (var v in cloudRows.ArrangedSubviews.ToArray()) { cloudRows.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        cloudRows.AddArrangedSubview(Hairline());
+ 
+         // The NAS: its server, its folder, what it holds.
+         var nas = LoadNas();
+@@ -1518,13 +1506,14 @@
+                                    Theme.Font(13, UIFontWeight.Medium), Theme.Text, 0);
+         UIButton Small(string text, Action tapped)
+         {
+-            var b = Theme.Pill(text, null, false, 40);
++            var b = ShelfButton(text, null, false, false, true);   // the design's grey button
+             b.TouchUpInside += (_, __) => tapped();
+             return b;
+         }
++        void Block(UIView content) { cloudRows.AddArrangedSubview(SettingsPad(content, 14)); cloudRows.AddArrangedSubview(Hairline()); }
+         var nasButtons = new UIStackView(new UIView[] { Small("Set up…", ConfigureNas), Small("Folder…", ChooseNasFolder), Small("Test", TestNas) })
+         { Axis = UILayoutConstraintAxis.Horizontal, Spacing = 8, Distribution = UIStackViewDistribution.FillEqually };
+-        cloudRows.AddArrangedSubview(Theme.Wrap(Theme.Column(8, nasTitle, nasLabel, nasState, nasButtons), 22, 14));
++        Block(Theme.Column(8, nasTitle, nasLabel, nasState, nasButtons));
+ 
+         // The Files folders.
+         foreach (var source in folderSources)
+@@ -1558,7 +1547,7 @@
+                 PresentWhenFree(a);
+             });
+             var buttons = new UIStackView(new UIView[] { refresh, remove }) { Axis = UILayoutConstraintAxis.Horizontal, Spacing = 8, Distribution = UIStackViewDistribution.FillEqually };
+-            cloudRows.AddArrangedSubview(Theme.Wrap(Theme.Column(8, head, line, buttons), 22, 14));
++            Block(Theme.Column(8, head, line, buttons));
+         }
+     }
+ 
+@@ -2001,7 +1990,7 @@
+ 
+     /// Downloads `files` into `folder` one after another (each as .part, renamed at the end), the first file's name
+     /// carrying the whole set's progress.
+-    private void Download(List<CloudFile> files, string folder)
++    private void Download(List<CloudFile> files, string folder, Action<string> done = null)
+     {
+         if (files.Count == 0) return;
+         long need = files.Sum(f => f.Size);
+@@ -2062,6 +2051,7 @@
+                 }
+                 RefreshGames();
+                 RefreshScreen();
++                if (error == null) done?.Invoke(key);
+             });
+         });
+     }
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -741,11 +741,13 @@
+     // Pages: 0 Library, 1 Cloud, 2 Keys, 3 Logs, 4 Settings, 5 Exported apps. Two tabs: Library, and Settings, which
+     // opens Cloud, Keys, Logs and Exported apps as sub-pages (each with a way back). The log timeline keeps receiving
+     // lines while hidden: Append and TailLogs do not know which page is showing.
+-    private readonly UIView[] pages = { new UIView(), new UIView(), new UIView(), new UIView(), new UIView(), new UIView(), new UIView() };
+-    private readonly UIButton[] tabs = { new UIButton(UIButtonType.System), new UIButton(UIButtonType.System) };
+-    private static readonly string[] TabTitles = { "Library", "Settings" };
+-    private static readonly string[] TabIcons = { "square.grid.2x2.fill", "gearshape.fill" };
+-    private static readonly string[] TabIds = { "tab-games", "tab-settings" };
++    // Page 7 is Build (GameAppShelf.cs). The three tabs, left to right: Library (page 0), Build (7), Settings (4).
++    private readonly UIView[] pages = { new UIView(), new UIView(), new UIView(), new UIView(), new UIView(), new UIView(), new UIView(), new UIView() };
++    private readonly UIButton[] tabs = { new UIButton(UIButtonType.System), new UIButton(UIButtonType.System), new UIButton(UIButtonType.System) };
++    private static readonly string[] TabTitles = { "Library", "Build", "Settings" };
++    private static readonly string[] TabIcons = { "square.grid.2x2.fill", "hammer.fill", "gearshape.fill" };
++    private static readonly string[] TabIds = { "tab-games", "tab-build", "tab-settings" };
++    private static readonly int[] TabPages = { 0, 7, 4 };
+     private int currentTab;
+     private readonly UIStackView banner = new UIStackView();      // missing prerequisites, tappable (GameAppUi.Prerequisites)
+     private readonly UIStackView grid = new UIStackView();        // the "All games" list
+@@ -836,13 +838,14 @@
+ 
+         // An exported game sets up its Documents (settings, saves, profile, the framework stamp) before the first screen.
+         GameExport.PreparePlayerDocuments(GameAppMain.Documents, text => Write(text));
+-        BuildGamesPage();
++        if (GameExport.IsPlayer) BuildGamesPage(); else BuildShelf();   // the library: the old page for an exported player, the shelf for the app
+         BuildCloudPage();
+         BuildKeysPage();
+         BuildLogsPage();
+         BuildSettingsPage();
+         BuildAppsPage();
+         BuildQueuePage();
++        if (!GameExport.IsPlayer) BuildBuildTab();   // after the queue page: it takes the queue's views
+         if (GameExport.IsPlayer)
+             BuildPlayerPage();   // an exported game: its own one screen, no tabs
+         else
+@@ -1612,7 +1615,8 @@
+             if (firstFrameDone) Guarded("cloud icons", FetchCloudIcons);
+             var games = facts.Games ?? new List<string>();
+             Guarded("selection", () => { if (!IsCloudOnly(selected)) selected = GameAppUi.SelectGame(games, selected, facts); });
+-            Guarded("games", () => RefreshGamesPage(facts, games));
++            Guarded("games", () => { if (GameExport.IsPlayer) RefreshGamesPage(facts, games); else RefreshShelf(facts, games); });
++            Guarded("build tab", () => RefreshBuildTab(facts));
+             Guarded("player", () => RefreshPlayer(facts));
+             Guarded("pointer", () => Theme.Hover(View));
+         }
+@@ -2976,21 +2980,40 @@
+         this.rebuild = rebuild;
+     }
+ 
++    /// The sheet's text in the app's fonts: Subheadline is a row's title, Footnote a note, Title3 the page's title.
+     private static UILabel Text(string text, UIFontTextStyle style, UIColor color, bool bold = false)
+     {
+-        var font = UIFont.GetPreferredFontForTextStyle(style);
+-        if (bold) font = UIFont.FromDescriptor(font.FontDescriptor.CreateWithTraits(UIFontDescriptorSymbolicTraits.Bold), font.PointSize);
+-        return new UILabel { Text = text, Font = font, TextColor = color, Lines = 0, AdjustsFontForContentSizeCategory = true };
++        UIFont font = style == UIFontTextStyle.Title3 ? Theme.Rounded(22, UIFontWeight.Bold)
++                    : style == UIFontTextStyle.Footnote ? Theme.Font(12, UIFontWeight.Regular)
++                    : Theme.Font(15, bold ? UIFontWeight.Semibold : UIFontWeight.Regular);
++        return new UILabel { Text = text, Font = font, TextColor = color, Lines = 0 };
+     }
+ 
++    private static void StyleSegmented(UISegmentedControl control)
++    {
++        control.SelectedSegmentTintColor = UIColor.FromWhiteAlpha(1f, 0.2f);
++        control.SetTitleTextAttributes(new UIStringAttributes { ForegroundColor = Theme.Text, Font = Theme.Font(13, UIFontWeight.Semibold) }, UIControlState.Normal);
++    }
++
++    private static UIView Rule()
++    {
++        var d = new UIView { BackgroundColor = UIColor.FromWhiteAlpha(1f, 0.08f) };
++        d.HeightAnchor.ConstraintEqualTo(1).Active = true;
++        return d;
++    }
++
++    /// In the game's sheet (a page pushed on it): a way back, and the same theme. Set before the page is shown.
++    public bool Embedded { get; set; }
++
+     /// A titled row of choices: `labels` are what the user reads, `values` what the file keeps.
+     private UIView Choice(string title, string id, string[] labels, string[] values, string current, Action<string> set)
+     {
+         var control = new UISegmentedControl(labels) { Enabled = enabled, AccessibilityIdentifier = id };
++        StyleSegmented(control);
+         var index = Array.IndexOf(values, current);
+         control.SelectedSegment = index < 0 ? 0 : index;
+         control.ValueChanged += (_, __) => set(values[(int) control.SelectedSegment]);
+-        return new UIStackView(new UIView[] { Text(title, UIFontTextStyle.Subheadline, UIColor.Label, bold: true), control })
++        return new UIStackView(new UIView[] { Text(title, UIFontTextStyle.Subheadline, Theme.Text, bold: true), control })
+         {
+             Axis = UILayoutConstraintAxis.Vertical,
+             Spacing = 6,
+@@ -3000,22 +3023,34 @@
+     public override void ViewDidLoad()
+     {
+         base.ViewDidLoad();
+-        View.BackgroundColor = UIColor.SystemBackground;
++        View.BackgroundColor = Theme.Ground;
++        View.TintColor = Theme.Accent;   // the buttons under the controls (Saves…, Mods…, Prepare the shaders…) are the app's violet, not the system's blue
+ 
+-        var done = UIButton.FromType(UIButtonType.System);
+-        done.SetTitle("Done", UIControlState.Normal);
++        var done = Theme.Pill("Done", null, false, 36);
+         done.AccessibilityIdentifier = "settings-done";
+         done.TouchUpInside += (_, __) => DismissViewController(true, null);
+-        var header = new UIStackView(new UIView[] { Text("Game settings", UIFontTextStyle.Title3, UIColor.Label, bold: true), new UIView(), done })
++        var headViews = new List<UIView>();
++        if (Embedded)
+         {
++            var back = Theme.Round("chevron.left", "Back to the game");
++            back.AccessibilityIdentifier = "settings-back";
++            back.TouchUpInside += (_, __) => NavigationController?.PopViewController(true);
++            headViews.Add(back);
++        }
++        headViews.Add(Text("Game settings", UIFontTextStyle.Title3, Theme.Text, bold: true));
++        headViews.Add(new UIView());
++        headViews.Add(done);
++        var header = new UIStackView(headViews.ToArray())
++        {
+             Axis = UILayoutConstraintAxis.Horizontal,
+             Alignment = UIStackViewAlignment.Center,
++            Spacing = 12,
+         };
+ 
+-        var views = new List<UIView> { header, Text(name, UIFontTextStyle.Subheadline, UIColor.SecondaryLabel) };
++        var views = new List<UIView> { header, Text(name, UIFontTextStyle.Subheadline, Theme.Muted) };
+         if (!enabled)
+             views.Add(Text("This file name carries no [title id], so its settings cannot be saved. Rename the file to include it.",
+-                           UIFontTextStyle.Footnote, UIColor.SystemOrange));
++                           UIFontTextStyle.Footnote, Theme.Warn));
+         if (launcher != null) AddLauncherViews(views);
+         else
+         {
+@@ -3026,9 +3061,9 @@
+             views.Add(Choice("Picture", "setting-picture", new[] { "Fit", "Fill screen" }, new[] { "fit", "fill" },
+                              settings.Picture, v => Apply(settings with { Picture = v })));
+ 
+-            var toggle = new UISwitch { On = settings.ShowFps, Enabled = enabled, AccessibilityIdentifier = "setting-show-fps" };
++            var toggle = new UISwitch { On = settings.ShowFps, Enabled = enabled, AccessibilityIdentifier = "setting-show-fps", OnTintColor = Theme.Accent };
+             toggle.ValueChanged += (_, __) => Apply(settings with { ShowFps = toggle.On });
+-            var fpsRow = new UIStackView(new UIView[] { Text("Show FPS", UIFontTextStyle.Subheadline, UIColor.Label, bold: true), new UIView(), toggle })
++            var fpsRow = new UIStackView(new UIView[] { Text("Show FPS", UIFontTextStyle.Subheadline, Theme.Text, bold: true), new UIView(), toggle })
+             {
+                 Axis = UILayoutConstraintAxis.Horizontal,
+                 Alignment = UIStackViewAlignment.Center,
+@@ -3038,8 +3073,8 @@
+ 
+         var memory = new UIStackView(new UIView[]
+         {
+-            Text("Game memory: Automatic", UIFontTextStyle.Subheadline, UIColor.Label, bold: true),
+-            Text("The app sizes it from the game's first boot.", UIFontTextStyle.Footnote, UIColor.SecondaryLabel),
++            Text("Game memory: Automatic", UIFontTextStyle.Subheadline, Theme.Text, bold: true),
++            Text("The app sizes it from the game's first boot.", UIFontTextStyle.Footnote, Theme.Muted),
+         })
+         {
+             Axis = UILayoutConstraintAxis.Vertical,
+@@ -3052,19 +3087,19 @@
+             var button = UIButton.FromType(UIButtonType.System);
+             var config = UIButtonConfiguration.TintedButtonConfiguration;
+             config.Title = "Rebuild from scratch";
+-            config.BaseForegroundColor = UIColor.SystemRed;
++            config.BaseForegroundColor = Theme.Error;
+             button.Configuration = config;
+             button.AccessibilityIdentifier = "rebuild-from-scratch";
+             button.TouchUpInside += (_, __) => DismissViewController(true, () => rebuild());
+             views.Add(button);
+             views.Add(Text(GameAppUi.RebuildTitle.Replace("Rebuild everything instead", "Rebuilds everything for this game") + ".",
+-                           UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
++                           UIFontTextStyle.Footnote, Theme.Muted));
+         }
+ 
+         if (AddContent != null)
+         {
+-            views.Add(Text("Update and DLC", UIFontTextStyle.Subheadline, UIColor.Label, bold: true));
+-            views.Add(Text(ContentInfo ?? "", UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
++            views.Add(Text("Update and DLC", UIFontTextStyle.Subheadline, Theme.Text, bold: true));
++            views.Add(Text(ContentInfo ?? "", UIFontTextStyle.Footnote, Theme.Muted));
+             var add = UIButton.FromType(UIButtonType.System);
+             var aconfig = UIButtonConfiguration.TintedButtonConfiguration;
+             aconfig.Title = "Add an update or DLC…";
+@@ -3090,7 +3125,7 @@
+             saves.TouchUpInside += (_, __) => DismissViewController(true, () => savesAction());
+             views.Add(saves);
+             views.Add(Text("Copies of the game's save: one before each launch, yours when you want; restore, share, and JKSV backups in and out.",
+-                           UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
++                           UIFontTextStyle.Footnote, Theme.Muted));
+         }
+ 
+         if (ManageMods != null)
+@@ -3106,7 +3141,7 @@
+             modsButton.TouchUpInside += (_, __) => DismissViewController(true, () => modsAction());
+             views.Add(modsButton);
+             views.Add(Text("Mods in the Atmosphere layout (RomFS files, code patches such as 60 fps, cheats), from a .zip or a folder in Files. "
+-                           + "A 60 fps mod usually goes with the FPS setting \"60\" above.", UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
++                           + "A 60 fps mod usually goes with the FPS setting \"60\" above.", UIFontTextStyle.Footnote, Theme.Muted));
+         }
+ 
+         if (PrepareShaders != null)
+@@ -3122,7 +3157,7 @@
+             prepare.TouchUpInside += (_, __) => DismissViewController(true, () => prepareAction());
+             views.Add(prepare);
+             views.Add(Text("Compiles the game's shader libraries now, in the background, so the first play session does not stop to compile them. It never starts by itself. "
+-                           + "It can take from minutes to an hour: best on a charger.", UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
++                           + "It can take from minutes to an hour: best on a charger.", UIFontTextStyle.Footnote, Theme.Muted));
+         }
+ 
+         if (ExportGame != null)
+@@ -3138,7 +3173,7 @@
+             export.TouchUpInside += (_, __) => DismissViewController(true, () => exportAction());
+             views.Add(export);
+             views.Add(Text("Makes this built game an app of its own, to install with SideStore or FlareStore. It runs without this app.",
+-                           UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
++                           UIFontTextStyle.Footnote, Theme.Muted));
+         }
+ 
+         if (DeleteGame != null)
+@@ -3148,17 +3183,17 @@
+             dconfig.Title = "Delete this game…";
+             dconfig.Image = UIImage.GetSystemImage("trash");
+             dconfig.ImagePadding = 6;
+-            dconfig.BaseForegroundColor = UIColor.SystemRed;
++            dconfig.BaseForegroundColor = Theme.Error;
+             delete.Configuration = dconfig;
+             delete.AccessibilityIdentifier = "delete-game";
+             var action = DeleteGame;
+             delete.TouchUpInside += (_, __) => DismissViewController(true, () => action());
+             views.Add(delete);
+             views.Add(Text("Frees the space the game takes: its file, its shaders and its build. You choose whether its saves stay.",
+-                           UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
++                           UIFontTextStyle.Footnote, Theme.Muted));
+         }
+ 
+-        var stack = new UIStackView(views.ToArray()) { Axis = UILayoutConstraintAxis.Vertical, Spacing = 16, TranslatesAutoresizingMaskIntoConstraints = false };
++        var stack = new UIStackView(views.ToArray()) { Axis = UILayoutConstraintAxis.Vertical, Spacing = 12, TranslatesAutoresizingMaskIntoConstraints = false };
+         var scroll = new UIScrollView { TranslatesAutoresizingMaskIntoConstraints = false };
+         scroll.AddSubview(stack);
+         View.AddSubview(scroll);
+@@ -3188,7 +3223,7 @@
+     {
+         foreach (var (section, rows) in GameAppUi.Sections(launcher))
+         {
+-            var header = Text(section, UIFontTextStyle.Headline, UIColor.Label, bold: true);
++            var header = Theme.Label(section.ToUpperInvariant(), Theme.Font(11, UIFontWeight.Semibold), Theme.Muted);
+             sectionHeaders.Add((section, header));
+             views.Add(header);
+             foreach (var row in rows)
+@@ -3220,13 +3255,13 @@
+     {
+         var id = "setting-" + row.Env;
+         var current = GameAppUi.ValueOf(row, values);
+-        var title = Text(row.Label, UIFontTextStyle.Subheadline, UIColor.Label, bold: true);
++        var title = Text(row.Label, UIFontTextStyle.Subheadline, Theme.Text, bold: true);
+         var parts = new List<UIView>();
+         switch (row.Kind)
+         {
+             case "toggle":
+             {
+-                var toggle = new UISwitch { On = current == row.On, Enabled = enabled, AccessibilityIdentifier = id };
++                var toggle = new UISwitch { On = current == row.On, Enabled = enabled, AccessibilityIdentifier = id, OnTintColor = Theme.Accent };
+                 toggle.ValueChanged += (_, __) => SetValue(row.Env, toggle.On ? row.On : row.Off);
+                 parts.Add(new UIStackView(new UIView[] { title, new UIView(), toggle })
+                 {
+@@ -3241,9 +3276,9 @@
+                 var slider = new UISlider
+                 {
+                     MinValue = (float) row.Min, MaxValue = (float) row.Max, Value = (float) GameAppUi.RangeValue(row, values),
+-                    Enabled = enabled, AccessibilityIdentifier = id,
++                    Enabled = enabled, AccessibilityIdentifier = id, MinimumTrackTintColor = Theme.Accent,
+                 };
+-                var shown = Text("", UIFontTextStyle.Subheadline, UIColor.SecondaryLabel);
++                var shown = Text("", UIFontTextStyle.Subheadline, Theme.Muted);
+                 shown.SetContentHuggingPriority(1000, UILayoutConstraintAxis.Horizontal);
+                 void Show()
+                 {
+@@ -3281,6 +3316,7 @@
+                 if (options.Count <= 4)
+                 {
+                     var control = new UISegmentedControl(options.Select(o => o.Label).ToArray()) { Enabled = enabled, AccessibilityIdentifier = id };
++                    StyleSegmented(control);
+                     control.SelectedSegment = index < 0 ? -1 : index;
+                     control.ValueChanged += (_, __) => SetValue(row.Env, options[(int) control.SelectedSegment].Value);
+                     parts.Add(title);
+@@ -3292,6 +3328,7 @@
+                     button.Enabled = enabled;
+                     button.AccessibilityIdentifier = id;
+                     button.ShowsMenuAsPrimaryAction = true;
++                    button.TintColor = Theme.Text;
+                     button.HorizontalAlignment = UIControlContentHorizontalAlignment.Trailing;
+                     button.SetContentCompressionResistancePriority(250, UILayoutConstraintAxis.Horizontal);
+                     string selected = index < 0 ? null : options[index].Value;
+@@ -3325,11 +3362,12 @@
+                 break;
+             }
+         }
+-        if (row.Note.Length > 0) parts.Add(Text(row.Note, UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
++        if (row.Note.Length > 0) parts.Add(Text(row.Note, UIFontTextStyle.Footnote, Theme.Muted));
+         if (row.Env == "DM_FPS_TARGET" && row.Kind == "choice" && row.Options.Any(o => o.Value == "120"))
+             parts.Add(Text("120 fps is experimental: the game falls back to 60 when a frame is late, during movies and when the phone is hot.",
+-                           UIFontTextStyle.Footnote, UIColor.SecondaryLabel));
+-        return new UIStackView(parts.ToArray()) { Axis = UILayoutConstraintAxis.Vertical, Spacing = 6 };
++                           UIFontTextStyle.Footnote, Theme.Muted));
++        parts.Add(Rule());
++        return new UIStackView(parts.ToArray()) { Axis = UILayoutConstraintAxis.Vertical, Spacing = 10 };
+     }
+ 
+     // DM_OPMODE's default, for the pixel size of a render scale while the player has not chosen a mode.
+diff -ruN a/GameAppModsUi.cs b/GameAppModsUi.cs
+--- a/GameAppModsUi.cs
++++ b/GameAppModsUi.cs
+@@ -30,7 +30,8 @@
+     public override void ViewDidLoad()
+     {
+         base.ViewDidLoad();
+-        View.BackgroundColor = UIKit.UIColor.SystemBackground;
++        View.BackgroundColor = Theme.Ground;   // the colours of the game sheet it opens from (GameAppShelf.cs)
++        View.TintColor = Theme.Accent;
+         var done = UIKit.UIButton.FromType(UIKit.UIButtonType.System);
+         done.SetTitle("Done", UIKit.UIControlState.Normal);
+         done.AccessibilityIdentifier = "mods-done";
+@@ -127,7 +128,7 @@
+             del.Configuration = dc; del.AccessibilityIdentifier = "mod-delete-" + mi; del.HorizontalAlignment = UIKit.UIControlContentHorizontalAlignment.Leading;
+             del.TouchUpInside += (_, __) => ConfirmDelete(mod.Name);
+             card.AddArrangedSubview(del);
+-            card.BackgroundColor = UIKit.UIColor.SecondarySystemBackground;
++            card.BackgroundColor = Theme.Glass;
+             card.LayoutMargins = new UIKit.UIEdgeInsets(12, 12, 8, 12);
+             card.LayoutMarginsRelativeArrangement = true;
+             card.Layer.CornerRadius = 12;
+diff -ruN a/GameAppQueueUi.cs b/GameAppQueueUi.cs
+--- a/GameAppQueueUi.cs
++++ b/GameAppQueueUi.cs
+@@ -62,12 +62,12 @@
+     {
+         if (!BuildQueue.Add(buildQueue, game)) { Write($"build queue: {GameAppUi.DisplayName(game)} is already in it"); return; }
+         SaveBuildQueue();
+-        Write($"build queue: {GameAppUi.DisplayName(game)} added ({buildQueue.Queued} waiting). Settings › Build queue starts it.");
++        Write($"build queue: {GameAppUi.DisplayName(game)} added ({buildQueue.Queued} waiting). The Build tab starts it.");
+         var a = UIAlertController.Create("Added to the build queue",
+-            $"{GameAppUi.DisplayName(game)} waits in Settings › Build queue. The queue builds one game after another; each build keeps running if you leave iBuilder, but the next game starts when you open it again.",
++            $"{GameAppUi.DisplayName(game)} waits in the Build tab. The queue builds one game after another; each build keeps running if you leave iBuilder, but the next game starts when you open it again.",
+             UIAlertControllerStyle.Alert);
+         a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
+-        a.AddAction(UIAlertAction.Create("Open the queue", UIAlertActionStyle.Default, _ => ShowTab(6)));
++        a.AddAction(UIAlertAction.Create("Open the queue", UIAlertActionStyle.Default, _ => ShowTab(7)));
+         PresentWhenFree(a);
+     }
+ 
+@@ -255,7 +255,7 @@
+         buildQueue.AutoStart = false;
+         UIApplication.SharedApplication.IdleTimerDisabled = false;
+         SaveBuildQueue();
+-        Write("build queue: done" + (failed ? " (some games stopped: Settings › Build queue)" : ""));
++        Write("build queue: done" + (failed ? " (some games stopped: see the Build tab)" : ""));
+         var content = new UserNotifications.UNMutableNotificationContent
+         {
+             Title = "Build queue done",
+diff -ruN a/GameAppSavesUi.cs b/GameAppSavesUi.cs
+--- a/GameAppSavesUi.cs
++++ b/GameAppSavesUi.cs
+@@ -40,7 +40,8 @@
+     public override void ViewDidLoad()
+     {
+         base.ViewDidLoad();
+-        View.BackgroundColor = UIKit.UIColor.SystemBackground;
++        View.BackgroundColor = Theme.Ground;   // the colours of the game sheet it opens from (GameAppShelf.cs)
++        View.TintColor = Theme.Accent;
+         var done = UIKit.UIButton.FromType(UIKit.UIButtonType.System);
+         done.SetTitle("Done", UIKit.UIControlState.Normal);
+         done.AccessibilityIdentifier = "saves-done";
+@@ -90,6 +91,7 @@
+             var copy = c;
+             var b = UIKit.UIButton.FromType(UIKit.UIButtonType.System);
+             var cfg = UIKit.UIButtonConfiguration.GrayButtonConfiguration;
++            cfg.Background.BackgroundColor = Theme.Glass;
+             cfg.Title = copy.When.ToString("g");
+             cfg.Subtitle = $"{GameSaves.KindLabel(copy.Kind)} · {GameAppUi.SizeText(copy.Size)}";
+             cfg.TitleAlignment = UIKit.UIButtonConfigurationTitleAlignment.Leading;
+diff -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs
++++ b/GameAppShelf.cs
+@@ -0,0 +1,1061 @@
++// gameapp/GameAppShelf.cs: the three-tab design (app/patches/0062). Tabs: Library, Build, Settings.
++//
++//   Library  the games of this iPhone as a grid or a list (a toggle, kept): each with its cover (CoverView: the icon, else the name's colour and initials, so a game never has an empty cover),
++//            and the buttons that fit what this install can do: Play and Export IPA with a development certificate (get-task-allow), Export IPA alone with a distribution one (GameAppUi.GameAction
++//            says which), Set up for a game not built yet, Update when an update or DLC was added since the build. A tap opens the game's sheet (the settings sheet); a long press opens its menu.
++//   Build    what the queue is doing now, the games on this phone (Build, Rebuild, Update, Update and DLC) and the games only in the cloud (Download, Download and build).
++//
++// An exported player keeps its own one screen (BuildPlayerPage, GameAppLibrary.cs) and the old library page, but draws that screen with the helpers of this file: the gradient Play (GradientBackView),
++// the flat rows (SettingsRow, SettingsCard). The tabs, the shelf, the Build tab and the sheet do not run for it.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using CoreAnimation;
++using CoreGraphics;
++using Foundation;
++using ImageIO;
++using UIKit;
++
++/// A cover drawn from the name alone: the name's colour and a white glyph (ring, triangle or rounded square). It is the icon of an exported app whose game has none.
++internal static class CoverArt
++{
++    public static byte[] Png(string name, int size)
++    {
++        try
++        {
++            using var space = CGColorSpace.CreateDeviceRGB();
++            using var context = new CGBitmapContext(null, size, size, 8, size * 4, space, CGImageAlphaInfo.NoneSkipLast);
++            context.SetFillColor(Theme.ColorFor(name).CGColor);
++            context.FillRect(new CGRect(0, 0, size, size));
++            context.SetStrokeColor(UIColor.White.CGColor);
++            context.SetLineWidth(size * 0.09f);
++            context.SetLineJoin(CGLineJoin.Round);
++            nfloat c = size / 2f, r = size * 0.27f;
++            int kind;
++            unchecked { int h = 17; foreach (var ch in name ?? "") h = h * 31 + ch; kind = (h & 0x7FFFFFFF) % 3; }
++            if (kind == 0) context.StrokeEllipseInRect(new CGRect(c - r, c - r, 2 * r, 2 * r));
++            else if (kind == 1)
++            {
++                context.MoveTo(c, c - r * 1.05f);
++                context.AddLineToPoint(c + r * 1.05f, c + r * 0.85f);
++                context.AddLineToPoint(c - r * 1.05f, c + r * 0.85f);
++                context.ClosePath();
++                context.StrokePath();
++            }
++            else
++            {
++                context.AddPath(UIBezierPath.FromRoundedRect(new CGRect(c - r, c - r, 2 * r, 2 * r), r * 0.35f).CGPath);
++                context.StrokePath();
++            }
++            using var image = context.ToImage();
++            var data = new NSMutableData();
++            using var dest = CGImageDestination.Create(data, "public.png", 1);
++            if (dest == null) return null;
++            dest.AddImage(image, (NSDictionary) null);
++            return dest.Close() ? data.ToArray() : null;
++        }
++        catch (Exception) { return null; }
++    }
++}
++
++/// The background of a primary button: a gradient of the game's own colour (the average of its cover, else the colour of its name). A button configuration takes it as its background view.
++internal sealed class GradientBackView : UIView
++{
++    [Export("layerClass")]
++    public static ObjCRuntime.Class LayerClass() => new ObjCRuntime.Class(typeof(CAGradientLayer));
++
++    /// The colour of what is written on it: dark on a light tint, white on a dark one.
++    public UIColor Foreground { get; }
++
++    public GradientBackView(UIColor tint)
++    {
++        UserInteractionEnabled = false;
++        tint.GetRGBA(out nfloat r, out nfloat g, out nfloat b, out nfloat a);
++        var top = UIColor.FromRGBA((nfloat) Math.Min(1.0, (double) r * 1.1 + 0.06), (nfloat) Math.Min(1.0, (double) g * 1.1 + 0.06), (nfloat) Math.Min(1.0, (double) b * 1.1 + 0.06), 1f);
++        var bottom = UIColor.FromRGBA(r * 0.58f, g * 0.58f, b * 0.58f, 1f);
++        var gradient = (CAGradientLayer) Layer;
++        gradient.StartPoint = new CGPoint(0, 0);
++        gradient.EndPoint = new CGPoint(1, 1);
++        gradient.Colors = new[] { top.CGColor, bottom.CGColor };
++        double lum = 0.2126 * (double) r + 0.7152 * (double) g + 0.0722 * (double) b;
++        Foreground = lum > 0.62 ? Theme.Ground : UIColor.White;
++    }
++}
++
++public sealed partial class GameAppViewController
++{
++    private sealed record ShelfAct(string Title, string Symbol, bool Primary, Action Do, UIMenu Menu = null);
++
++    // ---- Library -----------------------------------------------------------------------------------------------
++
++    private UIStackView shelfTiles;
++    private UILabel shelfSubtitle;
++    private UIButton shelfGridButton, shelfListButton;
++    private UIView shelfAppsCard;
++    private string shelfView = "grid";
++    private readonly List<NSObject> shelfKeep = new List<NSObject>();   // the long-press delegates, alive as long as their tiles
++
++    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<UIImage, UIColor> tintCache = new System.Runtime.CompilerServices.ConditionalWeakTable<UIImage, UIColor>();
++
++    /// The colour a game gives its primary button: its cover's average, else the colour of its name.
++    private static UIColor TintOf(UIImage icon, string name)
++    {
++        if (icon == null) return Theme.ColorFor(name);
++        if (!tintCache.TryGetValue(icon, out var tint)) { tint = Theme.AverageColor(icon); tintCache.Add(icon, tint); }
++        return tint;
++    }
++
++    private static UIButton ShelfButton(string title, string symbol, bool primary, bool compact, bool enabled, UIColor tint = null)
++    {
++        bool tinted = primary && tint != null;
++        var b = new UIButton(UIButtonType.System);
++        var c = tinted ? UIButtonConfiguration.PlainButtonConfiguration : primary ? UIButtonConfiguration.FilledButtonConfiguration : UIButtonConfiguration.GrayButtonConfiguration;
++        if (!compact) c.AttributedTitle = new NSAttributedString(title, new UIStringAttributes { Font = Theme.Font(13, UIFontWeight.Semibold) });
++        if (symbol != null)
++        {
++            c.Image = UIImage.GetSystemImage(symbol);
++            c.ImagePadding = compact ? 0 : 5;
++            c.PreferredSymbolConfigurationForImage = UIImageSymbolConfiguration.Create(UIFont.SystemFontOfSize(compact ? 15 : 12, UIFontWeight.Bold));
++        }
++        c.CornerStyle = UIButtonConfigurationCornerStyle.Medium;
++        if (tinted)
++        {
++            var back = new GradientBackView(tint);
++            var background = c.Background;
++            background.CustomView = back;
++            background.CornerRadius = 12;
++            c.Background = background;
++            c.BaseForegroundColor = back.Foreground;
++        }
++        else
++        {
++            c.BaseBackgroundColor = primary ? Theme.Accent : UIColor.FromWhiteAlpha(1f, 0.12f);
++            c.BaseForegroundColor = primary ? Theme.Ground : Theme.Text;
++        }
++        c.ContentInsets = new NSDirectionalEdgeInsets(0, compact ? 0 : 8, 0, compact ? 0 : 8);
++        b.Configuration = c;
++        b.Enabled = enabled;
++        if (tinted && !enabled) b.Alpha = 0.5f;
++        b.PointerInteractionEnabled = true;
++        b.AccessibilityLabel = title;
++        b.HeightAnchor.ConstraintEqualTo(compact ? 42 : 38).Active = true;
++        if (compact) b.WidthAnchor.ConstraintEqualTo(42).Active = true;
++        return b;
++    }
++
++    private static UIButton ShelfActButton(ShelfAct a, bool compact, bool enabled, UIColor tint = null)
++    {
++        var b = ShelfButton(a.Title, a.Symbol, a.Primary, compact || a.Symbol == "ellipsis", enabled, tint);   // the "more" menu is an icon
++        if (a.Menu != null) { b.Menu = a.Menu; b.ShowsMenuAsPrimaryAction = true; }
++        else b.TouchUpInside += (_, __) => a.Do();
++        return b;
++    }
++
++    private static UIView ShelfChip(string text, UIColor tone)
++    {
++        var label = Theme.Label(text, Theme.Font(11, UIFontWeight.Semibold), tone);
++        label.TranslatesAutoresizingMaskIntoConstraints = false;
++        var chip = new UIView { BackgroundColor = Theme.Ground.ColorWithAlpha(0.86f), UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        chip.Layer.CornerRadius = 11;
++        chip.Layer.BorderWidth = 1;
++        chip.Layer.BorderColor = tone.CGColor;
++        chip.AddSubview(label);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            label.TopAnchor.ConstraintEqualTo(chip.TopAnchor, 3), label.BottomAnchor.ConstraintEqualTo(chip.BottomAnchor, -3),
++            label.LeadingAnchor.ConstraintEqualTo(chip.LeadingAnchor, 9), label.TrailingAnchor.ConstraintEqualTo(chip.TrailingAnchor, -9),
++        });
++        return chip;
++    }
++
++    private void BuildShelf()
++    {
++        shelfView = NSUserDefaults.StandardUserDefaults.StringForKey("library_view") == "list" ? "list" : "grid";
++        var title = Theme.Label("Library", Theme.Rounded(34, UIFontWeight.Bold), Theme.Text);
++        title.AccessibilityTraits = UIAccessibilityTrait.Header;
++        shelfSubtitle = Theme.Label("", Theme.Font(13, UIFontWeight.Regular), Theme.Muted);
++
++        UIButton Toggle(string symbol, string label, string view, string id)
++        {
++            var b = new UIButton(UIButtonType.System) { AccessibilityIdentifier = id, AccessibilityLabel = label };
++            b.WidthAnchor.ConstraintEqualTo(40).Active = true;
++            b.HeightAnchor.ConstraintEqualTo(34).Active = true;
++            b.Layer.CornerRadius = 10;
++            b.SetImage(UIImage.GetSystemImage(symbol, UIImageSymbolConfiguration.Create(UIFont.SystemFontOfSize(15, UIFontWeight.Semibold))), UIControlState.Normal);
++            b.TouchUpInside += (_, __) =>
++            {
++                shelfView = view;
++                NSUserDefaults.StandardUserDefaults.SetString(view, "library_view");
++                RefreshScreen();
++            };
++            return b;
++        }
++        shelfGridButton = Toggle("square.grid.2x2", "Grid view", "grid", "view-grid");
++        shelfListButton = Toggle("list.bullet", "List view", "list", "view-list");
++        var toggle = Theme.Wrap(Theme.Row(2, shelfGridButton, shelfListButton), 13, 3);
++        var header = Theme.Row(8, Theme.Column(4, title, shelfSubtitle), new UIView(), toggle);
++        header.Alignment = UIStackViewAlignment.Top;
++
++        banner.Axis = UILayoutConstraintAxis.Vertical;
++        banner.Spacing = 6;
++        shelfTiles = Theme.Column(18);
++        appsList.Axis = UILayoutConstraintAxis.Vertical;
++        appsList.Spacing = 2;
++        appsTitle = Theme.Label("EXPORTED APPS", Theme.Font(11, UIFontWeight.Semibold), Theme.Muted);
++        shelfAppsCard = appsList;
++
++        var column = Theme.Column(16, header, banner, shelfTiles, appsTitle, shelfAppsCard);
++        column.SetCustomSpacing(8, appsTitle);
++        var scroll = new UIScrollView { AlwaysBounceVertical = true, ShowsVerticalScrollIndicator = false };
++        column.TranslatesAutoresizingMaskIntoConstraints = false;
++        scroll.AddSubview(column);
++        Theme.PinColumn(scroll, column, 4, 24);
++        Fill(pages[0], scroll, 18);
++    }
++
++    private static string ShelfMeta(LibraryEntry e)
++    {
++        long size = 0;
++        try { size = new FileInfo(Path.Combine(GameAppMain.Documents, e.Name)).Length; } catch (Exception) { }
++        return size > 0 ? GameAppUi.SizeText(size) : "";
++    }
++
++    /// The buttons a game has right now, and its state chip. A running build or boot disables them (the phone is theirs).
++    private List<ShelfAct> ShelfActions(LibraryEntry e, UiFacts facts, out string chip, out UIColor tone)
++    {
++        var name = e.Name;
++        bool busy = facts.Running;
++        chip = null; tone = Theme.Muted;
++        var acts = new List<ShelfAct>();
++        var frac = CoverFraction(name, facts);
++        if (running && frac != null)
++        {
++            chip = $"Building {Math.Round(frac.Value * 100):0}%"; tone = Theme.Accent;
++            acts.Add(new ShelfAct("Watch the build", "list.bullet.rectangle", false, ShowBuildScreen));
++            return acts;
++        }
++        var next = GameAppUi.GameAction(name, facts);
++        var names = Dumps().Select(Path.GetFileName).ToList();
++        bool ready = GameAppUi.GameStatusOf(name, facts) == GameAppUi.GameStatus.Ready;
++        bool update = ready && GameAppUi.ContentChangedSinceBuild(name, names, facts);
++        void PlayIt() { selected = name; PrimaryTapped(); }
++        void ExportIt() { selected = name; ConfirmExport(name); }
++        if (!ready)
++        {
++            chip = "Needs setup"; tone = Theme.Warn;
++            acts.Add(new ShelfAct(next.Kind == ActionKind.Import ? "Import keys" : "Set up", next.Kind == ActionKind.Import ? "key.fill" : "hammer.fill", true, PlayIt));
++            return acts;
++        }
++        if (update) { chip = "Update available"; tone = Theme.Accent; acts.Add(new ShelfAct("Update", "arrow.triangle.2.circlepath", true, () => DoUpdate(name))); }
++        if (next.Kind == ActionKind.Boot)
++            acts.Add(new ShelfAct("Play", "play.fill", !update, PlayIt));
++        if (!(update && next.Kind == ActionKind.Boot))
++            acts.Add(new ShelfAct("Export IPA", "square.and.arrow.up", next.Kind != ActionKind.Boot && !update, ExportIt));
++        return acts;
++    }
++
++    /// The update or DLC added since the build goes in: the whole build runs again.
++    private void DoUpdate(string name)
++    {
++        selected = name;
++        if (AskIfHot(() => DoUpdate(name))) return;
++        SetUpAndPlay(name);
++        RefreshScreen();
++    }
++
++    private void ConfirmRebuild(string name)
++    {
++        var a = UIAlertController.Create("Rebuild " + GameAppUi.DisplayName(name) + "?", "The whole build runs again: about a minute for most games.", UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
++        a.AddAction(UIAlertAction.Create("Rebuild", UIAlertActionStyle.Default, _ => DoUpdate(name)));
++        PresentWhenFree(a);
++    }
++
++    private UIMenu ShelfMenu(LibraryEntry e, List<ShelfAct> acts, UiFacts facts)
++    {
++        var items = new List<UIMenuElement>();
++        foreach (var a in acts.Where(a => a.Menu == null))
++            items.Add(UIAction.Create(a.Title == "Export IPA" ? "Export as IPA…" : a.Title, UIImage.GetSystemImage(a.Symbol), null, _ => a.Do()));
++        bool ready = GameAppUi.GameStatusOf(e.Name, facts) == GameAppUi.GameStatus.Ready;
++        if (ready && !acts.Any(a => a.Title == "Export IPA") && !facts.Running)
++            items.Add(UIAction.Create("Export as IPA…", UIImage.GetSystemImage("square.and.arrow.up"), null, _ => { selected = e.Name; ConfirmExport(e.Name); }));
++        items.Add(UIAction.Create("Game settings", UIImage.GetSystemImage("gearshape"), null, _ => ShowGameSheet(e, true)));
++        var path = Path.Combine(GameAppMain.Documents, e.Name);
++        items.Add(UIAction.Create("Add to the build queue", UIImage.GetSystemImage("list.number"), null, _ => AddToBuildQueue(e.Name)));
++        foreach (var target in UploadTargets())
++            if (e.Cloud == null || e.Cloud.SourceId != target.Id)
++                items.Add(UIAction.Create("Upload to " + target.Name, UIImage.GetSystemImage("icloud.and.arrow.up"), null, _ => UploadTo(target, path, false)));
++        if (e.Cloud != null)
++            items.Add(UIAction.Create("Remove download (stays in the cloud)", UIImage.GetSystemImage("icloud.slash"), null, _ => RemoveGameDownload(e.Name)));
++        return UIMenu.Create(items.ToArray());
++    }
++
++    private sealed class ShelfMenuDelegate : UIContextMenuInteractionDelegate
++    {
++        private readonly Func<UIMenu> make;
++        public ShelfMenuDelegate(Func<UIMenu> make) => this.make = make;
++        public override UIContextMenuConfiguration GetConfigurationForMenu(UIContextMenuInteraction interaction, CGPoint location)
++            => UIContextMenuConfiguration.Create(null, null, _ => make());
++    }
++
++    private void ShelfLongPress(UIView view, LibraryEntry e, List<ShelfAct> acts, UiFacts facts)
++    {
++        var d = new ShelfMenuDelegate(() => ShelfMenu(e, acts, facts));
++        shelfKeep.Add(d);
++        view.AddInteraction(new UIContextMenuInteraction(d));
++    }
++
++    private UIView ShelfTile(LibraryEntry e, UiFacts facts)
++    {
++        var acts = ShelfActions(e, facts, out var chipText, out var tone);
++        var tile = new UIControl { AccessibilityIdentifier = "game-tile" };
++        var cover = new CoverView { UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        cover.Set(e.Icon, GameAppUi.DisplayName(e.Name), false, CoverFraction(e.Name, facts));
++        cover.HeightAnchor.ConstraintEqualTo(cover.WidthAnchor).Active = true;
++        var name = Theme.Label(GameAppUi.DisplayName(e.Name), Theme.Font(15, UIFontWeight.Semibold), Theme.Text, 2);
++        var meta = Theme.Label(ShelfMeta(e), Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
++        var info = Theme.Column(8, cover, Theme.Column(2, name, meta));
++        info.UserInteractionEnabled = false;
++        // The buttons sit one under the other: a tile is about 165 pt wide and "Export IPA" must fit in its button
++        var tint = TintOf(e.Icon, GameAppUi.DisplayName(e.Name));
++        var buttons = Theme.Column(8, acts.Select(a => (UIView) ShelfActButton(a, false, !facts.Running || a.Title == "Watch the build", tint)).ToArray());
++        foreach (var v in new UIView[] { info, buttons }) { v.TranslatesAutoresizingMaskIntoConstraints = false; tile.AddSubview(v); }
++        var constraints = new List<NSLayoutConstraint>
++        {
++            info.TopAnchor.ConstraintEqualTo(tile.TopAnchor), info.LeadingAnchor.ConstraintEqualTo(tile.LeadingAnchor), info.TrailingAnchor.ConstraintEqualTo(tile.TrailingAnchor),
++            buttons.TopAnchor.ConstraintEqualTo(info.BottomAnchor, 10), buttons.LeadingAnchor.ConstraintEqualTo(tile.LeadingAnchor), buttons.TrailingAnchor.ConstraintEqualTo(tile.TrailingAnchor),
++            buttons.BottomAnchor.ConstraintEqualTo(tile.BottomAnchor),
++        };
++        if (chipText != null)
++        {
++            var chip = ShelfChip(chipText, tone);
++            tile.AddSubview(chip);
++            constraints.Add(chip.TopAnchor.ConstraintEqualTo(cover.TopAnchor, 10));
++            constraints.Add(chip.LeadingAnchor.ConstraintEqualTo(cover.LeadingAnchor, 10));
++        }
++        NSLayoutConstraint.ActivateConstraints(constraints.ToArray());
++        tile.AccessibilityLabel = GameAppUi.DisplayName(e.Name) + (chipText != null ? ", " + chipText : "");
++        tile.TouchUpInside += (_, __) => ShowGameSheet(e);
++        ShelfLongPress(tile, e, acts, facts);
++        return tile;
++    }
++
++    private UIView ShelfRow(LibraryEntry e, UiFacts facts)
++    {
++        var acts = ShelfActions(e, facts, out var chipText, out var tone);
++        var row = new UIControl { AccessibilityIdentifier = "game-row" };   // flat: no card, a hairline under it (a list, not a stack of bubbles)
++        var cover = new CoverView { UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        cover.Set(e.Icon, GameAppUi.DisplayName(e.Name), false, CoverFraction(e.Name, facts));
++        cover.WidthAnchor.ConstraintEqualTo(58).Active = true;
++        cover.HeightAnchor.ConstraintEqualTo(58).Active = true;
++        var name = Theme.Label(GameAppUi.DisplayName(e.Name), Theme.Font(15, UIFontWeight.Semibold), Theme.Text, 2);
++        var meta = Theme.Label(ShelfMeta(e), Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
++        var texts = new List<UIView> { name, meta };
++        if (chipText != null) texts.Add(Theme.Label(chipText, Theme.Font(12, UIFontWeight.Semibold), tone));
++        var textColumn = Theme.Column(2, texts.ToArray());
++        textColumn.SetContentCompressionResistancePriority(1, UILayoutConstraintAxis.Horizontal);
++        textColumn.SetContentHuggingPriority(1, UILayoutConstraintAxis.Horizontal);
++        var info = Theme.Row(12, cover, textColumn);
++        info.UserInteractionEnabled = false;
++        bool compact = acts.Count > 1;
++        var tint = TintOf(e.Icon, GameAppUi.DisplayName(e.Name));
++        var buttons = Theme.Row(8, acts.Select(a => (UIView) ShelfActButton(a, compact, !facts.Running || a.Title == "Watch the build", tint)).ToArray());
++        buttons.SetContentHuggingPriority(1000, UILayoutConstraintAxis.Horizontal);
++        buttons.SetContentCompressionResistancePriority(1000, UILayoutConstraintAxis.Horizontal);
++        var line = Theme.Row(10, info, buttons);
++        line.TranslatesAutoresizingMaskIntoConstraints = false;
++        row.AddSubview(line);
++        var rule = new UIView { BackgroundColor = UIColor.FromWhiteAlpha(1f, 0.08f), UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        row.AddSubview(rule);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            line.TopAnchor.ConstraintEqualTo(row.TopAnchor, 12), line.BottomAnchor.ConstraintEqualTo(row.BottomAnchor, -12),
++            line.LeadingAnchor.ConstraintEqualTo(row.LeadingAnchor), line.TrailingAnchor.ConstraintEqualTo(row.TrailingAnchor),
++            rule.LeadingAnchor.ConstraintEqualTo(row.LeadingAnchor, 70), rule.TrailingAnchor.ConstraintEqualTo(row.TrailingAnchor),
++            rule.BottomAnchor.ConstraintEqualTo(row.BottomAnchor), rule.HeightAnchor.ConstraintEqualTo(1),
++        });
++        row.AccessibilityLabel = GameAppUi.DisplayName(e.Name) + (chipText != null ? ", " + chipText : "");
++        row.TouchUpInside += (_, __) => ShowGameSheet(e);
++        ShelfLongPress(row, e, acts, facts);
++        return row;
++    }
++
++    private UIView ShelfAddTile(bool list)
++    {
++        var add = new UIControl { AccessibilityIdentifier = "add-game", AccessibilityLabel = "Add a game" };
++        var plus = Theme.Symbol("plus", 28, Theme.Muted);
++        var box = new UIView { UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        box.Layer.CornerRadius = 22;
++        box.Layer.BorderWidth = 1.5f;
++        box.Layer.BorderColor = UIColor.FromWhiteAlpha(1f, 0.22f).CGColor;
++        box.AddSubview(plus);
++        plus.CenterXAnchor.ConstraintEqualTo(box.CenterXAnchor).Active = true;
++        plus.CenterYAnchor.ConstraintEqualTo(box.CenterYAnchor).Active = true;
++        var name = Theme.Label("Add a game", Theme.Font(15, UIFontWeight.Semibold), Theme.Text);
++        var meta = Theme.Label("In the Build tab", Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
++        var texts = Theme.Column(2, name, meta);
++        var stack = list ? Theme.Row(12, box, texts) : Theme.Column(8, box, texts);
++        stack.UserInteractionEnabled = false;
++        stack.TranslatesAutoresizingMaskIntoConstraints = false;
++        add.AddSubview(stack);
++        var constraints = new List<NSLayoutConstraint>
++        {
++            stack.TopAnchor.ConstraintEqualTo(add.TopAnchor), stack.LeadingAnchor.ConstraintEqualTo(add.LeadingAnchor),
++            stack.TrailingAnchor.ConstraintEqualTo(add.TrailingAnchor), stack.BottomAnchor.ConstraintEqualTo(add.BottomAnchor),
++        };
++        if (list) { constraints.Add(box.WidthAnchor.ConstraintEqualTo(58)); constraints.Add(box.HeightAnchor.ConstraintEqualTo(58)); box.Layer.CornerRadius = 14; }
++        else constraints.Add(box.HeightAnchor.ConstraintEqualTo(box.WidthAnchor));
++        NSLayoutConstraint.ActivateConstraints(constraints.ToArray());
++        add.TouchUpInside += (_, __) => ShowTab(7);
++        return add;
++    }
++
++    private void RefreshShelf(UiFacts facts, IReadOnlyList<string> games)
++    {
++        if (shelfTiles == null) return;
++        // What is missing before anything can run: one tappable row each, as before.
++        foreach (var row in banner.ArrangedSubviews.ToArray()) { banner.RemoveArrangedSubview(row); row.RemoveFromSuperview(); }
++        foreach (var need in GameAppUi.Prerequisites(facts))
++        {
++            var importer = need.Importer;
++            var view = new BannerView(ChecklistLabel(need.Row), need.Row.Level == CheckLevel.Missing ? UIColor.SystemRed : UIColor.SystemOrange);
++            view.AccessibilityLabel = $"{need.Row.Label}: {need.Row.Detail}";
++            view.AccessibilityIdentifier = importer == GameAppUi.Importer.Keys ? "banner-keys" : "banner-certificate";
++            view.TouchUpInside += (_, __) => { if (importer == GameAppUi.Importer.Keys) Import(); else ImportCertificate(); };
++            banner.AddArrangedSubview(view);
++        }
++        AddKilledBanner();   // GameAppResume.cs: "iOS ended the last build (memory). Resume"
++        banner.Hidden = banner.ArrangedSubviews.Length == 0;
++
++        var localNames = Dumps().Select(Path.GetFileName).ToList();
++        var list = games.Select(g => new LibraryEntry(g, Cloud.CloudCopyOf(g, cloudFiles), CoverOf(g, facts))).ToList();
++        list.AddRange(Cloud.CloudOnlyGames(localNames, cloudFiles).Select(f => new LibraryEntry(f.Name, f, CoverOf(f.Name, facts))));
++        entries = list;   // the cloud-only ones too: the download flows look a game up there
++        if (selected == null || !entries.Any(e => e.Name == selected)) selected = entries.FirstOrDefault()?.Name;
++        if (currentTint == null) { currentTint = Theme.DefaultTint; ambient.SetTint(currentTint, false); }
++
++        var shown = list.Where(e => !IsCloudOnly(e.Name)).ToList();
++        shelfSubtitle.Text = $"{shown.Count} game{(shown.Count == 1 ? "" : "s")} · {GameAppUi.SizeText(FreeBytes())} free";
++        bool grid = shelfView == "grid";
++        void Lit(UIButton b, bool on) { b.BackgroundColor = on ? UIColor.FromWhiteAlpha(1f, 0.16f) : UIColor.Clear; b.TintColor = on ? Theme.Text : Theme.Muted; }
++        Lit(shelfGridButton, grid);
++        Lit(shelfListButton, !grid);
++
++        shelfKeep.Clear();
++        foreach (var v in shelfTiles.ArrangedSubviews.ToArray()) { shelfTiles.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        if (grid)
++        {
++            var cells = shown.Select(e => ShelfTile(e, facts)).ToList();
++            if (!GameExport.IsPlayer) cells.Add(ShelfAddTile(false));
++            for (int i = 0; i < cells.Count; i += 2)
++            {
++                var pair = new UIStackView(new UIView[] { cells[i], i + 1 < cells.Count ? cells[i + 1] : new UIView() })
++                    { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = 14, Alignment = UIStackViewAlignment.Top };
++                shelfTiles.AddArrangedSubview(pair);
++            }
++        }
++        else
++        {
++            var rows = new UIStackView { Axis = UILayoutConstraintAxis.Vertical, Spacing = 0 };
++            foreach (var e in shown) rows.AddArrangedSubview(ShelfRow(e, facts));
++            rows.AddArrangedSubview(ShelfAddTile(true));
++            shelfTiles.AddArrangedSubview(rows);
++        }
++
++        int appCount = FillApps(appsList);
++        appsTitle.Hidden = shelfAppsCard.Hidden = appCount == 0;
++    }
++
++    // ---- Build -------------------------------------------------------------------------------------------------
++
++    private UILabel buildSub, buildNowLine, cloudNote;
++    private UISegmentedControl buildFilter;
++    private UIProgressView buildNowBar;
++    private UIView buildNowCard, buildQueueSection, phoneSection, cloudSection, phoneCard, cloudCard;
++    private UIStackView phoneList, cloudList;
++
++    private static UILabel SectionLabel(string text) => Theme.Label(text, Theme.Font(11, UIFontWeight.Semibold), Theme.Muted);
++
++    private void BuildBuildTab()
++    {
++        var title = Theme.Label("Build", Theme.Rounded(34, UIFontWeight.Bold), Theme.Text);
++        title.AccessibilityTraits = UIAccessibilityTrait.Header;
++        buildSub = Theme.Label("", Theme.Font(13, UIFontWeight.Regular), Theme.Muted);
++        var refresh = Theme.Round("arrow.triangle.2.circlepath", "Refresh the cloud");
++        refresh.TouchUpInside += (_, __) => RefreshCloud(null);
++        var plus = Theme.Round("plus", "Add a game file");
++        plus.AccessibilityIdentifier = "import-file";
++        plus.TouchUpInside += (_, __) => Import();
++        var header = Theme.Row(8, Theme.Column(4, title, buildSub), new UIView(), refresh, plus);
++        header.Alignment = UIStackViewAlignment.Top;
++
++        buildFilter = new UISegmentedControl(new[] { "All", "On this phone", "Cloud" }) { SelectedSegment = 0, AccessibilityIdentifier = "build-filter" };
++        buildFilter.SelectedSegmentTintColor = UIColor.FromWhiteAlpha(1f, 0.2f);
++        buildFilter.SetTitleTextAttributes(new UIStringAttributes { ForegroundColor = Theme.Text, Font = Theme.Font(13, UIFontWeight.Semibold) }, UIControlState.Normal);
++        buildFilter.ValueChanged += (_, __) => RefreshBuildTab(GatherFacts());
++
++        buildNowLine = Theme.Label("", Theme.Font(13, UIFontWeight.Semibold), Theme.Text, 0);
++        buildNowBar = new UIProgressView(UIProgressViewStyle.Default) { ProgressTintColor = Theme.Accent, TrackTintColor = UIColor.FromWhiteAlpha(1f, 0.14f) };
++        var watch = Theme.Pill("Watch the build", "list.bullet.rectangle", false, 44);
++        watch.TouchUpInside += (_, __) => ShowBuildScreen();
++        buildNowCard = Theme.Wrap(Theme.Column(8, buildNowLine, buildNowBar, watch), 20, 14);
++        buildNowCard.Hidden = true;
++
++        // The queue's own views (BuildQueuePage made them): the list, its note and Start/Stop
++        buildQueueSection = Theme.Column(8, SectionLabel("QUEUE"), queueCard, queueStatus, queueStart);
++        phoneList = new UIStackView { Axis = UILayoutConstraintAxis.Vertical, Spacing = 0 };
++        cloudList = new UIStackView { Axis = UILayoutConstraintAxis.Vertical, Spacing = 0 };
++        cloudNote = Theme.Label("", Theme.Font(13, UIFontWeight.Regular), Theme.Muted, 0);
++        phoneCard = phoneList;
++        cloudCard = cloudList;
++        queueCard.BackgroundColor = UIColor.Clear;   // the queue's rows (GameRowView) in a flat list as well
++        queueCard.Layer.BorderWidth = 0;
++        queueCard.Layer.CornerRadius = 0;
++        phoneSection = Theme.Column(8, SectionLabel("ON THIS " + GameAppUi.DeviceName.ToUpperInvariant()), phoneCard);
++        cloudSection = Theme.Column(8, SectionLabel("IN THE CLOUD"), cloudCard, cloudNote);
++
++        var column = Theme.Column(18, header, buildFilter, buildNowCard, buildQueueSection, phoneSection, cloudSection);
++        var scroll = new UIScrollView { AlwaysBounceVertical = true, ShowsVerticalScrollIndicator = false };
++        column.TranslatesAutoresizingMaskIntoConstraints = false;
++        scroll.AddSubview(column);
++        Theme.PinColumn(scroll, column, 4, 24);
++        Fill(pages[7], scroll, 18);
++    }
++
++    /// A row of the Build lists: the cover, the name and what is known about it, then its buttons under it.
++    private UIView BuildRow(UIImage icon, string name, string sub, bool dim, double? fraction, string chip, UIColor tone, List<ShelfAct> acts, bool enabled, bool first)
++    {
++        var holder = new UIView();
++        var cover = new CoverView { UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        cover.Set(icon, name, dim, fraction);
++        cover.WidthAnchor.ConstraintEqualTo(48).Active = true;
++        cover.HeightAnchor.ConstraintEqualTo(48).Active = true;
++        var title = Theme.Label(name, Theme.Font(15, UIFontWeight.Semibold), Theme.Text, 2);
++        var subtitle = Theme.Label(sub, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 2);
++        var texts = new List<UIView> { title, subtitle };
++        if (chip != null) texts.Add(Theme.Label(chip, Theme.Font(12, UIFontWeight.Semibold), tone));
++        var textColumn = Theme.Column(2, texts.ToArray());
++        var top = Theme.Row(12, cover, textColumn);
++        top.Alignment = UIStackViewAlignment.Top;
++        var stack = Theme.Column(10, top);
++        if (acts.Count > 0)
++        {
++            var tint = TintOf(icon, name);
++            var buttons = Theme.Row(8, acts.Select(a => (UIView) ShelfActButton(a, false, enabled, tint)).ToArray());
++            buttons.Distribution = UIStackViewDistribution.FillProportionally;
++            stack.AddArrangedSubview(buttons);
++        }
++        stack.TranslatesAutoresizingMaskIntoConstraints = false;
++        holder.AddSubview(stack);
++        var constraints = new List<NSLayoutConstraint>
++        {
++            stack.TopAnchor.ConstraintEqualTo(holder.TopAnchor, 12), stack.BottomAnchor.ConstraintEqualTo(holder.BottomAnchor, -12),
++            stack.LeadingAnchor.ConstraintEqualTo(holder.LeadingAnchor), stack.TrailingAnchor.ConstraintEqualTo(holder.TrailingAnchor),
++        };
++        if (true)   // a hairline above every row, the first one too: it closes the section's title
++        {
++            var line = new UIView { BackgroundColor = UIColor.FromWhiteAlpha(1f, 0.08f), TranslatesAutoresizingMaskIntoConstraints = false };
++            holder.AddSubview(line);
++            constraints.Add(line.TopAnchor.ConstraintEqualTo(holder.TopAnchor));
++            constraints.Add(line.LeadingAnchor.ConstraintEqualTo(holder.LeadingAnchor));
++            constraints.Add(line.TrailingAnchor.ConstraintEqualTo(holder.TrailingAnchor));
++            constraints.Add(line.HeightAnchor.ConstraintEqualTo(1));
++        }
++        NSLayoutConstraint.ActivateConstraints(constraints.ToArray());
++        holder.AccessibilityLabel = name + (chip != null ? ", " + chip : "") + ", " + sub;
++        return holder;
++    }
++
++    private UIMenu ContentMenu(string game, UiFacts facts)
++    {
++        var names = Dumps().Select(Path.GetFileName).ToList();
++        var inCloud = GameAppUi.RelatedContent(game, cloudFiles.Select(f => f.Name)).Where(n => !names.Contains(n, StringComparer.OrdinalIgnoreCase)).ToList();
++        var items = new List<UIMenuElement>
++        {
++            UIAction.Create("Add files… (pick several)", UIImage.GetSystemImage("doc.badge.plus"), null, _ => Import()),
++            UIAction.Create("Find them in a folder…", UIImage.GetSystemImage("folder.badge.questionmark"), null, _ =>
++            {
++                var picker = new UIDocumentPickerViewController(new[] { "public.folder" }, UIDocumentPickerMode.Open);
++                picker.Delegate = new FolderPickerDelegate(url => ScanFolderForContent(game, url));
++                PresentWhenFree(picker);
++            }),
++        };
++        if (inCloud.Count > 0)
++            items.Add(UIAction.Create($"Download {inCloud.Count} from the cloud", UIImage.GetSystemImage("icloud.and.arrow.down"), null, _ =>
++                Download(inCloud.Select(n => Cloud.CloudCopyOf(n, cloudFiles)).Where(f => f != null).ToList(), GameAppMain.Documents)));
++        return UIMenu.Create(items.ToArray());
++    }
++
++    /// The game is on this phone after a download: it joins the queue, which starts if it is not going.
++    private void QueueNow(string game)
++    {
++        if (!File.Exists(Path.Combine(GameAppMain.Documents, game))) return;
++        BuildQueue.Add(buildQueue, game);
++        SaveBuildQueue();
++        if (!queueWanted) ToggleQueue();
++        RefreshScreen();   // a build that is refused at once (no keys) has already ended the queue: the Build tab shows it
++    }
++
++    private void RefreshBuildTab(UiFacts facts)
++    {
++        if (buildSub == null) return;
++        int filter = (int) buildFilter.SelectedSegment;   // 0 all, 1 on this phone, 2 cloud
++        var localNames = Dumps().Select(Path.GetFileName).ToList();
++        var phone = (facts.Games ?? new List<string>()).ToList();
++        var cloud = GameExport.IsPlayer ? new List<CloudFile>() : Cloud.CloudOnlyGames(localNames, cloudFiles);
++        buildSub.Text = $"{phone.Count} on this {GameAppUi.DeviceName}" + (cloud.Count > 0 ? $" · {cloud.Count} in the cloud" : "") + (buildQueue.Items.Count > 0 ? $" · {buildQueue.Items.Count} queued" : "");
++
++        // Now: the build that is running
++        buildNowCard.Hidden = !running;
++        if (running)
++        {
++            var s = GameAppUi.ParseStage(lastStage);
++            var step = GameAppUi.BuildSteps(lastStage, stepStarts, DateTime.Now).FirstOrDefault(r => r.State == GameAppUi.StepState.Now);
++            buildNowLine.Text = $"{GameAppUi.DisplayName(selected ?? "")} · {Math.Round(s.Fraction * 100):0}% · {step?.Name ?? "Starting"} · {GameAppUi.FormatElapsed(DateTime.Now - startedAt)}";
++            buildNowBar.Progress = (float) Math.Max(0.02, s.Fraction);
++        }
++        buildQueueSection.Hidden = buildQueue.Items.Count == 0 && !queueWanted;
++
++        // On this phone
++        foreach (var v in phoneList.ArrangedSubviews.ToArray()) { phoneList.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        for (int i = 0; i < phone.Count; i++)
++        {
++            var name = phone[i];
++            bool ready = GameAppUi.GameStatusOf(name, facts) == GameAppUi.GameStatus.Ready;
++            bool update = ready && GameAppUi.ContentChangedSinceBuild(name, localNames, facts);
++            bool isBase = GameAppUi.ContentKindOf(name) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(name);
++            var acts = new List<ShelfAct>();
++            var frac = CoverFraction(name, facts);
++            string chip; UIColor tone;
++            if (running && frac != null) { chip = $"Building {Math.Round(frac.Value * 100):0}%"; tone = Theme.Accent; }
++            else
++            {
++                var more = new List<UIMenuElement>();
++                if (!ready) { chip = "Not built yet"; tone = Theme.Warn; acts.Add(new ShelfAct("Build", "hammer.fill", true, () => { selected = name; PrimaryTapped(); })); more.Add(UIAction.Create("Add to the build queue", UIImage.GetSystemImage("list.number"), null, _ => AddToBuildQueue(name))); }
++                else if (update) { chip = "Update available"; tone = Theme.Accent; acts.Add(new ShelfAct("Update", "arrow.triangle.2.circlepath", true, () => DoUpdate(name))); }
++                else { chip = "Built"; tone = Theme.Ok; acts.Add(new ShelfAct("Rebuild", "arrow.clockwise", false, () => ConfirmRebuild(name))); }
++                if (isBase) more.Add(UIMenu.Create("Update & DLC", UIImage.GetSystemImage("plus"), UIMenuIdentifier.None, UIMenuOptions.DisplayInline, ContentMenu(name, facts).Children));
++                if (more.Count > 0) acts.Add(new ShelfAct("More", "ellipsis", false, null, UIMenu.Create(more.ToArray())));
++            }
++            var cloudCopy = Cloud.CloudCopyOf(name, cloudFiles);
++            phoneList.AddArrangedSubview(BuildRow(CoverOf(name, facts), GameAppUi.DisplayName(name), GameAppUi.SizeText(SafeLength(Path.Combine(GameAppMain.Documents, name))) + (cloudCopy != null ? " · also in the cloud" : ""),
++                                                  false, frac, chip, tone, acts, !facts.Running, i == 0));
++        }
++        if (phone.Count == 0) phoneList.AddArrangedSubview(Theme.Label("No game on this " + GameAppUi.DeviceName + " yet. Tap + to import a .nsp, .xci, .nsz or .nup, or pick one in the cloud.", Theme.Font(14, UIFontWeight.Regular), Theme.Muted, 0));
++        phoneSection.Hidden = filter == 2;
++        phoneCard.Hidden = false;   // it holds the "no game yet" line when there is none
++
++        // In the cloud
++        foreach (var v in cloudList.ArrangedSubviews.ToArray()) { cloudList.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        for (int i = 0; i < cloud.Count; i++)
++        {
++            var f = cloud[i];
++            var entry = entries.FirstOrDefault(x => x.Name == f.Name) ?? new LibraryEntry(f.Name, f, CoverOf(f.Name, facts));
++            bool busy = downloads.TryGetValue(f.Name, out var d);
++            var acts = new List<ShelfAct>();
++            string chip = null; UIColor tone = Theme.Accent;
++            if (busy) chip = $"Downloading {Math.Round(d * 100):0}%";
++            else
++            {
++                acts.Add(new ShelfAct("Download and build", "hammer.fill", true, () => DownloadAndBuild(entry)));
++                acts.Add(new ShelfAct("Download", "arrow.down.to.line", false, () => { selected = entry.Name; DownloadSelected(); }));
++            }
++            cloudList.AddArrangedSubview(BuildRow(entry.Icon, GameAppUi.DisplayName(f.Name), Cloud.Where(f, cloudSources),   // already says the source and the size
++                                                  false, busy ? (double?) Math.Max(0.02, d) : null, chip, tone, acts, !facts.Running || busy, i == 0));
++        }
++        cloudNote.Text = cloudSources.Count == 0 ? "No cloud source yet. Settings › Cloud adds a NAS or a folder (iCloud Drive, Google Drive…)."
++                       : cloud.Count == 0 ? "Everything in your cloud sources is already on this " + GameAppUi.DeviceName + "." : "";
++        cloudNote.Hidden = cloudNote.Text.Length == 0;
++        cloudCard.Hidden = cloud.Count == 0;
++        cloudSection.Hidden = filter == 1 || (cloud.Count == 0 && cloudSources.Count > 0 && filter == 0);
++    }
++
++    private void DownloadAndBuild(LibraryEntry e)
++    {
++        if (e.Cloud == null || downloads.ContainsKey(e.Name)) return;
++        selected = e.Name;
++        var local = Dumps().Select(Path.GetFileName).ToList();
++        var set = Cloud.DownloadSet(e.Name, e.Cloud.SourceId, cloudFiles, local);
++        if (set.Count == 0) set = new List<CloudFile> { e.Cloud };
++        Download(set, GameAppMain.Documents, key => QueueNow(e.Name));
++    }
++    // ---- Settings (the design's cards: rows of a name, a value and a chevron) --------------------------------------
++
++    private sealed class SettingsRowRef { public UIButton Button; public UILabel Value; public UIView Dot; public UILabel Title; }
++    private SettingsRowRef setPlay, setMemory, setExtended, setKeys, setCert, setCloud, setLogs;
++    private bool settingsShelf;
++
++    private static UIView Hairline()
++    {
++        var d = new UIView { BackgroundColor = UIColor.FromWhiteAlpha(1f, 0.08f) };
++        d.HeightAnchor.ConstraintEqualTo(1).Active = true;
++        return d;
++    }
++
++    /// A flat list: a hairline above, between and under the rows (no card, no rounded corners).
++    private static UIView SettingsCard(params UIView[] rows)
++    {
++        var views = new List<UIView> { Hairline() };
++        foreach (var r in rows) { views.Add(r); views.Add(Hairline()); }
++        return Theme.Column(0, views.ToArray());
++    }
++
++    private static UIView SettingsPad(UIView view, nfloat vertical)
++    {
++        var holder = new UIView();
++        view.TranslatesAutoresizingMaskIntoConstraints = false;
++        holder.AddSubview(view);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            view.TopAnchor.ConstraintEqualTo(holder.TopAnchor, vertical), view.BottomAnchor.ConstraintEqualTo(holder.BottomAnchor, -vertical),
++            view.LeadingAnchor.ConstraintEqualTo(holder.LeadingAnchor), view.TrailingAnchor.ConstraintEqualTo(holder.TrailingAnchor),
++        });
++        return holder;
++    }
++
++    private SettingsRowRef SettingsRow(string title, Action tap, bool chevron, bool dot, int navPage = -1, string id = null)
++    {
++        var b = new UIButton(UIButtonType.System) { AccessibilityIdentifier = id };
++        var label = Theme.Label(title, Theme.Font(16, UIFontWeight.Medium), Theme.Text);
++        label.SetContentCompressionResistancePriority(1000, UILayoutConstraintAxis.Horizontal);
++        var value = Theme.Label("", Theme.Font(14, UIFontWeight.Regular), Theme.Muted);
++        value.TextAlignment = UITextAlignment.Right;
++        value.LineBreakMode = UILineBreakMode.TailTruncation;
++        value.SetContentCompressionResistancePriority(250, UILayoutConstraintAxis.Horizontal);
++        var dotView = new UIView { BackgroundColor = Theme.Muted, Hidden = !dot, TranslatesAutoresizingMaskIntoConstraints = false };
++        dotView.Layer.CornerRadius = 4;
++        dotView.WidthAnchor.ConstraintEqualTo(8).Active = true;
++        dotView.HeightAnchor.ConstraintEqualTo(8).Active = true;
++        var views = new List<UIView> { label, new UIView(), dotView, value };
++        if (chevron) views.Add(Theme.Symbol("chevron.right", 13, Theme.Dim));
++        var row = Theme.Row(10, views.ToArray());
++        row.UserInteractionEnabled = false;
++        row.TranslatesAutoresizingMaskIntoConstraints = false;
++        b.AddSubview(row);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            row.TopAnchor.ConstraintEqualTo(b.TopAnchor, 13), row.BottomAnchor.ConstraintEqualTo(b.BottomAnchor, -13),
++            row.LeadingAnchor.ConstraintEqualTo(b.LeadingAnchor), row.TrailingAnchor.ConstraintEqualTo(b.TrailingAnchor),
++            b.HeightAnchor.ConstraintGreaterThanOrEqualTo(48),
++        });
++        if (tap != null) b.TouchUpInside += (_, __) => tap(); else b.UserInteractionEnabled = false;
++        if (navPage >= 0) navRows[navPage] = b;
++        b.AccessibilityLabel = title;
++        return new SettingsRowRef { Button = b, Value = value, Dot = dotView, Title = label };
++    }
++
++    private static UIView SettingsSwitchRow(string title, string caption, UISwitch toggle)
++    {
++        var texts = Theme.Column(2, Theme.Label(title, Theme.Font(16, UIFontWeight.Medium), Theme.Text, 0), Theme.Label(caption, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0));
++        var row = Theme.Row(12, texts, toggle);
++        toggle.SetContentHuggingPriority(1000, UILayoutConstraintAxis.Horizontal);
++        toggle.SetContentCompressionResistancePriority(1000, UILayoutConstraintAxis.Horizontal);
++        var holder = new UIView();
++        row.TranslatesAutoresizingMaskIntoConstraints = false;
++        holder.AddSubview(row);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            row.TopAnchor.ConstraintEqualTo(holder.TopAnchor, 12), row.BottomAnchor.ConstraintEqualTo(holder.BottomAnchor, -12),
++            row.LeadingAnchor.ConstraintEqualTo(holder.LeadingAnchor), row.TrailingAnchor.ConstraintEqualTo(holder.TrailingAnchor),
++        });
++        return holder;
++    }
++
++    private void ClearShaderCache()
++    {
++        var alert = UIAlertController.Create("Clear the shader cache?",
++            $"Frees {GameAppUi.SizeText(ShaderCacheBytes())}. Games already built keep their shaders; the next builds translate every shader again.", UIAlertControllerStyle.Alert);
++        alert.AddAction(UIAlertAction.Create("Clear", UIAlertActionStyle.Destructive, _ =>
++        {
++            try { if (Directory.Exists(ShaderCachePath)) Directory.Delete(ShaderCachePath, true); Write("shader cache cleared"); }
++            catch (Exception error) { Write($"could not clear the shader cache: {error.Message}"); }
++            RefreshCacheSize();
++        }));
++        alert.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(alert);
++    }
++
++    private void BuildSettingsShelf()
++    {
++        settingsShelf = true;
++        var title = Theme.Label("Settings", Theme.Rounded(34, UIFontWeight.Bold), Theme.Text);
++        title.AccessibilityTraits = UIAccessibilityTrait.Header;
++
++        setPlay = SettingsRow("Play inside iBuilder", () => ShowTab(2), true, true, 2, "settings-play");
++        setMemory = SettingsRow("Memory limit", () => ShowTab(2), true, true);
++        setExtended = SettingsRow("Extended addressing", () => ShowTab(2), true, true);
++        var installCard = SettingsCard(setPlay.Button, setMemory.Button, setExtended.Button);
++        var installNote = Theme.Label("A development certificate lets a game run inside iBuilder. With a distribution certificate, export a game and install it as its own app.",
++                                      Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
++
++        setKeys = SettingsRow("prod.keys", () => { var f = GatherFacts(); if (f.HasKeys) ShowTab(2); else Import(); }, true, true, -1, "settings-keys");
++        setCert = SettingsRow("Signing certificate", () => { if (GameAppMain.IdentityState().Holding == 1) ShowTab(2); else ImportCertificate(); }, true, true, -1, "settings-certificate");
++        var keysCard = SettingsCard(setKeys.Button, setCert.Button);
++
++        setCloud = SettingsRow("Cloud sources", () => ShowTab(1), true, false, 1, "settings-cloud");
++        var cloudCard = SettingsCard(setCloud.Button);
++
++        var storageCard = SettingsCard(SettingsPad(settingsStorage, 14));
++        cacheSizeLabel = Theme.Label("", Theme.Font(16, UIFontWeight.Medium), Theme.Text);
++        RefreshCacheSize();
++        var clear = ShelfButton("Clear", null, false, false, true);
++        clear.AccessibilityIdentifier = "clear-shader-cache";
++        clear.TouchUpInside += (_, __) => ClearShaderCache();
++        clear.SetContentHuggingPriority(1000, UILayoutConstraintAxis.Horizontal);
++        var cacheRow = Theme.Row(12, cacheSizeLabel, new UIView(), clear);
++        var cacheHolder = new UIView();
++        cacheRow.TranslatesAutoresizingMaskIntoConstraints = false;
++        cacheHolder.AddSubview(cacheRow);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            cacheRow.TopAnchor.ConstraintEqualTo(cacheHolder.TopAnchor, 8), cacheRow.BottomAnchor.ConstraintEqualTo(cacheHolder.BottomAnchor, -8),
++            cacheRow.LeadingAnchor.ConstraintEqualTo(cacheHolder.LeadingAnchor), cacheRow.TrailingAnchor.ConstraintEqualTo(cacheHolder.TrailingAnchor),
++        });
++
++        var parallel = new UISwitch { On = GameAppUi.ParallelShadersOn(ReadAppSettings()), AccessibilityIdentifier = "setting-parallel-shaders", OnTintColor = Theme.Accent };
++        parallel.ValueChanged += (_, __) =>
++        {
++            try
++            {
++                File.WriteAllText(AppSettingsPath, GameAppUi.WithAppSetting(ReadAppSettings(), "parallel_shaders", parallel.On ? "1" : "0"));
++                Write($"build setting: parallel shader preparation {(parallel.On ? "on" : "off")} (from the next build)");
++            }
++            catch (Exception error) { Write($"could not save the build setting: {error.Message}"); }
++        };
++        var lowPerf = new UISwitch { On = GameAppUi.LowPerformanceOn(ReadAppSettings()), AccessibilityIdentifier = "setting-low-performance", OnTintColor = Theme.Accent };
++        lowPerf.ValueChanged += (_, __) =>
++        {
++            try
++            {
++                File.WriteAllText(AppSettingsPath, GameAppUi.WithAppSetting(ReadAppSettings(), "low_performance", lowPerf.On ? "1" : "0"));
++                Write($"build setting: low performance {(lowPerf.On ? "on: at most 2 jobs at once" : "off")} (it applies to a build that is running too)");
++                if (running) WriteThermalFile();
++            }
++            catch (Exception error) { Write($"could not save the build setting: {error.Message}"); }
++        };
++        var buildCard = SettingsCard(
++            SettingsSwitchRow("Parallel shader preparation", "Uses every core while a build translates the shaders. Applies from the next build.", parallel),
++            SettingsSwitchRow("Low performance", "Cooler and slower: at most two jobs at once, also in a build that is running.", lowPerf),
++            cacheHolder);
++
++        setLogs = SettingsRow("Logs", () => ShowTab(3), true, false, 3, "settings-logs");
++        var share = SettingsRow("Share the logs", ExportLogs, true, false, -1, "settings-share-logs");
++        var hidden = SettingsRow("Hidden diagnostics", null, false, false);
++        hidden.Value.Text = "On";
++        var build = SettingsRow("Build", null, false, false);
++        build.Value.Text = GameAppBuild.Id;
++        var diagCard = SettingsCard(setLogs.Button, share.Button, hidden.Button, build.Button);
++
++        UIView[] column = {
++            title,
++            SectionLabel("THIS " + GameAppUi.DeviceName.ToUpperInvariant()), installCard, installNote,
++            SectionLabel("KEYS AND CERTIFICATE"), keysCard,
++            SectionLabel("CLOUD"), cloudCard,
++            SectionLabel("STORAGE"), storageCard,
++            SectionLabel("BUILD"), buildCard,
++            SectionLabel("DIAGNOSTICS"), diagCard,
++        };
++        var stack = Theme.Column(8, column);
++        stack.SetCustomSpacing(10, title);
++        foreach (var v in new UIView[] { installNote, keysCard, cloudCard, storageCard, buildCard }) stack.SetCustomSpacing(20, v);
++        var scroll = new UIScrollView { AlwaysBounceVertical = true, ShowsVerticalScrollIndicator = false };
++        stack.TranslatesAutoresizingMaskIntoConstraints = false;
++        scroll.AddSubview(stack);
++        Theme.PinColumn(scroll, stack, 4, 24);
++        Fill(pages[4], scroll, 18);
++    }
++
++    private void RefreshSettingsShelf(UiFacts facts)
++    {
++        var checklist = GameAppUi.Checklist(facts);
++        ChecklistRow Row(string label) => checklist.FirstOrDefault(r => r.Label == label);
++        void Set(SettingsRowRef r, string text, UIColor tone) { r.Value.Text = text; r.Dot.BackgroundColor = tone ?? Theme.Muted; r.Dot.Hidden = tone == null; }
++        var play = Row("Play inside iBuilder");
++        Set(setPlay, play == null ? "—" : play.Level == CheckLevel.Ok ? "Yes" : "No", play == null ? null : play.Level == CheckLevel.Ok ? Theme.Ok : Theme.Warn);
++        Set(setMemory, facts.AvailableMiB >= 0 ? $"{facts.AvailableMiB / 1024.0:0.0} GB" : "—", facts.AvailableMiB >= 0 ? (facts.AvailableMiB >= 3500 ? Theme.Ok : Theme.Warn) : null);
++        Set(setExtended, facts.ExtendedAddressing < 0 ? "—" : facts.ExtendedAddressing > 0 ? "Yes" : "No", facts.ExtendedAddressing < 0 ? null : facts.ExtendedAddressing > 0 ? Theme.Ok : Theme.Warn);
++        var keys = Row("prod.keys");
++        Set(setKeys, keys?.Level == CheckLevel.Ok ? "Found" : "Missing", keys?.Level == CheckLevel.Ok ? Theme.Ok : Theme.Error);
++        var cert = Row("Signing certificate");
++        Set(setCert, cert?.Level == CheckLevel.Ok ? "In the Keychain" : "Missing", cert?.Level == CheckLevel.Ok ? Theme.Ok : Theme.Error);
++        var sources = cloudSources;
++        setCloud.Value.Text = sources.Count == 0 ? "Not set up" : string.Join(" · ", sources.Select(x => x.Kind == CloudKind.Nas ? "NAS" : Cloud.ProviderName(x.Location)).Distinct());
++        setLogs.Value.Text = logErrors > 0 ? $"{logErrors} error{(logErrors == 1 ? "" : "s")}" : "";
++        setLogs.Value.TextColor = logErrors > 0 ? Theme.Error : Theme.Muted;
++        settingsStorage.Set(CurrentStorageSegments());
++    }
++
++    // ---- The game's sheet (a tap on a tile or a row): the design's "Game sheet" ------------------------------------
++
++    private static UIView SheetChip(string text, UIColor tone)
++    {
++        var label = Theme.Label(text, Theme.Font(11, UIFontWeight.Semibold), tone);
++        label.TranslatesAutoresizingMaskIntoConstraints = false;
++        var chip = new UIView { BackgroundColor = tone.ColorWithAlpha(0.16f), TranslatesAutoresizingMaskIntoConstraints = false };
++        chip.Layer.CornerRadius = 11;
++        chip.AddSubview(label);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            label.TopAnchor.ConstraintEqualTo(chip.TopAnchor, 4), label.BottomAnchor.ConstraintEqualTo(chip.BottomAnchor, -4),
++            label.LeadingAnchor.ConstraintEqualTo(chip.LeadingAnchor, 10), label.TrailingAnchor.ConstraintEqualTo(chip.TrailingAnchor, -10),
++        });
++        return chip;
++    }
++
++    private void ShowGameSheet(LibraryEntry e, bool openSettings = false)
++    {
++        if (running || e == null) return;
++        var game = e.Name;
++        selected = game;
++        var facts = GatherFacts();
++        var name = GameAppUi.DisplayName(game);
++        var vc = new UIViewController();
++        vc.View.BackgroundColor = Theme.Ground;
++        var nav = new UINavigationController(vc) { NavigationBarHidden = true };   // the game's settings are a page of this sheet, not another window
++        nav.View.BackgroundColor = Theme.Ground;
++        void Then(Action act) => nav.DismissViewController(true, () => act());
++        GameAppSettingsViewController SettingsPage()
++        {
++            var page = SettingsFor(game, false);
++            page.Embedded = true;
++            return page;
++        }
++        bool ready = GameAppUi.GameStatusOf(game, facts) == GameAppUi.GameStatus.Ready;
++        var tid = GameAppUi.BaseTitleIdOf(game);
++        var docs = GameAppMain.Documents;
++        var names = Dumps().Select(Path.GetFileName).ToList();
++
++        // Header: the cover, the name, its id and what is known about it
++        var cover = new CoverView { UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        cover.Set(e.Icon, name, false, null);
++        cover.WidthAnchor.ConstraintEqualTo(84).Active = true;
++        cover.HeightAnchor.ConstraintEqualTo(84).Active = true;
++        var title = Theme.Label(name, Theme.Rounded(22, UIFontWeight.Bold), Theme.Text, 3);
++        title.AccessibilityTraits = UIAccessibilityTrait.Header;
++        var idLabel = Theme.Label(tid ?? "", Theme.Mono(12), Theme.Muted);
++        var chips = new List<UIView>();
++        var size = ShelfMeta(e);
++        if (size.Length > 0) chips.Add(SheetChip(size, Theme.Muted));
++        switch (GameAppUi.ShadersOf(game, facts))
++        {
++            case GameAppUi.ShaderState.Ready: chips.Add(SheetChip("Shaders ready", Theme.Ok)); break;
++            case GameAppUi.ShaderState.Pending: chips.Add(SheetChip("Shaders imported", Theme.Ok)); break;
++            case GameAppUi.ShaderState.Missing: chips.Add(SheetChip("Shaders built at setup", Theme.Muted)); break;
++        }
++        if (!ready) chips.Add(SheetChip("Needs setup", Theme.Warn));
++        // three chips do not fit one line beside the cover on a phone: the first two, then the rest
++        UIStackView ChipRow(IEnumerable<UIView> some) => new UIStackView(some.ToArray()) { Axis = UILayoutConstraintAxis.Horizontal, Spacing = 6, Alignment = UIStackViewAlignment.Leading };
++        var chipRows = new List<UIView> { ChipRow(chips.Take(2)) };
++        if (chips.Count > 2) chipRows.Add(ChipRow(chips.Skip(2)));
++        var texts = Theme.Column(4, new UIView[] { title, idLabel }.Concat(chipRows).ToArray());
++        texts.SetCustomSpacing(8, idLabel);
++        var head = Theme.Row(16, cover, texts);
++        head.Alignment = UIStackViewAlignment.Center;
++
++        var done = Theme.Pill("Done", null, false, 36);
++        done.AccessibilityIdentifier = "sheet-done";
++        done.TouchUpInside += (_, __) => vc.DismissViewController(true, null);
++        var top = Theme.Row(0, new UIView(), done);
++
++        // The buttons: what a tile offers, and always Export IPA once the game is built
++        var acts = ShelfActions(e, facts, out _, out _);
++        if (ready && !acts.Any(a => a.Title == "Export IPA"))
++            acts.Add(new ShelfAct("Export IPA", "square.and.arrow.up", false, () => ConfirmExport(game)));
++        var tint = TintOf(e.Icon, name);
++        var buttons = acts.Select(a =>
++        {
++            var inner = a.Do;
++            var act = a with { Do = () => Then(inner) };
++            var b = ShelfActButton(act, false, !facts.Running || a.Title == "Watch the build", tint);
++            b.HeightAnchor.ConstraintEqualTo(48).Active = true;
++            return (UIView) b;
++        }).ToList();
++        UIView actionBlock;
++        if (buttons.Count <= 2)
++        {
++            var row = Theme.Row(10, buttons.ToArray());
++            row.Distribution = UIStackViewDistribution.FillEqually;
++            actionBlock = row;
++        }
++        else
++        {
++            var first = Theme.Row(10, buttons.Take(2).ToArray());
++            first.Distribution = UIStackViewDistribution.FillEqually;
++            actionBlock = Theme.Column(10, first, buttons[2]);
++        }
++
++        // GAME
++        var gameRows = new List<UIView>();
++        gameRows.Add(SettingsRow("Game settings", () => nav.PushViewController(SettingsPage(), true), true, false, -1, "sheet-game-settings").Button);
++        if (tid != null) gameRows.Add(SettingsRow("Saves", () => Then(() => ShowSaves(game)), true, false).Button);
++        if (tid != null && !GameExport.IsPlayer) gameRows.Add(SettingsRow("Mods and cheats", () => Then(() => ShowMods(game, ready)), true, false).Button);
++        bool isBase = GameAppUi.ContentKindOf(game) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(game);
++        if (isBase)
++        {
++            var update = GameAppUi.UpdateFor(game, names);
++            var dlcs = GameAppUi.DlcFor(game, names);
++            var content = SettingsRow("Update and DLC", () => Then(Import), true, false);
++            content.Value.Text = update == null && dlcs.Count == 0 ? "None" : (update != null ? "Update" : "") + (update != null && dlcs.Count > 0 ? " · " : "") + (dlcs.Count > 0 ? $"{dlcs.Count} DLC" : "");
++            gameRows.Add(content.Button);
++        }
++
++        // SHADERS
++        UIView shadersBlock = null;
++        if (WarmOffered(game))
++        {
++            var prepare = SettingsRow("Prepare the shaders…", () => Then(() => PrepareShadersFor(game)), true, false);
++            prepare.Value.Text = GameWarm.Active ? "Running" : "";
++            shadersBlock = Theme.Column(8, SectionLabel("SHADERS"), SettingsCard(prepare.Button),
++                Theme.Label("Compiles the game's shader libraries now, in the background, so the first session does not stop to compile them. Best on a charger.", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0));
++        }
++
++        // STORAGE
++        var storage = new List<UIView>();
++        void Line(string k, string v) { var r = SettingsRow(k, null, false, false); r.Value.Text = v; storage.Add(r.Button); }
++        long gameBytes = 0; try { gameBytes = new FileInfo(Path.Combine(docs, game)).Length; } catch (Exception) { }
++        Line("Game", GameAppUi.SizeText(gameBytes));
++        if (ready) Line("Build", GameAppUi.SizeText(FolderBytes(Path.Combine(docs, "extract")) + FolderBytes(Path.Combine(docs, "DmGameProbe.framework"))));
++        if (tid != null) Line("Shaders", GameAppUi.SizeText(FolderBytes(Path.Combine(docs, "shaders", tid))));
++        Line("Free on this " + GameAppUi.DeviceName, GameAppUi.SizeText(FreeBytes()));
++
++        // MORE
++        var more = new List<UIView>();
++        var logs = SettingsRow("Logs", () => Then(() => ShareGameLogs(game, View)), true, false);
++        more.Add(logs.Button);
++        more.Add(SettingsRow("Show in Files", () => ShowInFiles(Path.Combine(docs, game)), true, false).Button);
++        more.Add(SettingsRow("Add to the build queue", () => Then(() => AddToBuildQueue(game)), true, false).Button);
++        bool canRebuild = !GameExport.IsPlayer && GameAppUi.ShowRebuild(facts) && ready;
++        if (canRebuild) more.Add(SettingsRow("Rebuild from scratch…", () => Then(() => ConfirmRebuild(game)), false, false).Button);
++        var delete = SettingsRow("Delete this game…", () => Then(() => ConfirmDelete(game)), false, false);
++        delete.Title.TextColor = Theme.Error;
++        more.Add(delete.Button);
++
++        var column = new List<UIView> { top, head, actionBlock, SectionLabel("GAME"), SettingsCard(gameRows.ToArray()) };
++        if (shadersBlock != null) column.Add(shadersBlock);
++        column.Add(SectionLabel("STORAGE")); column.Add(SettingsCard(storage.ToArray()));
++        column.Add(SectionLabel("MORE")); column.Add(SettingsCard(more.ToArray()));
++        var stack = Theme.Column(8, column.ToArray());
++        stack.SetCustomSpacing(18, head);
++        stack.SetCustomSpacing(22, actionBlock);
++        foreach (var v in column.Skip(4)) if (!(v is UILabel)) stack.SetCustomSpacing(20, v);
++        var scroll = new UIScrollView { AlwaysBounceVertical = true, ShowsVerticalScrollIndicator = false };
++        stack.TranslatesAutoresizingMaskIntoConstraints = false;
++        scroll.TranslatesAutoresizingMaskIntoConstraints = false;
++        scroll.AddSubview(stack);
++        Theme.PinColumn(scroll, stack, 12, 32, 20);
++        vc.View.AddSubview(scroll);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            scroll.TopAnchor.ConstraintEqualTo(vc.View.SafeAreaLayoutGuide.TopAnchor), scroll.BottomAnchor.ConstraintEqualTo(vc.View.BottomAnchor),
++            scroll.LeadingAnchor.ConstraintEqualTo(vc.View.LeadingAnchor), scroll.TrailingAnchor.ConstraintEqualTo(vc.View.TrailingAnchor),
++        });
++        if (openSettings) nav.SetViewControllers(new UIViewController[] { vc, SettingsPage() }, false);
++        Theme.StyleSheet(nav);
++        var sheet = nav.SheetPresentationController;
++        if (sheet != null && !Theme.IsPad) { sheet.Detents = new[] { UISheetPresentationControllerDetent.CreateLargeDetent() }; sheet.PrefersGrabberVisible = true; }
++        PresentViewController(nav, true, null);
++    }
++
++}
+diff -ruN a/GameAppTheme.cs b/GameAppTheme.cs
+--- a/GameAppTheme.cs
++++ b/GameAppTheme.cs
+@@ -27,6 +27,8 @@
+     public static readonly UIColor Warn = Hex(0xFFC870);
+     public static readonly UIColor Error = Hex(0xFF8A8A);
+     public static readonly UIColor DefaultTint = Hex(0x6B4BD8);
++    /// The one accent of the three-tab design (GameAppShelf.cs): primary buttons, the lit tab, a running build.
++    public static readonly UIColor Accent = Hex(0x8B7CFF);
+ 
+     public static UIFont Font(nfloat size, UIFontWeight weight) => UIFont.SystemFontOfSize(size, weight);
+ 
+@@ -79,7 +81,7 @@
+         c.AttributedTitle = new NSAttributedString(title, new UIStringAttributes { Font = Font(16, UIFontWeight.Semibold) });
+         if (symbol != null) { c.Image = UIImage.GetSystemImage(symbol); c.ImagePadding = 8; }
+         c.CornerStyle = UIButtonConfigurationCornerStyle.Capsule;
+-        c.BaseBackgroundColor = primary ? UIColor.White : UIColor.FromWhiteAlpha(1f, 0.12f);
++        c.BaseBackgroundColor = primary ? Accent : UIColor.FromWhiteAlpha(1f, 0.12f);
+         c.BaseForegroundColor = primary ? Ground : Text;
+         b.Configuration = c;
+         b.HeightAnchor.ConstraintEqualTo(height == default ? 56 : height).Active = true;
+@@ -559,7 +561,7 @@
+ 
+         var c = trailingPrimary ? UIButtonConfiguration.FilledButtonConfiguration : UIButtonConfiguration.GrayButtonConfiguration;
+         c.CornerStyle = UIButtonConfigurationCornerStyle.Capsule;
+-        c.BaseBackgroundColor = trailingPrimary ? UIColor.White : UIColor.FromWhiteAlpha(1f, 0.12f);
++        c.BaseBackgroundColor = trailingPrimary ? Theme.Accent : UIColor.FromWhiteAlpha(1f, 0.12f);
+         c.BaseForegroundColor = trailingPrimary ? Theme.Ground : Theme.Text;
+         if (!string.IsNullOrEmpty(trailingTitle)) c.Title = trailingTitle;
+         if (trailingSymbol != null) { c.Image = UIImage.GetSystemImage(trailingSymbol); c.ImagePadding = 6; }

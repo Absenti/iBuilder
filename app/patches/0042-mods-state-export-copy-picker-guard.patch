@@ -1,0 +1,144 @@
+0042-mods-state-export-copy-picker-guard.patch -- three silent degradations of the app's own state and copies (docs/REVIEW-TRIAGE-2026-11-19.md, finding 4.9).
+Applied by scripts/build-app.sh to its copy of the C# snapshot (patch -p1, run in the project folder), after 0041; app/gameapp/ is not edited.
+UNTESTED ON DEVICE: written without a C# compiler. The fourth item of 4.9 (a passphrase longer than the shim's buffer) is in app/gameapp_shim_rust.c and the Rust side, not here.
+  * GameAppMods.cs: ReadState swallowed ANY read error and returned the empty state, and the first toggle then wrote that empty state over the real file: the player's mod / patch / cheat
+    choices were lost for good. ReadState (showing, the build) is unchanged; SetMod / SetPatch / SetCheat / Delete / Import now read with ReadStateForUpdate, which treats a missing file as empty
+    but lets a failing read of an existing file throw, before anything is changed. GameAppModsUi.cs shows that error ("Not changed") instead of letting a switch handler throw.
+  * GameAppExport.cs PreparePlayerDocuments (first launch of an exported player): a file is copied as <name>.part and renamed, so a copy that stops half way never leaves a truncated file under
+    its real name (which the next launches, seeing the name, skipped as already set up).
+  * GameAppMain.cs TakeCertificateBytes: the picker's copy of the .p12 is deleted so the certificate never stays in a file, but the test was "the path is under HOME", true for every file of the
+    container, including a .p12 the player had put in Documents/ and picked from there. Now only the container's tmp/ (where Import mode puts the copy) and Documents/Inbox/ qualify.
+--- a/GameAppExport.cs
++++ b/GameAppExport.cs
+@@ -77,7 +77,10 @@
+                     var dest = Path.Combine(documents, rel);
+                     if (File.Exists(dest)) continue;
+                     Directory.CreateDirectory(Path.GetDirectoryName(dest));
+-                    File.Copy(file, dest);
++                    // via .part: a copy that stops half way (a full disk, a kill) leaves a .part, never a file under its real name, which every later launch would take for a good one
++                    var part = dest + ".part";
++                    try { File.Copy(file, part, true); File.Move(part, dest); }
++                    catch { try { File.Delete(part); } catch (Exception) { } throw; }
+                     copied++;
+                 }
+             File.WriteAllText(Path.Combine(documents, "gameapp.framework"),
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -2692,12 +2692,21 @@
+         finally
+         {
+             if (scoped) url.StopAccessingSecurityScopedResource();
+-            var home = Environment.GetEnvironmentVariable("HOME") ?? "";
+-            if (home.Length > 0 && path.StartsWith(home, StringComparison.Ordinal))   // a copy inside our own container
++            if (IsPickerCopy(path))   // the picker's own copy in our container
+                 try { File.Delete(path); } catch (Exception) { }
+         }
+     }
+ 
++    /// True for a file the document picker copied into this app's container (Import mode: the container's tmp/, or Documents/Inbox/), which is ours to delete. NOT for any other file of the
++    /// container: a .p12 the player put in Documents/ and picked from there is the player's own file (the old test was "anywhere under HOME" and deleted it).
++    private static bool IsPickerCopy(string path)
++    {
++        var tmp = Path.GetTempPath();
++        if (tmp.Length > 1 && path.StartsWith(tmp, StringComparison.Ordinal)) return true;
++        var home = (Environment.GetEnvironmentVariable("HOME") ?? "").TrimEnd('/');
++        return home.Length > 0 && (path.StartsWith(home + "/tmp/", StringComparison.Ordinal) || path.StartsWith(home + "/Documents/Inbox/", StringComparison.Ordinal));
++    }
++
+     private void AskCertificatePassword(NSUrl url)
+     {
+         var name = url?.LastPathComponent ?? "certificate";
+--- a/GameAppMods.cs
++++ b/GameAppMods.cs
+@@ -59,11 +59,25 @@
+     public static string AppliedPath(string documents, string titleId) => Path.Combine(GameDir(documents, titleId), "mods.applied");
+     public static string BuildIdsPath(string documents, string titleId) => Path.Combine(GameDir(documents, titleId), "build_ids.txt");
+ 
++    /// For showing and for the build: a state that cannot be read is an empty one (nothing is written back).
+     public static State ReadState(string documents, string titleId)
+     {
+-        var s = new State();
+         string text;
+-        try { text = File.ReadAllText(StatePath(documents, titleId), Encoding.UTF8); } catch { return s; }
++        try { text = File.ReadAllText(StatePath(documents, titleId), Encoding.UTF8); } catch { return new State(); }
++        return ParseState(text);
++    }
++
++    /// For a change that is written back (a toggle, a delete, an import). No file is an empty state, but a file that IS there and cannot be read is an error, not "no choices yet": the write
++    /// that follows would replace it, and the player's mod / patch / cheat choices would be gone for good.
++    private static State ReadStateForUpdate(string documents, string titleId)
++    {
++        var path = StatePath(documents, titleId);
++        return File.Exists(path) ? ParseState(File.ReadAllText(path, Encoding.UTF8)) : new State();
++    }
++
++    private static State ParseState(string text)
++    {
++        var s = new State();
+         foreach (var line in text.Split('\n'))
+         {
+             var c = line.TrimEnd('\r').Split('\t');
+@@ -90,24 +104,24 @@
+ 
+     public static void SetMod(string documents, string titleId, string mod, bool on)
+     {
+-        var s = ReadState(documents, titleId); s.Mod[mod] = on; WriteState(documents, titleId, s);
++        var s = ReadStateForUpdate(documents, titleId); s.Mod[mod] = on; WriteState(documents, titleId, s);
+     }
+ 
+     public static void SetPatch(string documents, string titleId, string mod, string name, bool on)
+     {
+-        var s = ReadState(documents, titleId); s.Patch[(mod, name)] = on; WriteState(documents, titleId, s);
++        var s = ReadStateForUpdate(documents, titleId); s.Patch[(mod, name)] = on; WriteState(documents, titleId, s);
+     }
+ 
+     public static void SetCheat(string documents, string titleId, string mod, string name, bool on)
+     {
+-        var s = ReadState(documents, titleId); s.Cheat[(mod, name)] = on; WriteState(documents, titleId, s);
++        var s = ReadStateForUpdate(documents, titleId); s.Cheat[(mod, name)] = on; WriteState(documents, titleId, s);
+     }
+ 
+     public static void Delete(string documents, string titleId, string mod)
+     {
+         var dir = Path.Combine(ModsDir(documents, titleId), mod);
++        var s = ReadStateForUpdate(documents, titleId);   // read first: when it fails, nothing has been deleted
+         if (Directory.Exists(dir)) Directory.Delete(dir, true);
+-        var s = ReadState(documents, titleId);
+         s.Mod.Remove(mod);
+         foreach (var k in s.Patch.Keys.Where(k => k.Mod == mod).ToList()) s.Patch.Remove(k);
+         foreach (var k in s.Cheat.Keys.Where(k => k.Mod == mod).ToList()) s.Cheat.Remove(k);
+@@ -384,7 +398,7 @@
+                 ? " Expected atmosphere/contents/<title id>/romfs, exefs or cheats, a mods/<name>/romfs|exefs|cheats folder, or a .pchtxt / .ips patch." : ""));
+         }
+         var root = ModsDir(documents, titleId);
+-        var state = ReadState(documents, titleId);
++        var state = ReadStateForUpdate(documents, titleId);
+         var names = new List<string>();
+         // In two steps, so that a failure half way (a damaged zip entry, a full disk) changes nothing: every mod is first copied into a staging folder OUTSIDE mods/ (a half copied mod is
+         // never listed, and a build never reads it), and only when all of it is there do the old folders go and the new ones move in. (It used to delete the old folder of a mod first, then
+--- a/GameAppModsUi.cs
++++ b/GameAppModsUi.cs
+@@ -106,20 +106,20 @@
+             parts.Add(GameAppUi.SizeText(mod.Bytes));
+             var card = new UIKit.UIStackView { Axis = UIKit.UILayoutConstraintAxis.Vertical, Spacing = 8 };
+             card.AddArrangedSubview(SwitchRow(mod.Name, string.Join(" · ", parts), mod.Enabled, "mod-switch-" + mi,
+-                on => { GameMods.SetMod(documents, titleId, mod.Name, on); log?.Invoke($"mods: {mod.Name} {(on ? "on" : "off")}"); }));
++                on => { try { GameMods.SetMod(documents, titleId, mod.Name, on); log?.Invoke($"mods: {mod.Name} {(on ? "on" : "off")}"); } catch (Exception e) { Say("Not changed", e.Message); } }));
+             int pj = 0;
+             foreach (var p in mod.Patches)
+             {
+                 var patch = p;
+                 card.AddArrangedSubview(SwitchRow("Patch: " + patch.Name, null, patch.On, $"patch-switch-{mi}-{pj++}",
+-                    on => { GameMods.SetPatch(documents, titleId, mod.Name, patch.Name, on); log?.Invoke($"mods: {mod.Name} patch {patch.Name} {(on ? "on" : "off")}"); }, nested: true));
++                    on => { try { GameMods.SetPatch(documents, titleId, mod.Name, patch.Name, on); log?.Invoke($"mods: {mod.Name} patch {patch.Name} {(on ? "on" : "off")}"); } catch (Exception e) { Say("Not changed", e.Message); } }, nested: true));
+             }
+             int cj = 0;
+             foreach (var c in mod.Cheats)
+             {
+                 var cheat = c;
+                 card.AddArrangedSubview(SwitchRow("Cheat: " + cheat.Name, null, cheat.On, $"cheat-switch-{mi}-{cj++}",
+-                    on => { GameMods.SetCheat(documents, titleId, mod.Name, cheat.Name, on); log?.Invoke($"mods: {mod.Name} cheat {cheat.Name} {(on ? "on" : "off")}"); }, nested: true));
++                    on => { try { GameMods.SetCheat(documents, titleId, mod.Name, cheat.Name, on); log?.Invoke($"mods: {mod.Name} cheat {cheat.Name} {(on ? "on" : "off")}"); } catch (Exception e) { Say("Not changed", e.Message); } }, nested: true));
+             }
+             var del = UIKit.UIButton.FromType(UIKit.UIButtonType.System);
+             var dc = UIKit.UIButtonConfiguration.PlainButtonConfiguration;

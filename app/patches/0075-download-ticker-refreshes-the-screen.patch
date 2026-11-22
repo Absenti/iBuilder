@@ -1,0 +1,27 @@
+# 0075-download-ticker-refreshes-the-screen.patch -- the app no longer crashes one second into a download (NAS, Files folder, Download and build).
+# Applies after 0074. Device log 2026-11-20 (iPhone 15 Pro, iOS 27.2.1): "=== download South Park ... .nsz (+1: its update and DLC), 13.0 GB", then at the next launch
+#   "previous run ...: an unhandled managed exception ended it: terminating: System.NullReferenceException ... at UIKit.UIApplication.UIApplicationMain", three times; .part files of 51.9 MB
+#   and 0.2 MB left behind (the download had just started).
+# CAUSE (read in the code): StartDownloadTicker (GameAppLibrary.cs) redraws every second the OLD games page (carousel.SetItems, RefreshSelection, RefreshList). Since patch 0062 the app builds
+#   the shelf (BuildShelf) and only an exported player builds that page (GameAppMain.cs: `if (GameExport.IsPlayer) BuildGamesPage(); else BuildShelf();`), so in the app gearGlass, grid,
+#   contentCardView, ... are null: RefreshSelection's first null field throws on the main thread, outside any guard, and the managed exception ends the process.
+# FIX: the tick calls RefreshScreen() (the coalesced refresh: the shelf in the app, the old page in a player, each part inside Guarded), which already draws a download's progress (the shelf
+#   and the Build tab read `downloads`). Compiled (dotnet build -t:Compile, ios-arm64, Release). Not run on a device.
+diff --color -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs	2026-11-20 20:57:48
++++ b/GameAppLibrary.cs	2026-11-20 20:58:00
+@@ -2222,10 +2222,10 @@
+         downloadTicker = new Timer(_ => BeginInvokeOnMainThread(() =>
+         {
+             if (downloads.Count == 0) { downloadTicker?.Dispose(); downloadTicker = null; return; }
+-            var facts = GatherFacts();
+-            carousel.SetItems(entries.Select(e => (e.Icon, GameAppUi.DisplayName(e.Name), IsCloudOnly(e.Name), CoverFraction(e.Name, facts))).ToList());
+-            RefreshSelection(facts);
+-            RefreshList(facts);
++            // Patch 0075: the screen's own refresh (coalesced, each part guarded). This tick used to redraw the OLD games page (carousel, selection, list), which only an exported player
++            // builds (BuildShelf replaced it in the app, patch 0062): in iBuilder its views are null, so the first tick, one second into any download, threw NullReferenceException on the
++            // main thread and ended the app (device log 2026-11-20, a NAS download of 13 GB, three times in a row)
++            RefreshScreen();
+         }), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+     }
+ }

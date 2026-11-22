@@ -1,0 +1,32 @@
+{
+  "name": "iBuilder",
+  "identifier": "dev.ibuilder.source",
+  "subtitle": "Switch games you own, built on your iPhone",
+  "description": "The official releases of iBuilder, from github.com/Absenti/iBuilder. The app contains no game, no firmware and no keys: use it only with games you own and keys dumped from your own console. Not affiliated with Nintendo.",
+  "sourceURL": "https://raw.githubusercontent.com/Absenti/iBuilder/main/apps.json",
+  "iconURL": "https://raw.githubusercontent.com/Absenti/iBuilder/main/docs/assets/icon.png",
+  "website": "https://github.com/Absenti/iBuilder",
+  "tintColor": "#EFB15A",
+  "apps": [
+    {
+      "name": "iBuilder",
+      "bundleIdentifier": "dev.ibuilder.app",
+      "developerName": "Absenti",
+      "subtitle": "Switch games, built on your iPhone",
+      "localizedDescription": "iBuilder turns a Switch game dump you own into a native iOS build on the iPhone itself: extract, rewrite, translate the shaders, sign and play. Experimental: results differ per game.\n\nNo game, firmware or key is included or downloaded. Use it only with your own games and the prod.keys of your own console. Not affiliated with Nintendo or Apple.\n\nWhat the app can do depends on the certificate you install it with: see the README.",
+      "iconURL": "https://raw.githubusercontent.com/Absenti/iBuilder/main/docs/assets/icon.png",
+      "tintColor": "#EFB15A",
+      "category": "utilities",
+      "versions": [],
+      "appPermissions": {
+        "entitlements": [
+          "com.apple.developer.kernel.increased-memory-limit"
+        ],
+        "privacy": {
+          "NSPhotoLibraryAddUsageDescription": "Saves the screenshots and clips you take while playing to your photo library."
+        }
+      }
+    }
+  ],
+  "news": []
+}

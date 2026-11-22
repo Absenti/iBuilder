@@ -1,0 +1,22 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    array<texture2d<float>, 33> fp_t2d_cb196614_10570000 [[id(0), raster_order_group(0)]];
+    array<texture2d<float>, 32> fp_t2d_cb196614_10570000 [[id(33)]];
+};
+
+struct main0_out
+{
+    float4 c [[color(0)]];
+};
+
+fragment	main0_out main0(int)
+{
+
+}

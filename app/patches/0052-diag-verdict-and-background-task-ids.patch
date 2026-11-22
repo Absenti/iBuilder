@@ -1,0 +1,53 @@
+# 1. GameAppDiag: the previous-run verdict blamed heat when the phone had been Serious at ANY sample; it is the LAST samples that count, and a stop from outside (Xcode / devicectl / an update installed over the app) is named.
+# 2. Info.plist.fragment: BGTaskSchedulerPermittedIdentifiers also lists dev.nxpocket.gameapp.* : the task id is the RUNTIME bundle id + ".build.<n>", and a sideloading service (dev.nxpocket.gameapp.<TEAM>) or a cable install (.usb)
+#    does not run under dev.nxpocket.gameapp: the system refused the registration ("background: the system refused the task registration"), so a build did not continue in the background.
+# Applies after 0051.
+diff -ruN a/GameAppDiag.cs b/GameAppDiag.cs
+--- a/GameAppDiag.cs
++++ b/GameAppDiag.cs
+@@ -352,7 +352,7 @@
+             var lastStage = ev.Where(l => kindOf(l) == "stage" || kindOf(l) == "stage-progress").Select(l => l.Split('\t')[4]).LastOrDefault() ?? "(none)";
+             var lastPhase = last.Split('\t').Length > 2 ? last.Split('\t')[2] : "?";
+             long minAvail = long.MaxValue, maxFoot = 0;
+-            string maxThermal = "Nominal";
++            string maxThermal = "Nominal", lastThermal = "Nominal";
+             foreach (var l in sm)
+             {
+                 var p = l.Split('\t');
+@@ -362,6 +362,7 @@
+                 var f = Regex.Match(p[6], "footprint\\s+(\\d+)");
+                 if (f.Success && long.TryParse(f.Groups[1].Value, out var fp)) maxFoot = Math.Max(maxFoot, fp);
+                 if (p[3] == "Serious" || p[3] == "Critical") maxThermal = p[3];
++                lastThermal = p[3];
+             }
+             var memWarnings = ev.Count(l => kindOf(l) == "memory-warning");
+             var cleanExit = ev.Any(l => kindOf(l) == "exit");
+@@ -371,13 +372,13 @@
+             else if (unhandled != null) verdict = "an unhandled managed exception ended it: " + (unhandled.Length > 300 ? unhandled.Substring(0, 300) : unhandled);
+             else if (state == "background") verdict = "ended while in the BACKGROUND with no terminate: iOS reclaimed the memory of a suspended app, or the player closed it from the app switcher (not a fault of the app)";
+             else if (memWarnings > 0 || (minAvail != long.MaxValue && minAvail < 350)) verdict = $"ended in the FOREGROUND after memory pressure ({memWarnings} memory warning(s), lowest available {(minAvail == long.MaxValue ? "?" : minAvail.ToString(CultureInfo.InvariantCulture))} MiB): most likely a memory kill (jetsam)";
+-            else if (maxThermal != "Nominal") verdict = $"ended in the FOREGROUND, thermal state reached {maxThermal}: heat may be involved (a thermal shutdown looks like this too)";
+-            else verdict = "ended in the FOREGROUND with no terminate, no memory warning and memory not low: a crash (native fault) or a kill the app was not told about; MetricKit diagnostics of the next launch (metrickit/) and Settings > Privacy > Analytics > Analytics Data (GameApp .ips) hold the stack";
++            else if (lastThermal == "Serious" || lastThermal == "Critical") verdict = $"ended in the FOREGROUND while the phone was {lastThermal} on the thermal scale: heat may be involved (a thermal shutdown looks like this too)";
++            else verdict = "ended in the FOREGROUND with no terminate, no memory warning, memory not low and the phone not hot: the app was stopped from outside (Xcode / devicectl, an update installed over it, a restart of the phone) or it crashed (a native fault); MetricKit diagnostics of the next launch (metrickit/) and Settings > Privacy > Analytics > Analytics Data (GameApp .ips) hold the stack of a crash";
+             var text = new StringBuilder();
+             text.AppendLine($"previous run {previous}");
+             text.AppendLine($"verdict: {verdict}");
+             text.AppendLine($"last app state: {state}; last phase: {lastPhase}; last stage: {lastStage}");
+-            text.AppendLine($"memory: lowest available {(minAvail == long.MaxValue ? "?" : minAvail.ToString(CultureInfo.InvariantCulture))} MiB, highest footprint {maxFoot} MiB, memory warnings {memWarnings}, thermal worst {maxThermal}");
++            text.AppendLine($"memory: lowest available {(minAvail == long.MaxValue ? "?" : minAvail.ToString(CultureInfo.InvariantCulture))} MiB, highest footprint {maxFoot} MiB, memory warnings {memWarnings}, thermal worst {maxThermal}, last {lastThermal}");
+             text.AppendLine($"last sample: {sm.LastOrDefault() ?? "(none)"}");
+             text.AppendLine("last events:");
+             foreach (var l in ev.Skip(Math.Max(0, ev.Length - 60))) text.AppendLine("  " + l);
+diff -ruN a/Info.plist.fragment b/Info.plist.fragment
+--- a/Info.plist.fragment
++++ b/Info.plist.fragment
+@@ -17,6 +17,8 @@
+ 	<key>BGTaskSchedulerPermittedIdentifiers</key>
+ 	<array>
+ 		<string>dev.nxpocket.gameapp.build.*</string>
++		<!-- the id a sideloading service or a cable install gives the app (dev.nxpocket.gameapp.<TEAM> / .usb): the task id is that id plus ".build.<n>" (GameAppBackground.cs BackgroundPrefix) -->
++		<string>dev.nxpocket.gameapp.*</string>
+ 	</array>
+ 	<!-- ProMotion: a display link may run above 60 Hz (the engine's 120 fps path; load/front_pad.m front_screen_max_fps) -->
+ 	<key>CADisableMinimumFrameDurationOnPhone</key>

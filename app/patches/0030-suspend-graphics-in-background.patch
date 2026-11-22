@@ -1,0 +1,77 @@
+0030-suspend-graphics-in-background.patch -- tell the host when the app leaves the foreground. docs/ENGINE-UPDATE.md section 6; docs/UPSTREAM-AUDIT.md section 4 (Grizzy's 84 lines of
+kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted) and section 5 item 3.
+Applied by scripts/build-app.sh to its copy of the C# snapshot (patch -p1, run in the project folder) in file-name order, after 0010 and 0020 (and after 0030-import-and-download-never-delete-first); app/gameapp/ is not edited.
+Touches GameAppExternal.cs and GameAppMain.cs only, away from every hunk of 0010, 0020, 0030-import, 0031 and 0032.
+  * GameAppExternal.cs, GameAppHost: Background(entering) and Active(entering), calling the host's own lifecycle entries through ibuilder_host_symbol (the dlsym the gamepad entries use), in the order
+    the engine's front end takes (dm/ios/Sources/front_ios.m front_ios_focus_event 0..3): DidEnterBackground -> dm_focus_set(3), dm_audio_suspend(1), guest_clock_freeze_for(1, 1), dm_gfx_suspend(1);
+    WillEnterForeground -> dm_gfx_suspend(0), guest_clock_freeze_for(1, 0), dm_audio_suspend(0), dm_focus_set(2); WillResignActive / DidBecomeActive -> dm_focus_set(2) / (1).
+    Every entry is looked up at the call: a host not loaded yet (no game booted) or without one makes the call a no-op. The host exports dm_gfx_suspend(int) for both directions (there is no dm_gfx_resume).
+  * GameAppMain.cs, GameAppGameViewController.ViewDidLoad: the four UIApplication notifications, registered with the view's other observers (removed with them in ViewDidDisappear), so they exist only while a game's window does.
+  Not done here (the engine's event 0 also does it, front_ios.m): dm_gamepad_reset / dm_movie_active on resign-active, and the audio session re-activation on return (front_ios_audio_session is a stub in
+  load/glue_front_standin.m). NOT COMPILED, NOT RUN ON A DEVICE: C# cannot be built here; the function-pointer calls follow GameAppMain.RegisterShaderTranslator's `delegate* unmanaged` use.
+--- a/GameAppExternal.cs
++++ b/GameAppExternal.cs
+@@ -252,6 +252,49 @@
+         }
+         catch (EntryPointNotFoundException) { return null; }
+     }
++
++    // ---- the app leaving the foreground (app/patches/0030-suspend-graphics-in-background.patch, docs/ENGINE-UPDATE.md) --------------------------
++    // The engine's own front end maps the four UIKit scene events onto the host's lifecycle entries (dm/ios/Sources/front_ios.m, front_ios_focus_event); GameApp links no front end
++    // (load/glue_front_standin.m stubs it), so until now nothing told the host the app had left: the game went on submitting GPU work in the background (the 84 lines of
++    // kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted at the end of Grizzy's log) and its clock and audio went on. The entries are the host's own and are looked up as
++    // the gamepad's are (ibuilder_host_symbol, a dlsym on the loaded host): before the boot loads it, or on a host without one, every call here does nothing.
++    [DllImport("__Internal")] private static extern IntPtr ibuilder_host_symbol(string name);
++
++    private static bool away;   // the host has been told "background" and not yet "foreground" (main thread only)
++
++    /// UIApplication.WillResignActive (<c>entering</c> true: out of focus) and DidBecomeActive (false: in focus): oe's focus state, which a game reads to pause itself.
++    public static unsafe void Active(bool entering)
++    {
++        var focus = ibuilder_host_symbol("dm_focus_set");
++        if (focus != IntPtr.Zero) ((delegate* unmanaged<int, void>) focus)(entering ? 2 : 1);   // 1 InFocus, 2 OutOfFocus, 3 Background (hle_oe.c)
++    }
++
++    /// UIApplication.DidEnterBackground (<c>entering</c> true) and WillEnterForeground (false), in the order front_ios_focus_event takes: going away, the guest's focus, audio and
++    /// clock first and the graphics gate last (dm_gfx_suspend waits for the GPU work in flight and holds every later submit and present); coming back, the gate first. Main thread.
++    public static unsafe void Background(bool entering)
++    {
++        if (entering == away) return;
++        var gfx = ibuilder_host_symbol("dm_gfx_suspend");
++        if (gfx == IntPtr.Zero) return;   // the host is not loaded yet, or is one without the entry: nothing to suspend
++        var audio = ibuilder_host_symbol("dm_audio_suspend");
++        var clock = ibuilder_host_symbol("guest_clock_freeze_for");
++        var focus = ibuilder_host_symbol("dm_focus_set");
++        away = entering;
++        if (entering)
++        {
++            if (focus != IntPtr.Zero) ((delegate* unmanaged<int, void>) focus)(3);
++            if (audio != IntPtr.Zero) ((delegate* unmanaged<int, void>) audio)(1);
++            if (clock != IntPtr.Zero) ((delegate* unmanaged<int, int, void>) clock)(1, 1);   // reason 1: background (hle_os.c)
++            ((delegate* unmanaged<int, void>) gfx)(1);
++        }
++        else
++        {
++            ((delegate* unmanaged<int, void>) gfx)(0);
++            if (clock != IntPtr.Zero) ((delegate* unmanaged<int, int, void>) clock)(1, 0);
++            if (audio != IntPtr.Zero) ((delegate* unmanaged<int, void>) audio)(0);
++            if (focus != IntPtr.Zero) ((delegate* unmanaged<int, void>) focus)(2);   // DidBecomeActive follows and makes it 1
++        }
++    }
+ }
+ 
+ /// -GameAppDebugGame: the game window with a test Metal layer and no game, so the scene switching, the drawable's size and
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -497,6 +497,11 @@
+         // A hardware controller coming or going changes what the phone shows while the picture is on a TV
+         observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(new NSString("GCControllerDidConnectNotification"), _ => UpdateTvCover()));
+         observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(new NSString("GCControllerDidDisconnectNotification"), _ => UpdateTvCover()));
++        // The app leaving the foreground: the host suspends graphics (no GPU work once the app is in the background), audio and the guest's clock, and resumes them (GameAppHost.Background)
++        observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.WillResignActiveNotification, _ => GameAppHost.Active(true)));
++        observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.DidEnterBackgroundNotification, _ => GameAppHost.Background(true)));
++        observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.WillEnterForegroundNotification, _ => GameAppHost.Background(false)));
++        observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.DidBecomeActiveNotification, _ => GameAppHost.Active(false)));
+     }
+ 
+     public override void ViewDidAppear(bool animated)

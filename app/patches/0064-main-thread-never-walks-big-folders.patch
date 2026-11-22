@@ -1,0 +1,1403 @@
+# 0064-main-thread-never-walks-big-folders.patch -- no button, alert action or refresh walks or deletes a folder of thousands of files on the main thread; the foreground observer returns at once; the log page is bounded.
+# Applies after 0063 (the tree with 0010..0063 applied). UNTESTED ON DEVICE: compiled (dotnet build, ios-arm64: rc 0, no error, the same 45 warnings as the tree without it) and the new classes run in a host harness
+# (a net console program built from the real source text of GameAppPerf.cs and GameAppUi.cs, 70 checks); no iPhone run. Measured and assumed are told apart below.
+#
+# WHY (measured on the owner's iPhone, 2026-11-20, three crash reports of a 22,000-shader build): EXC_CRASH SIGKILL 0x8BADF00D, "scene-update watchdog transgression ... exhausted real (wall clock) time allowance of 10.00 seconds".
+#   Reports 1 and 2: the MAIN thread in -[UIApplication _sendWillEnterForegroundCallbacks] -> our WillEnterForeground observer -> lstat. Report 3: the main thread in lstat from managed code inside -[UIButton _sendActionsForEvents]
+#   -> -[UIControl sendAction:to:...]: a BUTTON HANDLER (twelve managed frames deep) walking files for over 10 s. The walk was the storage bar's FolderBytes (every refresh measured five folders, and every tab / game-sheet / selection
+#   handler refreshes): Documents/shadercache (15,000+ files), and on the owner's phone after the cache and the logs were cleared Documents/shaders/<id>.work (the shader build's resume folder: 27,144 files, 6.2 GB, about 50,000 for
+#   the 42,848 shaders of the game), still walked at every refresh: the app's own "first screen" lines were 586 ms (empty install) / 3,337 (9k cached shaders) / 5,090 (15k) / 3,892 / 2,278 (cache cleared, .work present) / 2,018.
+#   About 0.1 to 0.3 ms a file on the phone (estimates from those lines, not a separate measurement). Deleting the logs changed nothing: the log screen is not the main cost (it is bounded anyway, below).
+#
+#   * GameAppPerf.cs (new; no UIKit, compiled as it is by the host harness; build-app.sh picks it up with the other GameApp*.cs):
+#       FolderWalk.Bytes    the size of a folder through FileSystemEnumerable (one readdir and one stat a file, no path string and no FileInfo a file); an overload takes a filter on the top-level names (the packs of
+#                           Documents/shaders apart from the .work folders). Worker threads only. Same totals as the old FolderBytes (checked on 60,000 files).
+#       FolderSizes         the cache the screens read: last known size per folder (-1 = not known yet), measured by ONE Task.Run at a time (single flight: 16 threads asking 8,000 times = one walk of each folder), at least
+#                           30 s between two walks of a folder, 60 s for the heavy ones (extract, shaders, shadercache) while a build runs, 5 minutes for a SLOW one (the .work folders: measured rarely, by a build's end or a delete,
+#                           not by the clock), invalidated by the events that change a size (a build ends, a delete, 'Clear', an export, a removed export): measured again at once, except a heavy folder while a build runs; fifty
+#                           invalidations in a row are one walk; an invalidation during a walk is not lost. NOTHING is measured while a delete runs (hold). The last value stays shown. One 'a value arrived' post to the main
+#                           thread for several arrivals, which draws the storage bars, the shader cache's label and the open game sheet again, nothing else. Each walk's time goes to a hook (the launch-profile lines).
+#       BackgroundDelete    recursive deletes on ONE worker thread, in order, `Busy` from the Enqueue until the job's `done` ran on the main thread: the reusable helper (GameAppViewController.DeleteFolderInBackground).
+#       Coalescer           'run this once on a later turn of the run loop, however often it is asked, and not twice within N ms' (RefreshScreen: 250 ms; the log page's redraw: 400 ms).
+#       Bg                  'work on a worker thread, the answer on the main thread' (the saves and the mods).
+#       LaunchProfile       the `launch-profile: <part> <ms>` lines: in the first 90 s every part over 50 ms, afterwards a part over 250 ms and at most once per part every 10 s.
+#       UiLogModel          the lines the log page holds (see GameAppLibrary.cs).
+#   * GameAppMain.cs:
+#       OnWillEnterForeground   the observer does nothing synchronously: BeginInvokeOnMainThread posts RefreshScreen, RefreshCloud(null) (its Keychain read of the NAS password and its file reads too) and a size request.
+#       RefreshScreen           now a Coalescer request (next run-loop turn, once per 250 ms however many times it is asked: every tab, selection and sheet handler goes through it); RefreshScreenNow is the body, unchanged,
+#                               and ViewDidLoad calls it (the first frame has the shelf in it). By reading the code RefreshScreen is NOT called by the 1 s tailer, the 1 s ticker or the progress lines.
+#       CurrentStorageSegments  returns at once: the dumps' sizes (one short listing of Documents) and the free space now, the folders as last measured (0 until known; Documents/shaders = the packs + the .work folders +
+#                               the shader cache, three tracked folders), then asks FolderSizes; the bars are drawn again when the numbers are in. RefreshCacheSize: the label from the cache ('Shader cache: …').
+#       DeleteFolderInBackground(path, done)   REUSABLE: the folder is deleted on the delete worker (one at a time, in order), no size is measured meanwhile, the sizes are measured again when it is done, `done(error or null)` on
+#                               the main thread. Clear shader cache (Settings, both screens) uses it: 'Shader cache: clearing…', then the same log line as before. The pause/cancel work can call it for a cancelled build's .work.
+#       ConfirmDelete / PerformDelete / PlanBytes   the 'Frees ...' sizes on a worker thread; the deletion (files, then folders: extract/, shaders/<id>, shaders/<id>.work, ...) on the delete worker, same log lines in the same
+#                               order; a second question and BeginRun are refused while one runs ('a delete is still going: try again in a moment').
+#       ConfirmExport           the four walks of the alert's sizes (framework, extract/flat, shaders/<id>, the app bundle) on a worker thread; the alert comes up when they are in (ShowExportChoice, body unchanged).
+#       AutoCopySaves           the zip of the save before a boot (Boot button) on a worker thread; the boot starts when it is done, so the game never starts before its save is safe.
+#       Timed / NoteTime        launch-profile lines for GatherFacts, RefreshScreen and each part of it (keys, settings, storage, icons, cloud icons, selection, games, build tab, player, pointer), and in ViewDidLoad
+#                               PrepareLog, SweepLeftoverParts, LoadCloud, LoadBuildQueue, PreparePlayerDocuments, BuildShelf, BuildCloudPage, BuildKeysPage, BuildLogsPage (the log page), BuildSettingsPage, BuildAppsPage,
+#                               BuildQueuePage, BuildBuildTab, BuildTabBar, ShowTab(0), ReportInterruptedRunIfAny, RefreshGames, and every storage measurement ('launch-profile: storage/shaders-work 1830').
+#       Finish, StartExport end, the 1 s ticker   invalidate (all / Exports) or ask (cheap when nothing is due).
+#   * GameAppLibrary.cs: Append is linear in the text (it cut the rest off again at every line: 1,190 ms for a 594 KB block of 20,000 lines on the host, 0.8 ms now; the real per-tick batches are tens of lines, so this is a guard);
+#       the lines go to UiLogModel (not a List of 6,000); the page is redrawn at most every 400 ms instead of rebuilt at every append (and timed: 'log rebuild'). The FILES are written first and are unchanged. An exported player's
+#       title screen reads the save folder (Current, List) on a worker thread, at most every 30 s, instead of at every refresh. A removed export invalidates Exports.
+#   * GameAppShelf.cs: the Clear alert as above; the game sheet's Build and Shaders lines show '…' and are filled when FolderSizes has them (shaders/<id> is its own tracked folder, measured when the sheet opens).
+#   * GameAppSavesUi.cs: the saves page (Current = a walk of the save folder, the copies' listing) is filled from a worker thread; 'Save a copy now' (a zip of the save), 'Replace' (the copy of the save it replaces, the staging
+#       delete, the swap, the delete of the old folder) and the JKSV export run on a worker thread; one at a time.
+#   * GameAppModsUi.cs: the mods page (GameMods.List walks every mod's RomFS tree: also at every switch) is filled from a worker thread; Delete (a mod's folder) and both imports (the picked zip's copy and unpacking, a folder's
+#       walk and copy; the folder's security scope is kept until it is done) run on a worker thread; one at a time.
+#
+# MEASURED (host harness, Apple silicon Mac, warm file cache, .NET 11, 60,000 files of 64..963 bytes in 600 folders, the same files under shadercache and under shaders/<id>.work):
+#       old FolderBytes of the 60,000 files 154-247 ms (median ~160-180) on the MAIN thread: CurrentStorageSegments did it five times over (173-188 ms), Documents/shaders with the .work folder 171 ms. New FolderWalk 132-173 ms on a
+#       worker. The main thread's cost of the same bars: the first call 0.1-1.0 ms (it starts the worker), then 0.05-1.4 us a call. The packs of Documents/shaders alone: 0.6 ms; the .work folder: 146 ms, on the worker, once.
+#       Directory.Delete(recursive) of the 60,000 files: 3,203 ms (the old handler, on the main thread; the phone is slower per file: seconds to tens of seconds); enqueued on the delete worker: 0.4 ms on the calling thread.
+#       Single flight / interval / invalidation / hold-while-deleting / slow key / coalescer / delete queue (in order, one at a time, a failing job reports and the next one runs): 70 of 70 checks.
+#       The log page, on the owner's real 1,944-line log: 1,012 rows before, 246 now (766 'unity compute source' lines left out of the page, 926 counter/step lines merged in place; the rows are exactly the old timeline's rows
+#       without the compute lines). One 22,000-shader build as the engine writes it (2,156 lines): 416 rows before, 46 now. GameAppUi.Timeline from 1,944 lines 2.2 ms, from the model's 252 lines 0.33 ms; the old cap of 6,000
+#       lines, rebuilt at every append while the page showed: 6.9 ms. UiLogModel.Add 0.4 us a line.
+# NOT MEASURED / ASSUMED: every number above is a Mac's; the phone's file system is 30 times slower or more per file (see WHY), so a 60,000-file walk or delete there is seconds to tens of seconds: the point of the patch is that none of
+#       it is on the main thread. That the foreground return and the button handlers no longer trip the watchdog is argued from the three stacks, not demonstrated. The UIKit cost of the log page, the bars and the saves / mods pages
+#       is not measured. RefreshScreen's remaining work is proportional to the number of GAMES (a few listings of Documents, one cover lookup a game); GatherFacts' Keychain read and address-space read are untouched.
+# LEFT ALONE (all shallow, bounded by the number of games or a few files): SweepLeftoverParts at launch (Documents, Exports/<folder>, SaveBackups/<folder>: one level each), Dumps / DocumentNames / DumpBytes / GatherFacts' listings
+#       (one level of Documents) and InstalledShaderPacks (one File.Exists per entry of shaders/), AppsSummary / FillApps / GameAppUi.AllRomfs (Exports, one level, a folder a game), RemoveEmptyGameFolder (one non-recursive delete of an
+#       empty folder), GameAppDiag.Rotate / ShareFiles / SaveMetric (.diag: six sessions, metrickit 40 files), the lifecycle observers of GameAppDiag (MemLine = task_info + statfs, one line written), GameAppHost.Background /
+#       Active (dlsym calls into the host), CopyIn's File.Move (a rename inside the container; its File.Copy fallback is one big file, not a walk: patch 0060's), Delete of a downloaded dump (one unlink). Already on a worker:
+#       Export / PlaceRomfs, ScanFolderForContent, RefreshCloud's folder listing, CopyWithProgress and Nas.Download, ShareGameLogs / LogWindow.BuildZip, FetchMissingIcons, GameWarm.Run.
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -701,6 +701,28 @@
+         PresentWhenFree(picker);
+     }
+ 
++    private string playerLastText, playerSavesText;
++    private DateTime playerSavesAt = DateTime.MinValue;
++    private bool playerSavesBusy;
++
++    private void RequestPlayerSaves(string docs, string tid, string name)
++    {
++        if (playerSavesBusy || DateTime.UtcNow - playerSavesAt < TimeSpan.FromSeconds(30)) return;
++        playerSavesBusy = true;
++        Bg.Run(() => (GameSaves.Current(docs, tid), GameSaves.List(docs, tid, name)), (found, error) =>
++        {
++            playerSavesBusy = false;
++            playerSavesAt = DateTime.UtcNow;
++            if (error != null) return;
++            var changed = found.Item1.Changed;
++            var copies = found.Item2;
++            playerLastText = changed == null ? $"No save yet: your progress is kept on this {GameAppUi.DeviceName}" : "Last saved " + Ago(changed.Value);
++            playerSavesText = copies.Count == 0 ? "no copy yet" : $"copy {Ago(copies[0].When)} · {copies.Count} kept";
++            if (playerLast != null) playerLast.Text = playerLastText;
++            if (playerSaves != null) playerSaves.Text = playerSavesText;
++        }, work => BeginInvokeOnMainThread(work));
++    }
++
+     private void RefreshPlayer(UiFacts facts)
+     {
+         if (playerPlay == null) return;
+@@ -736,10 +758,9 @@
+         var docs = GameAppMain.Documents;
+         if (tid != null)
+         {
+-            var (bytes, changed) = GameSaves.Current(docs, tid);
+-            playerLast.Text = changed == null ? $"No save yet: your progress is kept on this {GameAppUi.DeviceName}" : "Last saved " + Ago(changed.Value);
+-            var copies = GameSaves.List(docs, tid, GameAppUi.DisplayName(game));
+-            playerSaves.Text = copies.Count == 0 ? "no copy yet" : $"copy {Ago(copies[0].When)} · {copies.Count} kept";
++            // The save folder is a tree of files and the copies a listing: read on a worker thread, at most every 30 s, drawn when they arrive (the last texts stay meanwhile).
++            if (playerLastText != null) { playerLast.Text = playerLastText; playerSaves.Text = playerSavesText; }
++            RequestPlayerSaves(docs, tid, GameAppUi.DisplayName(game));
+         }
+         var v = LoadSettingValues(game);
+         string Get(string k) => v.TryGetValue(k, out var x) ? x : null;
+@@ -1106,8 +1127,11 @@
+ 
+     // ---- Logs: a timeline ------------------------------------------------------------------------------------
+ 
+-    private const int MaxLogLines = 6000;
+-    private readonly List<(string Time, string Text, GameAppUi.LogKind Kind)> logLines = new List<(string, string, GameAppUi.LogKind)>();
++    // The lines the page shows (GameAppPerf.cs, UiLogModel): about 400, a counter line ("compiling: 758/21990 shaders") replaces the one before it in place, the engine's "unity compute source" lines are
++    // not rows. The FILES keep every line (Append writes them before the model sees them). Measured on the owner's real log (host harness, patch 0064): 1,944 lines made 1,012 rows, now 246; one 22,000-shader build made 416, now 46.
++    private readonly UiLogModel logModel = new UiLogModel();
++    private List<(string Time, string Text, GameAppUi.LogKind Kind)> logLines => logModel.Lines;
++    private Coalescer logRedraw;
+     private string logPartial = "";
+     private bool onlyProblems;
+     private int logErrors, logWarnings;
+@@ -1200,23 +1224,27 @@
+         }
+         catch { }
+         logPartial += text;
+-        int nl, added = 0;
++        int nl, added = 0, from = 0;
+         var time = DateTime.Now.ToString("HH:mm");
+-        while ((nl = logPartial.IndexOf('\n')) >= 0)
++        // Linear in the text: the rest of it used to be cut off again at every line (a build that went on in the background left thousands of lines for the first tick after the return).
++        while ((nl = logPartial.IndexOf('\n', from)) >= 0)
+         {
+-            var line = logPartial.Substring(0, nl).TrimEnd('\r');
+-            logPartial = logPartial.Substring(nl + 1);
++            var line = logPartial.Substring(from, nl - from).TrimEnd('\r');
++            from = nl + 1;
+             if (line.Trim().Length == 0) continue;
+             GameAppDiag.Ui(line);
+             var kind = GameAppUi.KindOfLine(line);
+-            logLines.Add((time, line, kind));
+-            added++;
++            if (logModel.Add(time, line, kind)) added++;   // false: a line only the files keep
+             if (kind == GameAppUi.LogKind.Error) logErrors++;
+             else if (kind == GameAppUi.LogKind.Warning) logWarnings++;
+         }
+-        if (logLines.Count > MaxLogLines) logLines.RemoveRange(0, logLines.Count - MaxLogLines * 3 / 4);
+-        if (added > 0 && !pages[3].Hidden) RebuildLog(keepPlace: true);
+-        else if (added > 0) logDirty = true;
++        if (from > 0) logPartial = logPartial.Substring(from);
++        if (added > 0)
++        {
++            logDirty = true;
++            // The page is drawn again at most every 400 ms, on a later turn of the run loop (it was a full rebuild of up to 6,000 lines at every append, once a second during a build).
++            if (!pages[3].Hidden) (logRedraw ??= new Coalescer(work => BeginInvokeOnMainThread(work), () => { if (!pages[3].Hidden && logDirty) RebuildLog(keepPlace: true); }, TimeSpan.FromMilliseconds(400))).Request();
++        }
+         RefreshLogTiles();
+     }
+ 
+@@ -1224,7 +1252,9 @@
+ 
+     /// The rows again from the lines (the filter, the headers). While the page is hidden nothing is redrawn: it is
+     /// drawn when it shows (ShowTab), so a long build does not lay out a table nobody sees.
+-    private void RebuildLog(bool keepPlace = false)
++    private void RebuildLog(bool keepPlace = false) => Timed("log rebuild", () => RebuildLogBody(keepPlace));
++
++    private void RebuildLogBody(bool keepPlace)
+     {
+         bool atEnd = !keepPlace || logTable.ContentOffset.Y + logTable.Bounds.Height >= logTable.ContentSize.Height - 120;
+         logSource.Rows = GameAppUi.Timeline(logLines, onlyProblems);
+@@ -2175,6 +2205,7 @@
+                 catch (Exception e) { Write($"not removed: {Path.GetFileName(p)}: {e.Message}"); }
+             // A game's folder under Exports goes with its last game file.
+             foreach (var p in paths) GameAppUi.RemoveEmptyGameFolder(Path.Combine(GameAppMain.Documents, "Exports"), p);
++            sizes.Invalidate(FolderSizes.Exports);   // an exported app may have gone
+             RefreshScreen();
+         }));
+         PresentWhenFree(a);
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -906,10 +906,10 @@
+         ambient.Frame = View.Bounds;
+         ambient.AutoresizingMask = UIViewAutoresizing.FlexibleDimensions;
+         View.AddSubview(ambient);
+-        PrepareLog();
+-        SweepLeftoverParts(text => Write(text));   // before anything can start a copy (the exported player's PreparePlayerDocuments below, an import, a download)
+-        LoadCloud();
+-        LoadBuildQueue();
++        Timed("PrepareLog", PrepareLog);
++        Timed("SweepLeftoverParts", () => SweepLeftoverParts(text => Write(text)));   // before anything can start a copy (the exported player's PreparePlayerDocuments below, an import, a download)
++        Timed("LoadCloud", LoadCloud);
++        Timed("LoadBuildQueue", LoadBuildQueue);
+ 
+         // Export: share the LOG FILES themselves through UIActivityViewController, so a run that misbehaved can
+         // be AirDropped or mailed out without copying text off the screen -- which the user could not do when the
+@@ -919,21 +919,21 @@
+         export.TouchUpInside += (_, __) => ExportLogs();
+ 
+         // An exported game sets up its Documents (settings, saves, profile, the framework stamp) before the first screen.
+-        GameExport.PreparePlayerDocuments(GameAppMain.Documents, text => Write(text));
+-        if (GameExport.IsPlayer) BuildGamesPage(); else BuildShelf();   // the library: the old page for an exported player, the shelf for the app
+-        BuildCloudPage();
+-        BuildKeysPage();
+-        BuildLogsPage();
+-        BuildSettingsPage();
+-        BuildAppsPage();
+-        BuildQueuePage();
+-        if (!GameExport.IsPlayer) BuildBuildTab();   // after the queue page: it takes the queue's views
++        Timed("PreparePlayerDocuments", () => GameExport.PreparePlayerDocuments(GameAppMain.Documents, text => Write(text)));
++        Timed("BuildShelf", () => { if (GameExport.IsPlayer) BuildGamesPage(); else BuildShelf(); });   // the library: the old page for an exported player, the shelf for the app
++        Timed("BuildCloudPage", BuildCloudPage);
++        Timed("BuildKeysPage", BuildKeysPage);
++        Timed("BuildLogsPage", BuildLogsPage);   // the log page
++        Timed("BuildSettingsPage", BuildSettingsPage);
++        Timed("BuildAppsPage", BuildAppsPage);
++        Timed("BuildQueuePage", BuildQueuePage);
++        if (!GameExport.IsPlayer) Timed("BuildBuildTab", BuildBuildTab);   // after the queue page: it takes the queue's views
+         if (GameExport.IsPlayer)
+-            BuildPlayerPage();   // an exported game: its own one screen, no tabs
++            Timed("BuildPlayerPage", BuildPlayerPage);   // an exported game: its own one screen, no tabs
+         else
+         {
+-            BuildTabBar();
+-            ShowTab(0);
++            Timed("BuildTabBar", BuildTabBar);
++            Timed("ShowTab(0)", () => ShowTab(0));
+             AddKeyCommands();
+         }
+ 
+@@ -945,13 +945,12 @@
+         Write(GameAppMain.IdentityLine());
+         var argsPath = Path.Combine(GameAppMain.Documents, "gameapp.args");
+         bool hadArgs = File.Exists(argsPath);
+-        bool interrupted = ReportInterruptedRunIfAny();
+-        RefreshGames();
+-        RefreshScreen();
++        bool interrupted = Timed("ReportInterruptedRunIfAny", ReportInterruptedRunIfAny);
++        Timed("RefreshGames", RefreshGames);
++        RefreshScreenNow();   // synchronous: the first frame has the shelf in it (every other refresh is coalesced, RefreshScreen)
+         StartWarmAtLaunch();   // GameAppWarm.cs: starts nothing by itself (only a debug launch argument); the shaders are prepared when the player asks
+-        // Back from the Files app or the background, Documents may have gained a game or a key: say so.
+-        NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.WillEnterForegroundNotification,
+-                                                       _ => { RefreshScreen(); RefreshCloud(null); });
++        // Back from the Files app or the background, Documents may have gained a game or a key: say so -- on the next turn of the run loop, never inside the notification (OnWillEnterForeground).
++        NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.WillEnterForegroundNotification, _ => OnWillEnterForeground());
+         // The cloud listing and its icons wait for the first frame (ViewDidAppear, GameAppLibrary.cs): the library
+         // is drawn from what is on disk, and the network is not on the way to it.
+         Write($"launch: view built in {launchClock.ElapsedMilliseconds} ms");
+@@ -1155,7 +1154,9 @@
+ 
+     /// What the screen's decisions depend on, read from Documents and the Keychain right now. Everything that
+     /// decides what to show or what the main button does is in GameAppUi (tested on a Mac); this only looks.
+-    private UiFacts GatherFacts()
++    private UiFacts GatherFacts() => Timed("GatherFacts", GatherFactsBody);
++
++    private UiFacts GatherFactsBody()
+     {
+         var bootExists = File.Exists(BootOnlyPath);
+         string bootContent = null;
+@@ -1495,36 +1496,79 @@
+         catch (Exception) { return ""; }
+     }
+ 
+-    private static long FolderBytes(string path)
++    // The folder sizes are measured by GameAppPerf.cs (FolderSizes): off the main thread, one at a time, cached. Nothing on the main thread walks a folder: the shader cache is up to 60,000 files, shaders/<id> 22,000,
++    // extract/ thousands, and a walk of 15,000 files on the main thread inside the WillEnterForeground notification was what the system killed the app for (0x8BADF00D, 2026-11-20).
++
++    private FolderSizes sizesCache;
++    private FolderSizes sizes => sizesCache ??= MakeSizes();
++    private bool exportSizing, deleteSizing;
++    private BackgroundDelete deleteJobs;
++    private BackgroundDelete deletes => deleteJobs ??= new BackgroundDelete(work => BeginInvokeOnMainThread(work));
++
++    private FolderSizes MakeSizes()
+     {
+-        try
+-        {
+-            return Directory.Exists(path)
+-                ? Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length) : 0;
+-        }
+-        catch (Exception) { return 0; }
++        _ = deletes;   // made here, on the main thread, before any worker can ask (the walk's `hold` reads it from a worker thread)
++        var docs = GameAppMain.Documents;
++        // nothing is measured while a delete runs (the folder is being emptied under the walk); each walk's time goes to the log as a launch-profile line when it is long
++        var made = new FolderSizes(FolderWalk.Bytes, work => BeginInvokeOnMainThread(work), () => running, () => DateTime.UtcNow, RefreshStorageViews,
++                                   () => deletes.Busy, (key, ms, bytes) => BeginInvokeOnMainThread(() => NoteTime("storage/" + key, ms)));
++        made.Track(FolderSizes.Framework, Path.Combine(docs, "DmGameProbe.framework"), false);
++        made.Track(FolderSizes.Extract, Path.Combine(docs, "extract"), true);
++        made.Track(FolderSizes.Exports, Path.Combine(docs, "Exports"), false);
++        // Documents/shaders: the installed packs (shaders/<id>) here; the shader build's resume folders (shaders/<id>.work: 27,144 files and 6.2 GB on the owner's phone, ~50,000 for a 42,848-shader game)
++        // are measured apart, rarely (FolderSizes.SlowGap: a build or a delete invalidates them, the clock does not), and never by a refresh.
++        made.Track(FolderSizes.Shaders, Path.Combine(docs, "shaders"), true, path => FolderWalk.Bytes(path, name => !name.EndsWith(".work", StringComparison.Ordinal)));
++        made.Track(FolderSizes.ShaderWork, Path.Combine(docs, "shaders"), true, path => FolderWalk.Bytes(path, name => name.EndsWith(".work", StringComparison.Ordinal)), slow: true);
++        made.Track(FolderSizes.ShaderCache, ShaderCachePath, true);
++        return made;
+     }
+ 
+-    private static long ShaderCacheBytes() => FolderBytes(ShaderCachePath);
++    /// The shader cache's size, as the last measurement knows it: "…" until the first one is in. Never walks.
++    private void RefreshCacheSize()
++    {
++        if (cacheSizeLabel == null) return;
++        var bytes = sizes.Get(FolderSizes.ShaderCache);
++        if (clearingCache) cacheSizeLabel.Text = "Shader cache: clearing…";
++        else cacheSizeLabel.Text = bytes < 0 ? "Shader cache: …" : "Shader cache: " + GameAppUi.SizeText(bytes);
++        sizes.Request();
++    }
+ 
+-    private int cacheSizeBusy;
++    private bool clearingCache;
+ 
+-    /// The shader cache is thousands of files: walked off the main thread, the label set when it is known.
+-    private void RefreshCacheSize()
++    /// What "Clear" says it frees: the last measurement (an alert must not wait for a walk).
++    private string CacheFreesText()
+     {
+-        if (cacheSizeLabel == null || Interlocked.CompareExchange(ref cacheSizeBusy, 1, 0) != 0) return;
+-        if (string.IsNullOrEmpty(cacheSizeLabel.Text)) cacheSizeLabel.Text = "Shader cache: …";
+-        System.Threading.Tasks.Task.Run(() =>
++        var bytes = sizes.Get(FolderSizes.ShaderCache);
++        return bytes < 0 ? "Frees the space of every shader the app translated" : $"Frees {GameAppUi.SizeText(bytes)}";
++    }
++
++    /// Deletes a folder and everything in it on a worker thread: NEVER on the main thread (40,000 files take longer than the 10 s the system gives a button handler or a scene update, which ends the app).
++    /// One delete at a time (they wait for each other, in order); no folder size is measured while one runs; the sizes are measured again when it is done. `done` runs on the main thread: null when it went well,
++    /// else what failed. Made reusable for the build's own cleanup (the .work folder of a cancelled shader build: DeleteFolderInBackground(Path.Combine(docs, "shaders", id + ".work"), ...)).
++    internal void DeleteFolderInBackground(string path, Action<string> done = null)
++    {
++        deletes.Enqueue(() => BackgroundDelete.DeleteTree(path), error =>
+         {
+-            var bytes = ShaderCacheBytes();
+-            BeginInvokeOnMainThread(() =>
+-            {
+-                if (cacheSizeLabel != null) cacheSizeLabel.Text = "Shader cache: " + GameAppUi.SizeText(bytes);
+-                Interlocked.Exchange(ref cacheSizeBusy, 0);
+-            });
++            sizes.Invalidate();
++            done?.Invoke(error?.Message);
+         });
+     }
+ 
++    /// Deletes Documents/shadercache (60,000 files: seconds) in the background: "clearing…" meanwhile, then the log line, and the size measured again.
++    private void ClearShaderCacheNow()
++    {
++        if (clearingCache) return;
++        clearingCache = true;
++        RefreshCacheSize();
++        DeleteFolderInBackground(ShaderCachePath, error =>
++        {
++            clearingCache = false;
++            Write(error == null ? "shader cache cleared" : $"could not clear the shader cache: {error}");
++            sizes.Reset(FolderSizes.ShaderCache);
++            RefreshCacheSize();
++        });
++    }
++
+     /// The app's build settings (Documents/gameapp.settings.tsv, read by the shim and the pipeline at each build): parallel
+     /// shader preparation, and the shader translation cache every game shares (Documents/shadercache).
+     private UIView BuildSection()
+@@ -1566,14 +1610,9 @@
+         clear.TouchUpInside += (_, __) =>
+         {
+             var alert = UIAlertController.Create("Clear the shader cache?",
+-                $"Frees {GameAppUi.SizeText(ShaderCacheBytes())}. Games already built keep their shaders; the next builds translate every shader again.",
++                $"{CacheFreesText()}. Games already built keep their shaders; the next builds translate every shader again.",
+                 UIAlertControllerStyle.Alert);
+-            alert.AddAction(UIAlertAction.Create("Clear", UIAlertActionStyle.Destructive, ___ =>
+-            {
+-                try { if (Directory.Exists(ShaderCachePath)) Directory.Delete(ShaderCachePath, true); Write("shader cache cleared"); }
+-                catch (Exception error) { Write($"could not clear the shader cache: {error.Message}"); }
+-                RefreshCacheSize();
+-            }));
++            alert.AddAction(UIAlertAction.Create("Clear", UIAlertActionStyle.Destructive, ___ => ClearShaderCacheNow()));
+             alert.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
+             PresentViewController(alert, true, null);
+         };
+@@ -1712,17 +1751,59 @@
+         });
+     }
+ 
++    private Coalescer refreshSoon;
++
++    // ---- the launch-profile lines: where the time goes (the next field log answers it) ----------------------------------------------------------------------------
++    private readonly LaunchProfile launchProfile = new LaunchProfile();
++
++    /// One `launch-profile: <part> <ms>` line when the part was long (LaunchProfile: over 50 ms in the first 90 s, over 250 ms after). Main thread.
++    private void NoteTime(string part, long ms)
++    {
++        var line = launchProfile.Line(part, ms, launchClock.Elapsed);
++        if (line != null) Write(line);
++    }
++
++    private void Timed(string part, Action action)
++    {
++        var clock = System.Diagnostics.Stopwatch.StartNew();
++        try { action(); } finally { NoteTime(part, clock.ElapsedMilliseconds); }
++    }
++
++    private T Timed<T>(string part, Func<T> action)
++    {
++        var clock = System.Diagnostics.Stopwatch.StartNew();
++        try { return action(); } finally { NoteTime(part, clock.ElapsedMilliseconds); }
++    }
++
++    /// Asks for a redraw of the whole screen: it runs once, on the next turn of the run loop, however many times it is asked before then (a run's start, its end, an import and a selection in one
++    /// breath are one redraw), and not twice within 250 ms. Never inside the call that asks: RefreshScreenNow is the synchronous one (the first frame).
++    private void RefreshScreen() => (refreshSoon ??= new Coalescer(work => BeginInvokeOnMainThread(work), RefreshScreenNow, TimeSpan.FromMilliseconds(250))).Request();
++
++    /// The notification that the app is coming back to the foreground runs inside the system's scene update, which ends the app at 10 s (0x8BADF00D: measured twice on the owner's iPhone,
++    /// the main thread walking the shader cache). It does nothing here: the redraw, the cloud refresh and the folder measurements wait for the next turn of the run loop.
++    private void OnWillEnterForeground()
++    {
++        BeginInvokeOnMainThread(() =>
++        {
++            RefreshScreen();
++            RefreshCloud(null);
++            sizes.Request();
++        });
++    }
++
+     /// Redraw the whole screen from the facts on disk: the banner, the carousel and list, the selected game, the Keys rows. Called at
+-    /// launch, when the app comes back to the foreground, when a run starts and ends, after an import or a
++    /// launch (this one, synchronously), and through RefreshScreen when the app comes back to the foreground, when a run starts and ends, after an import or a
+     /// certificate, and when a game is selected.
+-    private void RefreshScreen()
++    private void RefreshScreenNow() => Timed("RefreshScreen", RefreshScreenBody);
++
++    private void RefreshScreenBody()
+     {
+         UiFacts facts;
+         try { facts = GatherFacts(); }
+         catch (Exception error) { Write($"screen: the facts could not be read: {error.GetType().Name}: {error.Message}"); return; }
+         // The Keys page first, and each part on its own: a part that throws (a game's file, an icon, the storage
+         // sizes) is logged and the rest is still drawn (the Keys card came up empty on a phone, 2026-11-18).
+-        sharedSegments = null; sharingSegments = true;   // the Library's and Settings' storage bars walk the folders once
++        sharedSegments = null; sharingSegments = true;   // the Library's and Settings' storage bars read the folders' sizes once
+         try
+         {
+             Guarded("keys", () => FillKeysRows(facts));
+@@ -1748,25 +1829,42 @@
+     private List<GameAppUi.StorageSegment> CurrentStorageSegments()
+     {
+         if (sharingSegments && sharedSegments != null) return sharedSegments;
+-        var docs = GameAppMain.Documents;
++        // Returns at once: the games (the dumps in Documents: a short listing) and the free space are read now, the folders are the last measurement (0 until it is known: the bar shows what it has and is
++        // drawn again when the walk is done, RefreshStorageViews). The walk itself is off the main thread (FolderSizes).
++        long Known(string key) => Math.Max(0, sizes.Get(key));
+         var segments = GameAppUi.StorageSegments(DumpBytes(),
+-            FolderBytes(Path.Combine(docs, "extract")) + FolderBytes(Path.Combine(docs, "DmGameProbe.framework")),
+-            FolderBytes(Path.Combine(docs, "shaders")) + ShaderCacheBytes(),
+-            FolderBytes(Path.Combine(docs, "Exports")), FreeBytes());
++            Known(FolderSizes.Extract) + Known(FolderSizes.Framework),
++            Known(FolderSizes.Shaders) + Known(FolderSizes.ShaderWork) + Known(FolderSizes.ShaderCache),
++            Known(FolderSizes.Exports), FreeBytes());
++        sizes.Request();
+         if (sharingSegments) sharedSegments = segments;
+         return segments;
+     }
+ 
++    private Action sheetStorageFill;   // the open game sheet's Build and Shaders lines (GameAppShelf.cs)
++
++    /// A measurement arrived: the storage bars, the shader cache's label and the open game sheet are drawn again from the new values; nothing else is.
++    private void RefreshStorageViews()
++    {
++        var segments = CurrentStorageSegments();
++        settingsStorage.Set(segments);
++        storageBar.Set(segments);
++        RefreshCacheSize();
++        sheetStorageFill?.Invoke();
++    }
++
+     private int refreshFailures;
+ 
+     private void Guarded(string part, Action action)
+     {
++        var clock = System.Diagnostics.Stopwatch.StartNew();
+         try { action(); }
+         catch (Exception error)
+         {
+             if (refreshFailures++ < 20)
+                 Write($"screen: the {part} part could not be drawn: {error.GetType().Name}: {error.Message}\n{error.StackTrace?.Split('\n').FirstOrDefault()?.Trim()}");
+         }
++        finally { NoteTime("refresh/" + part, clock.ElapsedMilliseconds); }
+     }
+ 
+     private void FillKeysRows(UiFacts facts)
+@@ -1822,9 +1920,12 @@
+             case ActionKind.Import: Import(); break;
+             case ActionKind.Boot:
+                 if (builtThisProcess) { AskToRestartForGame(selected); break; }
+-                AutoCopySaves(selected);
+-                Write("no rebuild: this tap boots the framework this version of the app already built and signed");
+-                BeginRun("boot-only (the framework is built and signed)", null, skipExtract: true, bootOnly: true);
++                if (savesCopying) break;   // the copy before the launch is still being made
++                AutoCopySaves(selected, () =>
++                {
++                    Write("no rebuild: this tap boots the framework this version of the app already built and signed");
++                    BeginRun("boot-only (the framework is built and signed)", null, skipExtract: true, bootOnly: true);
++                });
+                 break;
+             case ActionKind.Run: SetUpAndPlay(selected); break;
+             // A distribution certificate: the built game runs only from an app's own bundle (GameAppUi.CannotRunHere).
+@@ -1938,7 +2039,7 @@
+         return null;
+     }
+ 
+-    /// Bytes the plan's paths hold now (missing ones count 0).
++    /// Bytes the plan's paths hold now (missing ones count 0). A walk: worker threads only.
+     private static long PlanBytes(GameAppUi.DeletionPlan plan)
+     {
+         long total = 0;
+@@ -1951,7 +2052,7 @@
+             try
+             {
+                 var d = Path.Combine(GameAppMain.Documents, rel);
+-                if (Directory.Exists(d)) total += Directory.EnumerateFiles(d, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
++                total += FolderWalk.Bytes(d);
+             }
+             catch (Exception) { }
+         }
+@@ -1964,15 +2065,31 @@
+     /// installer does with it), then writes Documents/Exports/<Name>.ipa off the main thread and offers to share it.
+     private void ConfirmExport(string game)
+     {
+-        if (running || exporting || game == null) return;
++        if (running || exporting || exportSizing || deletes.Busy || game == null) return;
+         var tid = BuiltTitleId();
+         if (tid == null) { Write("export: the built game has no title id (profile.tsv): build it again"); return; }
+-        long size = 0;
+-        foreach (var rel in new[] { "DmGameProbe.framework", "extract/flat", "shaders/" + tid })
+-            size += FolderBytes(Path.Combine(GameAppMain.Documents, rel));
+-        long romfs = 0;
+-        try { romfs = new FileInfo(Path.Combine(GameAppMain.Documents, "extract", "RomFS.img")).Length; } catch (Exception) { }
+-        size += FolderBytes(NSBundle.MainBundle.BundlePath);
++        // What goes into the app is measured on a worker thread: the build is thousands of files, the shaders tens of thousands (the alert comes up when the numbers are in).
++        exportSizing = true;
++        var documents = GameAppMain.Documents;
++        var bundlePath = NSBundle.MainBundle.BundlePath;
++        System.Threading.Tasks.Task.Run(() =>
++        {
++            long total = 0;
++            foreach (var rel in new[] { "DmGameProbe.framework", "extract/flat", "shaders/" + tid })
++                total += FolderWalk.Bytes(Path.Combine(documents, rel));
++            long image = 0;
++            try { image = new FileInfo(Path.Combine(documents, "extract", "RomFS.img")).Length; } catch (Exception) { }
++            total += FolderWalk.Bytes(bundlePath);
++            BeginInvokeOnMainThread(() =>
++            {
++                exportSizing = false;
++                if (!running && !exporting) ShowExportChoice(game, tid, total, image);
++            });
++        });
++    }
++
++    private void ShowExportChoice(string game, string tid, long size, long romfs)
++    {
+         var name = GameAppUi.DisplayName(game);
+         var romfsName = GameAppUi.RomfsFileName(name, tid);
+         // Light for big games only: an installer repacks the whole .ipa, and a 15.5 GB one was more than FlareStore could do.
+@@ -2015,6 +2132,7 @@
+                 exporting = false;
+                 UIApplication.SharedApplication.IdleTimerDisabled = false;
+                 UIApplication.SharedApplication.EndBackgroundTask(task);
++                sizes.Invalidate(FolderSizes.Exports);   // the .ipa (and the game files beside a light one) are in Exports/ now
+                 RefreshScreen();
+                 if (path == null)
+                 {
+@@ -2049,13 +2167,27 @@
+     /// "Delete this game…": what goes and the space it frees, with or without the saves; nothing while a run is going.
+     private void ConfirmDelete(string game)
+     {
+-        if (running || game == null) return;
++        if (running || deletes.Busy || deleteSizing || exportSizing || game == null) return;
+         var facts = GatherFacts();
+         var all = Dumps().Select(Path.GetFileName).ToList();
+         var builtId = BuiltTitleId();
+         var keep = GameAppUi.PlanDeletion(game, all, facts.FrameworkGame, builtId, keepSaves: true);
+         var everything = GameAppUi.PlanDeletion(game, all, facts.FrameworkGame, builtId, keepSaves: false);
+-        long keepBytes = PlanBytes(keep), allBytes = PlanBytes(everything);
++        // "Frees ..." is measured on a worker thread (the build and the shaders are thousands of files); the question comes up when the numbers are in.
++        deleteSizing = true;
++        System.Threading.Tasks.Task.Run(() =>
++        {
++            long keepBytes = PlanBytes(keep), allBytes = PlanBytes(everything);
++            BeginInvokeOnMainThread(() =>
++            {
++                deleteSizing = false;
++                if (!running && !deletes.Busy) ShowDeleteChoice(game, all, keep, everything, keepBytes, allBytes);
++            });
++        });
++    }
++
++    private void ShowDeleteChoice(string game, List<string> all, GameAppUi.DeletionPlan keep, GameAppUi.DeletionPlan everything, long keepBytes, long allBytes)
++    {
+         var extra = keep.Files.Where(f => f != game && all.Contains(f)).ToList();
+         var message = $"Frees {GameAppUi.SizeText(keepBytes)}: the game file, its shaders" + (keep.BuildToo ? ", its build (the extracted game)" : "")
+                       + " and its settings."
+@@ -2070,24 +2202,34 @@
+ 
+     private void PerformDelete(string game, GameAppUi.DeletionPlan plan)
+     {
+-        if (running) return;
+-        long freed = PlanBytes(plan);
++        if (running || deletes.Busy) return;
++        // The files and folders go on the delete worker (extract/, shaders/<id> and shaders/<id>.work are tens of thousands of files); BeginRun waits for it, no size is measured meanwhile.
++        long freed = 0;
+         int removed = 0, failed = 0;
+-        foreach (var rel in plan.Files)
++        var notes = new List<string>();
++        deletes.Enqueue(() =>
+         {
+-            var path = Path.Combine(GameAppMain.Documents, rel);
+-            try { if (File.Exists(path)) { File.Delete(path); removed++; } }
+-            catch (Exception error) { failed++; Write($"delete: {rel} not removed ({error.Message})"); }
+-        }
+-        foreach (var rel in plan.Folders)
++            freed = PlanBytes(plan);
++            foreach (var rel in plan.Files)
++            {
++                var path = Path.Combine(GameAppMain.Documents, rel);
++                try { if (File.Exists(path)) { File.Delete(path); removed++; } }
++                catch (Exception error) { failed++; notes.Add($"delete: {rel} not removed ({error.Message})"); }
++            }
++            foreach (var rel in plan.Folders)
++            {
++                var path = Path.Combine(GameAppMain.Documents, rel);
++                try { if (Directory.Exists(path)) { BackgroundDelete.DeleteTree(path); removed++; } }
++                catch (Exception error) { failed++; notes.Add($"delete: {rel}/ not removed ({error.Message})"); }
++            }
++        }, _ =>
+         {
+-            var path = Path.Combine(GameAppMain.Documents, rel);
+-            try { if (Directory.Exists(path)) { Directory.Delete(path, true); removed++; } }
+-            catch (Exception error) { failed++; Write($"delete: {rel}/ not removed ({error.Message})"); }
+-        }
+-        Write($"deleted {GameAppUi.DisplayName(game)}: {removed} item(s), {GameAppUi.SizeText(freed)} freed" + (failed > 0 ? $", {failed} could not be removed" : ""));
+-        if (selected == game) selected = null;
+-        RefreshScreen();
++            foreach (var note in notes) Write(note);
++            Write($"deleted {GameAppUi.DisplayName(game)}: {removed} item(s), {GameAppUi.SizeText(freed)} freed" + (failed > 0 ? $", {failed} could not be removed" : ""));
++            if (selected == game) selected = null;
++            sizes.Invalidate();
++            RefreshScreen();
++        });
+     }
+ 
+     /// The game's settings, as the sheet draws them: the engine launcher's rows when the game was built, else the four
+@@ -2129,18 +2271,25 @@
+         PresentWhenFree(sheet);
+     }
+ 
++    private bool savesCopying;
++
+     /// A copy of the save before every launch: the ten newest are kept (GameSaves.KeepAuto). A game that ruins its save
+-    /// (a crash mid-write, a wrong choice) can always go back to how it was when it last started.
+-    private void AutoCopySaves(string game)
++    /// (a crash mid-write, a wrong choice) can always go back to how it was when it last started. The zip is made on a worker thread (a save is a tree of files); `then` (the boot) runs on the main thread
++    /// when the copy is done, so the game never starts before its save is safe.
++    private void AutoCopySaves(string game, Action then)
+     {
+         var tid = GameAppUi.BaseTitleIdOf(game);
+-        if (tid == null) return;
+-        try
++        if (tid == null) { then(); return; }
++        savesCopying = true;
++        var documents = GameAppMain.Documents;
++        var name = GameAppUi.DisplayName(game);
++        Bg.Run(() => GameSaves.Create(documents, tid, name, "auto", DateTime.Now), (path, error) =>
+         {
+-            var p = GameSaves.Create(GameAppMain.Documents, tid, GameAppUi.DisplayName(game), "auto", DateTime.Now);
+-            if (p != null) Write($"saves: copy before the launch, {Path.GetFileName(p)}");
+-        }
+-        catch (Exception error) { Write($"saves: no copy before the launch ({error.Message}) — the game starts anyway"); }
++            savesCopying = false;
++            if (error != null) Write($"saves: no copy before the launch ({error.Message}) — the game starts anyway");
++            else if (path != null) Write($"saves: copy before the launch, {Path.GetFileName(path)}");
++            then();
++        }, work => BeginInvokeOnMainThread(work));
+     }
+ 
+     // ---- an exported game's app: one screen, the game and its settings (GameAppExport.cs) ------------------------------
+@@ -2355,6 +2504,7 @@
+     private void BeginRun(string name, string[] arguments, bool skipExtract, bool bootOnly = false)
+     {
+         if (running) return;
++        if (deletes.Busy) { Write("a delete is still going: try again in a moment"); return; }   // its worker thread is removing the build and the shaders
+         // A Switch 2 game (.nup): no extractor run here (it reads NSP/XCI only); the chain reads the package itself
+         // (gameapp_pipeline.extract_nup, from the config's nup= line), with no keys.
+         if (arguments != null && arguments.Length > 1 && GameAppUi.IsNup(arguments[1])) skipExtract = true;
+@@ -2566,6 +2716,8 @@
+         QueueBuildEnded();
+         RefreshRunLine();
+         RefreshBuildScreen();
++        sizes.Invalidate();   // the build, the shaders and the shader cache changed: measured again, off the main thread
++        playerSavesAt = DateTime.MinValue;   // the save may have changed (a player's title screen reads it again)
+         // The run may have left a boot request (a refused in-process boot, or a boot that never came back): the
+         // main button now says what is owed, and the checklist shows the framework that is waiting.
+         RefreshScreen();
+@@ -2611,6 +2763,7 @@
+             // (docs/PROFILE-DERIVED.md).
+             RefreshBuildScreen();
+             RefreshRunLine();
++            sizes.Request();   // the shader cache grows while a build runs: measured again at most every 60 s, off the main thread (FolderSizes), the bars drawn again when it is in
+             // The bar follows the stage and never goes back inside one run.
+             BackgroundTick();   // GameAppBackground.cs: the system's progress UI
+             var target = (float) GameAppUi.ParseStage(lastStage).Fraction;
+diff -ruN a/GameAppModsUi.cs b/GameAppModsUi.cs
+--- a/GameAppModsUi.cs
++++ b/GameAppModsUi.cs
+@@ -13,6 +13,8 @@
+     private readonly Action<string> log;
+     private readonly UIKit.UIStackView rows = new UIKit.UIStackView { Axis = UIKit.UILayoutConstraintAxis.Vertical, Spacing = 14 };
+     private readonly UIKit.UILabel note = new UIKit.UILabel { Lines = 0 };
++    private bool busy;        // a mod is being added or deleted on a worker thread (a mod is a tree of files: never on the main thread)
++    private int reloadSeq;
+ 
+     /// `built`: the game has a build on this iPhone (an exefs patch change then needs a rebuild; before that it is just applied by the first one).
+     public GameAppModsViewController(string documents, string titleId, string gameName, bool built, Action<string> log)
+@@ -80,9 +82,20 @@
+ 
+     private void Reload()
+     {
++        // The mods' trees are walked (a RomFS mod can be thousands of files) on a worker thread; the page is filled when they arrive (a newer reload replaces an older one).
++        var seq = ++reloadSeq;
++        var docs = documents; var id = titleId;
++        Bg.Run(() => (GameMods.List(docs, id), GameMods.ExefsChangedSinceBuild(docs, id)), (found, error) =>
++        {
++            if (seq != reloadSeq) return;
++            if (error != null) { note.TextColor = UIKit.UIColor.SystemOrange; note.Text = "The mods could not be read: " + error.Message; return; }
++            Fill(found.Item1, found.Item2);
++        }, work => BeginInvokeOnMainThread(work));
++    }
++
++    private void Fill(System.Collections.Generic.List<GameMods.Mod> list, bool changed)
++    {
+         foreach (var v in rows.ArrangedSubviews) { rows.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+-        var list = GameMods.List(documents, titleId);
+-        var changed = GameMods.ExefsChangedSinceBuild(documents, titleId);
+         note.Font = UIKit.UIFont.GetPreferredFontForTextStyle(UIKit.UIFontTextStyle.Subheadline);
+         note.AccessibilityIdentifier = "mods-note";
+         if (changed)
+@@ -149,8 +162,15 @@
+         a.AddAction(UIKit.UIAlertAction.Create("Cancel", UIKit.UIAlertActionStyle.Cancel, null));
+         a.AddAction(UIKit.UIAlertAction.Create("Delete", UIKit.UIAlertActionStyle.Destructive, _ =>
+         {
+-            try { GameMods.Delete(documents, titleId, mod); log?.Invoke($"mods: {mod} deleted"); } catch (Exception e) { Say("Not deleted", e.Message); }
+-            Reload();
++            if (busy) return;
++            busy = true;   // the mod's folder goes on a worker thread
++            Bg.Run(() => { GameMods.Delete(documents, titleId, mod); return true; }, (_ok, error) =>
++            {
++                busy = false;
++                if (error != null) Say("Not deleted", error.Message);
++                else log?.Invoke($"mods: {mod} deleted");
++                Reload();
++            }, work => BeginInvokeOnMainThread(work));
+         }));
+         PresentViewController(a, true, null);
+     }
+@@ -182,12 +202,25 @@
+         {
+             var name = url?.LastPathComponent ?? "";
+             if (!name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) { Say("Not a zip", $"{name} is not a .zip. Pick a mod archive, or use \"A folder…\"."); return; }
++            if (busy) return;
++            busy = true;   // the copy of the picked zip and its unpacking (a tree of files) go on a worker thread
+             var local = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "mod-import-" + Guid.NewGuid().ToString("N") + ".zip");
+-            try { File.Copy(url.Path, local, true); try { File.Delete(url.Path); } catch { } }
+-            catch (Exception e) { Say("Not read", e.Message); return; }
+-            try { Imported(GameMods.ImportPath(documents, titleId, local), name); }
+-            catch (Exception e) { log?.Invoke($"mods: {name} not added: {e.Message}"); Say("Not added", e.Message); }
+-            finally { try { File.Delete(local); } catch { } }
++            var picked = url.Path;
++            Bg.Run(() =>
++            {
++                try { File.Copy(picked, local, true); try { File.Delete(picked); } catch { } }
++                catch (Exception e) { return new ModImport { ReadError = e }; }
++                try { return new ModImport { Result = GameMods.ImportPath(documents, titleId, local) }; }
++                catch (Exception e) { return new ModImport { AddError = e }; }
++                finally { try { File.Delete(local); } catch { } }
++            }, (r, error) =>
++            {
++                busy = false;
++                if (error != null) { log?.Invoke($"mods: {name} not added: {error.Message}"); Say("Not added", error.Message); }
++                else if (r.ReadError != null) Say("Not read", r.ReadError.Message);
++                else if (r.AddError != null) { log?.Invoke($"mods: {name} not added: {r.AddError.Message}"); Say("Not added", r.AddError.Message); }
++                else Imported(r.Result, name);
++            }, work => BeginInvokeOnMainThread(work));
+         }));
+         PresentViewController(picker, true, null);
+     }
+@@ -197,11 +230,17 @@
+         var picker = new UIKit.UIDocumentPickerViewController(new[] { "public.folder" }, UIKit.UIDocumentPickerMode.Open);
+         picker.Delegate = new PickerDelegate(url => BeginInvokeOnMainThread(() =>
+         {
+-            if (url == null) return;
++            if (url == null || busy) return;
++            busy = true;   // the folder is walked and copied on a worker thread; its access is kept until it is done
+             bool scoped = url.StartAccessingSecurityScopedResource();
+-            try { Imported(GameMods.ImportPath(documents, titleId, url.Path), url.LastPathComponent); }
+-            catch (Exception e) { log?.Invoke($"mods: {url.LastPathComponent} not added: {e.Message}"); Say("Not added", e.Message); }
+-            finally { if (scoped) url.StopAccessingSecurityScopedResource(); }
++            var source = url.Path; var shown = url.LastPathComponent;
++            Bg.Run(() => GameMods.ImportPath(documents, titleId, source), (result, error) =>
++            {
++                busy = false;
++                if (scoped) url.StopAccessingSecurityScopedResource();
++                if (error != null) { log?.Invoke($"mods: {shown} not added: {error.Message}"); Say("Not added", error.Message); }
++                else Imported(result, shown);
++            }, work => BeginInvokeOnMainThread(work));
+         }));
+         PresentViewController(picker, true, null);
+     }
+@@ -211,6 +250,12 @@
+         log?.Invoke($"mods: {source}: {r.Kept} file(s) kept as {string.Join(", ", r.Mods)}" + (r.Notes.Count > 0 ? " (" + string.Join("; ", r.Notes) + ")" : ""));
+         Reload();
+         if (r.Notes.Count > 0) Say("Added", $"{string.Join(", ", r.Mods)}: {r.Kept} file(s) kept.\n" + string.Join("\n", r.Notes.Select(n => "• " + n)));
++    }
++
++    private sealed class ModImport
++    {
++        public GameMods.ImportResult Result;
++        public Exception ReadError, AddError;
+     }
+ 
+     private sealed class PickerDelegate : Foundation.NSObject, UIKit.IUIDocumentPickerDelegate
+diff -ruN a/GameAppPerf.cs b/GameAppPerf.cs
+--- a/GameAppPerf.cs
++++ b/GameAppPerf.cs
+@@ -0,0 +1,411 @@
++// gameapp/GameAppPerf.cs -- what keeps the main thread out of the file system and out of work proportional to the size of the data (patch 0064).
++//
++// Measured on the owner's iPhone (2026-11-20, two crash reports): the app died with 0x8BADF00D, "scene-update watchdog transgression ... exhausted real (wall clock) time allowance of 10.00
++// seconds", with the MAIN thread in -[UIApplication _sendWillEnterForegroundCallbacks] -> our WillEnterForeground observer -> lstat: a walk of Documents/shadercache (15,000+ files after a partial build
++// of a 22,000-shader game). The walk was the storage bar's (every refresh measured five folders), and the app's first screen grew from 586 ms (nothing cached) to 3,337 ms (9,000 shaders) to 5,090 ms (15,000).
++//
++// No UIKit, no Foundation here (the host harness compiles this file as it is): the controller (GameAppMain.cs and the others) hands in what only UIKit can do (`post` = BeginInvokeOnMainThread).
++//
++//   FolderWalk      the size of a folder: one readdir and one stat per file, no path string and no FileInfo per file. Only ever called from a worker thread.
++//   FolderSizes     the cache the screens read instead of walking: last known value per folder, measured off the main thread, ONE measurement at a time, a minimum interval between two of the same
++//                   folder, invalidated by the events that really change a size (a build ends, a delete, a clear, an export). A screen asks, never waits: Get returns the last value (or -1 = not known yet).
++//   Coalescer       "run this on the next turn of the run loop, once, however many times it is asked, and not twice within `spacing`": RefreshScreen, the log page's redraw.
++//   BackgroundDelete  recursive deletes (the shader cache, a game's build and shaders, the shader build's .work folder: 27,144 files, 6.2 GB measured on the phone) on ONE worker thread, in order; FolderSizes measures nothing meanwhile.
++//   Bg              "work on a worker thread, the answer on the main thread": the saves and the mods (a zip, a staging delete, a walk of a mod's tree).
++//   LaunchProfile   the `launch-profile: <part> <ms>` lines of the app log.
++//   UiLogModel      the lines the log page shows: bounded (about 400 rows), a counter line replaces the one before it in place, the engine's "unity compute source" lines stay in the files only.
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.IO.Enumeration;
++using System.Linq;
++using System.Threading;
++using System.Threading.Tasks;
++
++internal static class FolderWalk
++{
++    /// The bytes of every file under `path` (0 when there is none, 0 when it cannot be read at all). A subfolder that cannot be read is skipped, not fatal. Several seconds for 60,000 files on a phone:
++    /// a worker thread only.
++    internal static long Bytes(string path)
++    {
++        try
++        {
++            if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) return 0;
++            var options = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = 0, ReturnSpecialDirectories = false };
++            long total = 0;
++            var files = new FileSystemEnumerable<long>(path, (ref FileSystemEntry entry) => entry.Length, options) { ShouldIncludePredicate = (ref FileSystemEntry entry) => !entry.IsDirectory };
++            foreach (var length in files) total += length;
++            return total;
++        }
++        catch (Exception) { return 0; }
++    }
++
++    /// The bytes under `path` of the entries whose NAME `topLevel` accepts (the folders and files directly in `path`; what is inside an accepted folder counts whole). For Documents/shaders: the packs
++    /// (shaders/<id>) apart from the shader build's resume folders (shaders/<id>.work: 27,144 files, 6.2 GB on the owner's phone), which are measured on their own, rarely. Worker threads only.
++    internal static long Bytes(string path, Func<string, bool> topLevel)
++    {
++        try
++        {
++            if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) return 0;
++            long total = 0;
++            foreach (var info in new DirectoryInfo(path).EnumerateFileSystemInfos())
++            {
++                if (!topLevel(info.Name)) continue;
++                if (info is DirectoryInfo folder) total += Bytes(folder.FullName);
++                else if (info is FileInfo file) total += file.Length;
++            }
++            return total;
++        }
++        catch (Exception) { return 0; }
++    }
++}
++
++internal sealed class FolderSizes
++{
++    internal const string Extract = "extract", Framework = "framework", Shaders = "shaders", ShaderWork = "shaders-work", ShaderCache = "shadercache", Exports = "exports", GameShaders = "game-shaders";
++
++    private sealed class Slot
++    {
++        public string Path;
++        public long Bytes = -1;               // -1: never measured
++        public DateTime At = DateTime.MinValue;
++        public bool Stale;                    // an event changed it since: measure again
++        public bool Heavy;                    // thousands of files: not more often than BuildGap while a build runs
++        public bool Slow;                     // tens of thousands, changed only by a build or a delete: not more often than SlowGap when nothing invalidated it
++        public Func<string, long> Walk;       // its own measurement (null: the one the cache was made with)
++    }
++
++    private readonly Dictionary<string, Slot> slots = new Dictionary<string, Slot>();
++    private readonly List<string> order = new List<string>();
++    private readonly object gate = new object();
++    private readonly Func<string, long> walk;
++    private readonly Action<Action> post;
++    private readonly Func<bool> building;
++    private readonly Func<DateTime> now;
++    private readonly Action changed;
++    private readonly Func<bool> hold;
++    private readonly Action<string, long, long> measured;
++    private bool flying, notifyQueued;
++    private int inWalk, mostInWalk, walks;
++
++    /// The least time between two measurements of one folder when nothing invalidated it.
++    internal TimeSpan Gap = TimeSpan.FromSeconds(30);
++    /// The least time between two measurements of a heavy folder (the shader cache, the shaders, the extraction) while a build runs, an invalidation included: the build is writing there.
++    internal TimeSpan BuildGap = TimeSpan.FromSeconds(60);
++    /// The least time between two measurements of a slow folder (the shader build's .work folders) when nothing invalidated it: a build or a delete does, the clock does not.
++    internal TimeSpan SlowGap = TimeSpan.FromMinutes(5);
++
++    /// walk: the measurement (FolderWalk.Bytes); post: runs an action on the main thread without waiting (BeginInvokeOnMainThread); building: a build is running; now: the clock; changed: a value
++    /// arrived (on the thread `post` runs on; several arrivals in a row make one call); hold: nothing is measured while it answers true (a delete is going: the folder is being emptied under the walk);
++    /// measured: a walk ended (key, milliseconds, bytes), on the worker thread (the launch-profile lines).
++    internal FolderSizes(Func<string, long> walk, Action<Action> post, Func<bool> building, Func<DateTime> now, Action changed, Func<bool> hold = null, Action<string, long, long> measured = null)
++    {
++        this.walk = walk; this.post = post; this.building = building; this.now = now ?? (() => DateTime.UtcNow); this.changed = changed; this.hold = hold; this.measured = measured;
++    }
++
++    /// Names a folder to keep the size of (the path of a known key can change: the new one starts unknown). `walk`: its own measurement; `slow`: see SlowGap.
++    internal void Track(string key, string path, bool heavy, Func<string, long> walk = null, bool slow = false)
++    {
++        lock (gate)
++        {
++            if (!slots.TryGetValue(key, out var slot)) { slot = new Slot(); slots[key] = slot; order.Add(key); }
++            if (slot.Path != path) { slot.Path = path; slot.Bytes = -1; slot.At = DateTime.MinValue; slot.Stale = false; }
++            slot.Heavy = heavy; slot.Slow = slow; slot.Walk = walk;
++        }
++    }
++
++    /// These folders' sizes are not known any more (a folder was emptied): "…" until the next measurement, which is asked for now.
++    internal void Reset(params string[] keys)
++    {
++        lock (gate)
++            foreach (var key in order)
++                if (keys == null || keys.Length == 0 || Array.IndexOf(keys, key) >= 0) { slots[key].Bytes = -1; slots[key].At = DateTime.MinValue; slots[key].Stale = false; }
++        Request();
++    }
++
++    /// The last value measured, or -1 (not known yet). Never walks, never waits.
++    internal long Get(string key)
++    {
++        lock (gate) return slots.TryGetValue(key, out var slot) ? slot.Bytes : -1;
++    }
++
++    /// An event changed these folders' sizes (all of them when none is named): they are measured again, now, except a heavy folder while a build runs (BuildGap). The last value stays shown meanwhile.
++    internal void Invalidate(params string[] keys)
++    {
++        lock (gate)
++            foreach (var key in order)
++                if (keys == null || keys.Length == 0 || Array.IndexOf(keys, key) >= 0) slots[key].Stale = true;
++        Request();
++    }
++
++    /// Starts measuring what is due, off the calling thread, unless a measurement is already going (it then picks up what became due). Cheap: the main thread may call it at every refresh.
++    internal void Request()
++    {
++        lock (gate)
++        {
++            if (flying || NextDue() == null) return;
++            flying = true;
++        }
++        Task.Run(Pass);
++    }
++
++    /// Measurements made, and the most that ever ran at once (always 1).
++    internal int Walks { get { lock (gate) return walks; } }
++    internal int MostAtOnce { get { lock (gate) return mostInWalk; } }
++
++    private string NextDue()   // under the gate
++    {
++        if (hold != null && hold()) return null;
++        var t = now();
++        bool busy = building();
++        foreach (var key in order)
++        {
++            var s = slots[key];
++            if (string.IsNullOrEmpty(s.Path)) continue;
++            if (s.Bytes < 0 && s.At == DateTime.MinValue) return key;   // never measured
++            var since = t - s.At;
++            bool throttled = busy && s.Heavy;
++            var gap = s.Slow ? SlowGap : throttled ? BuildGap : Gap;
++            if (s.Stale ? (!throttled || since >= BuildGap) : since >= gap) return key;
++        }
++        return null;
++    }
++
++    private void Pass()
++    {
++        while (true)
++        {
++            string key; string path; Func<string, long> measure;
++            lock (gate)
++            {
++                key = NextDue();
++                if (key == null) { flying = false; return; }
++                path = slots[key].Path;
++                measure = slots[key].Walk ?? walk;
++                slots[key].Stale = false;   // an invalidation that comes while this walks sets it again
++                slots[key].At = now();
++                inWalk++; if (inWalk > mostInWalk) mostInWalk = inWalk;
++            }
++            long bytes = -1;
++            var clock = System.Diagnostics.Stopwatch.StartNew();
++            try { bytes = measure(path); } catch (Exception) { }
++            try { measured?.Invoke(key, clock.ElapsedMilliseconds, bytes); } catch (Exception) { }
++            lock (gate)
++            {
++                inWalk--; walks++;
++                var s = slots[key];
++                if (s.Path == path && bytes >= 0) { s.Bytes = bytes; s.At = now(); }
++            }
++            Notify();
++        }
++    }
++
++    private void Notify()
++    {
++        lock (gate) { if (notifyQueued || changed == null) return; notifyQueued = true; }
++        post(() => { lock (gate) notifyQueued = false; changed(); });
++    }
++}
++
++/// Runs `run` once on the thread `post` posts to, on a later turn (never inside the call that asks), however many times it is asked before then, and not twice within `spacing`.
++/// Request is called from that thread only.
++internal sealed class Coalescer
++{
++    private readonly Action<Action> post;
++    private readonly Action run;
++    private readonly TimeSpan spacing;
++    private readonly Func<DateTime> now;
++    private bool scheduled;
++    private DateTime lastRun = DateTime.MinValue;
++    private Timer later;
++
++    internal int Asked, Runs;
++
++    internal Coalescer(Action<Action> post, Action run, TimeSpan spacing, Func<DateTime> now = null)
++    {
++        this.post = post; this.run = run; this.spacing = spacing; this.now = now ?? (() => DateTime.UtcNow);
++    }
++
++    internal void Request()
++    {
++        Asked++;
++        if (scheduled) return;
++        scheduled = true;
++        var wait = lastRun + spacing - now();
++        if (wait <= TimeSpan.Zero) post(Fire);
++        else { later?.Dispose(); later = new Timer(_ => post(Fire), null, wait, Timeout.InfiniteTimeSpan); }
++    }
++
++    private void Fire()
++    {
++        scheduled = false;
++        lastRun = now();
++        Runs++;
++        run();
++    }
++}
++
++/// The lines of the log page (GameAppUi.Timeline turns them into rows). The files keep every line; this is what the screen holds:
++///   * at most MaxLines (and a few old errors): the page does not grow with a build of 22,000 shaders;
++///   * a counter line ("compiling: 758/21990 shaders", "NAS: 40 % of x.ipa") replaces the counter line before it, in place, instead of adding one (Timeline did that at every redraw, over all the lines);
++///   * a step line ("stage 3/5: ... (758/21990 shaders)", one every ~25 shaders) replaces the step's previous one: only the first of a step opens its header;
++///   * the engine's "unity compute source: [...]" lines (hundreds a build) are not rows: they stay in the files.
++internal sealed class UiLogModel
++{
++    internal const int MaxLines = 400;
++    private const int Slack = 100;           // trimmed in steps of this many, not at every line
++    private const int KeepErrors = 50;       // errors older than the window stay (the red rows, "Jump to the first error")
++
++    internal readonly List<(string Time, string Text, GameAppUi.LogKind Kind)> Lines = new List<(string, string, GameAppUi.LogKind)>();
++
++    private int rowAt = -1, stepAt = -1;      // the last line that is a row, the last step line
++    private string rowLabel;                  // its counter label, or null
++    private int step = -1, rowStep = -1;      // the step the lines are in now, and when the last row was added
++    internal int Kept, Merged, FileOnly;      // counts, for the harness
++
++    /// A line that only the files keep.
++    internal static bool IsFileOnly(string line) => line != null && line.StartsWith("unity compute source:", StringComparison.Ordinal);
++
++    /// Adds a line the log page shows; false when the page does not show it (a file-only line).
++    internal bool Add(string time, string line, GameAppUi.LogKind kind)
++    {
++        if (IsFileOnly(line)) { FileOnly++; return false; }
++        if (kind == GameAppUi.LogKind.Stage)
++        {
++            var s = GameAppUi.ParseStage(line.Trim());
++            if (s.Valid && s.Of == 5)
++            {
++                if (s.Step == step && stepAt >= 0) { Lines[stepAt] = (time, line, kind); Merged++; return true; }
++                step = s.Step;
++                stepAt = Push(time, line, kind);
++                return true;
++            }
++            if (line.Trim().StartsWith("=== ", StringComparison.Ordinal)) { step = 0; stepAt = -1; }   // a new run: its first step opens a header again
++        }
++        var label = line.Trim().StartsWith("=== ", StringComparison.Ordinal) ? null : GameAppUi.ProgressLabel(GameAppUi.Tidy(line));
++        if (label != null && rowAt >= 0 && rowLabel == label && rowStep == step && Lines[rowAt].Kind == kind)
++        {
++            Lines[rowAt] = (time, line, kind);
++            Merged++;
++            return true;
++        }
++        rowAt = Push(time, line, kind);
++        rowLabel = label;
++        rowStep = step;
++        return true;
++    }
++
++    private int Push(string time, string line, GameAppUi.LogKind kind)
++    {
++        Lines.Add((time, line, kind));
++        Kept++;
++        if (Lines.Count > MaxLines + Slack) Trim();
++        return Lines.Count - 1;   // after a trim the last line is still the last
++    }
++
++    private void Trim()
++    {
++        int drop = Lines.Count - MaxLines;
++        var survivors = new List<(string Time, string Text, GameAppUi.LogKind Kind)>();
++        for (int i = 0; i < drop && survivors.Count < KeepErrors; i++)
++            if (Lines[i].Kind == GameAppUi.LogKind.Error) survivors.Add(Lines[i]);
++        survivors.AddRange(Lines.Skip(drop));
++        Lines.Clear();
++        Lines.AddRange(survivors);
++        rowAt = stepAt = -1;   // the next counter line is a row of its own once, then merges again
++        rowLabel = null;
++    }
++
++    internal void Clear()
++    {
++        Lines.Clear();
++        rowAt = stepAt = -1; rowLabel = null; step = rowStep = -1;
++    }
++}
++
++/// Recursive deletes on ONE worker thread, in the order they were asked. A delete of 40,000 files takes longer than the 10 s the system gives a button handler or a scene update (the third crash report of
++/// 2026-11-20 had a handler walking files for that long); none runs on the main thread. `Busy` is true from the Enqueue until the job's `done` has run on the main thread, so the screens can say "clearing…", refuse
++/// a second question and start no build meanwhile, and FolderSizes (hold) measures nothing while a folder is being emptied.
++internal sealed class BackgroundDelete
++{
++    private readonly Action<Action> post;
++    private readonly Queue<(Action Work, Action<Exception> Done)> queue = new Queue<(Action, Action<Exception>)>();
++    private readonly object gate = new object();
++    private bool flying;
++    private int pending, running, most;
++
++    internal BackgroundDelete(Action<Action> post) { this.post = post; }
++
++    internal bool Busy { get { lock (gate) return pending > 0; } }
++    /// The most jobs that ever ran at once (always 1: the harness).
++    internal int MostAtOnce { get { lock (gate) return most; } }
++
++    /// Runs `work` on the worker after the jobs asked before it; `done(error)` on the main thread afterwards (error null: it went well).
++    internal void Enqueue(Action work, Action<Exception> done)
++    {
++        lock (gate)
++        {
++            queue.Enqueue((work, done));
++            pending++;
++            if (flying) return;
++            flying = true;
++        }
++        Task.Run(Pump);
++    }
++
++    private void Pump()
++    {
++        while (true)
++        {
++            (Action Work, Action<Exception> Done) job;
++            lock (gate)
++            {
++                if (queue.Count == 0) { flying = false; return; }
++                job = queue.Dequeue();
++                running++; if (running > most) most = running;
++            }
++            Exception error = null;
++            try { job.Work(); } catch (Exception e) { error = e; }
++            lock (gate) running--;
++            post(() => { lock (gate) pending--; job.Done?.Invoke(error); });
++        }
++    }
++
++    /// The deletion of a folder and everything in it; nothing when there is no such folder.
++    internal static void DeleteTree(string path)
++    {
++        if (Directory.Exists(path)) Directory.Delete(path, true);
++    }
++}
++
++/// Work on a worker thread, its answer on the main thread (`post`): exactly one `done(result, error)`.
++internal static class Bg
++{
++    internal static void Run<T>(Func<T> work, Action<T, Exception> done, Action<Action> post)
++    {
++        Task.Run(() =>
++        {
++            T result = default; Exception error = null;
++            try { result = work(); } catch (Exception e) { error = e; }
++            post(() => done(result, error));
++        });
++    }
++}
++
++/// The `launch-profile: <part> <ms>` lines: in the first 90 s of the process every part over 50 ms (the launch: where the time goes), afterwards only a part over 250 ms and at most one line per part every 10 s
++/// (a slow refresh must not fill the log). Main thread only.
++internal sealed class LaunchProfile
++{
++    internal static readonly TimeSpan LaunchPhase = TimeSpan.FromSeconds(90);
++    private readonly Dictionary<string, TimeSpan> last = new Dictionary<string, TimeSpan>();
++
++    /// The line to write for `part` that took `ms` when the process is `sinceLaunch` old, or null.
++    internal string Line(string part, long ms, TimeSpan sinceLaunch)
++    {
++        bool launch = sinceLaunch < LaunchPhase;
++        if (ms <= (launch ? 50 : 250)) return null;
++        if (!launch && last.TryGetValue(part, out var at) && sinceLaunch - at < TimeSpan.FromSeconds(10)) return null;
++        last[part] = sinceLaunch;
++        return $"launch-profile: {part} {ms}";
++    }
++}
+diff -ruN a/GameAppSavesUi.cs b/GameAppSavesUi.cs
+--- a/GameAppSavesUi.cs
++++ b/GameAppSavesUi.cs
+@@ -11,6 +11,8 @@
+     private readonly Action<string> log;
+     private readonly UIKit.UIStackView rows = new UIKit.UIStackView { Axis = UIKit.UILayoutConstraintAxis.Vertical, Spacing = 10 };
+     private readonly UIKit.UILabel current = new UIKit.UILabel { Lines = 0 };
++    private bool busy;        // a copy, a restore or an export is being made on a worker thread (a save is a tree of files: never on the main thread)
++    private int reloadSeq;
+ 
+     /// Set by the screen when a NAS is set up: "Send to the NAS" on a copy.
+     public Action<string> SendToNas { get; set; }
+@@ -76,14 +78,25 @@
+ 
+     private void Reload()
+     {
+-        var (bytes, changed) = GameSaves.Current(documents, titleId);
++        // The save folder is walked and the copies listed on a worker thread; the page is filled when they arrive (a newer reload replaces an older one).
++        var seq = ++reloadSeq;
++        var docs = documents; var id = titleId; var name = gameName;
++        Bg.Run(() => (GameSaves.Current(docs, id), GameSaves.List(docs, id, name)), (found, error) =>
++        {
++            if (seq != reloadSeq) return;
++            if (error != null) { current.Text = "The saves could not be read: " + error.Message; return; }
++            Fill(found.Item1.Bytes, found.Item1.Changed, found.Item2);
++        }, work => BeginInvokeOnMainThread(work));
++    }
++
++    private void Fill(long bytes, DateTime? changed, System.Collections.Generic.List<GameSaves.Copy> list)
++    {
+         current.AttributedText = null;
+         current.Font = UIKit.UIFont.GetPreferredFontForTextStyle(UIKit.UIFontTextStyle.Subheadline);
+         current.TextColor = UIKit.UIColor.SecondaryLabel;
+         current.Text = changed == null ? "No save yet: the game has not saved." : $"Current save: {GameAppUi.SizeText(bytes)}, last written {changed.Value:g}";
+         current.AccessibilityIdentifier = "saves-current";
+         foreach (var v in rows.ArrangedSubviews) { rows.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+-        var list = GameSaves.List(documents, titleId, gameName);
+         if (list.Count == 0) rows.AddArrangedSubview(Text("No copy yet.", UIKit.UIFontTextStyle.Subheadline, UIKit.UIColor.SecondaryLabel));
+         int i = 0;
+         foreach (var c in list)
+@@ -113,14 +126,19 @@
+ 
+     private void MakeCopy()
+     {
+-        try
++        if (busy) return;
++        busy = true;
++        Bg.Run(() => GameSaves.Create(documents, titleId, gameName, "manual", DateTime.Now), (p, error) =>
+         {
+-            var p = GameSaves.Create(documents, titleId, gameName, "manual", DateTime.Now);
+-            log?.Invoke(p == null ? "saves: no save to copy yet" : $"saves: copy made, {System.IO.Path.GetFileName(p)}");
+-            if (p == null) Say("No save yet", "The game has not saved anything yet.");
+-        }
+-        catch (Exception e) { Say("The copy failed", e.Message); }
+-        Reload();
++            busy = false;
++            if (error != null) Say("The copy failed", error.Message);
++            else
++            {
++                log?.Invoke(p == null ? "saves: no save to copy yet" : $"saves: copy made, {System.IO.Path.GetFileName(p)}");
++                if (p == null) Say("No save yet", "The game has not saved anything yet.");
++            }
++            Reload();
++        }, work => BeginInvokeOnMainThread(work));
+     }
+ 
+     private void CopyActions(GameSaves.Copy copy, UIKit.UIView source)
+@@ -147,13 +165,15 @@
+         a.AddAction(UIKit.UIAlertAction.Create("Cancel", UIKit.UIAlertActionStyle.Cancel, null));
+         a.AddAction(UIKit.UIAlertAction.Create("Replace", UIKit.UIAlertActionStyle.Destructive, _ =>
+         {
+-            try
++            if (busy) return;
++            busy = true;   // the copy of the save it replaces, the staging and the swap are file trees: on a worker thread
++            Bg.Run(() => GameSaves.Restore(documents, titleId, gameName, zip, beforeKind, DateTime.Now), (kept, error) =>
+             {
+-                var kept = GameSaves.Restore(documents, titleId, gameName, zip, beforeKind, DateTime.Now);
+-                log?.Invoke($"saves: {System.IO.Path.GetFileName(zip)} put in place" + (kept != null ? $"; the replaced save kept as {System.IO.Path.GetFileName(kept)}" : ""));
+-            }
+-            catch (Exception e) { log?.Invoke("saves: restore failed: " + e.Message); Say("Not restored", e.Message); }
+-            Reload();
++                busy = false;
++                if (error != null) { log?.Invoke("saves: restore failed: " + error.Message); Say("Not restored", error.Message); }
++                else log?.Invoke($"saves: {System.IO.Path.GetFileName(zip)} put in place" + (kept != null ? $"; the replaced save kept as {System.IO.Path.GetFileName(kept)}" : ""));
++                Reload();
++            }, work => BeginInvokeOnMainThread(work));
+         }));
+         PresentWhenFree(a);
+     }
+@@ -176,14 +196,16 @@
+ 
+     private void ExportJksv()
+     {
+-        try
++        if (busy) return;
++        busy = true;
++        Bg.Run(() => GameSaves.ExportJksv(documents, titleId, gameName, DateTime.Now), (p, error) =>
+         {
+-            var p = GameSaves.ExportJksv(documents, titleId, gameName, DateTime.Now);
++            busy = false;
++            if (error != null) { Say("Not exported", error.Message); return; }
+             if (p == null) { Say("No save yet", "The game has not saved anything yet."); return; }
+             log?.Invoke($"saves: JKSV zip written, {System.IO.Path.GetFileName(p)}");
+             Share(p, View);
+-        }
+-        catch (Exception e) { Say("Not exported", e.Message); }
++        }, work => BeginInvokeOnMainThread(work));
+     }
+ 
+     // Import mode (a copy into tmp/): Open mode's taps did nothing in a FlareStore install (docs/DECISIONS.md trap 56).
+diff -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs
++++ b/GameAppShelf.cs
+@@ -766,13 +766,8 @@
+     private void ClearShaderCache()
+     {
+         var alert = UIAlertController.Create("Clear the shader cache?",
+-            $"Frees {GameAppUi.SizeText(ShaderCacheBytes())}. Games already built keep their shaders; the next builds translate every shader again.", UIAlertControllerStyle.Alert);
+-        alert.AddAction(UIAlertAction.Create("Clear", UIAlertActionStyle.Destructive, _ =>
+-        {
+-            try { if (Directory.Exists(ShaderCachePath)) Directory.Delete(ShaderCachePath, true); Write("shader cache cleared"); }
+-            catch (Exception error) { Write($"could not clear the shader cache: {error.Message}"); }
+-            RefreshCacheSize();
+-        }));
++            $"{CacheFreesText()}. Games already built keep their shaders; the next builds translate every shader again.", UIAlertControllerStyle.Alert);
++        alert.AddAction(UIAlertAction.Create("Clear", UIAlertActionStyle.Destructive, _ => ClearShaderCacheNow()));
+         alert.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
+         PresentWhenFree(alert);
+     }
+@@ -1013,12 +1008,26 @@
+ 
+         // STORAGE
+         var storage = new List<UIView>();
+-        void Line(string k, string v) { var r = SettingsRow(k, null, false, false); r.Value.Text = v; storage.Add(r.Button); }
++        UILabel Line(string k, string v) { var r = SettingsRow(k, null, false, false); r.Value.Text = v; storage.Add(r.Button); return r.Value; }
+         long gameBytes = 0; try { gameBytes = new FileInfo(Path.Combine(docs, game)).Length; } catch (Exception) { }
+         Line("Game", GameAppUi.SizeText(gameBytes));
+-        if (ready) Line("Build", GameAppUi.SizeText(FolderBytes(Path.Combine(docs, "extract")) + FolderBytes(Path.Combine(docs, "DmGameProbe.framework"))));
+-        if (tid != null) Line("Shaders", GameAppUi.SizeText(FolderBytes(Path.Combine(docs, "shaders", tid))));
++        // Build and Shaders are folders of thousands of files: "…" until the worker thread has measured them (FolderSizes), then the value (RefreshStorageViews calls sheetStorageFill).
++        string Known(long bytes) => bytes < 0 ? "…" : GameAppUi.SizeText(bytes);
++        string BuildText() { long ex = sizes.Get(FolderSizes.Extract), fw = sizes.Get(FolderSizes.Framework); return Known(ex < 0 || fw < 0 ? -1 : ex + fw); }
++        UILabel buildValue = ready ? Line("Build", BuildText()) : null;
++        UILabel shadersValue = null;
++        if (tid != null)
++        {
++            sizes.Track(FolderSizes.GameShaders, Path.Combine(docs, "shaders", tid), true);
++            shadersValue = Line("Shaders", Known(sizes.Get(FolderSizes.GameShaders)));
++        }
+         Line("Free on this " + GameAppUi.DeviceName, GameAppUi.SizeText(FreeBytes()));
++        sheetStorageFill = () =>
++        {
++            if (buildValue != null) buildValue.Text = BuildText();
++            if (shadersValue != null) shadersValue.Text = Known(sizes.Get(FolderSizes.GameShaders));
++        };
++        sizes.Request();
+ 
+         // MORE
+         var more = new List<UIView>();

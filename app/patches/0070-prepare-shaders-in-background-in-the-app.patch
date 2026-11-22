@@ -1,0 +1,499 @@
+# 0070-prepare-shaders-in-background-in-the-app.patch -- the main app prepares the built game's shaders BY ITSELF, in the background, while the player is in iBuilder, with a progress bar on the game's
+# Library tile/row and in its sheet; Play stays available at every moment. The seed-list run is capped at 4,000 libraries (the player's first start too).
+# Applies after 0069 (the tree with 0010..0069 applied). UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled only (dotnet build -c Release -r ios-arm64 of a copy of the generated device project with these
+# files: rc 0, 0 errors, 39 warnings, the same 28 distinct warnings as that copy built without the patch: rc 0, 0 errors, 39). The pure part (WarmCap, PrepareCount, PrepareText, the cap keeping the seed
+# list's order through Order) ran in a host check (GameAppWarm.cs compiled with WARM_LOGIC_ONLY: 11 checks). No run on an iPhone: nothing here is measured yet.
+#
+# WHY (the owner, paraphrased: "let the compilation run in the background while the player is in the iBuilder app, with a progress bar, and the player can launch the game at any moment"; everything
+#   automatic on the phone). Field facts, iPhone 15 Pro, Ocarina of Time (Switch 2, 42,848 shaders, pso_manifest.tsv 25,163 lines):
+#   * at each Play the host compiled the head of the seed list from Metal source before the first frame: 13,066 lines = 9,124 libraries, 1,061-1,708 s on 6 workers, 200-1,800 ms a library on a cold
+#     cache, 1-4 ms on a hit;
+#   * iOS's Metal compile cache (per bundle id) kept only about 5,500-5,800 of this game's libraries: in every later session the first ~5,800 were hits and everything after was compiled again. Warming
+#     more is wasted: hence the cap;
+#   * a separate change (Rust, the host) builds only ~500 lines before the first frame and the rest during play. What this patch buys: those later on-demand compiles become 1-4 ms hits.
+#
+# WHAT IT DOES
+#   * GameAppWarm.cs, GameWarmLogic: WarmCap = 4000 (comment: the ~5,500-5,800 seen kept), PrepareCount(listed) = min(listed, WarmCap), PrepareText(done, total) = "Preparing the shaders… 1,200 of 4,000"
+#       (invariant thousands separators).
+#   * GameAppWarm.cs, GameWarm.Run: the seed-list mode (firstStart: true; NeededKeys = manifest, then pso_user.tsv, then the used keys) takes the first PrepareCount(front) libraries in that order (it took
+#       them all: ~25k keys for Ocarina in a player's first start). The main app's seed-list run shows PrepareText; an exported player keeps "Preparing the game (once)…". A seed-list run that finds
+#       nothing to compile writes prepared.tsv too (else every launch would read the pack to find nothing). Start/Run take an optional `why` that opens the first log line, e.g.
+#       `shader warm-up: started by itself after the build of <game>: 4000 libraries of <tid>'s seed list (cap 4000; the list, the learned and the used ones name 25210) to compile into Metal's cache,
+#       4 workers; ...`. Workers, QoS and waits unchanged for that mode: 4 workers at UserInitiated, wait at thermal Serious+, wait below 700 MiB available.
+#   * GameAppWarm.cs, view controller:
+#       - PrepareAfterBuild(outcome): after a build whose outcome is StopOutcome.Finished (not boot-only, not failed, paused or cancelled) -> AutoPrepare.
+#       - StartWarmAtLaunch(): besides the debug argument, in the main app only: if gameapp.args, gameapp.continue or gameapp.boot-only exists at this point (the launch will build, continue or boot;
+#         an ATTEMPTED boot-only is skipped too) it logs `shader warm-up: not resumed at this launch (...)` and does nothing; else after 3 s (first frame, the queue's QueueResumeIfOwed) -> AutoPrepare.
+#       - AutoPrepare: main app, no run, no warm-up going; the game whose framework is Fresh (GameStatus.Ready); its title id; on a worker: HasLibrary + FirstStartPending (no prepared.tsv for this
+#         app build + chain); back on the main thread: still no run, no warm-up, no build queue owed (buildQueue.AutoStart) -> StartWarmTitle(tid, game, firstStart: true, why). A finished run's
+#         prepared.tsv means it never runs again for this app build: this is not the whole-library review at every launch that 0020 removed.
+#       - StopWarm (a build or boot starts, BeginRun): also ends the warm-up's ticker and its continued-processing task at once (BackgroundEndWarm), because BeginRun asks for the build's task right
+#         after and BackgroundBegin returns when a task is in flight: before, a warm-up running when a build started left the build without a background task, and the warm-up's ticker then called
+#         BackgroundEnd, which would end whatever task was in flight.
+#       - WarmChanged: one main-thread post in flight at a time (Interlocked), redraws coalesced to at most 2 a second (Coalescer, 500 ms); it fired a BeginInvokeOnMainThread per library before.
+#       - WarmStrip(game, sheet): a 12 pt accent line (GameWarm.Status) + a UIProgressView (GameWarm.Fraction) when `game` is the one being prepared (title id = GameWarm.ActiveGame); the views are kept
+#         in two lists and updated in place by UpdateWarmViews (called from ShowWarm); the shelf is redrawn (RefreshScreen, coalesced) only when the game being prepared changes (a run starts or ends).
+#         Accessibility ids: game-warm-status / game-warm-progress, sheet-warm-status / sheet-warm-progress.
+#   * GameAppShelf.cs: the Library tile (under name and size) and row (under the chip) add WarmStrip; RefreshShelf clears the shelf's bar list; the game sheet's SHADERS block shows the strip and
+#       a line saying the app prepares the shaders the game asks for first by itself after a build ("Prepare the shaders…" stays, for the whole library). Play is untouched: available while it runs; a
+#       tap goes through BeginRun -> StopWarm (or, right after a build, through "Close and play", which ends the process: up to ~4 KB of warmed.tsv rows not yet flushed are redone next time, as hits).
+#   * GameAppBackground.cs: BackgroundEndWarm(success) ends the task only when it is a warm-up's; BackgroundTick takes GameWarm.Fraction (it parsed "N of M" from the status, which the separators would
+#       break); a refused submit says "the shader preparation runs only while iBuilder is open" for a warm-up.
+#   * GameAppMain.cs: two hook lines only: the launch call (StartWarmAtLaunch, comment) and the build end (`if (!bootOnly) { RemoveSourceAfterBuild(name, outcome); PrepareAfterBuild(outcome); }`).
+#
+# NOT DONE / KNOWN EDGES (not verified on a device)
+#   * Finish()'s last comment in GameAppMain.cs still says the shaders are never prepared at the end of a build: left as it is (this patch was limited to the two hook lines there).
+#   * A build that ends while iBuilder is in the background: the build's continued-processing task is completed by Finish and the warm-up asks for a new one from the background; iOS may refuse
+#     (logged), and the warm-up then runs only while the app is open; the next ordinary launch resumes it anyway.
+#   * While a warm-up runs, Export's build cleanup offer is not made ("something else is going on": GameAppBuildCleanupUi.cs counts GameWarm.Active as busy; unchanged here).
+#   * A run stopped by the player ("Stop preparing the shaders" in the sheet) resumes at the next ordinary launch: only prepared.tsv ends it.
+#   * Whether 4,000 is the right cap, and whether warming in the app leaves the host's first ~500 lines as hits, are to be measured on the phone (the log line gives the count; warmed.tsv the ms).
+diff -ruN a/GameAppBackground.cs b/GameAppBackground.cs
+--- a/GameAppBackground.cs	2026-11-20 16:00:46
++++ b/GameAppBackground.cs	2026-11-20 16:02:52
+@@ -68,7 +68,7 @@
+                 {
+                     if (error == null) return;
+                     lock (backgroundLock) if (backgroundId == id && backgroundTask == null) backgroundId = null;
+-                    BeginInvokeOnMainThread(() => Write($"background: the build runs only while iBuilder is open ({error.Code}: {error.LocalizedDescription})"));
++                    BeginInvokeOnMainThread(() => Write($"background: the {(warm ? "shader preparation" : "build")} runs only while iBuilder is open ({error.Code}: {error.LocalizedDescription})"));
+                 });
+             }
+         }
+@@ -107,10 +107,9 @@
+         string step = stage.Valid ? $"{stage.Step}/{stage.Of}: {stage.Text}" : (lastStage ?? "Starting");
+         if (backgroundWarm)
+         {
+-            // the warm-up's own status ("Preparing the shaders… 1200 of 29650")
++            // the warm-up's own fraction and status ("Preparing the shaders… 1,200 of 4,000": the count has thousands separators now, so it is not parsed back from the text)
+             var status = GameWarm.Status ?? "";
+-            var m = System.Text.RegularExpressions.Regex.Match(status, @"(\d+) of (\d+)");
+-            if (m.Success && long.TryParse(m.Groups[2].Value, out var total) && total > 0) fraction = long.Parse(m.Groups[1].Value) / (double) total;
++            fraction = GameWarm.Fraction;
+             step = status.Length > 0 ? status : "Starting";
+         }
+         lock (backgroundLock)
+@@ -125,6 +124,17 @@
+                 backgroundSubtitle = step;
+                 task.UpdateTitle(task.Title, step);
+             }
++        }
++    }
++
++    /// The shader warm-up ended or was stopped: its task ends, and ONLY a warm-up's (patch 0070: the warm-up's ticker used to call BackgroundEnd, which would end a build's task that started
++    /// meanwhile; and StopWarm ends it before BeginRun asks for the build's). Nothing when the task in flight is a build's, or none is.
++    private void BackgroundEndWarm(bool success)
++    {
++        lock (backgroundLock)   // held across the look and the end (Monitor is re-entrant: BackgroundEnd takes it again)
++        {
++            if (!backgroundWarm || backgroundId == null) return;
++            BackgroundEnd(success);
+         }
+     }
+ 
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs	2026-11-20 16:00:46
++++ b/GameAppMain.cs	2026-11-20 16:03:14
+@@ -973,7 +973,7 @@
+         Timed("RefreshGames", RefreshGames);
+         Timed("RecoverStoppedBuilds", RecoverStoppedBuilds);   // GameAppStopUi.cs: the builds the person paused (and the work folder a cancel left), from the files
+         RefreshScreenNow();   // synchronous: the first frame has the shelf in it (every other refresh is coalesced, RefreshScreen)
+-        StartWarmAtLaunch();   // GameAppWarm.cs: starts nothing by itself (only a debug launch argument); the shaders are prepared when the player asks
++        StartWarmAtLaunch();   // GameAppWarm.cs (patch 0070): at an ordinary launch, resumes the built game's seed-list preparation when it is owed (never when this launch builds or boots)
+         // Back from the Files app or the background, Documents may have gained a game or a key: say so -- on the next turn of the run loop, never inside the notification (OnWillEnterForeground).
+         NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.WillEnterForegroundNotification, _ => OnWillEnterForeground());
+         // The cloud listing and its icons wait for the first frame (ViewDidAppear, GameAppLibrary.cs): the library
+@@ -2755,7 +2755,7 @@
+                 if (!RestartForStage3(rc, chainError))   // GameAppResume.cs: the chain may end on purpose before stage 3
+                 {
+                     Finish();
+-                    if (!bootOnly) RemoveSourceAfterBuild(name, outcome);   // GameAppSourceUi.cs (patch 0068): a successful build of an imported game frees the game file (an empty stub stays)
++                    if (!bootOnly) { RemoveSourceAfterBuild(name, outcome); PrepareAfterBuild(outcome); }   // GameAppSourceUi.cs (patch 0068): a successful build of an imported game frees the game file (an empty stub stays); GameAppWarm.cs (patch 0070): it prepares its seed list's shaders
+                 }
+             });
+         });
+diff -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs	2026-11-20 16:00:46
++++ b/GameAppShelf.cs	2026-11-20 16:03:07
+@@ -330,7 +330,9 @@
+         cover.HeightAnchor.ConstraintEqualTo(cover.WidthAnchor).Active = true;
+         var name = Theme.Label(GameAppUi.DisplayName(e.Name), Theme.Font(15, UIFontWeight.Semibold), Theme.Text, 2);
+         var meta = Theme.Label(ShelfMeta(e), Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
+-        var info = Theme.Column(8, cover, Theme.Column(2, name, meta));
++        var tileTexts = new List<UIView> { name, meta };
++        if (WarmStrip(e.Name, false) is UIView tileWarm) tileTexts.Add(tileWarm);   // GameAppWarm.cs (patch 0070): "Preparing the shaders… 1,200 of 4,000" and its bar; Play stays available
++        var info = Theme.Column(8, cover, Theme.Column(2, tileTexts.ToArray()));
+         info.UserInteractionEnabled = false;
+         // The buttons sit one under the other: a tile is about 165 pt wide and "Export IPA" must fit in its button
+         var tint = TintOf(e.Icon, GameAppUi.DisplayName(e.Name));
+@@ -368,6 +370,7 @@
+         var meta = Theme.Label(ShelfMeta(e), Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
+         var texts = new List<UIView> { name, meta };
+         if (chipText != null) texts.Add(Theme.Label(chipText, Theme.Font(12, UIFontWeight.Semibold), tone));
++        if (WarmStrip(e.Name, false) is UIView rowWarm) texts.Add(rowWarm);   // GameAppWarm.cs (patch 0070): the shaders being prepared, with a bar
+         var textColumn = Theme.Column(2, texts.ToArray());
+         textColumn.SetContentCompressionResistancePriority(1, UILayoutConstraintAxis.Horizontal);
+         textColumn.SetContentHuggingPriority(1, UILayoutConstraintAxis.Horizontal);
+@@ -458,6 +461,8 @@
+         Lit(shelfListButton, !grid);
+ 
+         shelfKeep.Clear();
++        warmShelfViews.Clear();   // GameAppWarm.cs: the tiles drawn below add their bars again
++        warmShelfTitle = GameWarm.ActiveGame;
+         foreach (var v in shelfTiles.ArrangedSubviews.ToArray()) { shelfTiles.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+         if (grid)
+         {
+@@ -1029,8 +1034,12 @@
+         {
+             var prepare = SettingsRow("Prepare the shaders…", () => Then(() => PrepareShadersFor(game)), true, false);
+             prepare.Value.Text = GameWarm.Active ? "Running" : "";
+-            shadersBlock = Theme.Column(8, SectionLabel("SHADERS"), SettingsCard(prepare.Button),
+-                Theme.Label("Compiles the game's shader libraries now, in the background, so the first session does not stop to compile them. Best on a charger.", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0));
++            var shaderViews = new List<UIView> { SectionLabel("SHADERS"), SettingsCard(prepare.Button) };
++            warmSheetViews.Clear();
++            if (WarmStrip(game, true) is UIView sheetWarm) shaderViews.Add(sheetWarm);   // GameAppWarm.cs (patch 0070): the automatic preparation of this game, live
++            shaderViews.Add(Theme.Label("After a build, iBuilder prepares the shaders the game asks for first, by itself, while you are in the app (Play stays available). "
++                + "\"Prepare the shaders…\" compiles all the game's libraries now, in the background, so the first session does not stop to compile them. Best on a charger.", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0));
++            shadersBlock = Theme.Column(8, shaderViews.ToArray());
+         }
+ 
+         // STORAGE
+diff -ruN a/GameAppWarm.cs b/GameAppWarm.cs
+--- a/GameAppWarm.cs	2026-11-20 16:00:46
++++ b/GameAppWarm.cs	2026-11-20 16:07:44
+@@ -21,10 +21,19 @@
+ // game's prewarm list in front of a progress screen (268 s on an iPhone 15 Pro for Mario Kart 8 Deluxe). The player prepares exactly those libraries (the pack's seed list, this phone's learned list and what
+ // was used) at its first launch instead, as a step of its own with a progress bar and the continued-processing task, once: GameWarm.Start(.., firstStart: true), ended by prepared.tsv.
+ //
+-// MANUAL ONLY (app/patches/0020-warm-up-manual-only.patch): nothing else here starts by itself. Not at a launch (an exported player used to prepare ALL its libraries at EVERY launch:
+-// it read and hashed the whole library image each time, and compiled it all on the first), not after a build. The player starts it from the game's settings sheet ("Prepare the
+-// shaders…", GameAppSettingsViewController.PrepareShaders) and can stop it there; it also stops when a build or a boot starts. The one other way in is the debug launch argument.
++// THE MAIN APP PREPARES THE SEED LIST BY ITSELF (app/patches/0070): the same seed-list run as the player's first start, in the background, while the player is in iBuilder, with a bar on the game's
++// Library tile or row and in its sheet; Play stays available at every moment (a boot stops it, as any run does). It starts (a) right after a build that FINISHED (not a pause, a cancel, a failure,
++// a boot), for the game just built, and (b) at an ordinary launch (no build, continuation or boot requested: no gameapp.args, gameapp.continue or gameapp.boot-only, and no build queue owed) when the
++// game whose framework is fresh (status Ready) has no prepared.tsv for this app build and chain: it resumes, and what warmed.tsv holds is skipped in milliseconds. A finished run writes prepared.tsv,
++// so it never runs again for this build: this is NOT the "re-review every shader at every launch" that patch 0020 removed (that was the whole library, read and hashed at each launch).
++// Why it pays (field facts, iPhone 15 Pro, Ocarina of Time, 42,848 shaders, a seed list of 25,163 lines): the host compiled 9,124 libraries before the first frame (1,061-1,708 s on 6 workers,
++// 200-1,800 ms each when cold, 1-4 ms on a hit); the host now builds about 500 lines before the first frame and the rest during play, so a library warmed here turns a stall in play into a hit.
++// THE CAP (GameWarmLogic.WarmCap): iOS's Metal compile cache kept only about 5,500-5,800 of that game's libraries (every later session: the first ~5,800 hits, everything after compiled again),
++// so a seed-list run (the player's first start too) prepares at most the first 4,000, in the seed list's order (the order the host asks for them).
+ //
++// MANUAL (app/patches/0020-warm-up-manual-only.patch): the WHOLE library (not just the seed list) is only ever compiled when the player asks, from the game's settings sheet ("Prepare the
++// shaders…", GameAppSettingsViewController.PrepareShaders); the player can stop any run there; every run stops when a build or a boot starts. The debug launch argument is the other way in.
++//
+ // The pure parts (the image's index, the warmed.tsv rows, the options' decision) have no iOS types and are tested on a Mac
+ // (gameapp/tests/GameWarm.Tests, compiled with WARM_LOGIC_ONLY); the part below #if !WARM_LOGIC_ONLY needs the iOS SDK.
+ 
+@@ -38,6 +47,7 @@
+ using System.Collections.Concurrent;
+ using System.Diagnostics;
+ using System.Threading;
++using System.Threading.Tasks;
+ using Foundation;
+ using Metal;
+ using UIKit;
+@@ -297,6 +307,18 @@
+     /// "Preparing the game… 120 of 900", the line of the first-start preparation.
+     public static string FirstStartText(int done, int total) => $"Preparing the game (once)… {done} of {total}";
+ 
++    /// The most libraries a seed-list run prepares (the main app's automatic run and an exported player's first start). Field fact (iPhone 15 Pro, Ocarina of Time, Switch 2): iOS's Metal compile
++    /// cache of one bundle id kept only about 5,500-5,800 of the game's libraries; in every later session the first ~5,800 were hits and everything after was compiled again from source. Warming
++    /// more than the cache keeps costs heat and battery for nothing, and may push out what the host's own first frames need; 4,000 stays well under what was seen kept.
++    public const int WarmCap = 4000;
++
++    /// How many of the `listed` libraries of a seed list a run prepares: the first ones, at most WarmCap (the list's order is the host's order).
++    public static int PrepareCount(int listed) => Math.Max(0, Math.Min(listed, WarmCap));
++
++    /// "Preparing the shaders… 1,200 of 4,000", the main app's line of the seed-list run (the Library tile, the sheet, the lock screen).
++    public static string PrepareText(int done, int total) =>
++        string.Create(System.Globalization.CultureInfo.InvariantCulture, $"Preparing the shaders… {done:N0} of {total:N0}");
++
+     /// "Preparing the shaders… the ones you played: 120 of 140" while the used libraries are being done, then the plain count.
+     public static string StatusText(int done, int total, int usedDone, int usedTotal) =>
+         usedTotal > 0 && usedDone < usedTotal ? $"Preparing the shaders… the ones you played: {usedDone} of {usedTotal}" : StatusText(done, total);
+@@ -324,7 +346,8 @@
+     public static float Fraction => progressTotal > 0 ? Math.Min(1f, (float)Volatile.Read(ref progressDone) / progressTotal) : 0f;
+     public static string Status => active ? status : "";
+ 
+-    /// Whether an exported player still owes its first-start preparation: it has a library to compile and no prepared.tsv for this app build and chain.
++    /// Whether a seed-list preparation is still owed (an exported player's first start, or the main app's automatic run of a built game): it has a library to compile and no prepared.tsv for this
++    /// app build and chain. Reads a directory listing and a small file: call it off the main thread.
+     public static bool FirstStartPending(string titleId, string packRoot)
+     {
+         try
+@@ -377,13 +400,15 @@
+ 
+     private sealed record Item(string Name, string Path, long Offset, long Size);
+ 
+-    /// Starts preparing `titleId`'s libraries from `packRoot` (Documents/shaders, or the player's bundle copy). Returns at once. Only the player's tap calls it.
+-    public static void Start(string titleId, string packRoot, bool firstStart = false)
++    /// Starts preparing `titleId`'s libraries from `packRoot` (Documents/shaders, or the player's bundle copy). Returns at once. `firstStart`: the seed-list run (an exported player's first start, or
++    /// the main app's automatic run after a build or at a launch), capped at GameWarmLogic.WarmCap and ended by prepared.tsv; else the whole library (the player's "Prepare the shaders…").
++    /// `why` opens the run's first log line ("started by itself after the build of ...").
++    public static void Start(string titleId, string packRoot, bool firstStart = false, string why = null)
+     {
+         if (string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(packRoot)) return;
+         int mine;
+         lock (gate) { mine = ++generation; active = true; activeGame = titleId; status = ""; firstStartRun = firstStart; progressDone = 0; progressTotal = 0; }
+-        var t = new Thread(() => { try { Run(titleId, packRoot, mine, firstStart); } catch (Exception error) { Log("shader warm-up: [ORANGE] " + error.Message); } finally { lock (gate) { if (generation == mine) active = false; } Changed?.Invoke(); } })
++        var t = new Thread(() => { try { Run(titleId, packRoot, mine, firstStart, why); } catch (Exception error) { Log("shader warm-up: [ORANGE] " + error.Message); } finally { lock (gate) { if (generation == mine) active = false; } Changed?.Invoke(); } })
+         { IsBackground = true, Name = "shader-warm-up" };
+         t.Start();
+     }
+@@ -403,7 +428,11 @@
+ 
+     private static bool Current(int mine) => Volatile.Read(ref generation) == mine;
+ 
+-    private static void Run(string titleId, string packRoot, int mine, bool firstStart)
++    /// The seed-list run (the player's first start, the main app's automatic run): four workers (the boot's own prepare used six) at UserInitiated; a manual run of the whole library: two at Utility.
++    private static int WorkersPlanned(bool firstStart) =>
++        firstStart ? Math.Min(4, Math.Max(1, Environment.ProcessorCount - 2)) : Math.Min(2, Math.Max(1, Environment.ProcessorCount / 2));
++
++    private static void Run(string titleId, string packRoot, int mine, bool firstStart, string why)
+     {
+         NSThread.Current.QualityOfService = firstStart ? NSQualityOfService.UserInitiated : NSQualityOfService.Utility;
+         var documents = GameAppMain.Documents;
+@@ -436,12 +465,23 @@
+         }
+         var items = GameWarmLogic.Order(packNames, learnedNames, usedKeys, out int usedCount, out int learnedCount).Select(n => byName[n]).ToList();
+         int played = firstStart ? 0 : usedCount, front = usedCount + learnedCount;   // the first `front` are what a session needs; the rest waits for a charger or a cool phone
+-        if (firstStart) items = items.Take(front).ToList();
+-        if (items.Count == 0) { Log($"shader warm-up: nothing to compile for {titleId} (no .metal source in its pack: a Mac-made pack holds .metallib)"); return; }
++        // The seed-list run stops at the cap (GameWarmLogic.WarmCap: what iOS's Metal cache was seen to keep), in the list's order: the libraries the host asks for first
++        if (firstStart) items = items.Take(GameWarmLogic.PrepareCount(front)).ToList();
++        // The main app's seed-list run says "Preparing the shaders… 1,200 of 4,000"; an exported player's first start keeps its own line
++        bool mainPrepare = firstStart && !GameExport.IsPlayer;
+ 
+         var gameDir = Path.Combine(documents, "games", titleId.ToUpperInvariant());
+         var warmedPath = Path.Combine(gameDir, "warmed.tsv");
+         var header = GameWarmLogic.Header(GameAppBuild.Id, chain);
++        if (items.Count == 0)
++        {
++            Log($"shader warm-up: {(why != null ? why + ": " : "")}nothing to compile for {titleId} ("
++                + (firstStart ? "its seed list names no .metal source of its pack" : "no .metal source in its pack") + ": a Mac-made pack holds .metallib)");
++            // A seed-list run with nothing in it is done for this build too: without the marker every launch would read the pack again to find nothing
++            if (firstStart && Current(mine) && pack != null)
++                try { Directory.CreateDirectory(gameDir); File.WriteAllText(Path.Combine(gameDir, "prepared.tsv"), header + "\n0\t" + DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ") + "\n"); } catch (Exception) { }
++            return;
++        }
+         HashSet<string> warmed;
+         try { warmed = GameWarmLogic.ParseWarmed(File.Exists(warmedPath) ? File.ReadAllText(warmedPath) : "", header); }
+         catch (Exception) { warmed = new HashSet<string>(); }
+@@ -459,7 +499,8 @@
+         void Report()
+         {
+             Volatile.Write(ref progressDone, Volatile.Read(ref done));
+-            status = firstStart ? GameWarmLogic.FirstStartText(Volatile.Read(ref done), total) : GameWarmLogic.StatusText(Volatile.Read(ref done), total, Volatile.Read(ref usedDone), played);
++            status = mainPrepare ? GameWarmLogic.PrepareText(Volatile.Read(ref done), total)
++                   : firstStart ? GameWarmLogic.FirstStartText(Volatile.Read(ref done), total) : GameWarmLogic.StatusText(Volatile.Read(ref done), total, Volatile.Read(ref usedDone), played);
+             Changed?.Invoke();
+         }
+         void Flush(bool force)
+@@ -468,11 +509,15 @@
+             lock (rows) { if (rows.Length == 0 || (!force && rows.Length < 4096)) return; text = rows.ToString(); rows.Clear(); }
+             try { File.AppendAllText(warmedPath, text); } catch (Exception) { }
+         }
+-        Log($"shader warm-up: {total} librar{(total == 1 ? "y" : "ies")} of {titleId} to prepare so the first session finds them in Metal's cache ({played} used in earlier sessions, {learnedCount} learned while it ran; the other {total - front} wait for a charger or a cool phone)");
++        if (firstStart)
++            Log($"shader warm-up: {(why != null ? why + ": " : "")}{total} librar{(total == 1 ? "y" : "ies")} of {titleId}'s seed list (cap {GameWarmLogic.WarmCap}; the list, the learned and the used ones name {front}) "
++                + $"to compile into Metal's cache, {WorkersPlanned(firstStart)} workers; what warmed.tsv already holds for this app build is skipped");
++        else
++            Log($"shader warm-up: {(why != null ? why + ": " : "")}{total} librar{(total == 1 ? "y" : "ies")} of {titleId} to prepare so the first session finds them in Metal's cache ({played} used in earlier sessions, {learnedCount} learned while it ran; the other {total - front} wait for a charger or a cool phone)");
+         Report();
+ 
+         // The first start is the step the player waits for: four workers (the boot's own prepare used six), at the usual QoS above Utility. A manual run stays at two, in the background
+-        int workers = firstStart ? Math.Min(4, Math.Max(1, Environment.ProcessorCount - 2)) : Math.Min(2, Math.Max(1, Environment.ProcessorCount / 2));
++        int workers = WorkersPlanned(firstStart);
+         var threads = new List<Thread>();
+         for (int w = 0; w < workers; w++)
+         {
+@@ -550,19 +595,19 @@
+ 
+ public sealed partial class GameAppViewController
+ {
+-    /// The player asked ("Prepare the shaders…" in the game's settings): prepare the game's shaders in the background. Nothing else calls this: not a launch, not the end of a build.
++    /// The player asked ("Prepare the shaders…" in the game's settings): prepare ALL the game's shaders in the background. Nothing else calls this (the automatic run is the seed list: AutoPrepare).
+     private void StartWarm(string game) => StartWarmTitle(string.IsNullOrEmpty(game) ? null : GameAppUi.BaseTitleIdOf(GameExport.IsPlayer ? GameExport.PlayerDump : game), GameExport.IsPlayer ? GameExport.PlayerDump : game);
+ 
+     private NSTimer warmTicker;
+ 
+-    private void StartWarmTitle(string tid, string game = null, bool firstStart = false)
++    private void StartWarmTitle(string tid, string game = null, bool firstStart = false, string why = null)
+     {
+         if (tid == null) return;
+         GameWarm.Sink = line => BeginInvokeOnMainThread(() => Write(line));
+         var root = GameExport.IsPlayer ? Path.Combine(GameExport.BundleGame, "shaders") : Path.Combine(GameAppMain.Documents, "shaders");
+         GameWarm.Changed -= WarmChanged;
+         GameWarm.Changed += WarmChanged;
+-        GameWarm.Start(tid, root, firstStart);
++        GameWarm.Start(tid, root, firstStart, why);
+         // The warm-up keeps going when the player leaves the app: a continued-processing task (iOS 26) with its own progress on the lock screen, fed once a second by its status
+         BackgroundBegin(game ?? tid, warm: true);
+         warmTicker?.Invalidate();
+@@ -571,10 +616,52 @@
+             if (GameWarm.Active) { BackgroundTick(); return; }
+             warmTicker?.Invalidate();
+             warmTicker = null;
+-            BackgroundEnd(true);
++            BackgroundEndWarm(GameWarm.Fraction >= 1f);   // GameAppBackground.cs: the warm-up's task only, never a build's
+         });
++        RefreshScreen();   // the bar on the game's tile (UpdateWarmViews keeps it current from here)
+     }
+ 
++    // ---- The main app's automatic seed-list run (app/patches/0070) ------------------------------------------------------------------------------------
++
++    /// After a build that FINISHED (the build-end hook in BeginRun; not a boot, a pause, a cancel or a failure): the game just built prepares its seed list in the background.
++    private void PrepareAfterBuild(StopOutcome outcome)
++    {
++        if (GameExport.IsPlayer || outcome != StopOutcome.Finished || failedRun) return;
++        AutoPrepare(afterBuild: true);
++    }
++
++    /// The seed-list run of the game whose framework is fresh (status Ready), when it is owed (no prepared.tsv for this app build and chain) and nothing else has the phone. The facts are read
++    /// here (GatherFacts: the small reads every redraw makes); the pack lookup and prepared.tsv are read on a worker (the main thread never walks folders, patch 0064), the start is on the main thread.
++    private void AutoPrepare(bool afterBuild)
++    {
++        if (GameExport.IsPlayer || running || GameWarm.Active) return;
++        var facts = GatherFacts();
++        var game = facts.Framework == FrameworkState.Fresh ? facts.FrameworkGame : null;
++        if (string.IsNullOrEmpty(game) || GameAppUi.GameStatusOf(game, facts) != GameAppUi.GameStatus.Ready)
++        {
++            if (afterBuild) Write("shader warm-up: not started after the build: no game is ready (the framework on disk is not this build's)");
++            return;
++        }
++        var tid = WarmTitleOf(game);
++        if (tid == null) { if (afterBuild) Write("shader warm-up: not started after the build: the game file names no title id"); return; }
++        var root = WarmPackRoot();
++        var name = GameAppUi.DisplayName(game);
++        Task.Run(() =>
++        {
++            bool has = false, owed = false;
++            try { has = GameWarm.HasLibrary(tid, root); owed = has && GameWarm.FirstStartPending(tid, root); } catch (Exception) { }
++            BeginInvokeOnMainThread(() =>
++            {
++                if (!has) { if (afterBuild) Write($"shader warm-up: nothing to prepare for {name} (no shader library of this app's chain in Documents/shaders/{tid})"); return; }
++                if (!owed) { if (afterBuild) Write($"shader warm-up: {name}'s shaders are already prepared for this app build (prepared.tsv)"); return; }
++                if (running || GameWarm.Active) return;   // a build, a boot or another warm-up got there first; the next ordinary launch resumes
++                if (buildQueue.AutoStart) { Write("shader warm-up: not started: the build queue goes on (the next ordinary launch resumes the preparation)"); return; }
++                StartWarmTitle(tid, game, firstStart: true,
++                               why: afterBuild ? $"started by itself after the build of {name}" : $"resumed by itself at this launch for {name} (its preparation is not finished for this app build)");
++            });
++        });
++    }
++
+     /// An exported player's first launch: prepare the shaders the game needs, once (GameWarm.FirstStartPending says whether it is owed), with the bar and the background task. Nothing for the main app.
+     private void StartFirstStartPrepare()
+     {
+@@ -596,12 +683,79 @@
+         PresentWhenFree(a);
+     }
+ 
+-    /// A run (a build or a boot) starts: the warm-up gives the phone back.
+-    private void StopWarm(string why) => GameWarm.Stop(why);
++    /// A run (a build or a boot) starts: the warm-up gives the phone back, and its continued-processing task too, NOW: BeginRun asks for the build's own task right after this, and one task is in
++    /// flight at a time (BackgroundBegin returns when one is), so a warm-up task left to the ticker's next second would leave the build without one.
++    private void StopWarm(string why)
++    {
++        GameWarm.Stop(why);
++        warmTicker?.Invalidate();
++        warmTicker = null;
++        BackgroundEndWarm(false);
++    }
+ 
+-    private void WarmChanged() => BeginInvokeOnMainThread(ShowWarm);
++    // GameWarm.Changed fires from the workers at every library (hundreds a second when they are cache hits): one post to the main thread in flight at a time, and the screen redrawn at most
++    // twice a second (Coalescer, GameAppPerf.cs). The redraw reads the state when it runs, so the last change (the run's end) is always drawn.
++    private int warmPosted;
++    private Coalescer warmUi;
+ 
+-    /// The status on the run card of the game being prepared (after "Built in ..."), or on a player's title screen.
++    private void WarmChanged()
++    {
++        if (Interlocked.Exchange(ref warmPosted, 1) == 1) return;
++        BeginInvokeOnMainThread(() =>
++        {
++            Volatile.Write(ref warmPosted, 0);
++            (warmUi ??= new Coalescer(work => BeginInvokeOnMainThread(work), ShowWarm, TimeSpan.FromMilliseconds(500))).Request();
++        });
++    }
++
++    // The bars of the game being prepared: its Library tile or row (rebuilt with the shelf: RefreshShelf clears them) and its sheet (ShowGameSheet clears them). Updated in place; the shelf is
++    // redrawn only when the game being prepared changes (a run starts or ends), which is what adds or removes a bar.
++    private readonly List<(UIProgressView Bar, UILabel Text)> warmShelfViews = new List<(UIProgressView, UILabel)>();
++    private readonly List<(UIProgressView Bar, UILabel Text)> warmSheetViews = new List<(UIProgressView, UILabel)>();
++    private string warmShelfTitle;   // the title id being prepared when the shelf was last drawn (null: none)
++
++    private static string WarmLine()
++    {
++        if (!GameWarm.Active) return GameWarm.Fraction >= 1f ? "The shaders are prepared" : "Preparation paused: it goes on at the next launch";
++        var s = GameWarm.Status;
++        return s.Length > 0 ? s : "Preparing the shaders…";
++    }
++
++    /// A bar and its line for `game`'s tile, row (`sheet` false) or sheet, when `game` is the one being prepared; else null. Main thread.
++    private UIView WarmStrip(string game, bool sheet)
++    {
++        if (GameExport.IsPlayer || !GameWarm.Active) return null;
++        var tid = GameAppUi.BaseTitleIdOf(game);
++        if (tid == null || !string.Equals(tid, GameWarm.ActiveGame, StringComparison.OrdinalIgnoreCase)) return null;
++        var text = Theme.Label(WarmLine(), Theme.Font(12, UIFontWeight.Medium), Theme.Accent, 2);
++        text.AccessibilityIdentifier = sheet ? "sheet-warm-status" : "game-warm-status";
++        var bar = new UIProgressView(UIProgressViewStyle.Default)
++        {
++            ProgressTintColor = Theme.Accent, TrackTintColor = UIColor.FromWhiteAlpha(1f, 0.14f), Progress = GameWarm.Fraction,
++            AccessibilityIdentifier = sheet ? "sheet-warm-progress" : "game-warm-progress",
++        };
++        (sheet ? warmSheetViews : warmShelfViews).Add((bar, text));
++        var strip = Theme.Column(4, text, bar);
++        strip.UserInteractionEnabled = false;
++        return strip;
++    }
++
++    /// Main thread: the bars follow GameWarm.Fraction and its line; a run that started or ended redraws the shelf (coalesced, RefreshScreen).
++    private void UpdateWarmViews()
++    {
++        if (GameExport.IsPlayer) return;
++        var now = GameWarm.ActiveGame;
++        if (!string.Equals(now ?? "", warmShelfTitle ?? "", StringComparison.OrdinalIgnoreCase)) { warmShelfTitle = now; RefreshScreen(); }
++        var fraction = GameWarm.Fraction;
++        var line = WarmLine();
++        foreach (var (bar, text) in warmShelfViews.Concat(warmSheetViews))
++        {
++            bar.SetProgress(fraction, false);
++            text.Text = line;
++        }
++    }
++
++    /// The status on the run card of the game being prepared (after "Built in ..."), on its Library tile and sheet, or on a player's title screen.
+     private void ShowWarm()
+     {
+         if (GameExport.IsPlayer)
+@@ -612,17 +766,25 @@
+             else RefreshScreen();   // done: the screen says what it says
+             return;
+         }
++        UpdateWarmViews();
+         if (runCardView == null || running) return;
+         RefreshRunLine();
+         if (GameWarm.Active && GameWarm.Status.Length > 0 && !runCardView.Hidden && !failedRun) runLine.Text += "\n" + GameWarm.Status;
+     }
+ 
+-    /// A launch starts NOTHING by itself. (It used to start an exported player's whole warm-up at every launch.) The one exception is a debug launch that names a game with the
+-    /// launch argument "-GAMEAPP_WARM_TITLE <title id>" (the simulator's check: it reaches NSUserDefaults; an environment variable cannot be set through the device tools).
++    /// At a launch (called from ViewDidLoad, before the launch decides whether it builds, continues or boots): the main app resumes the seed-list run of the built game when it is owed
++    /// (AutoPrepare), and only at an ORDINARY launch. A launch that will run something is told by its request files, read now, before the launch consumes them: gameapp.args (a build),
++    /// gameapp.continue (the rest of a build), gameapp.boot-only (a boot: the game's process must have the phone; an attempted request is skipped too, the player taps Play next). The check
++    /// itself waits 3 s, for the first frame and the build queue's own start (QueueResumeIfOwed), and gives way to any run that started meanwhile. An exported player's first start is
++    /// StartFirstStartPrepare's. The debug launch argument "-GAMEAPP_WARM_TITLE <title id>" still starts the manual (whole-library) run of that title (the simulator's check).
+     private void StartWarmAtLaunch()
+     {
+         var test = NSUserDefaults.StandardUserDefaults.StringForKey("GAMEAPP_WARM_TITLE");
+-        if (!string.IsNullOrEmpty(test)) StartWarmTitle(test.ToUpperInvariant());
++        if (!string.IsNullOrEmpty(test)) { StartWarmTitle(test.ToUpperInvariant()); return; }
++        if (GameExport.IsPlayer) return;
++        var request = new[] { Path.Combine(GameAppMain.Documents, "gameapp.args"), ContinuePath, BootOnlyPath }.FirstOrDefault(File.Exists);
++        if (request != null) { Write($"shader warm-up: not resumed at this launch ({Path.GetFileName(request)}: this launch builds or boots)"); return; }
++        NSTimer.CreateScheduledTimer(3.0, _ => AutoPrepare(afterBuild: false));
+     }
+ 
+     /// Where the game's pack is: Documents/shaders, or an exported player's bundle copy.

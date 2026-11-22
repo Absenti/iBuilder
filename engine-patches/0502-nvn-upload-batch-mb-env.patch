@@ -1,0 +1,32 @@
+# nvn/upload: DM_NVN_UP_BATCH_MB, the upload batch's staging budget by environment
+#
+# Source:    https://github.com/cheemu21/kid-with-sword-remake  branch L, commit f61ef96ecaa266542b21c88cc878deb311663c47 ("L7.2: an upload batch counts the guest memory its uploads
+#            read, 48 MB a batch on iOS", 2026-11-18); only the switch is taken, see below
+# Author:    patpat (the commit's name)
+# Licence:   MIT, Copyright (c) 2026 seedds and contributors (nxnative LICENSE; the fork is MIT too); the attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m, up_batch_bytes)
+#   DM_NVN_UP_BATCH_MB=<16..512> sets the upload batch's staging budget (MiB). Unset or empty: as before (128 MiB, 16 MiB with DM_LOW_MEMORY from iOSBuilder's 0202). The fork's value on iOS
+#   is 48 and the area loads of Ocarina of Time there (300-650 uploads, 57-245 MB a frame) lifted the footprint 3.8 -> 5.0 GB for a few seconds.
+# What is NOT taken: the fork's second half (the zero-copy source buffers count against the budget and split the batch) is already in the engine as engine-patches/0405
+#   (DM_NVN_UPLOAD_SRC_MB, opt-in, same idea, bound per batch). Use both: DM_NVN_UPLOAD_SRC_MB=48 and this one, without DM_LOW_MEMORY (which the Memory saver profile no longer sets).
+# DEFAULT: unchanged. Shader chain: not touched. Checked: patch -p1 --forward --dry-run, no fuzz, in the series 0401..0415 + 0500..; NOT run on a device.
+# Use: DM_NVN_UP_BATCH_MB=48 in app/profiles/0400486024DEC000.env.txt.
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -3897,7 +3897,13 @@
+ static size_t g_up_staging_bytes;
+ // DM_LOW_MEMORY: 16 MiB a batch (two 8 MiB blocks), so a loading burst holds at most about three batches of staging in flight instead of three of 128 MiB. The cost: such a burst is
+ // cut into more batches, each its own upload command buffer, and the fourth waits for its slot's previous batch on the GPU (up_begin, WS_UPALLOC): slower loading and streaming
+-static unsigned up_batch_bytes(void) { return dm_low_memory() ? 16u * 1024u * 1024u : 128u * 1024u * 1024u; }
++// DM_NVN_UP_BATCH_MB=<MB> (16 to 512; kid-with-sword-remake L7.2 ships 48 on iOS): the batch's budget, whatever DM_LOW_MEMORY says; unset or empty = as before (16 with DM_LOW_MEMORY, else 128)
++static unsigned up_batch_bytes(void) {
++    static unsigned v;
++    if (!v) { const char *e = getenv("DM_NVN_UP_BATCH_MB"); long mb = e && *e ? atol(e) : 0; unsigned d = dm_low_memory() ? 16u * 1024u * 1024u : 128u * 1024u * 1024u;
++        v = mb > 0 ? (unsigned)(MAX(16, MIN(mb, 512))) << 20 : d; if (mb > 0) MLOG("upload batches: %u MB of staging each (DM_NVN_UP_BATCH_MB)", v >> 20); }
++    return v;
++}
+ #define UP_BATCH_BYTES up_batch_bytes()
+ 
+ 

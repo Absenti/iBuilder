@@ -1,0 +1,59 @@
+# GameAppAudio.cs: the audio session of a game, as the engine's own iOS front end sets it (front_ios.m): Playback, 48 kHz, I/O buffer 5 ms. Without it RemoteIO asks for 1024 frames per callback, the guest keeps only 960 queued, and EVERY callback
+# is 64 frames short and zero-filled: ~47 gaps a second (device log 2026-11-19: "2002 underruns in 2000 callbacks, 2671.7 ms zero-padded"). Set when the game view comes up (before the guest opens its audio output) and again at DidBecomeActive.
+# Applies after 0052.
+diff -ruN a/GameAppAudio.cs b/GameAppAudio.cs
+--- a/GameAppAudio.cs
++++ b/GameAppAudio.cs
+@@ -0,0 +1,32 @@
++using System;
++using AVFoundation;
++using Foundation;
++
++/// The audio session of a game, as the engine's own iOS front end sets it (dm/ios/Sources/front_ios.m front_ios_audio_session): category Playback (the ring / silent switch does not mute a
++/// game), 48 kHz, and an I/O buffer of 5 ms.
++///
++/// WHY: the frames RemoteIO asks for in each callback follow the session's I/O buffer duration, about 21 ms by default (1024 frames at 48 kHz). The guest keeps only 4 blocks of 240 frames in flight
++/// (4 x 5 ms), so every callback came up 64 frames (1.33 ms) short and was zero-filled: about 47 gaps a second, an audible crackle. Device log, 2026-11-19, Mario Kart 8 Deluxe on an iPhone 15 Pro:
++/// "audio #0 device callbacks 4000: 1024-1024 frames each, 4.0 blocks queued on average at callback; in these 2000, 2002 underruns, 2671.7 ms zero-padded". This app hosts the engine without front_ios.m,
++/// so nothing configured the session. Asked for 5 ms, the system picks the nearest size it supports (256 frames or so): below what the game keeps queued.
++internal static class GameAppAudio
++{
++    /// Configure and activate the shared audio session; the line to log. Main thread. Safe to call again (a return to the foreground, the end of an interruption).
++    internal static string Configure()
++    {
++        try
++        {
++            var session = AVAudioSession.SharedInstance();
++            var problems = "";
++            if (!session.SetCategory(AVAudioSession.CategoryPlayback, out NSError categoryError)) problems += " [RED] category: " + categoryError?.LocalizedDescription;
++            session.SetPreferredSampleRate(48000, out _);
++            if (!session.SetPreferredIOBufferDuration(0.005, out NSError bufferError)) problems += " [RED] I/O buffer duration: " + bufferError?.LocalizedDescription;
++            if (!session.SetActive(true, out NSError activeError)) problems += " [RED] activation: " + activeError?.LocalizedDescription;
++            return $"audio session: sample rate {session.SampleRate:F0} Hz, I/O buffer {session.IOBufferDuration * 1000:F2} ms (asked for 5 ms), {session.OutputNumberOfChannels} output channel(s){problems}";
++        }
++        catch (Exception error)
++        {
++            return "[RED] audio session: " + error.GetType().Name + ": " + error.Message;
++        }
++    }
++}
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -508,7 +508,7 @@
+         observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.WillResignActiveNotification, _ => GameAppHost.Active(true)));
+         observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.DidEnterBackgroundNotification, _ => GameAppHost.Background(true)));
+         observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.WillEnterForegroundNotification, _ => GameAppHost.Background(false)));
+-        observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.DidBecomeActiveNotification, _ => GameAppHost.Active(false)));
++        observers.Add(NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.DidBecomeActiveNotification, _ => { GameAppHost.Active(false); GameAppDiag.Event("audio", GameAppAudio.Configure()); }));
+     }
+ 
+     public override void ViewDidAppear(bool animated)
+@@ -795,6 +795,7 @@
+     {
+         if (!running || gameWindow == null || gameWindowShown || !GameAppUi.IsBootStage(lastStage)) return;
+         gameWindowShown = true;
++        Write(GameAppAudio.Configure());   // before the guest opens its audio output (see GameAppAudio.cs: the 1024-frame default crackles)
+         UIViewController top = this;
+         while (top.PresentedViewController != null) top = top.PresentedViewController;
+         top.PresentViewController(gameWindow, false, () => Write("game view on screen (landscape, full screen)"));

@@ -1,0 +1,1442 @@
+# 0073-per-game-storage-and-optimize-storage.patch -- one folder per game for its build: the build of the game that is not in use is PARKED in Documents/games/<TITLE ID>/slot (renames, no copy) and moved
+#   back when that game needs it; extract/ExeFS is kept, so a rebuild starts from the extraction without the game file; games come back from the builds on disk; Settings > "Optimize storage" replaces a game's
+#   files by empty stubs once it is extracted.
+# Applies after 0072 (the tree with 0010..0072 applied). UNTESTED ON DEVICE: compiled (dotnet build gameapp.csproj -c Release -r ios-arm64 -t:Compile -nologo: rc 0, 0 errors, 38 warnings: the same set, file
+#   and code, as the same project with the 0072 sources) and the pure classes run in a host harness (a net11 console program built from the real source text of GameAppSlot.cs, GameAppUi.cs and the files the
+#   0068 / 0071 harnesses compile: 120 checks, all pass; 19 mutations of the new logic, each caught by at least one check; 0068's harness 330 of 330 and 0071's 55 of 55 on this tree, the same as on the 0072
+#   tree). No iPhone run. Measured and assumed are told apart below.
+#
+# WHY (the owner, field facts): storage on the iPhone is the limit. Ocarina of Time: a 25.6 GB .nup, then Documents/extract/RomFS.img 24.4 GB. The owner deleted the .nup in Files and the library showed "0 games"
+#   while 24.6 GB of build were on disk. ONE shared slot held the built game, building another game wiped it, and extract/ExeFS (36.6 MB) was deleted after each build (keep_exefs=0), so after an app update
+#   (which withdraws the framework: "framework on disk was not built by this version") the rebuild had to read the game file again.
+#
+# THE SLOT (GameSlot.Items, GameAppSlot.cs). Inventory, from GameAppMain.ConfigText and crates/ibuilder-pipeline/src (layout.rs, markers.rs, chain.rs, profile.rs, assemble.rs, shaders.rs) and ibuilder-nup's
+#   extract.rs: extract/ (ExeFS/, RomFS.img, RomFS.img.inputs.json, romfs_programs/, control.nacp, icon.jpg, rewrite/, flat/, shader_out/), DmGameProbe.framework/, profile.tsv, gameapp.framework (the stamp),
+#   pipeline.boot, and gameapp.extracted (new, below). Already per game, NOT moved: shaders/<id>, shaders/<id>.work, games/<id>/ (settings, saves, aoc/<n>.img, launcher.json, rewrite-cache, icon, cover),
+#   profile-derived/<id>. Not a game's: gameapp.boot-only (a request, written only after the slot is ready), gameapp.args / .continue / .continue.run / .running / .stage / .killed, gameapp.config (rewritten
+#   every run), shader_map.tsv (a generic fallback map), .nsz/ (a conversion deleted after use), the logs.
+#
+# WHAT
+#   * keep_exefs=1 in the config (GameAppMain.ConfigText; GAMEAPP_KEEP_EXEFS still overrides: 0 drops it as before). nup= is written only when the .nup has content (NupHasContent): a stub or placeholder is
+#     never handed to the chain, which then builds from extract/ (the orchestrator's Rust guard for a zero-byte nup= is a second line of defence, not needed by this patch).
+#   * THE EXTRACTION MARKER, Documents/gameapp.extracted (ExtractionMark: game file, base title id, the update / DLC signature, time; written through .part + rename). Deleted in BeginRun when an extraction is
+#     about to run (the C# step, or a .nup with content); written by AfterExtraction (GameAppSlotUi.cs) when an extraction is complete: for .nsp .xci .nsz right after the C# step (P.Main rc 0, then its DLC);
+#     for a .nup after the chain returned (any outcome) when the chain derived profile.tsv in this run (its mtime >= the run's start: the profile stage runs only once the package is read). The title is checked
+#     first: ExeFS/main.npdm's program id (ACI0 + 0x10, as ibuilder-profile reads it), else profile.tsv's, must be the file name's id (when the name has one), and ExeFS/main and a non-empty RomFS.img must be
+#     there. ExtractionUse.Usable: an extraction stands in for a game's files when it is whole (ExeFS/main + RomFS.img), the slot's title is the game's, and the marker names this game with the same update / DLC
+#     signature (a slot from before this patch: its stamp's game= and content= instead). Not when an update or DLC was added since: the file is asked for, as before.
+#   * REBUILD WITHOUT THE FILE: GameAppSourceUi.GameFileHasContent (0068's guard of Set up / Rebuild / Update / "Add to the build queue") is true when the content is missing but ExtractionOnDisk finds a usable
+#     extraction (in Documents or parked); SetUpAndPlay then needs no prod.keys; the queue's own start goes on too. BeginRun (every build path: SetUpAndPlay, AutoRunFromArgs, StartContinuedBuild) prepares the
+#     slot first and, when the game's files lack content and the extraction in Documents is usable, skips the C# extraction (an .nsp / .xci / .nsz); a .nup is never extracted by C# and gets no nup=. The
+#     "framework not built by this version" path is a Set up of a game that is "Needs setup": it goes through the same guards.
+#   * PARKING (SlotPlanner / SlotMover / SlotJournal, GameAppSlot.cs; EnsureSlotFor, GameAppSlotUi.cs). Before a build (BeginRun, after the restart-for-run question, before anything writes), before Play
+#     (PrimaryTapped's Boot: before AskToRestartForGame writes gameapp.boot-only and before the in-process boot), and before an export (ConfirmExport, before its sizes are measured), Documents is made to hold
+#     the game's slot: a slot of another title (by the marker, else profile.tsv, else the stamp's game) is parked in games/<its id>/slot; the game's own parked slot comes back. A slot that names nobody (a read
+#     cut short before the chain knew the title) is left where it is, as before (the build overwrites it), and put aside only when the game's own parked slot must come in. One Directory.Move / File.Move per item
+#     (rename(2) on the one APFS volume: nothing copied; Directory.Move throws rather than copy across volumes; files never over a file). Something already at the destination (a stale copy) is moved into
+#     Documents/.slot-trash/<name>/ first, never overwritten or mixed; those folders are deleted on a worker (Task.Run, not the delete queue: a launch that boots must not wait). Refused while a build or a boot
+#     runs, an export runs or is sized, or a delete runs (the log says why and the action does nothing). Main thread: renames and a few stats only, no walk.
+#     JOURNAL Documents/gameapp.slot.tsv: `active <TITLE ID>` (the title in Documents, for the log and the person; decisions read the files) and `op park|unpark|trash <arg> <time>`, written BEFORE each op
+#     (through .part + rename) and cleared after it. In the session a failing op is rolled back (the renames it made are undone) and the journal cleared. A launch whose last process was killed in the middle
+#     (RecoverSlotAtLaunch, in ViewDidLoad right after SweepLeftoverParts: before the library is drawn and before the launch's boot-only / args / continue requests) FINISHES the op (every rename not yet done is done:
+#     the moves are idempotent); a recovery that fails keeps the op for the next launch. The journal's argument is a title id or a plain folder name: nothing else is acted on. The launch sweep knows
+#     gameapp.slot.tsv.part and gameapp.extracted.part.
+#     READY WHILE PARKED: UiFacts.Parked (GatherFacts, from a 5 s cache of the parked slots invalidated by every move) maps the parked games whose stamp this app build made (ClassifyFramework Fresh, framework and
+#     flat/ there) to their content=. GameAppUi.GameStatusOf: such a game is Ready (Play, Export IPA, settings, saves, mods, "Rebuild from scratch"); ContentChangedSinceBuild reads its content= ("Update
+#     available"); ShowRebuild also when only parked builds are ready. Play brings the slot back first.
+#     DELETE: GameAppUi.PlanDeletion adds games/<id>/slot (keep saves; without saves games/<id> goes whole) and gameapp.extracted with the build; the "Frees ..." sizes and the delete are 0064's (worker).
+#     CANCEL (GameAppStopUi.ApplyCancel): "free the space" also removes the game's PARKED extraction when it is not a finished build; it never deletes Documents/extract when that holds another title's slot (the
+#     paused game's extraction was parked by a Play of another game, whose record still says "extracted"); and a game whose files have no content keeps its extraction (the choice becomes "keep").
+#     SIZES: FolderSizes key "parked" (Documents/games/*/slot, a worker walk, rarely: a move or a delete invalidates it) is added to the storage bars' "Builds"; the game sheet's Build line of a parked game
+#     measures its games/<id>/slot (key "game-slot").
+#   * RECOVERY (SlotRecovery, RecoverGamesFromSlots): at launch and back from the foreground, inside 0071's KeepBuiltGames worker (before its own pass), for the slot in Documents and every parked one that holds a
+#     finished build or a RomFS.img and has a title: if no game file of that game is in Documents (its name in any case, or another BASE file of its title id), its placeholder is made again: the built record
+#     (BuiltLedger.Seed, the size the import record knew else 0) and 0071's BuiltKeep placeholder (the import ledger first, then a zero-byte file renamed in, never over a file). The name: the stamp's game=, else
+#     the marker's, else the built record of its title, else the import record of its title (a base game); only when none knows it, `<title> [<TITLE ID>].<ext>`: the title from extract/control.nacp (the first
+#     non-empty of its 16 language entries; "Game" when none; / \ : [ ] * ? " < > | and control characters dropped, no ".." word, no leading dot), the extension .nup when the slot shows a Switch 2 game, else .nsp.
+#     The Switch 2 evidence: extract/romfs_programs/ (made only by the NUP reader: ibuilder-nup extract.rs PROGRAMS), or "spec: Ounce" in the rewritten sdk (extract/flat/sdk.patched.bin or
+#     extract/rewrite/sdk/sdk.patched.bin: the decompressed image; the same string ibuilder-profile facts.rs reads to give a Switch 2 game its 9 GB pool). Title id ranges were NOT used: nothing in this
+#     repository states which ids are Switch 2 games. A Switch game's extraction does not say whether it came from an NSP or an XCI: .nsp is a game file the library lists, and the content is not there either
+#     way. The owner's Ocarina (slot in Documents, stamp game= the .nup, file deleted) comes back as its stub by the stamp's name and is Ready without a rebuild (0071 alone already does this from the stamp; the
+#     parked slots and the name fallbacks are new).
+#   * OPTIMIZE STORAGE (StorageOptimizer, GameAppSlot.cs; the switch in GameAppShelf.cs). It REPLACES 0068's "Remove the game file after a successful build" (one switch; 0068's removal after the build is gone:
+#     RemoveSourceAfterBuild now only records the built game, 0071). Key optimize_storage in gameapp.settings.tsv; when absent, 0068's remove_source_after_build is carried over only when the owner had STORED it
+#     on; default OFF. When on, right after AfterExtraction wrote the marker: the base file, the update and the DLC that extraction read (a .nup: the .nup) are each replaced by a zero-byte stub when it is a game
+#     file (never prod.keys or anything else), of the extracted title (by its file name's id; a file with no id only when it is the base file itself) and has content. The import ledger first (the app's own
+#     record, marked removed, its source kept for "Add it again from <source>"; else a new record: how "hand", source "iBuilder's folder"), then 0068's SourceStub.Replace (one rename); a stub that cannot be
+#     made puts the ledger back and leaves the file as it was. Not when the person asked to cancel the build and free the space (that deletes the extraction). Any file, not only ones the app imported.
+#
+# NEW STRINGS: "Optimize storage", "Removes a game's file (.nsp, .xci, .nsz, .nup) once it is extracted. The game stays in the library and plays from its extraction; a later rebuild uses the extraction. Off: the
+#   files are kept." Log lines `storage: ...` (the moves, `... (renamed, nothing copied)`, a refusal and why, a recovery, the marker, each stub, a game brought back), `build setting: optimize storage on/off ...`,
+#   `build cancelled: ...: its extraction is kept ...` / `... its parked extraction (...) is removed in the background`, `<game>: the game file has no content, its extraction is in Documents/extract: the build
+#   starts from it (no extraction)`. ImportHow.ByHand "hand" ("put in iBuilder's folder"). ACCESSIBILITY ID: setting-optimize-storage (replaces setting-remove-source).
+#
+# MEASURED (host harness, .NET 11, Apple silicon Mac, APFS, scratch folders): marker and journal round trips, garbage, a newline in a field, a journal op naming a path or anything but a title id refused; a slot
+#   read (6 items, its title by marker / profile / stamp, npdm program id, a cut npdm); Usable over 9 cases; the planner over 10 cases; EXECUTED on real trees: B built, A built, Play B, Play A: games/<B>/slot
+#   holds exactly B's files (SHA-256 of every file), RomFS.img keeps its inode through park and unpark (renamed, not copied), every other file untouched, games/<B>/slot removed and games/<B> kept after the
+#   unpark, the journal's active title; a move failing at the third rename: every file back where it was, no op left; a journal that cannot be written: nothing moved; a kill after the journal and after 0, 1 or
+#   2 renames of a park, an unpark, a trash: Recover finishes it, a second Recover does nothing, a failing recovery keeps the op; a stale copy at the destination goes to .slot-trash; recovery names (stamp,
+#   marker, built record, import record, synthesized), NACP title, Switch 2 evidence, Decide over 5 cases, a parked build whose file is gone comes back as a stub with its built record; the owner's layout
+#   (stamp game= the .nup, no ExeFS): stub, Ready and Play, a rebuild not offered from that extraction until ExeFS is there; the toggle (default, own key, carried over, precedence); the optimizer's plan (base,
+#   update, DLC by id; another title, a no-id non-base file, prod.keys, a .txt, missing, empty, an unknown extracted title) and its run (two stubs with the right records, another game's file and prod.keys keep
+#   their SHA-256, run again does nothing, a failing rename leaves the file and the ledger as they were); UiFacts.Parked: Ready / Play / Needs setup, Rebuild offered, Update available, PlanDeletion.
+#   Mutations caught (19): BelongsTo without the title, no put-aside, no roll back, Usable without the content or the title, the optimizer without the title check, the toggle on by default, Recover not
+#   finishing, Decide missing another file of the title, any trash name accepted, trashing a nobody slot always, parking the game's own slot, no journal before a move, parked games not Ready, Delete keeping
+#   the parked slot, a new stub record not removed, no ledger roll back, no Switch 2 evidence from the sdk, brackets kept in a synthesized name.
+# NOT EXERCISED / ASSUMED (no device run): everything UIKit and every hook in GameAppViewController (EnsureSlotFor before Play / a build / an export, the launch recovery, AfterExtraction's two call sites, the
+#   switch, the sheet's Build line, the storage bars, the cancel guards); that Directory.Move of a 24 GB extract/ on the phone is a rename (APFS, one volume: expected, not measured there); that the chain
+#   builds a game from extract/ with no nup= and the C# step skipped (by reading chain.rs: exe_dir defaults to extract/ExeFS, the profile derives from extract/); that profile.tsv's mtime is a reliable sign the
+#   NUP read finished on the phone; that keep_exefs=1 is honoured by drop_exefs (read in profile.rs, not run); a kill in the middle of a real park on the phone; the recovery racing a move the person starts in
+#   the first second of a launch (both read the slot; the recovery only adds placeholders for games with no file).
+# LIMITS / RISKS: every game now keeps its ExeFS (36.6 MB for Ocarina, 80 MB for Grizzy). The owner's existing Ocarina extraction has no ExeFS: its first rebuild after an app update still needs the file once.
+#   0066's "Delete the build?" after a full export still deletes extract/ (its text says the game file stays: not true for a game "Optimize storage" emptied; the game then needs its file again to be rebuilt).
+#   0065's cleanup and 0066's cleanup do not delete gameapp.extracted (their exact lists are checked by their harnesses): a marker left alone is harmless (a usable extraction needs ExeFS/main and RomFS.img).
+#   A game whose file name has no title id and whose id was never read cannot name games/<id>/slot when deleted: its parked slot stays. A slot that names nobody stays in Documents until a parked slot must come
+#   back (then it is put aside and deleted). A paused build whose extraction a later build replaced (0065's ExtractReplacedBy) resumes "from the start", but its parked extraction comes back first and, when the
+#   file is a stub with a marker, the extraction is not run again. The parked list is cached 5 s: a change made outside the app shows up to 5 s late.
+diff --color -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs	2026-11-20 17:12:41
++++ b/GameAppMain.cs	2026-11-20 17:39:30
+@@ -265,6 +265,12 @@
+         catch (Exception) { return new List<string>(); }
+     }
+ 
++    /// A game file with bytes in it (not missing, not a zero-byte stub or placeholder: patches 0068 / 0071 / 0073).
++    internal static bool NupHasContent(string path)
++    {
++        try { var f = new FileInfo(path); return f.Exists && f.Length > 0; } catch (Exception) { return false; }
++    }
++
+     /// The config gameapp_pipeline.py reads: where the extraction wrote, the host dylib inside THIS bundle, and
+     /// the framework to assemble, sign and load. Written by the app, not by the harness.
+     internal static string ConfigText(string bundlePath, string game = null)
+@@ -278,8 +284,9 @@
+         var playerLines = player
+             ? new[] { "shader_packs=" + Path.Combine(GameExport.BundleGame, "shaders"), "shader_build=0" }
+             : new string[0];
+-        // A Switch 2 package: the chain reads it itself (gameapp_pipeline.extract_nup) before the profile.
+-        if (!player && game != null && GameAppUi.IsNup(game) && File.Exists(Path.Combine(documents, game)))
++        // A Switch 2 package: the chain reads it itself (gameapp_pipeline.extract_nup) before the profile. Not when the file has no content (patch 0073: a stub left by
++        // "Optimize storage" or a placeholder of patch 0071): the chain then builds from the extraction already in Documents/extract (ExeFS and RomFS.img, kept: keep_exefs below).
++        if (!player && game != null && GameAppUi.IsNup(game) && NupHasContent(Path.Combine(documents, game)))
+             playerLines = new[] { "nup=" + Path.Combine(documents, game) };
+         var lines = new[]
+         {
+@@ -301,9 +308,10 @@
+             "boot_seconds=" + (Environment.GetEnvironmentVariable("GAMEAPP_BOOT_SECONDS") ?? "0"),
+             // the player starts the game; GAMEAPP_BOOT_AFTER_BUILD=1 boots it at the end of the build (harness runs)
+             "boot_after_build=" + (Environment.GetEnvironmentVariable("GAMEAPP_BOOT_AFTER_BUILD") ?? "0"),
+-            // extract/ExeFS is removed once a build has its framework and shaders (space); the harness keeps it for
+-            // its chain-only runs (GAMEAPP_KEEP_EXEFS=1, gameapp/run_gameapp.sh)
+-            "keep_exefs=" + (Environment.GetEnvironmentVariable("GAMEAPP_KEEP_EXEFS") ?? "0"),
++            // extract/ExeFS (the game's code as extracted: 36.6 MB for Ocarina of Time) is KEPT after a build (patch 0073): with it, a rebuild (after
++            // an app update withdrew the framework, or of a game whose file "Optimize storage" removed) starts from the extraction and never needs the
++            // game file again. GAMEAPP_KEEP_EXEFS=0 drops it after the build, as before (the harness may set either).
++            "keep_exefs=" + (Environment.GetEnvironmentVariable("GAMEAPP_KEEP_EXEFS") ?? "1"),
+             // The margin the chain demands before it boots the guest IN ITS OWN PROCESS. The chain's footprint at
+             // the boot is what it PEAKED at (~2.9 GiB on a device, a 3365 MiB ceiling: available 520 MiB), and the
+             // guest itself commits ~2 GB of its alias region before the first frames — measured on the simulator,
+@@ -891,7 +899,7 @@
+ 
+     /// A copy, a download or an export writes <name>.part and renames it when it is whole (patches 0040, 0041, 0063's exports; GameAppNas.cs); a kill or a power loss in the middle leaves that .part, possibly
+     /// gigabytes, for good. At launch, before anything can start a copy, the .part files of OUR families are deleted, at fixed places and no deeper, by exact name:
+-    ///   Documents/                     <name>.nsp|.xci|.nsz|.nup|.ipa|.romfs.part (an import or a download), prod.keys.part, .titleids.tsv.part, gameapp.paused.tsv.part
++    ///   Documents/                     <name>.nsp|.xci|.nsz|.nup|.ipa|.romfs.part (an import or a download), prod.keys.part, .titleids.tsv.part, gameapp.paused.tsv.part, gameapp.slot.tsv.part and gameapp.extracted.part (patch 0073)
+     ///   Documents/games/<folder>/      cover.jpg.part, icon.jpg.part, <hash>.cover.jpg.part (a cover or an icon written through .part: GameAppCoverUi.cs)
+     ///   Documents/Exports/             <name>.ipa.part (an export, a downloaded app)
+     ///   Documents/Exports/<folder>/    <name> [<title id>].romfs.part (a slim export's game files)
+@@ -902,7 +910,7 @@
+         if (partsSwept) return;
+         partsSwept = true;
+         var documents = GameAppMain.Documents;
+-        SweepPartsIn(documents, "Documents", name => name == "prod.keys.part" || name == ".titleids.tsv.part" || name == "gameapp.paused.tsv.part" || name == ImportLedger.FileName + ".part" || IsPartOf(name, OurPartExtensions), log);
++        SweepPartsIn(documents, "Documents", name => name == "prod.keys.part" || name == ".titleids.tsv.part" || name == "gameapp.paused.tsv.part" || name == ImportLedger.FileName + ".part" || name == SlotJournal.FileName + ".part" || name == ExtractionMark.FileName + ".part" || IsPartOf(name, OurPartExtensions), log);
+         var exports = Path.Combine(documents, "Exports");
+         if (Directory.Exists(exports) && new DirectoryInfo(exports).LinkTarget == null)
+         {
+@@ -932,6 +940,7 @@
+         View.AddSubview(ambient);
+         Timed("PrepareLog", PrepareLog);
+         Timed("SweepLeftoverParts", () => SweepLeftoverParts(text => Write(text)));   // before anything can start a copy (the exported player's PreparePlayerDocuments below, an import, a download)
++        Timed("RecoverSlot", RecoverSlotAtLaunch);   // GameAppSlotUi.cs (patch 0073): a slot move the last launch was killed in the middle of is finished before the library is drawn or a boot starts
+         Timed("LoadCloud", LoadCloud);
+         Timed("LoadBuildQueue", LoadBuildQueue);
+ 
+@@ -1228,6 +1237,7 @@
+             Framework: GameAppUi.ClassifyFramework(frameworkOnDisk, stamp, GameAppBuild.Id),
+             FrameworkGame: GameAppUi.ParseFrameworkStamp(stamp)?.Game,
+             FrameworkContent: GameAppUi.ParseFrameworkStamp(stamp)?.Content,
++            Parked: GameExport.IsPlayer ? null : ParkedReadyGames(),   // GameAppSlotUi.cs (patch 0073): the games whose build is parked and ready
+             ShaderPacks: InstalledShaderPacks(),
+             PendingShaderPacks: Directory.Exists(GameAppMain.Documents)
+                 ? Directory.EnumerateFiles(GameAppMain.Documents, "*.shaders.tar")
+@@ -1548,6 +1558,8 @@
+         made.Track(FolderSizes.Shaders, Path.Combine(docs, "shaders"), true, path => FolderWalk.Bytes(path, name => !name.EndsWith(".work", StringComparison.Ordinal)));
+         made.Track(FolderSizes.ShaderWork, Path.Combine(docs, "shaders"), true, path => FolderWalk.Bytes(path, name => name.EndsWith(".work", StringComparison.Ordinal)), slow: true);
+         made.Track(FolderSizes.ShaderCache, ShaderCachePath, true);
++        // the parked builds (patch 0073: Documents/games/<id>/slot, an extraction each): measured rarely, a move or a delete invalidates them
++        made.Track(ParkedSizeKey, Path.Combine(docs, "games"), true, ParkedBytes, slow: true);
+         return made;
+     }
+ 
+@@ -1865,7 +1877,7 @@
+         // drawn again when the walk is done, RefreshStorageViews). The walk itself is off the main thread (FolderSizes).
+         long Known(string key) => Math.Max(0, sizes.Get(key));
+         var segments = GameAppUi.StorageSegments(DumpBytes(),
+-            Known(FolderSizes.Extract) + Known(FolderSizes.Framework),
++            Known(FolderSizes.Extract) + Known(FolderSizes.Framework) + Known(ParkedSizeKey),
+             Known(FolderSizes.Shaders) + Known(FolderSizes.ShaderWork) + Known(FolderSizes.ShaderCache),
+             Known(FolderSizes.Exports), FreeBytes());
+         sizes.Request();
+@@ -1951,6 +1963,8 @@
+         {
+             case ActionKind.Import: Import(); break;
+             case ActionKind.Boot:
++                // patch 0073: the game's build may be parked (another game had the slot): it comes back BEFORE the boot, and before gameapp.boot-only is written (the next launch boots Documents/DmGameProbe.framework)
++                if (!EnsureSlotFor(selected, "Play")) break;
+                 if (builtThisProcess) { AskToRestartForGame(selected); break; }
+                 if (savesCopying) break;   // the copy before the launch is still being made
+                 AutoCopySaves(selected, () =>
+@@ -1975,10 +1989,12 @@
+         if (running) { Write("a build is already running"); return; }
+         var keys = Path.Combine(GameAppMain.Documents, "prod.keys");
+         bool nup = GameAppUi.IsNup(game);   // a Switch 2 package is not encrypted: no keys
+-        if (!nup && !File.Exists(keys)) { Write("no prod.keys in Documents: the tool cannot read an NSP without them"); return; }
+         var path = Path.Combine(GameAppMain.Documents, game);
++        // patch 0073: the file (or its update / DLC) has no content but the game's extraction is on this iPhone: the build starts from it (no extraction, no keys needed)
++        bool fromExtraction = File.Exists(path) && ContentMissing(game).Count > 0 && ExtractionOnDisk(game) != null;
++        if (!nup && !fromExtraction && !File.Exists(keys)) { Write("no prod.keys in Documents: the tool cannot read an NSP without them"); return; }
+         if (!File.Exists(path)) { Write($"{game} is no longer in Documents"); return; }
+-        if (!GameFileHasContent(game)) return;   // GameAppSourceUi.cs: the file was removed after the build: it says so and offers to add it again (patch 0068)
++        if (!fromExtraction && !GameFileHasContent(game)) return;   // GameAppSourceUi.cs: the file was removed after the build: it says so and offers to add it again (patch 0068)
+         rebuildRequested = true;
+         BeginRunWithArguments(keys, path, "--romfs-image");
+     }
+@@ -2099,6 +2115,7 @@
+     private void ConfirmExport(string game)
+     {
+         if (running || exporting || exportSizing || deletes.Busy || game == null) return;
++        if (!EnsureSlotFor(game, "the export")) return;   // patch 0073 (GameAppSlotUi.cs): the export reads the build in Documents: a parked one comes back first
+         var tid = BuiltTitleId();
+         if (tid == null) { Write("export: the built game has no title id (profile.tsv): build it again"); return; }
+         // What goes into the app is measured on a worker thread: the build is thousands of files, the shaders tens of thousands (the alert comes up when the numbers are in).
+@@ -2268,6 +2285,7 @@
+             Write($"deleted {GameAppUi.DisplayName(game)}: {removed} item(s), {GameAppUi.SizeText(freed)} freed" + (failed > 0 ? $", {failed} could not be removed" : ""));
+             if (selected == game) selected = null;
+             if (pausedBuilds.Any(r => r.Game == game)) { pausedBuilds = PausedStore.Remove(pausedBuilds, game); SavePaused(); stop.Forget(); }   // a deleted game has no paused build
++            SlotsChanged();   // patch 0073: its parked build (games/<id>/slot) went with it
+             sizes.Invalidate();
+             RefreshScreen();
+         });
+@@ -2496,11 +2514,12 @@
+     /// the DLC's title id minus the game's AddOnContentBaseId (its NACP), as the engine's NSP script computes it. Images
+     /// of DLC no longer in Documents go first. A DLC that cannot be read is logged and left out: the game still builds.
+     /// Runs on the run's worker thread.
+-    private void ExtractDlc(string gameName, string[] arguments)
++    private List<string> ExtractDlc(string gameName, string[] arguments)
+     {
+         void Say(string line) => BeginInvokeOnMainThread(() => Write(line));
++        var read = new List<string>();   // patch 0073: the DLC files read (what "Optimize storage" may replace by stubs)
+         var tid = GameAppUi.BaseTitleIdOf(gameName);
+-        if (tid == null || arguments == null || arguments.Length < 4) return;
++        if (tid == null || arguments == null || arguments.Length < 4) return read;
+         var names = Dumps().Select(Path.GetFileName).ToList();
+         var dlcs = GameAppUi.DlcFor(gameName, names);
+         var aoc = Path.Combine(GameAppMain.Documents, "games", tid, "aoc");
+@@ -2509,7 +2528,7 @@
+             if (Directory.Exists(aoc)) foreach (var old in Directory.GetFiles(aoc, "*.img")) File.Delete(old);
+         }
+         catch (Exception error) { Say($"DLC: could not clear {aoc}: {error.Message}"); }
+-        if (dlcs.Count == 0) return;
++        if (dlcs.Count == 0) return read;
+         Directory.CreateDirectory(aoc);
+         ulong baseId = ulong.Parse(tid, System.Globalization.NumberStyles.HexNumber), aocBase = 0;
+         try
+@@ -2539,7 +2558,9 @@
+             catch (Exception error) { rc = -1; Say($"DLC: {dlc}: {error.GetType().Name}: {error.Message}"); }
+             finally { if (converted != null) try { File.Delete(converted); } catch (Exception) { } }
+             Say(rc == 0 ? $"DLC: {dlc} -> aoc/{index}.img" : $"DLC: {dlc} could not be read (exit {rc}) — left out, the game still builds");
++            if (rc == 0) read.Add(dlc);
+         }
++        return read;
+     }
+ 
+     private void BeginRun(string name, string[] arguments, bool skipExtract, bool bootOnly = false)
+@@ -2550,6 +2571,16 @@
+         // (gameapp_pipeline.extract_nup, from the config's nup= line), with no keys.
+         if (arguments != null && arguments.Length > 1 && GameAppUi.IsNup(arguments[1])) skipExtract = true;
+         if (pythonRanThisProcess) { AskToRestartForRun(name, bootOnly); return; }
++        // Patch 0073 (GameAppSlotUi.cs): the slot (Documents/extract, the framework, profile.tsv, the stamp) is this game's before anything reads or writes it: another game's build is parked in
++        // Documents/games/<id>/slot, this game's comes back from there (renames). Then a game whose file (or update / DLC) has no content is built from its extraction when it is in Documents now: no
++        // extraction is run (a .nup: the config gets no nup=, GameAppMain.ConfigText).
++        var slotGame = !bootOnly && arguments != null && arguments.Length > 1 ? Path.GetFileName(arguments[1]) : null;
++        if (slotGame != null && !EnsureSlotFor(slotGame, "a build")) return;
++        if (slotGame != null && !skipExtract && ContentMissing(slotGame).Count > 0 && ActiveExtractionFor(slotGame))
++        {
++            skipExtract = true;
++            Write($"{slotGame}: the game file has no content, its extraction is in Documents/extract: the build starts from it (no extraction)");
++        }
+         // Pre-flight: a stale or missing keys file must be a clear refusal, not an exception deep inside the
+         // C# extraction tool that the app then reports as "ok" (measured on the device). The path has already
+         // been re-anchored under the current Documents by the caller.
+@@ -2567,6 +2598,15 @@
+         if (!bootOnly && GameAppMain.IdentityLine().Contains("MISSING"))
+             Write("WARNING: no signing certificate in this app's Keychain — the chain will rewrite and assemble, "
+                 + "then fail at stage 4b. Open the Keys tab and tap \"Certificate (.p12)\" first if you want the boot.");
++        // Patch 0073: an extraction about to run (the C# step, or the chain reading a .nup) replaces extract/: its marker goes first, and is written again when the new extraction is complete
++        // (AfterExtraction: then "Optimize storage" replaces the files it read by stubs, when the toggle is on).
++        bool nupRead = slotGame != null && GameAppUi.IsNup(slotGame) && GameAppMain.NupHasContent(Path.Combine(GameAppMain.Documents, slotGame));
++        if ((!bootOnly && !skipExtract && arguments != null) || nupRead)
++            try { File.Delete(Path.Combine(GameAppMain.Documents, ExtractionMark.FileName)); } catch (Exception) { }
++        var runStartUtc = DateTime.UtcNow;
++        bool optimize = !bootOnly && StorageOptimizer.ToggleOn(ReadAppSettings());
++        var usedContent = slotGame != null ? GameAppUi.ContentSignature(slotGame, Dumps().Select(Path.GetFileName).ToList()) : "";
++        var updateUsed = arguments != null && arguments.Length > 2 && arguments[2] != "-" ? Path.GetFileName(arguments[2]) : null;
+         // The request has now been honoured, whichever path wrote it: the picker writes gameapp.args as the run's
+         // own record of its argv, the harness leaves it for the next launch to pick up. Renaming it aside HERE,
+         // and not only in the launch path, is what makes the request truly one-shot: a run started from the picker
+@@ -2669,7 +2709,14 @@
+                 {
+                     // The engine's own entry point, in this process, in this runtime. No shell, no argument file.
+                     code = P.Main(arguments);
+-                    if (code == 0) ExtractDlc(name, arguments);
++                    if (code == 0)
++                    {
++                        var dlcRead = ExtractDlc(name, arguments);
++                        // patch 0073 (GameAppSlotUi.cs): the extraction is complete: its marker, then "Optimize storage" (the base file, the update and the DLC it read become empty stubs). Not when the person
++                        // asked to cancel and free the space (the extraction is deleted then: the files are what is left of the game).
++                        if (!(stop.State is StopState.Cancelling && stop.Choice == CancelChoice.FreeSpace))
++                            AfterExtraction(name, new[] { name, updateUsed }.Concat(dlcRead).Where(f => f != null).ToList(), usedContent, optimize, line => BeginInvokeOnMainThread(() => Write(line)));
++                    }
+                 }
+                 catch (Exception error)
+                 {
+@@ -2756,6 +2803,14 @@
+                 Write($"chain returned {rc} after {Took(chainTook)}");
+                 if (askedBefore && outcome is StopOutcome.Finished or StopOutcome.Failed) Write("the stop came too late: the chain had already ended");
+                 failedRun = outcome == StopOutcome.Failed;
++                // patch 0073: a .nup the chain was given (nup=) is extracted when the chain derived its profile in this run (that stage runs only once the package is read): its marker, then "Optimize storage".
++                // Any outcome, except a cancel that frees the space (it deletes the extraction).
++                var profilePath = Path.Combine(GameAppMain.Documents, "profile.tsv");
++                if (nupRead && !(outcome == StopOutcome.Cancelled && stop.Choice == CancelChoice.FreeSpace) && File.Exists(profilePath) && File.GetLastWriteTimeUtc(profilePath) >= runStartUtc.AddSeconds(-1))
++                {
++                    var read = slotGame;
++                    System.Threading.Tasks.Task.Run(() => AfterExtraction(read, new[] { read }, usedContent, optimize, line => BeginInvokeOnMainThread(() => Write(line))));
++                }
+                 Write($"memory at the end: {GameAppMain.MemLine()}");
+                 Write($"free space at the end: {GameAppMain.FreeSpace()}");
+                 if (!RestartForStage3(rc, chainError))   // GameAppResume.cs: the chain may end on purpose before stage 3
+diff --color -ruN a/GameAppQueueUi.cs b/GameAppQueueUi.cs
+--- a/GameAppQueueUi.cs	2026-11-20 17:12:41
++++ b/GameAppQueueUi.cs	2026-11-20 17:30:22
+@@ -182,7 +182,7 @@
+             return;
+         }
+         var path = Path.Combine(GameAppMain.Documents, item.Game);
+-        if (ContentMissing(item.Game).Count > 0)
++        if (ContentMissing(item.Game).Count > 0 && ExtractionOnDisk(item.Game) == null)   // patch 0073: a game whose extraction is on this iPhone builds from it
+         {
+             BuildQueue.Ended(buildQueue, item.Game, false, "the game file was removed after the build: add it again");   // GameAppSourceUi.cs (patch 0068): no alert in the middle of the queue
+             SaveBuildQueue();
+diff --color -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs	2026-11-20 17:12:41
++++ b/GameAppShelf.cs	2026-11-20 17:30:37
+@@ -850,20 +850,21 @@
+             }
+             catch (Exception error) { Write($"could not save the build setting: {error.Message}"); }
+         };
+-        var removeSource = new UISwitch { On = SourceRemoval.ToggleOn(ReadAppSettings()), AccessibilityIdentifier = "setting-remove-source", OnTintColor = Theme.Accent };
+-        removeSource.ValueChanged += (_, __) =>
++        // patch 0073: "Optimize storage" replaces 0068's "Remove the game file after a successful build" (one toggle; its stored "on" is carried over, StorageOptimizer.ToggleOn; default off)
++        var optimize = new UISwitch { On = StorageOptimizer.ToggleOn(ReadAppSettings()), AccessibilityIdentifier = "setting-optimize-storage", OnTintColor = Theme.Accent };
++        optimize.ValueChanged += (_, __) =>
+         {
+             try
+             {
+-                File.WriteAllText(AppSettingsPath, GameAppUi.WithAppSetting(ReadAppSettings(), SourceRemoval.SettingKey, removeSource.On ? "1" : "0"));
+-                Write($"build setting: the game file is {(removeSource.On ? "removed (an empty stub stays) after a successful build of a game iBuilder imported" : "kept after a build")}");
++                File.WriteAllText(AppSettingsPath, GameAppUi.WithAppSetting(ReadAppSettings(), StorageOptimizer.SettingKey, optimize.On ? "1" : "0"));
++                Write($"build setting: optimize storage {(optimize.On ? "on: a game's file (and its update and DLC) is replaced by an empty placeholder once the game is extracted" : "off: the game files are kept")}");
+             }
+             catch (Exception error) { Write($"could not save the build setting: {error.Message}"); }
+         };
+         var buildCard = SettingsCard(
+             SettingsSwitchRow("Parallel shader preparation", "Uses every core while a build translates the shaders. Applies from the next build.", parallel),
+             SettingsSwitchRow("Low performance", "Cooler and slower: at most two jobs at once, also in a build that is running.", lowPerf),
+-            SettingsSwitchRow(SourceText.SettingTitle, SourceText.SettingNote, removeSource),   // GameAppSourceRemoval.cs (patch 0068)
++            SettingsSwitchRow(StorageOptimizer.Title, StorageOptimizer.Note, optimize),   // GameAppSlot.cs (patch 0073)
+             cacheHolder);
+ 
+         setLogs = SettingsRow("Logs", () => ShowTab(3), true, false, 3, "settings-logs");
+@@ -1048,7 +1049,14 @@
+         Line("Game", GameFileSizeText(game));
+         // Build and Shaders are folders of thousands of files: "…" until the worker thread has measured them (FolderSizes), then the value (RefreshStorageViews calls sheetStorageFill).
+         string Known(long bytes) => bytes < 0 ? "…" : GameAppUi.SizeText(bytes);
+-        string BuildText() { long ex = sizes.Get(FolderSizes.Extract), fw = sizes.Get(FolderSizes.Framework); return Known(ex < 0 || fw < 0 ? -1 : ex + fw); }
++        // a build parked while another game had the slot (patch 0073): its own folder, games/<id>/slot, measured on a worker as the others
++        var parkedSlot = ready && !(facts.Framework == FrameworkState.Fresh && facts.FrameworkGame == game) ? ParkedSlotOf(game) : null;
++        if (parkedSlot != null) sizes.Track(GameSlotSizeKey, parkedSlot.Root, true);
++        string BuildText()
++        {
++            if (parkedSlot != null) return Known(sizes.Get(GameSlotSizeKey));
++            long ex = sizes.Get(FolderSizes.Extract), fw = sizes.Get(FolderSizes.Framework); return Known(ex < 0 || fw < 0 ? -1 : ex + fw);
++        }
+         UILabel buildValue = ready ? Line("Build", BuildText()) : null;
+         UILabel shadersValue = null;
+         if (tid != null)
+diff --color -ruN a/GameAppSlot.cs b/GameAppSlot.cs
+--- a/GameAppSlot.cs	1970-01-01 01:00:00
++++ b/GameAppSlot.cs	2026-11-20 17:35:09
+@@ -0,0 +1,606 @@
++// gameapp/GameAppSlot.cs -- one folder per game for its build (parking), the extraction marker, the games brought back from what is on disk, and "Optimize storage", with no UIKit (patch 0073; the host harness
++// compiles this file as it is).
++//
++// Why (the owner, field facts of Ocarina of Time, a 25.6 GB .nup): storage is the limit. The build of ONE game lived in Documents (extract/ with the 24.4 GB RomFS.img, the framework, profile.tsv, the stamp): building
++// another game wiped it, and an app update (which withdraws the framework) needed the game file again because extract/ExeFS was deleted after each build. Now:
++//   * THE SLOT is the set of paths in Documents that belong to the game built last (GameSlot.Items: extract/, DmGameProbe.framework/, profile.tsv, gameapp.framework, pipeline.boot, gameapp.extracted). The chain and the
++//     export read them at those fixed paths, so they stay there for the game in use; another game's slot is PARKED in Documents/games/<TITLE ID>/slot/ (Directory.Move / File.Move: the same APFS volume, one rename
++//     per item, nothing is copied) and moved back when that game needs the slot again (a build, Play, an export). Every move is journaled (Documents/gameapp.slot.tsv) and an interrupted one is finished at the next launch.
++//   * THE EXTRACTION MARKER, Documents/gameapp.extracted (it moves with the slot): written when an extraction is complete (game file name, title id, the update / DLC signature). With extract/ExeFS kept (keep_exefs=1),
++//     a game whose file has no content can be rebuilt from its extraction (ExtractionUse.Usable).
++//   * RECOVERY: a slot (in Documents or parked) whose game has no file in Documents gets its zero-byte placeholder back (patch 0071's BuiltKeep), with a name from the stamp, the marker, the built record, the import
++//     record, or, when nothing knows it, a name made from the game's own control data (SlotRecovery.Synthesize).
++//   * OPTIMIZE STORAGE (StorageOptimizer): once a game is extracted, its base file, update and DLC are replaced by zero-byte stubs (0068's ledger-first stub), when the Settings toggle is on.
++//
++//   GameSlot          the names and paths.
++//   SlotView / SlotStore    what one slot holds (read from its folder: a few stats and three small files), the parked slots.
++//   ExtractionMark / ExtractionUse   the marker, and whether an extraction can stand in for a game's files.
++//   SlotJournal       Documents/gameapp.slot.tsv: the title in the slot and the move going on.
++//   SlotPlanner / SlotMover   what makes the slot hold a game (park the occupant, or put an occupant nobody owns aside; bring the game's own slot back) and the moves themselves (journaled, rolled back in the
++//                     session when a move fails, finished at the next launch when the app was killed in the middle).
++//   SlotRecovery      the name of a slot's game and whether its placeholder must be made again.
++//   StorageOptimizer  the toggle, which files go after an extraction, and the stubs.
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using System.Text;
++
++public static class GameSlot
++{
++    public const string Extract = "extract", Framework = "DmGameProbe.framework", Stamp = "gameapp.framework", Profile = "profile.tsv", PipelineBoot = "pipeline.boot";
++
++    /// The folders and files of a game's build in Documents (the chain's config names them: extract_out, framework_out, profile; the pipeline writes the stamp and pipeline.boot; this patch the marker). Nothing else in
++    /// Documents is a game's build: shaders/<id>, games/<id> (settings, saves, aoc/, launcher.json, the rewrite cache) and profile-derived/<id> are per game already.
++    public static readonly string[] Folders = { Extract, Framework };
++    public static readonly string[] Files = { Stamp, Profile, PipelineBoot, ExtractionMark.FileName };
++    public static IEnumerable<string> Items => Folders.Concat(Files);
++
++    public const string GamesRoot = "games", SlotFolder = "slot";
++
++    /// Documents/.slot-trash/<name>/: what a move had to put aside (a slot no game owns, or a stale copy in the way); deleted on a worker, never on the main thread.
++    public const string TrashRoot = ".slot-trash";
++
++    public static bool IsTitleId(string s) => s != null && s.Length == 16 && s.All(Uri.IsHexDigit);
++    public static string Norm(string tid) => IsTitleId(tid) ? tid.ToUpperInvariant() : null;
++
++    public static string ParkedRelative(string tid) => GamesRoot + "/" + tid + "/" + SlotFolder;
++    public static string ParkedPath(string documents, string tid) => Path.Combine(documents, GamesRoot, tid, SlotFolder);
++
++    internal static bool Exists(string path) => File.Exists(path) || Directory.Exists(path);
++}
++
++/// `Game`: the game file the extraction was made from; `TitleId`: the base title id the extraction holds (ExeFS/main.npdm); `Content`: GameAppUi.ContentSignature of the update and DLC it took; `At`: UTC.
++public sealed record ExtractionMark(string Game, string TitleId, string Content, string At)
++{
++    public const string FileName = "gameapp.extracted";
++
++    public static ExtractionMark Parse(string text)
++    {
++        if (text == null) return null;
++        string game = null, tid = null, content = "", at = "";
++        foreach (var raw in text.Split('\n'))
++        {
++            var line = raw.TrimEnd('\r');
++            var eq = line.IndexOf('=');
++            if (eq <= 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
++            var key = line.Substring(0, eq).Trim();
++            var value = line.Substring(eq + 1).Trim();
++            if (key == "game") game = value;
++            else if (key == "title_id") tid = value;
++            else if (key == "content") content = value;
++            else if (key == "at") at = value;
++        }
++        return string.IsNullOrEmpty(game) ? null : new ExtractionMark(game, GameSlot.Norm(tid), content, at);
++    }
++
++    private static string Clean(string s) => (s ?? "").Replace('\n', ' ').Replace('\r', ' ');
++
++    public string Format() =>
++        "# the extraction in this folder is complete (patch 0073): a rebuild can start from it when the game file has no content\n"
++        + "game=" + Clean(Game) + "\ntitle_id=" + Clean(TitleId) + "\ncontent=" + Clean(Content) + "\nat=" + Clean(At) + "\n";
++
++    /// Written through <file>.part and one rename. Throws when it cannot be written.
++    public static void Write(string folder, ExtractionMark mark)
++    {
++        var path = Path.Combine(folder, FileName);
++        var part = path + ".part";
++        try { File.WriteAllText(part, mark.Format()); File.Move(part, path, true); }
++        catch { try { File.Delete(part); } catch (Exception) { } throw; }
++    }
++}
++
++/// What one slot holds: `Root` is Documents (the slot in use) or games/<id>/slot (a parked one). `FolderTid`: the <id> of a parked slot, null for Documents. `Items`: which of GameSlot.Items are there.
++public sealed record SlotView(string Root, string FolderTid, string ProfileTid, string StampText, FrameworkStamp Stamp, ExtractionMark Mark, IReadOnlyList<string> Items,
++                              bool FrameworkOnDisk, bool FlatOnDisk, bool ExeFsOnDisk, long RomfsBytes)
++{
++    /// The title the slot belongs to: the marker's (the extraction itself), else profile.tsv's (the chain derived it from the extraction), else the stamp's game's, else the parked folder's name. Null: nobody's.
++    public string Tid => Mark?.TitleId ?? ProfileTid ?? GameAppUi.BaseTitleIdOf(Stamp?.Game is { Length: > 0 } g ? g : null) ?? FolderTid;
++
++    /// The game file named by the stamp (a finished build), else by the marker (an extraction).
++    public string Game => !string.IsNullOrEmpty(Stamp?.Game) ? Stamp.Game : Mark?.Game;
++
++    public bool IsEmpty => Items.Count == 0;
++
++    /// A finished build is here (the stamp, the framework and flat/): what Play and Export need.
++    public bool HasBuild => Stamp != null && FrameworkOnDisk && FlatOnDisk;
++
++    /// A whole extraction is here: what a rebuild without the game file needs (the chain reads ExeFS and RomFS.img).
++    public bool HasExtraction => ExeFsOnDisk && RomfsBytes > 0;
++
++    /// Worth keeping a game in the library for: a finished build, or the game's files.
++    public bool HasContent => HasBuild || RomfsBytes > 0;
++
++    /// This slot is `game`'s: it names that file, or it holds that title (the same game under another file name: its build is replaced by the next one anyway).
++    public bool BelongsTo(string game, string tid)
++    {
++        if (!string.IsNullOrEmpty(game) && (string.Equals(Stamp?.Game, game, StringComparison.Ordinal) || string.Equals(Mark?.Game, game, StringComparison.Ordinal))) return true;
++        var mine = GameSlot.Norm(tid);
++        return mine != null && string.Equals(Tid, mine, StringComparison.Ordinal);
++    }
++}
++
++public static class SlotStore
++{
++    private static string ReadSmall(string path, int max = 1 << 20)
++    {
++        try { var f = new FileInfo(path); return f.Exists && f.Length <= max ? File.ReadAllText(path) : null; } catch (Exception) { return null; }
++    }
++
++    /// profile.tsv's title_id (the same reading as GameAppMain.BuiltTitleId), or null.
++    public static string ProfileTitleId(string profilePath)
++    {
++        try
++        {
++            if (!File.Exists(profilePath)) return null;
++            foreach (var line in File.ReadLines(profilePath))
++                if (line.StartsWith("title_id\t", StringComparison.Ordinal)) return GameSlot.Norm(line.Substring(9).Trim());
++        }
++        catch (Exception) { }
++        return null;
++    }
++
++    /// One slot, read now: a stat per item, the stamp and the marker (small files) and profile.tsv's title line. No walk: safe on the main thread.
++    public static SlotView Read(string root, string folderTid = null)
++    {
++        var items = GameSlot.Items.Where(i => GameSlot.Exists(Path.Combine(root, i))).ToList();
++        var stampText = ReadSmall(Path.Combine(root, GameSlot.Stamp), 64 * 1024);
++        var mark = ExtractionMark.Parse(ReadSmall(Path.Combine(root, ExtractionMark.FileName), 64 * 1024));
++        long romfs = 0;
++        try { var f = new FileInfo(Path.Combine(root, GameSlot.Extract, "RomFS.img")); if (f.Exists) romfs = f.Length; } catch (Exception) { }
++        return new SlotView(root, GameSlot.Norm(folderTid), ProfileTitleId(Path.Combine(root, GameSlot.Profile)), stampText, GameAppUi.ParseFrameworkStamp(stampText), mark, items,
++                            File.Exists(Path.Combine(root, GameSlot.Framework, "DmGameProbe")), Directory.Exists(Path.Combine(root, GameSlot.Extract, "flat")),
++                            File.Exists(Path.Combine(root, GameSlot.Extract, "ExeFS", "main")), romfs);
++    }
++
++    /// The parked slots: Documents/games/<16 hex digits>/slot/ folders (one listing of games/, a stat each; the slot of a game is read only when it exists). Never throws.
++    public static List<SlotView> ListParked(string documents)
++    {
++        var list = new List<SlotView>();
++        try
++        {
++            var games = Path.Combine(documents, GameSlot.GamesRoot);
++            if (!Directory.Exists(games)) return list;
++            foreach (var dir in Directory.EnumerateDirectories(games))
++            {
++                var tid = GameSlot.Norm(Path.GetFileName(dir));
++                if (tid == null) continue;
++                var slot = Path.Combine(dir, GameSlot.SlotFolder);
++                if (!Directory.Exists(slot)) continue;
++                var view = Read(slot, tid);
++                if (!view.IsEmpty) list.Add(view);
++            }
++        }
++        catch (Exception) { }
++        return list;
++    }
++
++    /// The program id of ExeFS/main.npdm (its ACI0 block, +0x10), as a base title id (low 12 bits cleared), or null. The same reading as ibuilder-profile's title_id.
++    public static string NpdmTitleId(string npdmPath)
++    {
++        try
++        {
++            var f = new FileInfo(npdmPath);
++            if (!f.Exists || f.Length > (4 << 20)) return null;
++            var d = File.ReadAllBytes(npdmPath);
++            for (int i = 0; i + 0x18 <= d.Length; i++)
++                if (d[i] == (byte) 'A' && d[i + 1] == (byte) 'C' && d[i + 2] == (byte) 'I' && d[i + 3] == (byte) '0')
++                    return (BitConverter.ToUInt64(d, i + 0x10) & ~0xFFFUL).ToString("X16", CultureInfo.InvariantCulture);
++        }
++        catch (Exception) { }
++        return null;
++    }
++}
++
++public static class ExtractionUse
++{
++    /// The extraction in `slot` can stand in for `game`'s files (whose update / DLC signature is `content` now): the whole extraction is there (ExeFS/main and a RomFS.img with bytes), the slot's title is the game's
++    /// (when both are known), and the marker names this game with the same update and DLC. A slot built before this patch has no marker: its stamp must name this game with the same content=. Anything else: no
++    /// (the file is asked for, as before).
++    public static bool Usable(SlotView slot, string game, string tid, string content)
++    {
++        if (slot == null || string.IsNullOrEmpty(game) || !slot.HasExtraction) return false;
++        var mine = GameSlot.Norm(tid);
++        if (mine != null && slot.Tid != null && !string.Equals(slot.Tid, mine, StringComparison.Ordinal)) return false;
++        if (slot.Mark != null)
++            return string.Equals(slot.Mark.Game, game, StringComparison.Ordinal) && string.Equals(slot.Mark.Content ?? "", content ?? "", StringComparison.Ordinal);
++        return slot.Stamp != null && string.Equals(slot.Stamp.Game, game, StringComparison.Ordinal) && slot.Stamp.Content != null
++               && string.Equals(slot.Stamp.Content, content ?? "", StringComparison.Ordinal);
++    }
++}
++
++// ---- the journal ----------------------------------------------------------------------------------------------------------------------------------------------
++
++public enum SlotStep { Park, Trash, Unpark }
++
++/// One move of a whole slot: Park(tid) Documents -> games/<tid>/slot; Unpark(tid) games/<tid>/slot -> Documents; Trash(name) Documents -> .slot-trash/<name> (a slot nobody owns).
++public sealed record SlotOp(SlotStep Step, string Arg);
++
++/// `Active`: the title id whose build is in Documents ("" = none or not known; for the log and the person, the decisions read the files). `Op`: the move going on, null when none.
++public sealed record SlotJournalState(string Active, SlotOp Op, string At);
++
++public static class SlotJournal
++{
++    public const string FileName = "gameapp.slot.tsv";
++
++    private static readonly object gate = new object();
++
++    public static string PathIn(string documents) => Path.Combine(documents, FileName);
++
++    public static SlotJournalState Parse(string text)
++    {
++        string active = "", at = "";
++        SlotOp op = null;
++        foreach (var raw in (text ?? "").Split('\n'))
++        {
++            var line = raw.TrimEnd('\r');
++            if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
++            var p = line.Split('\t');
++            if (p[0] == "active" && p.Length >= 2) active = GameSlot.Norm(p[1]) ?? "";
++            else if (p[0] == "op" && p.Length >= 3)
++            {
++                SlotStep? step = p[1] switch { "park" => SlotStep.Park, "unpark" => SlotStep.Unpark, "trash" => SlotStep.Trash, _ => null };
++                // the argument is a title id (park / unpark) or a plain folder name (trash): nothing else is ever acted on
++                var arg = step == SlotStep.Trash ? (IsTrashName(p[2]) ? p[2] : null) : GameSlot.Norm(p[2]);
++                if (step != null && arg != null) { op = new SlotOp(step.Value, arg); at = p.Length >= 4 ? p[3] : ""; }
++            }
++        }
++        return new SlotJournalState(active, op, at);
++    }
++
++    public static bool IsTrashName(string s) => !string.IsNullOrEmpty(s) && s.Length <= 64 && s.All(c => char.IsLetterOrDigit(c) || c == '-' || c == '_');
++
++    public static string Format(SlotJournalState s)
++    {
++        var sb = new StringBuilder("# the build slot of Documents (patch 0073): the game whose build is in Documents/extract and beside it, and a move of a slot that was going on (it is finished at the next launch)\n");
++        sb.Append("active\t").Append(s?.Active ?? "").Append('\n');
++        if (s?.Op != null)
++            sb.Append("op\t").Append(s.Op.Step switch { SlotStep.Park => "park", SlotStep.Unpark => "unpark", _ => "trash" }).Append('\t').Append(s.Op.Arg).Append('\t').Append(s.At ?? "").Append('\n');
++        return sb.ToString();
++    }
++
++    /// Never throws: an unreadable journal is "nothing going on".
++    public static SlotJournalState Read(string documents)
++    {
++        lock (gate)
++        {
++            try { var path = PathIn(documents); return Parse(File.Exists(path) ? File.ReadAllText(path) : ""); }
++            catch (Exception) { return new SlotJournalState("", null, ""); }
++        }
++    }
++
++    /// Through <file>.part and one rename. Throws when it cannot be written (a move is then not started).
++    public static void Write(string documents, SlotJournalState s)
++    {
++        lock (gate)
++        {
++            var path = PathIn(documents);
++            var part = path + ".part";
++            try { File.WriteAllText(part, Format(s)); File.Move(part, path, true); }
++            catch { try { File.Delete(part); } catch (Exception) { } throw; }
++        }
++    }
++
++    /// At launch, before the library is drawn: a move the app was killed in the middle of is FINISHED (every rename is done again where it is not done yet: the moves are idempotent). Returns the folders put
++    /// aside (to delete on a worker). Renames only: no walk. Never throws.
++    public static List<string> Recover(string documents, Action<string> log, Action<string, string, bool> move = null)
++    {
++        var trash = new List<string>();
++        var state = Read(documents);
++        if (state.Op == null) return trash;
++        log?.Invoke($"storage: the last launch ended in the middle of a slot move ({SlotMover.Describe(state.Op)}, {state.At}): it is finished now");
++        try { trash.AddRange(SlotMover.Apply(documents, state.Op, log, move, rollBack: false)); }
++        catch (Exception e) { log?.Invoke($"storage: the slot move could not be finished ({e.Message}): it is tried again at the next launch"); return trash; }
++        try { Write(documents, state with { Op = null, Active = state.Op.Step == SlotStep.Unpark ? state.Op.Arg : "" }); }
++        catch (Exception e) { log?.Invoke($"storage: the slot journal could not be cleared ({e.Message})"); }
++        return trash;
++    }
++}
++
++// ---- the plan and the moves --------------------------------------------------------------------------------------------------------------------------------
++
++public sealed record SlotDecision(IReadOnlyList<SlotOp> Ops, string Note);
++
++public static class SlotPlanner
++{
++    /// What makes Documents hold `game`'s slot (`tid`: its base title id from the file name, null when it has none). `active`: the slot in Documents; `parked`: the parked ones.
++    ///   * Documents already holds this game's slot (it names the file or holds the title): nothing (a build of it replaces it in place, as always).
++    ///   * Documents holds another title's: it is PARKED under that title. It holds nobody's (no marker, no profile, no stamp: a read cut short before the chain knew the title): it is put aside (trash) only when this
++    ///     game's own slot must come in, else left where it is (the build overwrites it, as before this patch).
++    ///   * This game has a parked slot: it comes back.
++    public static SlotDecision For(string game, string tid, SlotView active, IReadOnlyList<SlotView> parked, string trashName)
++    {
++        var ops = new List<SlotOp>();
++        var mine = (parked ?? Array.Empty<SlotView>()).FirstOrDefault(p => p.FolderTid != null && p.BelongsTo(game, tid));
++        if (active != null && !active.IsEmpty)
++        {
++            if (active.BelongsTo(game, tid)) return new SlotDecision(ops, "the slot is this game's already");
++            if (active.Tid != null) ops.Add(new SlotOp(SlotStep.Park, active.Tid));
++            else if (mine != null) ops.Add(new SlotOp(SlotStep.Trash, trashName));
++        }
++        if (mine != null) ops.Add(new SlotOp(SlotStep.Unpark, mine.FolderTid));
++        return new SlotDecision(ops, ops.Count == 0 ? "nothing to move" : string.Join(", ", ops.Select(SlotMover.Describe)));
++    }
++}
++
++public static class SlotMover
++{
++    public static string Describe(SlotOp op) => op.Step switch
++    {
++        SlotStep.Park => $"park {op.Arg} in {GameSlot.ParkedRelative(op.Arg)}",
++        SlotStep.Unpark => $"bring {op.Arg} back from {GameSlot.ParkedRelative(op.Arg)}",
++        _ => $"put a slot that names no game aside ({GameSlot.TrashRoot}/{op.Arg})",
++    };
++
++    private static void DefaultMove(string from, string to, bool folder)
++    {
++        if (folder) Directory.Move(from, to);        // rename(2): the same volume, nothing copied; it throws rather than copy across volumes
++        else File.Move(from, to, false);             // never over a file
++    }
++
++    private static string NewTrash(string documents)
++    {
++        var name = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N").Substring(0, 6);
++        var dir = Path.Combine(documents, GameSlot.TrashRoot, name);
++        Directory.CreateDirectory(dir);
++        return dir;
++    }
++
++    /// One op's renames. Items already where they belong are skipped (a recovery runs it again). Something in the way at the destination (a stale copy) is put aside first, never overwritten. `rollBack`: on a failure,
++    /// the renames this call made are undone (in the session); false at a recovery (the next launch tries again). Returns the folders put aside.
++    internal static List<string> Apply(string documents, SlotOp op, Action<string> log, Action<string, string, bool> move, bool rollBack)
++    {
++        move ??= DefaultMove;
++        var trash = new List<string>();
++        var done = new List<(string From, string To, bool Folder)>();
++        string trashDir = null;
++        string Aside(string path, bool folder)
++        {
++            trashDir ??= NewTrash(documents);
++            if (!trash.Contains(trashDir)) trash.Add(trashDir);
++            var to = Path.Combine(trashDir, Path.GetFileName(path));
++            move(path, to, folder);
++            done.Add((path, to, folder));
++            return to;
++        }
++        string fromRoot, toRoot;
++        switch (op.Step)
++        {
++            case SlotStep.Park: fromRoot = documents; toRoot = GameSlot.ParkedPath(documents, op.Arg); break;
++            case SlotStep.Unpark: fromRoot = GameSlot.ParkedPath(documents, op.Arg); toRoot = documents; break;
++            default:
++                fromRoot = documents;
++                toRoot = Path.Combine(documents, GameSlot.TrashRoot, op.Arg);
++                trash.Add(toRoot);
++                break;
++        }
++        var moved = new List<string>();
++        try
++        {
++            if (!Directory.Exists(fromRoot)) return trash;   // a park / unpark that already finished (its folder is gone)
++            Directory.CreateDirectory(toRoot);
++            foreach (var item in GameSlot.Items)
++            {
++                var from = Path.Combine(fromRoot, item);
++                bool folder = Directory.Exists(from);
++                if (!folder && !File.Exists(from)) continue;
++                var to = Path.Combine(toRoot, item);
++                if (GameSlot.Exists(to)) Aside(to, Directory.Exists(to));   // a stale copy in the way: aside, never overwritten, never mixed
++                move(from, to, folder);
++                done.Add((from, to, folder));
++                moved.Add(item);
++            }
++        }
++        catch
++        {
++            if (rollBack)
++            {
++                for (int i = done.Count - 1; i >= 0; i--)
++                    try { move(done[i].To, done[i].From, done[i].Folder); } catch (Exception) { }
++            }
++            throw;
++        }
++        if (op.Step == SlotStep.Unpark)
++            try { if (!Directory.EnumerateFileSystemEntries(fromRoot).Any()) Directory.Delete(fromRoot); } catch (Exception) { }   // the empty games/<id>/slot (games/<id> keeps the game's settings and saves)
++        if (moved.Count > 0) log?.Invoke($"storage: {Describe(op)}: {string.Join(", ", moved)} (renamed, nothing copied)");
++        return trash;
++    }
++
++    /// Runs `ops` in order, each one journaled first (the journal says what to finish if the app is killed in the middle). A failing op is rolled back and the rest is not run: `ok` false, the slot is as it was before
++    /// that op. Returns the folders put aside (to delete on a worker). `finalActive`: the title id the journal records as in the slot afterwards.
++    public static List<string> Run(string documents, IReadOnlyList<SlotOp> ops, string finalActive, Action<string> log, out bool ok, Action<string, string, bool> move = null)
++    {
++        var trash = new List<string>();
++        ok = true;
++        var active = SlotJournal.Read(documents).Active;
++        foreach (var op in ops ?? Array.Empty<SlotOp>())
++        {
++            try { SlotJournal.Write(documents, new SlotJournalState(active, op, ImportLedger.Now())); }
++            catch (Exception e) { log?.Invoke($"storage: the slot journal could not be written ({e.Message}): nothing was moved"); ok = false; return trash; }
++            try { trash.AddRange(Apply(documents, op, log, move, rollBack: true)); }
++            catch (Exception e)
++            {
++                log?.Invoke($"storage: could not {Describe(op)} ({e.Message}): the slot is as it was");
++                try { SlotJournal.Write(documents, new SlotJournalState(active, null, "")); } catch (Exception) { }
++                ok = false;
++                return trash;
++            }
++            active = op.Step == SlotStep.Unpark ? op.Arg : "";
++        }
++        try { SlotJournal.Write(documents, new SlotJournalState(GameSlot.Norm(finalActive) ?? active ?? "", null, "")); }
++        catch (Exception e) { log?.Invoke($"storage: the slot journal could not be updated ({e.Message})"); }
++        return trash;
++    }
++}
++
++// ---- recovery: a game comes back from what is on disk -------------------------------------------------------------------------------------------------------
++
++public enum RecoverWhy { Nothing, Present, Recreate }
++
++public sealed record RecoverDecision(RecoverWhy Why, string Name, string Tid, string Where);
++
++public static class SlotRecovery
++{
++    /// The game file name of a slot: the stamp's game=, else the marker's, else the built record of its title, else the import record of its title (a base game file), else null (then: Synthesize).
++    public static string NameFor(SlotView slot, IReadOnlyList<BuiltRecord> built, IReadOnlyList<ImportRecord> imports)
++    {
++        if (slot == null) return null;
++        if (BuiltLedger.IsGameFile(slot.Stamp?.Game)) return slot.Stamp.Game;
++        if (BuiltLedger.IsGameFile(slot.Mark?.Game)) return slot.Mark.Game;
++        var tid = slot.Tid;
++        if (tid == null) return null;
++        bool Base(string n) => BuiltLedger.IsGameFile(n) && GameAppUi.ContentKindOf(n) == GameAppUi.ContentKind.Base && string.Equals(GameAppUi.BaseTitleIdOf(n), tid, StringComparison.Ordinal);
++        var b = (built ?? Array.Empty<BuiltRecord>()).LastOrDefault(r => BuiltLedger.IsGameFile(r.Name) && (string.Equals(GameSlot.Norm(r.TitleId), tid, StringComparison.Ordinal) || Base(r.Name)));
++        if (b != null) return b.Name;
++        return (imports ?? Array.Empty<ImportRecord>()).LastOrDefault(r => Base(r.Name))?.Name;
++    }
++
++    /// `files`: the game files in Documents now (any content). Nothing to do for a slot with no build and no game files in it, or with no title; Present when its file, or another base file of its title, is there.
++    public static RecoverDecision Decide(SlotView slot, string name, IReadOnlyList<string> files)
++    {
++        var where = slot?.FolderTid == null ? "Documents" : GameSlot.ParkedRelative(slot.FolderTid);
++        if (slot == null || !slot.HasContent || slot.Tid == null || !BuiltLedger.IsGameFile(name)) return new RecoverDecision(RecoverWhy.Nothing, name, slot?.Tid, where);
++        foreach (var f in files ?? Array.Empty<string>())
++        {
++            if (string.Equals(f, name, StringComparison.OrdinalIgnoreCase)) return new RecoverDecision(RecoverWhy.Present, name, slot.Tid, where);
++            if (BuiltLedger.IsGameFile(f) && GameAppUi.ContentKindOf(f) is GameAppUi.ContentKind.Base && string.Equals(GameAppUi.BaseTitleIdOf(f), slot.Tid, StringComparison.Ordinal))
++                return new RecoverDecision(RecoverWhy.Present, f, slot.Tid, where);
++        }
++        return new RecoverDecision(RecoverWhy.Recreate, name, slot.Tid, where);
++    }
++
++    /// The game's name in its control data (control.nacp: 16 language entries of 0x300 bytes, the name in the first 0x200, UTF-8; the first non-empty one), or null.
++    public static string NacpTitle(byte[] nacp)
++    {
++        if (nacp == null || nacp.Length < 0x300) return null;
++        for (int i = 0; i < 16 && (i + 1) * 0x300 <= nacp.Length; i++)
++        {
++            int start = i * 0x300, end = start;
++            while (end < start + 0x200 && nacp[end] != 0) end++;
++            if (end == start) continue;
++            string s;
++            try { s = new UTF8Encoding(false, true).GetString(nacp, start, end - start).Trim(); } catch (Exception) { continue; }
++            if (s.Length > 0) return s;
++        }
++        return null;
++    }
++
++    /// A Switch 2 game, from what its slot holds: the NUP reader's other programs (extract/romfs_programs/, ibuilder-nup extract.rs PROGRAMS: no NSP/XCI extraction makes it), or the rewritten sdk module says
++    /// "spec: Ounce" (the Switch 2's SDK: the test ibuilder-profile facts.rs uses for a Switch 2 game's 9 GB pool). `read`: a file's bytes (null when absent or larger than the limit). Worker threads only.
++    public static bool LooksLikeSwitch2(string slotRoot, Func<string, byte[]> read = null)
++    {
++        read ??= p => { try { var f = new FileInfo(p); return f.Exists && f.Length <= (256L << 20) ? File.ReadAllBytes(p) : null; } catch (Exception) { return null; } };
++        var extract = Path.Combine(slotRoot, GameSlot.Extract);
++        if (Directory.Exists(Path.Combine(extract, "romfs_programs"))) return true;
++        var needle = Encoding.ASCII.GetBytes("spec: Ounce");
++        foreach (var p in new[] { Path.Combine(extract, "flat", "sdk.patched.bin"), Path.Combine(extract, "rewrite", "sdk", "sdk.patched.bin") })
++        {
++            var d = read(p);
++            if (d != null && d.AsSpan().IndexOf(needle) >= 0) return true;
++        }
++        return false;
++    }
++
++    /// A file name when nothing knows the game's: "<title> [<TITLE ID>].nup" for a Switch 2 game, ".nsp" otherwise (a Switch game's extraction does not say whether it came from an NSP or an XCI, and the name only
++    /// has to be a game file the library lists: the content is not there either way). The title loses what a file name or the library's parsing cannot hold (/ \ : [ ] and control characters).
++    public static string Synthesize(string title, string tid, bool switch2)
++    {
++        var chars = (title ?? "").Select(c => char.IsControl(c) || "/\\:[]*?\"<>|".IndexOf(c) >= 0 ? ' ' : c).ToArray();
++        var t = string.Join(" ", new string(chars).Split(' ', StringSplitOptions.RemoveEmptyEntries).Where(w => w.Trim('.').Length > 0)).Trim().TrimStart('.').Trim();   // no ".." word, no hidden name
++        if (t.Length > 100) t = t.Substring(0, 100).TrimEnd();
++        if (t.Length == 0) t = "Game";
++        return $"{t} [{GameSlot.Norm(tid) ?? "0000000000000000"}]{(switch2 ? ".nup" : ".nsp")}";
++    }
++
++    /// The placeholder of a slot's game: the built record (patch 0071: kept when it exists, the size the import record knew else 0), then 0071's placeholder (the import ledger first, then the empty file; never over a
++    /// file). Returns true when the file was made. Worker threads only.
++    public static bool Recreate(string documents, RecoverDecision d, Action<string> log, Action<string, string> move = null)
++    {
++        if (d == null || d.Why != RecoverWhy.Recreate) return false;
++        long size = ImportLedger.Find(ImportLedger.Load(documents), d.Name)?.Size ?? 0;
++        BuiltLedger.Seed(documents, d.Name, d.Tid ?? "", size);
++        var record = BuiltLedger.Find(BuiltLedger.Load(documents), d.Name) ?? new BuiltRecord(d.Name, d.Tid ?? "", size, ImportLedger.Now());
++        var made = BuiltKeep.Execute(documents, new[] { new KeepDecision(record, KeepWhy.Placeholder) }, log, move);
++        if (made.Count > 0) log?.Invoke($"storage: {d.Name} is back in the library: its build is on this iPhone ({d.Where}) and its file was not");
++        return made.Count > 0;
++    }
++}
++
++// ---- "Optimize storage" ---------------------------------------------------------------------------------------------------------------------------------------
++
++public enum OptimizeWhy { Replace, NotAGameFile, OtherGame, NoContent, Missing, TitleUnknown }
++
++public sealed record OptimizeDecision(string File, OptimizeWhy Why, long Size);
++
++public static class StorageOptimizer
++{
++    public const string SettingKey = "optimize_storage";
++    public const string Title = "Optimize storage";
++    public const string Note = "Removes a game's file (.nsp, .xci, .nsz, .nup) once it is extracted. The game stays in the library and plays from its extraction; a later rebuild uses the extraction. Off: the files are kept.";
++
++    private static bool Truthy(string v) => (v ?? "").Trim().ToLowerInvariant() is "1" or "on" or "yes" or "true";
++
++    /// The toggle: optimize_storage when the file has it; else patch 0068's remove_source_after_build when the owner had STORED it on (carried over); else OFF (the default).
++    public static bool ToggleOn(string settingsText)
++    {
++        var v = GameAppUi.AppSetting(settingsText, SettingKey, null);
++        if (v != null) return Truthy(v);
++        var old = GameAppUi.AppSetting(settingsText, SourceRemoval.SettingKey, null);
++        return old != null && Truthy(old);
++    }
++
++    /// The files an extraction read (`files`: the base game, the update and the DLC it took), each decided on its own. `extractedTid`: the base title id the extraction holds (ExeFS/main.npdm), null when unknown
++    /// (then nothing goes). A file goes only when it is a game file (never prod.keys or anything else), of the extracted title (by its file name's id; a file with no id only when it is the base game file itself, the
++    /// one that was extracted), and it has content now.
++    public static List<OptimizeDecision> Plan(string game, IEnumerable<string> files, string extractedTid, Func<string, long> sizeOf)
++    {
++        var tid = GameSlot.Norm(extractedTid);
++        var list = new List<OptimizeDecision>();
++        foreach (var f in (files ?? Array.Empty<string>()).Where(f => !string.IsNullOrEmpty(f)).Distinct(StringComparer.OrdinalIgnoreCase))
++        {
++            if (!BuiltLedger.IsGameFile(f)) { list.Add(new OptimizeDecision(f, OptimizeWhy.NotAGameFile, 0)); continue; }
++            if (tid == null) { list.Add(new OptimizeDecision(f, OptimizeWhy.TitleUnknown, 0)); continue; }
++            var ftid = GameAppUi.BaseTitleIdOf(f);
++            if (ftid == null ? !string.Equals(f, game, StringComparison.Ordinal) : !string.Equals(ftid, tid, StringComparison.Ordinal)) { list.Add(new OptimizeDecision(f, OptimizeWhy.OtherGame, 0)); continue; }
++            long size;
++            try { size = sizeOf(f); } catch (Exception) { size = -1; }
++            list.Add(new OptimizeDecision(f, size < 0 ? OptimizeWhy.Missing : size == 0 ? OptimizeWhy.NoContent : OptimizeWhy.Replace, Math.Max(0, size)));
++        }
++        return list;
++    }
++
++    /// The import record that makes the empty file a stub (SourceStub.IsStub: size 0 and Removed): the app's own record when it has one (its source stays: "Add it again from <source>"), marked removed now; else a new
++    /// one: how "hand" (the file was put into iBuilder's folder), source "iBuilder's folder".
++    public static ImportRecord StubRecord(string name, long size, ImportRecord existing, string now) =>
++        existing != null ? existing with { Size = size, RemovedAt = now } : new ImportRecord(name, size, ImportHow.ByHand, "iBuilder's folder", "", now, now);
++
++    /// Replaces each Replace file by an empty stub: the import ledger FIRST (the record says "removed"), then SourceStub.Replace (one rename over the file); a stub that cannot be made puts the ledger back and leaves
++    /// the file as it was. One log line per file. Returns the bytes freed. Worker threads only.
++    public static long Execute(string documents, IEnumerable<OptimizeDecision> plan, Action<string> log, Action<string, string> move = null)
++    {
++        long freed = 0;
++        foreach (var d in plan ?? Array.Empty<OptimizeDecision>())
++        {
++            if (d.Why == OptimizeWhy.OtherGame) { log?.Invoke($"storage: {d.File} kept (it is not the extracted game's)"); continue; }
++            if (d.Why != OptimizeWhy.Replace) continue;
++            var path = Path.Combine(documents, d.File);
++            try
++            {
++                ImportRecord before = null;
++                var now = ImportLedger.Now();
++                ImportLedger.Update(documents, list => { before = ImportLedger.Find(list, d.File); return ImportLedger.Upsert(list, StubRecord(d.File, d.Size, before, now)); });
++                try { SourceStub.Replace(path, move); }
++                catch
++                {
++                    ImportLedger.Update(documents, list => before != null ? ImportLedger.Upsert(list, before) : ImportLedger.Remove(list, new[] { d.File }));   // as it was
++                    throw;
++                }
++                freed += d.Size;
++                log?.Invoke($"storage: {d.File} ({GameAppUi.SizeText(d.Size)}) replaced by an empty placeholder: the game is extracted (Optimize storage); it plays from its build and a rebuild uses the extraction");
++            }
++            catch (Exception e) { log?.Invoke($"storage: {d.File} was not removed ({e.Message})"); }
++        }
++        return freed;
++    }
++}
+diff --color -ruN a/GameAppSlotUi.cs b/GameAppSlotUi.cs
+--- a/GameAppSlotUi.cs	1970-01-01 01:00:00
++++ b/GameAppSlotUi.cs	2026-11-20 17:27:49
+@@ -0,0 +1,235 @@
++// gameapp/GameAppSlotUi.cs -- one folder per game for its build, rebuilds from the extraction, the games brought back from what is on disk, and "Optimize storage": the view controller's half (patch 0073). The plans,
++// the journal, the moves, the marker, the names and the stubs are in GameAppSlot.cs (no UIKit, run by the host harness).
++//
++//   * EnsureSlotFor(game): Documents holds this game's build, or is free for it, before anything reads or writes the slot: a build (BeginRun), Play (PrimaryTapped, before gameapp.boot-only is written: the next
++//     launch boots Documents/DmGameProbe.framework), an export (ConfirmExport). The other game's slot is parked in Documents/games/<TITLE ID>/slot/, this game's comes back from there. Renames only (the same APFS
++//     volume: no copy, no walk), on the main thread; never while a build or a boot runs, an export is going or being sized, or a delete runs (the answer is no and the log says why).
++//   * RecoverSlotAtLaunch: a move the last launch was killed in the middle of is finished (Documents/gameapp.slot.tsv), before the library is drawn; what a move put aside (.slot-trash) is deleted on a worker.
++//   * A parked game whose stamp this version of the app made is READY (UiFacts.Parked): Play, Export IPA, its settings, saves and mods; Play brings its slot back first.
++//   * A rebuild without the game file: Set up / Rebuild / "the framework on disk was not built by this version" / the queue, when the file (or its update / DLC) has no content but the game's extraction is on disk
++//     (in Documents or parked, with its marker and the same update / DLC): the extraction is not run again and the chain is not given nup= (the chain builds from extract/ExeFS and RomFS.img).
++//   * After an extraction (the C# step for .nsp .xci .nsz; for a .nup the chain's return when it read the package): the marker Documents/gameapp.extracted, then, with Settings > Optimize storage on, the base file, the
++//     update and the DLC it read become empty stubs.
++//   * At launch and back from the background (KeepBuiltGames' worker, patch 0071): a slot, in Documents or parked, whose game has no file in Documents gets its placeholder back.
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Threading.Tasks;
++
++using Foundation;
++using UIKit;
++
++public sealed partial class GameAppViewController
++{
++    /// FolderSizes keys (GameAppPerf.cs): every parked slot (Documents/games/*/slot, measured rarely: a move or a delete invalidates it), and the open game sheet's own parked slot.
++    internal const string ParkedSizeKey = "parked", GameSlotSizeKey = "game-slot";
++
++    private List<SlotView> parkedCache;
++    private DateTime parkedRead = DateTime.MinValue;
++
++    /// The parked slots, read again at most every 5 s or when a move changed them (a listing of games/ and a few stats: the screens ask at every refresh).
++    private List<SlotView> ParkedSlots()
++    {
++        if (GameExport.IsPlayer) return new List<SlotView>();
++        if (parkedCache == null || (DateTime.UtcNow - parkedRead).TotalSeconds > 5)
++        {
++            parkedCache = SlotStore.ListParked(GameAppMain.Documents);
++            parkedRead = DateTime.UtcNow;
++        }
++        return parkedCache;
++    }
++
++    private void SlotsChanged()
++    {
++        parkedCache = null;
++        sizes.Invalidate(FolderSizes.Extract, FolderSizes.Framework, ParkedSizeKey);
++    }
++
++    /// The parked games that are ready: their stamp was made by this version of the app and their framework and flat/ are there. Game file -> the stamp's content= (for "Update available").
++    private IReadOnlyDictionary<string, string> ParkedReadyGames()
++    {
++        var map = new Dictionary<string, string>(StringComparer.Ordinal);
++        foreach (var p in ParkedSlots())
++            if (!string.IsNullOrEmpty(p.Stamp?.Game) && GameAppUi.ClassifyFramework(p.FrameworkOnDisk && p.FlatOnDisk, p.StampText, GameAppBuild.Id) == FrameworkState.Fresh)
++                map[p.Stamp.Game] = p.Stamp.Content;
++        return map;
++    }
++
++    /// This game's parked slot, or null.
++    private SlotView ParkedSlotOf(string game) => game == null ? null : ParkedSlots().FirstOrDefault(p => p.BelongsTo(game, GameAppUi.BaseTitleIdOf(game)));
++
++    /// The bytes of every parked slot (Documents/games/<id>/slot). A walk: worker threads only (FolderSizes).
++    private static long ParkedBytes(string gamesRoot)
++    {
++        long total = 0;
++        try
++        {
++            if (!Directory.Exists(gamesRoot)) return 0;
++            foreach (var dir in Directory.EnumerateDirectories(gamesRoot))
++            {
++                var slot = Path.Combine(dir, GameSlot.SlotFolder);
++                if (GameSlot.IsTitleId(Path.GetFileName(dir)) && Directory.Exists(slot)) total += FolderWalk.Bytes(slot);
++            }
++        }
++        catch (Exception) { }
++        return total;
++    }
++
++    // ---- the slot for a game -------------------------------------------------------------------------------------------------------------------------------------
++
++    /// Documents holds `game`'s build, or is free for it. `why`: for the log ("a build", "Play", "the export"). False: it could not be done now (the log says why; the caller does nothing). Main thread; renames only.
++    private bool EnsureSlotFor(string game, string why)
++    {
++        if (GameExport.IsPlayer || string.IsNullOrEmpty(game)) return true;
++        if (running || exporting || exportSizing || deletes.Busy)
++        {
++            Write($"storage: {why} for {GameAppUi.DisplayName(game)}: not now ({(running ? "a build or a game is running" : deletes.Busy ? "a delete is going" : "an export is going")})");
++            return false;
++        }
++        var docs = GameAppMain.Documents;
++        var tid = GameAppUi.BaseTitleIdOf(game);
++        SlotDecision plan;
++        try
++        {
++            var trashName = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N").Substring(0, 6);
++            plan = SlotPlanner.For(game, tid, SlotStore.Read(docs), SlotStore.ListParked(docs), trashName);
++        }
++        catch (Exception error) { Write($"storage: the slot could not be read ({error.Message}): {why} not started"); return false; }
++        if (plan.Ops.Count == 0) return true;
++        Write($"storage: {why} for {GameAppUi.DisplayName(game)}: {plan.Note}");
++        var lines = new List<string>();
++        bool ok;
++        List<string> trash;
++        try { trash = SlotMover.Run(docs, plan.Ops, tid, lines.Add, out ok); }
++        catch (Exception error) { lines.Add($"storage: the slot move failed ({error.Message})"); trash = new List<string>(); ok = false; }
++        foreach (var line in lines) Write(line);
++        DeleteSlotTrash(trash);
++        SlotsChanged();
++        RefreshScreen();
++        if (!ok) Write($"storage: {why} for {GameAppUi.DisplayName(game)} is not started: the slot could not be prepared");
++        return ok;
++    }
++
++    /// What a move put aside: deleted on a worker (one at a time with nothing else: these folders are outside every path the app reads). Not on the delete queue: a launch that boots must not wait for it.
++    private void DeleteSlotTrash(IEnumerable<string> folders)
++    {
++        var list = (folders ?? Array.Empty<string>()).Where(Directory.Exists).ToList();
++        if (list.Count == 0) return;
++        var docs = GameAppMain.Documents;
++        Task.Run(() =>
++        {
++            var notes = new List<string>();
++            foreach (var f in list)
++                try { BackgroundDelete.DeleteTree(f); notes.Add($"storage: {Path.GetFileName(f)} put aside by a slot move: deleted"); }
++                catch (Exception error) { notes.Add($"storage: {f} could not be deleted ({error.Message}): it is tried again at the next launch"); }
++            try { var root = Path.Combine(docs, GameSlot.TrashRoot); if (Directory.Exists(root) && !Directory.EnumerateFileSystemEntries(root).Any()) Directory.Delete(root); } catch (Exception) { }
++            BeginInvokeOnMainThread(() => { foreach (var n in notes) Write(n); sizes.Invalidate(); });
++        });
++    }
++
++    /// At launch, before the library is drawn: a slot move the last process was killed in the middle of is finished; what an earlier move put aside is deleted on a worker. Renames only on this thread.
++    private void RecoverSlotAtLaunch()
++    {
++        if (GameExport.IsPlayer) return;
++        var docs = GameAppMain.Documents;
++        var lines = new List<string>();
++        var trash = SlotJournal.Recover(docs, lines.Add);
++        foreach (var line in lines) Write(line);
++        try
++        {
++            var root = Path.Combine(docs, GameSlot.TrashRoot);
++            if (Directory.Exists(root)) trash.AddRange(Directory.EnumerateDirectories(root));
++        }
++        catch (Exception) { }
++        DeleteSlotTrash(trash.Distinct().ToList());
++        if (lines.Count > 0) parkedCache = null;
++    }
++
++    // ---- a rebuild from the extraction -------------------------------------------------------------------------------------------------------------------------------
++
++    /// Where `game`'s extraction is, when it can stand in for its files (ExtractionUse.Usable: the whole extraction, this game's, with the update and DLC in Documents now): "in Documents" or "parked in
++    /// games/<id>/slot"; null when it is not on this iPhone. A few stats and small reads.
++    private string ExtractionOnDisk(string game)
++    {
++        if (GameExport.IsPlayer || string.IsNullOrEmpty(game)) return null;
++        try
++        {
++            var docs = GameAppMain.Documents;
++            var content = GameAppUi.ContentSignature(game, Dumps().Select(Path.GetFileName).ToList());
++            var tid = GameAppUi.BaseTitleIdOf(game);
++            if (ExtractionUse.Usable(SlotStore.Read(docs), game, tid, content)) return "in Documents";
++            foreach (var p in SlotStore.ListParked(docs))
++                if (ExtractionUse.Usable(p, game, tid, content)) return "parked in " + GameSlot.ParkedRelative(p.FolderTid);
++        }
++        catch (Exception) { }
++        return null;
++    }
++
++    /// The extraction in Documents (the slot in use) can stand in for `game`'s files.
++    private bool ActiveExtractionFor(string game)
++    {
++        try { return ExtractionUse.Usable(SlotStore.Read(GameAppMain.Documents), game, GameAppUi.BaseTitleIdOf(game), GameAppUi.ContentSignature(game, Dumps().Select(Path.GetFileName).ToList())); }
++        catch (Exception) { return false; }
++    }
++
++    // ---- after an extraction ---------------------------------------------------------------------------------------------------------------------------------------
++
++    /// The extraction of `game` is complete in Documents/extract (`used`: the game files it read; `content`: their update / DLC signature, as the build's config has it): the marker, then, with the toggle on, the
++    /// stubs. `say` posts a log line. Worker threads only; never throws.
++    private void AfterExtraction(string game, IReadOnlyList<string> used, string content, bool optimize, Action<string> say)
++    {
++        try
++        {
++            var docs = GameAppMain.Documents;
++            var extract = Path.Combine(docs, GameSlot.Extract);
++            var slot = SlotStore.Read(docs);
++            var tid = SlotStore.NpdmTitleId(Path.Combine(extract, "ExeFS", "main.npdm")) ?? slot.ProfileTid;
++            var fileTid = GameAppUi.BaseTitleIdOf(game);
++            if (!slot.HasExtraction || tid == null || (fileTid != null && !string.Equals(fileTid, tid, StringComparison.Ordinal)))
++            {
++                say($"storage: the extraction of {game} is not marked ({(!slot.HasExtraction ? "extract/ExeFS/main or extract/RomFS.img is missing" : tid == null ? "its title id cannot be read" : $"it holds {tid}, the file names {fileTid}")}): a rebuild will need the file");
++                return;
++            }
++            ExtractionMark.Write(docs, new ExtractionMark(game, tid, content ?? "", ImportLedger.Now()));
++            say($"storage: the extraction of {game} ({tid}) is complete: a rebuild can start from it (Documents/{ExtractionMark.FileName})");
++            if (!optimize) return;
++            var plan = StorageOptimizer.Plan(game, used, tid, f => { var i = new FileInfo(Path.Combine(docs, f)); return i.Exists ? i.Length : -1; });
++            var lines = new List<string>();
++            long freed = StorageOptimizer.Execute(docs, plan, lines.Add);
++            foreach (var line in lines) say(line);
++            if (freed > 0) BeginInvokeOnMainThread(() => { sizes.Invalidate(); RefreshScreen(); });
++        }
++        catch (Exception error) { say($"storage: after the extraction of {game}: {error.GetType().Name}: {error.Message}"); }
++    }
++
++    // ---- recovery: games from what is on disk -----------------------------------------------------------------------------------------------------------------------
++
++    /// The slot in Documents and every parked one: a game whose build or extraction is here and whose file is not in Documents gets its placeholder back (SlotRecovery). Worker threads only (KeepBuiltGames).
++    /// Returns how many were made.
++    private int RecoverGamesFromSlots(string documents, List<string> lines)
++    {
++        int made = 0;
++        var slots = new List<SlotView> { SlotStore.Read(documents) };
++        slots.AddRange(SlotStore.ListParked(documents));
++        var built = BuiltLedger.Load(documents);
++        var imports = ImportLedger.Load(documents);
++        foreach (var slot in slots.Where(s => s.HasContent && s.Tid != null))
++        {
++            var name = SlotRecovery.NameFor(slot, built, imports);
++            if (name == null)
++            {
++                string title = null;
++                try { var nacp = Path.Combine(slot.Root, GameSlot.Extract, "control.nacp"); if (File.Exists(nacp) && new FileInfo(nacp).Length <= (1 << 20)) title = SlotRecovery.NacpTitle(File.ReadAllBytes(nacp)); } catch (Exception) { }
++                bool switch2 = SlotRecovery.LooksLikeSwitch2(slot.Root);
++                name = SlotRecovery.Synthesize(title, slot.Tid, switch2);
++                lines.Add($"storage: the build of {slot.Tid} ({(slot.FolderTid == null ? "Documents" : GameSlot.ParkedRelative(slot.FolderTid))}) names no game file: it is listed as \"{name}\" ({(switch2 ? "a Switch 2 game: its sdk is the Switch 2's" : "a Switch game")}{(title == null ? ", no name in its control data" : "")})");
++            }
++            var decision = SlotRecovery.Decide(slot, name, Dumps().Select(Path.GetFileName).ToList());
++            if (decision.Why != RecoverWhy.Recreate) continue;
++            try { if (SlotRecovery.Recreate(documents, decision, lines.Add)) made++; }
++            catch (Exception error) { lines.Add($"storage: {name} could not be put back in the library ({error.Message})"); }
++        }
++        return made;
++    }
++}
+diff --color -ruN a/GameAppSourceRemoval.cs b/GameAppSourceRemoval.cs
+--- a/GameAppSourceRemoval.cs	2026-11-20 17:12:41
++++ b/GameAppSourceRemoval.cs	2026-11-20 17:27:55
+@@ -34,6 +34,7 @@
+ {
+     public const string Clone = "clone", Copy = "copy", Download = "download";
+     public const string DeletedByHand = "deleted";   // patch 0071: not an import: the record of a built game whose file was deleted by hand (an empty placeholder stands in for it)
++    public const string ByHand = "hand";             // patch 0073: not an import: a file put into iBuilder's folder by hand, replaced by an empty stub by "Optimize storage" after its extraction
+ }
+ 
+ public static class ImportLedger
+@@ -287,7 +288,7 @@
+     public static string Removed(string name, long size, string how, string source) =>
+         Inv($"source: removed {name} ({GameAppUi.SizeText(size)}) after the build (it was {HowText(how)}, from {(string.IsNullOrEmpty(source) ? "a file picker" : source)})");
+ 
+-    public static string HowText(string how) => how switch { ImportHow.Clone => "cloned", ImportHow.Copy => "copied", ImportHow.Download => "downloaded", ImportHow.DeletedByHand => "deleted in Files", _ => string.IsNullOrEmpty(how) ? "imported" : how };
++    public static string HowText(string how) => how switch { ImportHow.Clone => "cloned", ImportHow.Copy => "copied", ImportHow.Download => "downloaded", ImportHow.DeletedByHand => "deleted in Files", ImportHow.ByHand => "put in iBuilder's folder", _ => string.IsNullOrEmpty(how) ? "imported" : how };
+ 
+     public static string ReAdd(string source) => "Add it again from " + source;
+ 
+diff --color -ruN a/GameAppSourceUi.cs b/GameAppSourceUi.cs
+--- a/GameAppSourceUi.cs	2026-11-20 17:12:41
++++ b/GameAppSourceUi.cs	2026-11-20 17:30:17
+@@ -12,6 +12,8 @@
+ //   * Patch 0071: a build that ends with StopOutcome.Finished records its game in Documents/gameapp.built.tsv (RecordBuiltGame, toggle on or off). At launch (RefreshGames) and back from the background
+ //     (KeepBuiltGames), on a worker: the build stamp's game is added to that record when it has none (games built before 0071), and every recorded game whose file was deleted by hand gets an empty placeholder
+ //     and a "removed" import record (BuiltKeep): it is a stub, so it stays in the library with everything above.
++//   * Patch 0073: the removal AFTER a build and its toggle are gone; Settings > Optimize storage replaces the files by stubs as soon as the game is extracted (GameAppSlotUi.cs, GameAppSlot.cs). GameFileHasContent
++//     also lets a build go on when the game's extraction is on this iPhone (it starts from it), and KeepBuiltGames brings back the games whose build or extraction is here and whose file is not.
+ using System;
+ using System.Collections.Generic;
+ using System.IO;
+@@ -67,41 +69,12 @@
+ 
+     // ---- after a build ---------------------------------------------------------------------------------------------------------
+ 
+-    /// A build's chain ended: `outcome` says how. Main thread: the facts are a few small reads; the ledger, the stubs and the sizes are on a worker.
++    /// A build's chain ended: `outcome` says how. Patch 0073: the game file is no longer removed AFTER the build (0068's toggle is gone): "Optimize storage" replaces the files by stubs as soon as the game is extracted
++    /// (AfterExtraction, GameAppSlotUi.cs). What stays here is patch 0071's record of the built game, whatever the toggle says.
+     private void RemoveSourceAfterBuild(string game, StopOutcome outcome)
+     {
+         if (GameExport.IsPlayer || outcome != StopOutcome.Finished || failedRun || !InPlaceImport.Accepts(game)) return;
+-        RecordBuiltGame(game);   // patch 0071: before the removal below (its size is the file's, not the stub's), whatever the toggle says
+-        bool toggle = SourceRemoval.ToggleOn(ReadAppSettings());
+-        if (!toggle) return;
+-        var documents = GameAppMain.Documents;
+-        string stampGame = null, stampContent = null;
+-        try
+-        {
+-            var stamp = GameAppUi.ParseFrameworkStamp(File.Exists(FrameworkStampPath) ? File.ReadAllText(FrameworkStampPath) : null);
+-            stampGame = stamp?.Game; stampContent = stamp?.Content;
+-        }
+-        catch (Exception) { }
+-        var names = Dumps().Select(Path.GetFileName).ToList();
+-        var state = new SourceState(game, stampGame, stampContent, GameAppUi.ContentSignature(game, names),
+-                                    BuildRunning: running && stop.Game == game, PausedHere: pausedBuilds.Any(r => r.Game == game),
+-                                    QueuedHere: buildQueue.Items.Any(i => i.Game == game && i.State != BuildQueue.Failed));
+-        Task.Run(() =>
+-        {
+-            var lines = new List<string>();
+-            try
+-            {
+-                var plan = SourceRemoval.Plan(game, names, ImportLedger.Load(documents), f => { try { var i = new FileInfo(Path.Combine(documents, f)); return i.Exists ? i.Length : -1; } catch (Exception) { return -1; } }, outcome, toggle, state);
+-                foreach (var d in plan) { var why = SourceText.Kept(d.File, d.Why); if (why != null) lines.Add(why); }
+-                long freed = plan.Any(d => d.Why == RemoveWhy.Remove) ? SourceRemoval.Execute(documents, plan, lines.Add) : 0;
+-                BeginInvokeOnMainThread(() =>
+-                {
+-                    foreach (var line in lines) Write(line);
+-                    if (freed > 0) { sizes.Invalidate(); RefreshScreen(); }
+-                });
+-            }
+-            catch (Exception error) { BeginInvokeOnMainThread(() => Write($"source: the removal after the build failed ({error.GetType().Name}: {error.Message})")); }
+-        });
++        RecordBuiltGame(game);
+     }
+ 
+     // ---- patch 0071: a built game stays when its file is deleted by hand ----------------------------------------------------------------
+@@ -150,6 +123,9 @@
+             try
+             {
+                 if (!Directory.Exists(documents)) return;
++                // patch 0073 (GameAppSlotUi.cs): a build or an extraction on this iPhone (in Documents or parked) whose game has no file in Documents gets its placeholder back
++                try { made += RecoverGamesFromSlots(documents, lines); }
++                catch (Exception error) { lines.Add($"storage: the builds on this iPhone could not be checked ({error.GetType().Name}: {error.Message})"); }
+                 // a game built before this record existed: the build on disk names it
+                 string stampGame = null;
+                 try { stampGame = GameAppUi.ParseFrameworkStamp(File.Exists(stampPath) ? File.ReadAllText(stampPath) : null)?.Game; } catch (Exception) { }
+@@ -167,7 +143,7 @@
+                     var files = Dumps().Select(p => { long l = -1; try { l = new FileInfo(p).Length; } catch (Exception) { } return (Name: Path.GetFileName(p), Size: l); }).Where(f => f.Size >= 0).ToList();
+                     var plan = BuiltKeep.Plan(built, n => { try { var i = new FileInfo(Path.Combine(documents, n)); return i.Exists ? i.Length : -1; } catch (Exception) { return 0; } }, files);
+                     if (plan.Any(d => d.Why is KeepWhy.Placeholder or KeepWhy.Renamed))
+-                        made = BuiltKeep.Execute(documents, plan, lines.Add).Count;
++                        made += BuiltKeep.Execute(documents, plan, lines.Add).Count;
+                 }
+             }
+             catch (Exception error) { lines.Add($"library: the built games could not be checked ({error.GetType().Name}: {error.Message})"); }
+@@ -191,10 +167,16 @@
+         SourceGroup.Files(game, Dumps().Select(Path.GetFileName).ToList()).Where(n => GameFileContent(n) is SourceFileState.Stub or SourceFileState.Empty).ToList();
+ 
+     /// true: go on. false: a file the build reads has no content and the person was told (the alert) -- callers just return. A file that is not there is the callers' own message.
++    /// Patch 0073: also true when the game's extraction is on this iPhone (in Documents or parked: ExtractionOnDisk, GameAppSlotUi.cs): the build starts from it, the file is not needed.
+     private bool GameFileHasContent(string game)
+     {
+         var missing = ContentMissing(game);
+         if (missing.Count == 0) return true;
++        if (ExtractionOnDisk(game) is string where)
++        {
++            Write($"storage: {GameAppUi.DisplayName(game)}: {string.Join(", ", missing)} has no content, the game's extraction is {where}: a build starts from it");
++            return true;
++        }
+         ShowSourceRemoved(game, missing);
+         return false;
+     }
+diff --color -ruN a/GameAppStopUi.cs b/GameAppStopUi.cs
+--- a/GameAppStopUi.cs	2026-11-20 17:12:41
++++ b/GameAppStopUi.cs	2026-11-20 17:38:40
+@@ -153,6 +153,25 @@
+     private void ApplyCancel(string game, CancelChoice choice, bool chainRan, bool extractIsThis = true)
+     {
+         var tid = GameAppUi.BaseTitleIdOf(game);
++        // patch 0073: a game whose file has no content ("Optimize storage" replaced it by a stub after its extraction) keeps its extraction: it is all that is left to build it from
++        if (choice == CancelChoice.FreeSpace && ContentMissing(game).Count > 0)
++        {
++            choice = CancelChoice.KeepExtracted;
++            Write($"build cancelled: {GameAppUi.DisplayName(game)}: its extraction is kept (the game file has no content: Optimize storage removed it, a rebuild starts from the extraction)");
++        }
++        // patch 0073: freeing the space also removes this game's extraction parked while another game had the slot (never a finished build of it: that one is still Ready)
++        if (choice == CancelChoice.FreeSpace && tid != null && ParkedSlotOf(game) is SlotView parked && parked.FolderTid == tid && !parked.HasBuild)
++        {
++            var path = GameSlot.ParkedPath(GameAppMain.Documents, tid);
++            Write($"build cancelled: {GameAppUi.DisplayName(game)}: its parked extraction ({GameSlot.ParkedRelative(tid)}) is removed in the background");
++            DeleteFolderInBackground(path, error => { if (error != null) Write($"cancel: {GameSlot.ParkedRelative(tid)} could not be removed: {error}"); SlotsChanged(); });
++        }
++        // patch 0073: Documents/extract may be another game's now (this game's extraction was parked when that game was played): then it is not this game's to delete
++        if (extractIsThis)
++        {
++            var inSlot = SlotStore.Read(GameAppMain.Documents);
++            if (inSlot.Tid != null && !inSlot.BelongsTo(game, tid)) extractIsThis = false;
++        }
+         var plan = CancelPlan.For(choice, tid, FrameworkIsPartial(game), chainRan, extractIsThis);
+         pausedBuilds = PausedStore.Remove(pausedBuilds, game);
+         SavePaused();
+diff --color -ruN a/GameAppUi.cs b/GameAppUi.cs
+--- a/GameAppUi.cs	2026-11-20 17:12:41
++++ b/GameAppUi.cs	2026-11-20 17:28:10
+@@ -48,7 +48,8 @@
+                              FrameworkState Framework = FrameworkState.None, string FrameworkGame = null,
+                              IReadOnlyList<string> ShaderPacks = null, IReadOnlyList<string> PendingShaderPacks = null,
+                              int ExtendedAddressing = -1, double AddressSpaceFreeGiB = -1, int IncreasedMemory = -1,
+-                             bool PlayerMode = false, int LoadsFromDocuments = -1, string FrameworkContent = null);
++                             bool PlayerMode = false, int LoadsFromDocuments = -1, string FrameworkContent = null,
++                             IReadOnlyDictionary<string, string> Parked = null);   // patch 0073: the games whose build is parked in Documents/games/<id>/slot and ready (game file -> the stamp's content=)
+ 
+ public static class GameAppUi
+ {
+@@ -382,7 +383,8 @@
+     /// True when the framework on disk is this game's, and its update/DLC differ from what is in Documents now.
+     public static bool ContentChangedSinceBuild(string baseFile, IReadOnlyList<string> allFiles, UiFacts f) =>
+         f.FrameworkContent != null && f.FrameworkGame == baseFile && f.Framework == FrameworkState.Fresh
+-        && f.FrameworkContent != ContentSignature(baseFile, allFiles);
++            ? f.FrameworkContent != ContentSignature(baseFile, allFiles)
++            : baseFile != null && f.Parked != null && f.Parked.TryGetValue(baseFile, out var parked) && parked != null && parked != ContentSignature(baseFile, allFiles);   // a parked build (patch 0073)
+ 
+     // ---- the main button ------------------------------------------------------------------------------------
+ 
+@@ -417,7 +419,7 @@
+     /// offers the rebuild. Only when a rebuild could actually start: nothing running, and the keys and a game to
+     /// start it from.
+     public static bool ShowRebuild(UiFacts f) =>
+-        f.Framework == FrameworkState.Fresh && !f.Running && f.HasKeys && f.Games != null && f.Games.Count > 0;
++        (f.Framework == FrameworkState.Fresh || (f.Parked != null && f.Parked.Count > 0)) && !f.Running && f.HasKeys && f.Games != null && f.Games.Count > 0;
+ 
+     // Minutes, not a promise: ~2.5 min of rewrite when the game's shaders are already built, a quarter of an hour or more
+     // when they are not (stage 3; ~17 min for the whole chain of Grizzy on an iPhone 15 Pro).
+@@ -445,10 +447,12 @@
+     public enum GameStatus { Ready, NeedsSetup }
+ 
+     /// READY: the framework on disk is one THIS build made, from this very game file: it boots without a rebuild.
+-    /// Anything else needs the chain. (A framework of another game does not make this one ready.)
++    /// Anything else needs the chain. (A framework of another game does not make this one ready.) A build parked in
++    /// Documents/games/<id>/slot (patch 0073) that this build made is ready too: Play brings it back first.
+     public static GameStatus GameStatusOf(string fileName, UiFacts f) =>
+-        f.Framework == FrameworkState.Fresh && !string.IsNullOrEmpty(fileName) &&
+-        string.Equals(f.FrameworkGame, fileName, StringComparison.Ordinal)
++        !string.IsNullOrEmpty(fileName) &&
++        ((f.Framework == FrameworkState.Fresh && string.Equals(f.FrameworkGame, fileName, StringComparison.Ordinal))
++         || (f.Parked != null && f.Parked.ContainsKey(fileName)))
+             ? GameStatus.Ready
+             : GameStatus.NeedsSetup;
+ 
+@@ -598,6 +602,7 @@
+                     files.Add("games/" + id + "/" + f);
+                 folders.Add("games/" + id + "/rewrite-cache");
+                 folders.Add("games/" + id + "/temp");
++                folders.Add("games/" + id + "/slot");   // its build parked while another game had the slot (patch 0073)
+             }
+             else folders.Add("games/" + id);
+         }
+@@ -608,7 +613,7 @@
+         {
+             folders.Add("extract");
+             folders.Add("DmGameProbe.framework");
+-            files.AddRange(new[] { "gameapp.framework", "gameapp.boot-only", "pipeline.boot", "profile.tsv" });
++            files.AddRange(new[] { "gameapp.framework", "gameapp.boot-only", "pipeline.boot", "profile.tsv", "gameapp.extracted" });   // gameapp.extracted: the extraction marker (patch 0073)
+         }
+         return new DeletionPlan(files, folders, buildToo);
+     }

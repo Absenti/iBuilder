@@ -1,0 +1,439 @@
+# nvn/pso: this device's pso_user.tsv records every row the game asked for (crash-safe appends), and the prewarm walks it BEFORE the seed list (DM_PSO_USER_FIRST)
+#
+# Origin:  written in this repository after the Ocarina of Time (Switch 2, 0400486024DEC000) device session of 2026-11-20 (iPhone 15 Pro, 44 min, 9,022 frames). No upstream commit.
+#          Applies after 0412 (patch -p1 --forward, no fuzz), to out-stage/out-engine/engine + engine-patches/0401..0412. iOSBuilder paches/0007, 0008, 0009 still apply on top of it and
+#          land exactly where they did (their patched nvn_mtl.m differs from the 0412 one by this patch's lines only).
+# Licence: the licence of the tree it patches (the engine's MIT licence, Copyright (c) 2026 seedds and contributors).
+#
+# ROOT CAUSE ("pso_user.tsv: 2 lines", the learned list that never grows)
+#   The list is written, incrementally and on time: pso_user_record appends a row the moment the game needs a library (shader_get, the prefetch's claim, shader_prefetch_rest), a render
+#   pipeline (pso_get, pull_pso, demand_record, bf_fn), a compute pipeline (dispatch_) or a mesh pipeline (mtk_pso), with fflush; the path is right (games/<id>/pso_user.tsv, the parent
+#   of DM_SAVE; the log names it). It stays small BY DESIGN: a row the seed list (the pack's pso_manifest.tsv, 25,163 lines for this game) already holds is never written, so it is
+#   "what the seed lacks", 2 rows after the first session. And the prewarm read [seed, user]: with DM_PSO_PREPARE_PERCENT=2 the head before the first frame was the seed's first 464
+#   tasks by file order (464 library loads, 0 pipelines: "pipeline prepare: 464 lines (464 shaders, 0 render pipelines, 0 compute pipelines)") whatever this device had drawn, and the
+#   one tail worker went on in file order: 5,506 of 22,727 tasks in 37 min, while the draws waited 930 s for compiles of what they needed (libraries 350 s, pipelines 580 s).
+#   Two small weaknesses besides: fopen("a") + fputs + fflush leaves, after a kill in mid-row, a cut last row that the next start's first append glues to its own (one malformed line,
+#   two rows lost); and no lock (every caller is on the submit thread today).
+#
+# WHAT IT CHANGES (DM_PSO_USER_FIRST, default on; =0 is exactly the old list and order)
+#   * pso_user_record: the de-duplication set is this device's list only (not the seed): every row the game itself asked for on this device is written once, in the order it first
+#     asked for it. Rows the prewarm built and the game merely claimed are not written (as before: warm_claim writes only the prefetch's). The file is bounded by the distinct rows the
+#     game uses (at most the seed's size plus what it lacks: about 1-2 MB here).
+#   * warm_paths: [this device's list, the seed] (was [seed, list]); warm_parse already drops a row met twice, so a seed row the list holds is built once, at the list's place. With the
+#     split prepare step the head is then the first rows this device drew, then the seed's; the tail goes on with the rest of them, then the seed's. With DM_PSO_PREPARE_PERCENT=100
+#     (the engine's default) every row is built before the first frame as before, in another order.
+#   * Crash-safe appends: an O_RDWR|O_APPEND descriptor, one write(2) per row (a row is in the kernel when write returns: a jetsam kill or SIGKILL loses no row written, and two rows
+#     never interleave), a line end written first when the file ends in a cut row, an os_unfair_lock around the writer. A row longer than the 8 KB buffer is not written (none is).
+#   * Log: "pipeline prewarm: this device's list first, then the seed list (DM_PSO_USER_FIRST=0: the seed first)", and the cut-row line when it happens.
+#   For the app: GameWarmLogic.NeededKeys (0061/0076) reads the keys of pso_manifest.tsv, then pso_user.tsv; it may read pso_user.tsv first to follow the host (not done here). An
+#   exported player carries pso_user.tsv (0061): its first start's head becomes what the main app drew.
+#
+# MEASURED on this Mac (M1 Pro, macOS 27.3): dm/gfx/tests t_pso_user_first, 44 checks, 0 failed, with DM_PSO_MTL4=0 and =1: the rows (on / =0), the cut row, three writer processes
+#   killed with SIGKILL mid-stream (150,000-180,000 rows in the runs, every one whole, none twice), eight threads writing at once (3,200 rows whole and once), warm_paths' three cases, warm_parse's
+#   order, and the real prepare step on the GPU with DM_PSO_PREPARE_PERCENT=25: the head is exactly the 10 tasks the list names (on) or the seed's first 10 (=0), the tail builds the
+#   rest once. t_pso_demand_record (its fclose of the old FILE * replaced by the descriptor's close) 54 / 40 / 51 checks as before; t_pso_head 348, t_pso_warm 123, t_pso_archive 432,
+#   t_pso_prewarm 64, t_shmap_warm 12, unchanged.
+# Mutations (target/agent-work/eng/tools/mutate.py): the seed first again fails 4 checks (then the test's alarm), no line end after a cut row fails 3.
+# NOT VERIFIED (iPhone only): how much of what a session draws the next session's 2 % head and the tail then cover in time; the list's size after a long session; the app reading it.
+# RISKS: the head of a split prepare step changes for every game with a list (it becomes the device's first-drawn rows): that is the point, but a list recorded with an old game version
+#   is dropped row by row (warm_stale) as before. A device list from before this patch holds only rows the seed lacks: it is read first (its rows are what this device drew too).
+# Roll back: DM_PSO_USER_FIRST=0 in env.txt (the old list and order), or remove this file from engine-patches/ and run scripts/build-host.sh again.
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -6953,29 +6953,61 @@
+     if (u && *u) return @(u);
+     return save && *save ? [[@(save) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"pso_user.tsv"] : nil;
+ }
+-static FILE *g_pso_user; static int g_pso_user_checked;
++// engine-patches/0413 (DM_PSO_USER_FIRST, default on): this list holds EVERY row the game itself needed on this device, also the ones the seed list (pso_manifest.tsv) holds, once each,
++// in the order the game first needed them, and the prewarm walks it BEFORE the seed list (warm_paths): the head of a split prepare step (DM_PSO_PREPARE_PERCENT) and its tail build first
++// what this device draws. Before, a row the seed list held was never written here (the list was "what the seed lacks") and the seed came first: with a 25,163-line seed Ocarina of Time's
++// list stayed at 2 lines, and the head (2 %) was the seed's first 464 rows by file order, all of them library loads, whatever this device had drawn. Rows the prewarm built and the game
++// then claimed are not written (warm_claim writes only the prefetch's, as before): what is written is what the game asked for on its own. DM_PSO_USER_FIRST=0: the old list and order.
++// Crash-safe: one write(2) per row on an O_APPEND descriptor (a row is in the kernel when write returns, so a jetsam kill loses no row written, and two rows never interleave), and a file
++// whose last row a kill cut gets a line end before the first new row (with fopen("a") the cut row and the next one became one malformed line). g_pso_user_lock: one writer at a time
++static int g_pso_user_first = -1;   // read once (the tests set it back to -1)
++static int pso_user_first(void) {
++    if (g_pso_user_first < 0) { const char *e = getenv("DM_PSO_USER_FIRST"); g_pso_user_first = !(e && !strcmp(e, "0")); }
++    return g_pso_user_first;
++}
++static int g_pso_user_fd = -1; static int g_pso_user_checked;
+ static NSMutableSet<NSString *> *g_pso_user_seen;
+-static FILE *pso_user_file(void) {
+-    if (g_pso_user_checked) return g_pso_user;
++static os_unfair_lock g_pso_user_lock = OS_UNFAIR_LOCK_INIT;
++static int pso_user_file(void) {   // g_pso_user_lock held
++    if (g_pso_user_checked) return g_pso_user_fd;
+     g_pso_user_checked = 1;
+     NSString *path = pso_user_path();
+-    if (path) g_pso_user = fopen(path.fileSystemRepresentation, "a");
+-    return g_pso_user;
++    if (!path) return -1;
++    int fd = open(path.fileSystemRepresentation, O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
++    if (fd < 0) { MLOG("[RED] pipeline prewarm: this device's list %s cannot be opened for writing (%s): nothing is learned in this run", path.UTF8String, strerror(errno)); return -1; }
++    struct stat st; char last = '\n';
++    if (!fstat(fd, &st) && st.st_size > 0 && pread(fd, &last, 1, st.st_size - 1) != 1) last = '\n';
++    if (last != '\n') {
++        ssize_t w; do w = write(fd, "\n", 1); while (w < 0 && errno == EINTR);
++        MLOG("pipeline prewarm: this device's list %s ended in a row cut short (a process ended while writing it): a line end was added before the new rows", path.UTF8String);
++    }
++    g_pso_user_fd = fd;
++    return fd;
+ }
+ static void pso_user_record(const char *fmt, ...) {
+-    FILE *f = pso_user_file();
+-    if (!f) return;
+-    char line[8192]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
++    char line[8192]; va_list ap; va_start(ap, fmt); int len = vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
++    if (len <= 0 || len >= (int)sizeof line) return;   // never a row cut by the buffer (the longest row, an R row, is 2 * sizeof(pso_skey) + 3 bytes)
++    os_unfair_lock_lock(&g_pso_user_lock);
++    int fd = pso_user_file();
++    if (fd < 0) { os_unfair_lock_unlock(&g_pso_user_lock); return; }
+     if (!g_pso_user_seen) {
+         g_pso_user_seen = [NSMutableSet set];
+-        NSString *seed = g_shmap_path ? [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_manifest.tsv"] : nil;
+-        NSMutableArray<NSString *> *paths = [NSMutableArray array]; if (seed) [paths addObject:seed]; NSString *user = pso_user_path(); if (user) [paths addObject:user];
++        NSMutableArray<NSString *> *paths = [NSMutableArray array];
++        if (!pso_user_first()) {   // the old list: what the seed list lacks
++            NSString *seed = g_shmap_path ? [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_manifest.tsv"] : nil;
++            if (seed) [paths addObject:seed];
++        }
++        NSString *user = pso_user_path(); if (user) [paths addObject:user];
+         for (NSString *path in paths) { NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+             for (NSString *old in [txt componentsSeparatedByString:@"\n"]) if (old.length && ![old hasPrefix:@"#"]) [g_pso_user_seen addObject:old]; }
+     }
+-    size_t ll = strlen(line); NSString *s = [[NSString alloc] initWithBytes:line length:ll && line[ll - 1] == '\n' ? ll - 1 : ll encoding:NSUTF8StringEncoding];   // Compared with the manifest file line by line (without the newline)
+-    if (!s || [g_pso_user_seen containsObject:s]) return;
+-    [g_pso_user_seen addObject:s]; fputs(line, f); fflush(f);
++    size_t ll = (size_t)len; NSString *s = [[NSString alloc] initWithBytes:line length:line[ll - 1] == '\n' ? ll - 1 : ll encoding:NSUTF8StringEncoding];   // Compared with the lists line by line (without the newline)
++    if (s && ![g_pso_user_seen containsObject:s]) {
++        [g_pso_user_seen addObject:s];
++        ssize_t w; do w = write(fd, line, ll); while (w < 0 && errno == EINTR);
++        if (w != (ssize_t)ll) { static int told; if (!told++) MLOG("[RED] pipeline prewarm: a row of this device's list was not written whole (%s)", w < 0 ? strerror(errno) : "short write"); }
++    }
++    os_unfair_lock_unlock(&g_pso_user_lock);
+ }
+ // A library's name for the pipeline archive's index (arch_key): a digest of its bytes (SHA-256, first 16 bytes in hex), the same at every start and in every container. Not the file
+ // it came from: Metal hands out one MTLFunction per function content, device-wide, so two shader keys whose libraries are the same bytes (Unity's sprite shaders: Cuphead's
+@@ -12061,11 +12093,14 @@
+     NSMutableArray<NSString *> *all = [NSMutableArray array];
+     // A profile without a bundled seed list still warms what this device recorded: returning here left pso_user.tsv growing at every start and never read, and the
+     // pipeline archive never compacted (Donkey Kong Bananza: 2,132 lines unread, 88 archive files opened in 7 s)
++    // engine-patches/0413: this device's list first (DM_PSO_USER_FIRST, default on: the rows the game asked for here, in the order it first did), then the seed; =0: the seed first
++    NSString *user = pso_user_path(); int have_user = user && [NSFileManager.defaultManager fileExistsAtPath:user], first = pso_user_first();
++    if (have_user && first) [all addObject:user];
+     if ([NSFileManager.defaultManager fileExistsAtPath:seed]) [all addObject:seed];
+     else MLOG("[RED] pipeline prewarm: seed list does not exist: %s", seed.UTF8String);
+-    NSString *user = pso_user_path();
+-    if (user && [NSFileManager.defaultManager fileExistsAtPath:user]) [all addObject:user];
+-    else MLOG("pipeline prewarm: this device's user list %s%s", user ? "does not exist yet: " : "has no path (neither DM_PSO_USER nor DM_SAVE is set)", user ? user.UTF8String : "");
++    if (have_user && !first) [all addObject:user];
++    if (!have_user) MLOG("pipeline prewarm: this device's user list %s%s", user ? "does not exist yet: " : "has no path (neither DM_PSO_USER nor DM_SAVE is set)", user ? user.UTF8String : "");
++    else MLOG("pipeline prewarm: %s (DM_PSO_USER_FIRST%s)", first ? "this device's list first, then the seed list" : "the seed list first, then this device's list", first ? "=0: the seed first" : "=0");
+     return all.count ? all : nil;
+ }
+ // The prewarm lists' pipelines, captured into the archive and nothing kept: the lines a prepare step builds before the first frame (warm_parse, warm_task: the same decode, the same
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -540,6 +540,13 @@
+ check_t_pso_head: t_pso_head
+ 	DM_PSO_MTL4=0 MTL_DEBUG_LAYER=1 ./t_pso_head
+ 	DM_PSO_MTL4=1 MTL_DEBUG_LAYER=1 ./t_pso_head
++# DM_PSO_USER_FIRST (engine-patches/0413): this device's pso_user.tsv records every row the game asked for (crash-safe appends) and the prewarm walks it before the seed list
++t_pso_user_first: t_pso_user_first.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_user_first.m $(MTL_T_SRC) $(FW)
++.PHONY: check_t_pso_user_first
++check_t_pso_user_first: t_pso_user_first
++	DM_PSO_MTL4=0 MTL_DEBUG_LAYER=1 ./t_pso_user_first
++	DM_PSO_MTL4=1 MTL_DEBUG_LAYER=1 ./t_pso_user_first
+ t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_skey.m -framework Foundation
+ t_view_swizzle: t_view_swizzle.m $(MTL_T_DEP)
+--- a/dm/gfx/tests/t_pso_demand_record.m
++++ b/dm/gfx/tests/t_pso_demand_record.m
+@@ -112,6 +112,6 @@
+     for(NSUInteger i=0;i<before.count&&i<after.count;i++)CHECK("early row exactly equals eventual completion row",[before[i] isEqualToString:after[i]]);
+     CHECK("completion deduplicates or records off/capped demand",after.count==2);
+     child_reload(argv[0],path,2);
+-    if(g_pso_user){fclose(g_pso_user);g_pso_user=NULL;}unlink(path);
++    if(g_pso_user_fd>=0){close(g_pso_user_fd);g_pso_user_fd=-1;}unlink(path);   // engine-patches/0413: the list is an O_APPEND descriptor now
+     printf("t_pso_demand_record %s: %d checks, %d failed\n",off?"off":cap?"cap":"on",checks,failed);return failed!=0;
+ } }
+--- /dev/null
++++ b/dm/gfx/tests/t_pso_user_first.m
+@@ -0,0 +1,274 @@
++// engine-patches/0413 (DM_PSO_USER_FIRST): this device's pso_user.tsv holds every row the game itself asked for, the seed's too, once each and in that order, it is written crash-safe,
++// and the prewarm walks it before the seed list. What it shows, on this Mac (the second half on its GPU, with synthetic shader libraries as t_pso_head's):
++//  - pso_user_record: a row the seed list holds is written (on) or skipped (DM_PSO_USER_FIRST=0, the old list), a row is written once, rows keep their order;
++//  - a file whose last row a killed process cut gets a line end first, and the cut row and the next stay two lines; a child process killed with SIGKILL while it writes rows leaves only
++//    whole rows; eight threads writing at once leave every row whole and once;
++//  - warm_paths: [this device's list, the seed] (on), [the seed, this device's list] (=0), [the seed] without a list;
++//  - warm_parse of [list, seed]: the list's tasks first in its order, then the seed's others in theirs, nothing twice;
++//  - the real prepare step with DM_PSO_PREPARE_PERCENT=25 (10 of 40 tasks): the head is the 10 tasks the list names (on), the seed's first 10 (=0); the tail then builds the rest, each once.
++#include "../nvn/nvn_mtl.m"
++#include <fcntl.h>
++#include <signal.h>
++#include <spawn.h>
++#include <sys/wait.h>
++#include <unistd.h>
++extern char **environ;
++
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++
++static int checks, failed;
++#define EXPECT(name, want, got) do { long long w_ = (long long)(want), g_ = (long long)(got); checks++; \
++    if (w_ != g_) { printf("FAIL %s: expected %lld, got %lld (line %d)\n", name, w_, g_, __LINE__); failed++; } } while (0)
++#define EXPECT_LOG(name, log, needle) do { checks++; if ([(log) rangeOfString:@needle].location == NSNotFound) { printf("FAIL %s: the log has no \"%s\"\n--- log\n%s\n---\n", name, needle, [(log) UTF8String]); failed++; } } while (0)
++
++enum { NT = 40 };   // as t_pso_head: every 4th task a shader load (S), the others a pair of two pipelines (R): 10 + 30 tasks, 70 lines
++static NSString *g_dir, *g_seed, *g_user;
++static int g_logfd; static off_t g_logmark;
++static NSString *log_since(void) {
++    off_t end = lseek(g_logfd, 0, SEEK_END); NSString *s = @"";
++    if (end > g_logmark) {
++        NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)(end - g_logmark)]; ssize_t n = pread(g_logfd, d.mutableBytes, d.length, g_logmark);
++        if (n > 0) s = [[NSString alloc] initWithBytes:d.bytes length:(NSUInteger)n encoding:NSUTF8StringEncoding] ?: @"";
++    }
++    g_logmark = end; return s;
++}
++static NSArray<NSString *> *file_lines(NSString *path) {   // every line, the last one too when it has no line end; "" lines dropped
++    NSString *t = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] ?: @"";
++    NSMutableArray *a = [NSMutableArray array]; for (NSString *l in [t componentsSeparatedByString:@"\n"]) if (l.length) [a addObject:l];
++    return a;
++}
++static void user_reset(void) {   // the list's writer as a fresh process has it
++    os_unfair_lock_lock(&g_pso_user_lock);
++    if (g_pso_user_fd >= 0) close(g_pso_user_fd);
++    g_pso_user_fd = -1; g_pso_user_checked = 0; g_pso_user_seen = nil; g_pso_user_first = -1;
++    os_unfair_lock_unlock(&g_pso_user_lock);
++}
++
++// ---- the GPU half's fixtures: the libraries of t_pso_head (hs<t> for S tasks, hv<t> / hf<t> for R pairs), compiled with the Metal toolchain
++@interface UfGate : NSObject { @public id<MTLDevice> device; dispatch_semaphore_t entered, release; _Atomic unsigned calls; unsigned block_at; } @end
++@implementation UfGate
++- (id)forwardingTargetForSelector:(SEL)selector { return device; }
++- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
++    unsigned n = atomic_fetch_add(&calls, 1) + 1;
++    if (block_at && n == block_at) { dispatch_semaphore_signal(entered); dispatch_semaphore_wait(release, DISPATCH_TIME_FOREVER); }
++    return [device newLibraryWithData:data error:error];
++}
++@end
++static UfGate *g_gate;
++static int build_fixtures(NSString *dir) {
++    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
++        "vertex float4 vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); return float4(uv * 2 - 1, 0, 1); }\n"
++        "fragment float4 fs() { return float4(0.5, 0.25, 1, 0.5); }\n";
++    NSString *metal = [dir stringByAppendingPathComponent:@"fixture.metal"], *library = [dir stringByAppendingPathComponent:@"fixture.metallib"];
++    if (![source writeToFile:metal atomically:YES encoding:NSUTF8StringEncoding error:nil]) return 0;
++    NSTask *compiler = [NSTask new]; compiler.executableURL = [NSURL fileURLWithPath:@"/usr/bin/xcrun"];
++    compiler.arguments = @[@"-sdk", @"macosx", @"metal", metal, @"-o", library];
++    NSError *error = nil;
++    if (![compiler launchAndReturnError:&error]) { printf("fixture compiler: %s\n", error.localizedDescription.UTF8String); return 0; }
++    [compiler waitUntilExit]; if (compiler.terminationStatus) return 0;
++    NSFileManager *fm = NSFileManager.defaultManager; NSMutableDictionary *map = [NSMutableDictionary dictionary];
++    for (int t = 0; t < NT; t++) {
++        NSArray<NSArray *> *libs = t % 4 == 0 ? @[@[[NSString stringWithFormat:@"hs%d", t], @"vs", @"vertex"]]
++                                              : @[@[[NSString stringWithFormat:@"hv%d", t], @"vs", @"vertex"], @[[NSString stringWithFormat:@"hf%d", t], @"fs", @"pixel"]];
++        for (NSArray *l in libs) {
++            NSDictionary *reflection = @{@"chain": @DMSH_CHAIN, @"route": @"B", @"entry": l[1], @"entry_z": l[1], @"bindings": @[], @"vertex_inputs": @[]};
++            NSData *json = [NSJSONSerialization dataWithJSONObject:reflection options:0 error:nil];
++            if (![json writeToFile:[dir stringByAppendingPathComponent:[l[0] stringByAppendingString:@".json"]] atomically:YES]) return 0;
++            if (![fm copyItemAtPath:library toPath:[dir stringByAppendingPathComponent:[l[0] stringByAppendingString:@".metallib"]] error:nil]) return 0;
++            map[l[0]] = l[2];
++        }
++    }
++    g_msl_dir = dir; g_shmap = map;
++    return 1;
++}
++static NSString *rrow(NSString *vkey, NSString *fkey, unsigned chmask) {
++    NvShader *vs = [NvShader new], *fs = [NvShader new];
++    strcpy(vs->key, vkey.UTF8String); strcpy(fs->key, fkey.UTF8String); fs->stage = 1;
++    pso_key key = {0}; key.cfmt[0] = MTLPixelFormatRGBA8Unorm; key.samples = 1; key.chmask = chmask;
++    pso_skey sk; char hex[sizeof sk * 2 + 1]; pso_skey_from(&key, vs, fs, 0, NULL, &sk); pso_skey_hex(&sk, hex);
++    return [NSString stringWithFormat:@"R\t%s\n", hex];
++}
++static NSString *task_rows(int t) {
++    if (t % 4 == 0) return [NSString stringWithFormat:@"S\ths%d\t0\n", t];
++    NSString *v = [NSString stringWithFormat:@"hv%d", t], *f = [NSString stringWithFormat:@"hf%d", t];
++    return [rrow(v, f, 15) stringByAppendingString:rrow(v, f, 7)];
++}
++static int task_of_task(WarmTask *t) { return [[(t->kind == 0 ? t->key : t->vkey) substringFromIndex:2] intValue]; }
++static int task_of_item(WarmItem *it) { return [[(it->kind == 0 ? it->key : it->vs_key) substringFromIndex:2] intValue]; }
++static void reset_warm(void) {
++    nvn_hm_clear(&g_pso, hm_rel); g_shcache = nil; g_warm_items = [NSMutableArray array]; g_warm_dict = nil; g_warm_loads = nil;
++    g_warm_started = 0; atomic_store(&g_warm_bg, 0); atomic_store(&g_warm_stop, 0); atomic_store(&g_warm_ready, 0); atomic_store(&g_warm_running, 0); atomic_store(&g_warm_done, 0);
++    atomic_store(&g_sweep_warm, 0); atomic_store(&g_sweep_pairs, 0);
++    g_warm_shaders = g_warm_rps = g_warm_mps = g_warm_cps = g_warm_skip_fz = g_warm_skip_stale = 0; g_warm_claim_shaders = g_warm_claim_rps = g_warm_claim_cps = 0;
++}
++static NSArray<WarmItem *> *items_now(void) { os_unfair_lock_lock(&g_warm_lock); NSArray<WarmItem *> *a = [g_warm_items copy]; os_unfair_lock_unlock(&g_warm_lock); return a; }
++static NSSet<NSNumber *> *tasks_of_items(NSArray<WarmItem *> *items) { NSMutableSet *s = [NSMutableSet set]; for (WarmItem *it in items) [s addObject:@(task_of_item(it))]; return s; }
++static NSSet<NSNumber *> *range_set(int from, int to) { NSMutableSet *s = [NSMutableSet set]; for (int t = from; t < to; t++) [s addObject:@(t)]; return s; }
++static int wait_idle(double seconds) { uint64_t t0 = bp_now(); while (atomic_load(&g_warm_running)) { if ((bp_now() - t0) > (uint64_t)(seconds * 1e9)) return 0; usleep(2000); } return 1; }
++
++// the child of the kill test: records rows for ever (the parent kills it with SIGKILL)
++static int child_writer(const char *path) {
++    setenv("DM_PSO_USER", path, 1); user_reset();
++    for (unsigned long i = 0;; i++) pso_user_record("S\t%016lx_b\t%d\n", i * 2654435761ul, (int)(i % 5));
++    return 0;
++}
++
++int main(int argc, char **argv) { @autoreleasepool {
++    if (argc == 3 && !strcmp(argv[1], "--writer")) return child_writer(argv[2]);
++    alarm(240); setvbuf(stdout, NULL, _IOLBF, 0);
++    setenv("DM_PSO_ARCHIVE", "off", 1); setenv("DM_NVN_PREDICT", "0", 1); setenv("DM_PSO_PREPARE", "1", 1);
++    unsetenv("DM_PSO_RECORD"); unsetenv("DM_SAVE"); unsetenv("DM_PSO_PREBUILD"); unsetenv("DM_PSO_HYBRID"); unsetenv("DM_PSO_MANIFEST"); unsetenv("DM_PSO_USER_FIRST");
++    unsetenv("DM_PSO_PREPARE_PERCENT"); unsetenv("DM_PSO_PREPARE_TAIL");
++    char tmpl[1024]; snprintf(tmpl, sizeof tmpl, "%s/t_pso_user_first.XXXXXX", NSTemporaryDirectory().fileSystemRepresentation);
++    if (!mkdtemp(tmpl)) { perror("mkdtemp"); return 1; }
++    g_dir = @(tmpl);
++    g_logfd = open([g_dir stringByAppendingPathComponent:@"engine.log"].fileSystemRepresentation, O_RDWR | O_CREAT | O_TRUNC, 0600);
++    if (g_logfd < 0 || dup2(g_logfd, 2) < 0) { perror("log"); return 1; }
++    g_shmap_path = [g_dir stringByAppendingPathComponent:@"shader_map.tsv"];   // the seed list is the pso_manifest.tsv beside it
++    g_seed = [g_dir stringByAppendingPathComponent:@"pso_manifest.tsv"]; g_user = [g_dir stringByAppendingPathComponent:@"pso_user.tsv"];
++    NSFileManager *fm = NSFileManager.defaultManager;
++
++    // ---- 1. what the list records
++    [@"S\tseedA_b\t0\nS\tseedB_b\t1\n" writeToFile:g_seed atomically:YES encoding:NSUTF8StringEncoding error:nil];
++    setenv("DM_PSO_USER", g_user.UTF8String, 1);
++    {
++        [fm removeItemAtPath:g_user error:nil]; user_reset();
++        pso_user_record("S\t%s\t%d\n", "seedA_b", 0); pso_user_record("S\t%s\t%d\n", "newX_b", 1); pso_user_record("S\t%s\t%d\n", "seedA_b", 0);
++        pso_user_record("S\t%s\t%d\n", "newX_b", 1); pso_user_record("C\t%s\n", "seedB_b");
++        NSArray *l = file_lines(g_user);
++        EXPECT("on: a row the seed holds is recorded, each once, in order", 1, [l isEqualToArray:(@[@"S\tseedA_b\t0", @"S\tnewX_b\t1", @"C\tseedB_b"])]);
++        user_reset(); pso_user_record("S\t%s\t%d\n", "seedA_b", 0); pso_user_record("S\t%s\t%d\n", "newY_b", 0);
++        l = file_lines(g_user);
++        EXPECT("on: a fresh process does not write a row the list has again, and appends a new one", 1, [l isEqualToArray:(@[@"S\tseedA_b\t0", @"S\tnewX_b\t1", @"C\tseedB_b", @"S\tnewY_b\t0"])]);
++        [fm removeItemAtPath:g_user error:nil]; user_reset(); setenv("DM_PSO_USER_FIRST", "0", 1);
++        pso_user_record("S\t%s\t%d\n", "seedA_b", 0); pso_user_record("S\t%s\t%d\n", "newX_b", 1); pso_user_record("S\t%s\t%d\n", "seedB_b", 1);
++        l = file_lines(g_user);
++        EXPECT("=0: the old list, rows the seed lacks only", 1, [l isEqualToArray:(@[@"S\tnewX_b\t1"])]);
++        unsetenv("DM_PSO_USER_FIRST");
++    }
++    // ---- 2. a row cut by a killed process: a line end first, then the new row on its own line
++    {
++        [@"S\tseedA_b\t0\nR\t00ab" writeToFile:g_user atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        user_reset(); (void)log_since();
++        pso_user_record("S\t%s\t%d\n", "after_b", 4);
++        NSString *t = [NSString stringWithContentsOfFile:g_user encoding:NSUTF8StringEncoding error:nil];
++        EXPECT("cut row: the file is the old rows, a line end, the new row", 1, [t isEqualToString:@"S\tseedA_b\t0\nR\t00ab\nS\tafter_b\t4\n"]);
++        EXPECT_LOG("cut row: said once", log_since(), "ended in a row cut short");
++        pso_user_record("S\t%s\t%d\n", "after2_b", 4);
++        t = [NSString stringWithContentsOfFile:g_user encoding:NSUTF8StringEncoding error:nil];
++        EXPECT("cut row: no second line end", 1, [t isEqualToString:@"S\tseedA_b\t0\nR\t00ab\nS\tafter_b\t4\nS\tafter2_b\t4\n"]);
++        g_shmap = [@{} mutableCopy];   // warm_parse of the file: the cut row is one line of its own that parses as nothing
++        long lines = 0; NSArray *tasks = warm_parse(@[g_user], &lines); (void)tasks;
++        EXPECT("cut row: the next start reads the whole rows and drops the cut one", 0, lines);   // no key is in this empty map: every row is stale, none is glued to another
++    }
++    // ---- 3. SIGKILL while writing, three times: only whole rows; then the next writer appends whole rows
++    {
++        [fm removeItemAtPath:g_user error:nil];
++        int bad = 0, total = 0;
++        for (int round = 0; round < 3; round++) {
++            char *args[] = {argv[0], "--writer", (char *)g_user.fileSystemRepresentation, NULL}; pid_t pid;
++            EXPECT("kill: the writer starts", 0, posix_spawn(&pid, argv[0], NULL, NULL, args, environ));
++            usleep(150000 + 70000 * round); kill(pid, SIGKILL); int st = 0; waitpid(pid, &st, 0);
++            EXPECT("kill: the writer died of SIGKILL", 1, WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
++        }
++        NSString *t = [NSString stringWithContentsOfFile:g_user encoding:NSUTF8StringEncoding error:nil] ?: @"";
++        NSArray<NSString *> *parts = [t componentsSeparatedByString:@"\n"];
++        for (NSUInteger i = 0; i + 1 < parts.count; i++) { NSString *l = parts[i]; total++;
++            NSArray *c = [l componentsSeparatedByString:@"\t"];
++            if (c.count != 3 || ![c[0] isEqualToString:@"S"] || [c[1] length] != 18 || ![c[1] hasSuffix:@"_b"] || [c[2] length] != 1) bad++; }
++        printf("kill: %d rows written by three writers killed with SIGKILL, last part \"%s\" (empty: the file ends with a line end)\n", total, parts.lastObject.UTF8String);
++        EXPECT("kill: rows were written", 1, total > 100);
++        EXPECT("kill: every row is whole", 0, bad);
++        EXPECT("kill: the file ends with a line end", 0, (long)parts.lastObject.length);
++        NSSet *uniq = [NSSet setWithArray:[parts subarrayWithRange:NSMakeRange(0, parts.count - 1)]];
++        EXPECT("kill: no row twice (each writer reads the list before it writes)", total, (long)uniq.count);
++    }
++    // ---- 4. eight threads at once: every row whole and once
++    {
++        [fm removeItemAtPath:g_user error:nil]; user_reset();
++        dispatch_apply(8, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t w) {
++            for (int i = 0; i < 400; i++) pso_user_record("S\tt%zu_%04d_b\t%d\n", w, i, i % 5);
++            for (int i = 0; i < 400; i++) pso_user_record("S\tt%zu_%04d_b\t%d\n", (w + 1) % 8, i, i % 5);   // the next thread's rows again: written by whichever comes first
++        });
++        NSArray<NSString *> *l = file_lines(g_user);
++        EXPECT("threads: 3,200 rows", 3200, l.count); EXPECT("threads: each once", 3200, [NSSet setWithArray:l].count);
++        int bad = 0; for (NSString *r in l) if ([r componentsSeparatedByString:@"\t"].count != 3) bad++;
++        EXPECT("threads: every row whole", 0, bad);
++    }
++    // ---- 5. warm_paths
++    {
++        [@"S\tx_b\t0\n" writeToFile:g_user atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        g_pso_user_first = -1; (void)log_since();
++        NSArray *p = warm_paths(NULL);
++        EXPECT("paths on: this device's list, then the seed", 1, [p isEqualToArray:(@[g_user, g_seed])]);
++        EXPECT_LOG("paths on: the log says so", log_since(), "pipeline prewarm: this device's list first, then the seed list (DM_PSO_USER_FIRST=0: the seed first)");
++        setenv("DM_PSO_USER_FIRST", "0", 1); g_pso_user_first = -1;
++        p = warm_paths(NULL);
++        EXPECT("paths =0: the seed, then this device's list", 1, [p isEqualToArray:(@[g_seed, g_user])]);
++        unsetenv("DM_PSO_USER_FIRST"); g_pso_user_first = -1;
++        [fm removeItemAtPath:g_user error:nil];
++        p = warm_paths(NULL);
++        EXPECT("paths without a list: the seed alone", 1, [p isEqualToArray:(@[g_seed])]);
++        EXPECT_LOG("paths without a list: the old line", log_since(), "this device's user list does not exist yet");
++    }
++
++    // ---- 6. the GPU half: warm_parse's order and the real prepare step
++    mtl_init();
++    if (!build_fixtures(g_dir)) { printf("failed to make the synthetic shader libraries\n"); [fm removeItemAtPath:g_dir error:nil]; return 1; }
++    NSMutableString *seed = [NSMutableString string]; for (int t = 0; t < NT; t++) [seed appendString:task_rows(t)];
++    [seed writeToFile:g_seed atomically:YES encoding:NSUTF8StringEncoding error:nil];
++    NSMutableString *user = [NSMutableString string]; for (int t = 30; t < NT; t++) [user appendString:task_rows(t)];
++    [user appendString:task_rows(5)];   // and one of the seed's first tasks, last
++    [user writeToFile:g_user atomically:YES encoding:NSUTF8StringEncoding error:nil];
++    {
++        g_pso_user_first = -1; long lines = 0;
++        NSArray<WarmTask *> *tasks = warm_parse(warm_paths(NULL), &lines);
++        NSMutableArray *order = [NSMutableArray array]; for (WarmTask *t in tasks) [order addObject:@(task_of_task(t))];
++        NSMutableArray *want = [NSMutableArray array]; for (int t = 30; t < NT; t++) [want addObject:@(t)]; [want addObject:@5];
++        for (int t = 0; t < 30; t++) if (t != 5) [want addObject:@(t)];
++        EXPECT("parse: 40 tasks, 70 lines", 40, tasks.count); EXPECT("parse: lines", 70, lines);
++        EXPECT("parse: the list's tasks first in its order, then the seed's others in theirs", 1, [order isEqualToArray:want]);
++        int two = 1; for (WarmTask *t in tasks) if (t->kind == 1 && t->rs.count != 2) two = 0;
++        EXPECT("parse: a pair's rows from both lists are one task of two pipelines", 1, two);
++    }
++    pso4_init();
++    g_gate = [UfGate new]; g_gate->device = g_dev; g_dev = (id<MTLDevice>)g_gate;
++    setenv("DM_PSO_MANIFEST", "", 1); unsetenv("DM_PSO_MANIFEST");
++    for (int mode = 0; mode < 2; mode++) {   // 0: on, 1: DM_PSO_USER_FIRST=0
++        if (mode) setenv("DM_PSO_USER_FIRST", "0", 1); else unsetenv("DM_PSO_USER_FIRST");
++        g_pso_user_first = -1; reset_warm(); (void)log_since();
++        // the head of 25 %: 10 tasks. On: tasks 30..39 hold 2 S tasks (32, 36) and 8 pairs = 2 + 16 = 18 libraries; =0: tasks 0..9, 3 S and 7 pairs = 17. The tail's first load is held
++        unsigned head_libs = mode ? 17 : 18;
++        g_gate->entered = dispatch_semaphore_create(0); g_gate->release = dispatch_semaphore_create(0); g_gate->block_at = head_libs + 1; atomic_store(&g_gate->calls, 0);
++        setenv("DM_PSO_PREPARE_PERCENT", "25", 1);
++        warm_start();
++        unsetenv("DM_PSO_PREPARE_PERCENT");
++        NSString *log = log_since();
++        const char *m = mode ? "=0" : "on";
++        char b[160];
++        snprintf(b, sizeof b, "prepare %s: the tail reached its first library", m); EXPECT(b, 0, dispatch_semaphore_wait(g_gate->entered, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)));
++        NSSet *head = tasks_of_items(items_now());
++        snprintf(b, sizeof b, "prepare %s: the head is %s", m, mode ? "the seed's first 10 tasks" : "the 10 tasks this device's list names first");
++        EXPECT(b, 1, [head isEqualToSet:(mode ? range_set(0, 10) : range_set(30, 40))]);
++        snprintf(b, sizeof b, "prepare %s: the head's libraries", m); EXPECT(b, head_libs + 1, atomic_load(&g_gate->calls));
++        EXPECT_LOG("prepare: the plan line", log, "DM_PSO_PREPARE_PERCENT=25: head ");
++        if (!mode) EXPECT_LOG("prepare on: the order line", log, "this device's list first, then the seed list");
++        dispatch_semaphore_signal(g_gate->release);
++        snprintf(b, sizeof b, "prepare %s: the tail finishes", m); EXPECT(b, 1, wait_idle(60));
++        NSArray<WarmItem *> *all = items_now();
++        NSMutableDictionary *count = [NSMutableDictionary dictionary]; for (WarmItem *it in all) { NSNumber *k = @(task_of_item(it)); count[k] = @([count[k] intValue] + 1); }
++        int once = count.count == NT; for (int t = 0; t < NT; t++) if ([count[@(t)] intValue] != (t % 4 ? 2 : 1)) once = 0;
++        snprintf(b, sizeof b, "prepare %s: every task built once, head and tail together", m); EXPECT(b, 1, once);
++        snprintf(b, sizeof b, "prepare %s: 70 lines", m); EXPECT(b, 70, atomic_load(&g_warm_done));
++        (void)log_since();
++    }
++    unsetenv("DM_PSO_USER_FIRST");
++    g_dev = g_gate->device;
++    [fm removeItemAtPath:g_dir error:nil];
++    printf("t_pso_user_first: %d checks, %d failed; %s\n", checks, failed, g_comp4 ? "Metal 4" : "MTLDevice");
++    return failed != 0;
++} }

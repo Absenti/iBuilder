@@ -1,0 +1,177 @@
+# 0090-nas-covers-full-reads.patch -- the owner's field log of 2026-11-21 23:51: every .nsp and .nsz cover on the NAS "read failed: ResultFsOutOfRange (2002-3005)". Applies after
+# 0089. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, its pure part ran in the host harness, and the failure and its fix were reproduced with the app's LibHac (below).
+#
+# CAUSE (measured): GameIconsStream.Read puts the remote stream in LibHac's StreamStorage, whose read is ONE Stream.Read that takes a short count as the whole answer; SSH.NET's
+#   SftpFileStream.Read gives what one SFTP reply holds. With LibHac 0.19.0 and a stream that gives at most 7 bytes per Read, PartitionFileSystem.Initialize fails with exactly
+#   ResultFsOutOfRange (2002-3005) (probe90); a full-read stream (a file in Files) reads the same package. The .nup covers were not hit: NupRemote.Read already loops.
+# FIX: RemoteReadStream (GameAppField.cs): between a remote stream and anything that expects full reads, every Read fills what was asked (up to the end of the file) from aligned 256 KB
+#   blocks fetched with as many remote reads as needed and kept in a 16-block LRU (LibHac's many small header reads cost few round trips); Length is the size the listing's attributes
+#   give; a remote file shorter than listed ends there. Every NAS read stream goes through it: the covers' shared session (Nas.WithSession) and Nas.WithReadStream. Each NAS cover logs
+#   its cost: "cover: <game> (On the NAS): read in 3 requests, 768 KB".
+# The .nup "carries no icon" (Ocarina): real for its BASE package (DEVICE-FINDINGS 2026-11-20: its meta has the NPDM and three small records, no NACP, no icon). In the same series,
+#   crates/ibuilder-nup icon_of now falls back, when the base carries none, to the icon the BUILD writes (the newest update's control records, extract::control_meta), with a test; whether
+#   the owner's container has an update package with an icon is not known here.
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile (-t:Compile):
+#   0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness90: … P89;P90): 303 of 303 checks (9 new: 400 random reads over 7-byte reads full and identical,
+#   seek/length/end, one request for 2,000 small reads, the LRU, a short remote file, the log line, the wiring); 7 of 7 mutations killed. probe90 (LibHac 0.19.0, a synthetic PFS0 with an
+#   icon file): full stream -> the bytes; 7-byte reads into StreamStorage -> ResultFsOutOfRange (2002-3005); the same through RemoteReadStream -> the SAME bytes; 32 KB replies -> 8 requests.
+# NOT VERIFIED: a real NAS cover read (SSH.NET's reply size, the real request counts), a real NCA's control data through it.
+# NEW LOG LINES: "cover: … (On the NAS): read in N requests, M KB" (" request", " requests, ", " KB").
+diff -ruN k/GameAppAttachUi.cs l/GameAppAttachUi.cs
+--- k/GameAppAttachUi.cs	2026-11-22 00:09:15
++++ l/GameAppAttachUi.cs	2026-11-22 01:10:22
+@@ -306,7 +306,12 @@
+                                 // ONE connection for the whole source (it was one per cover); each cover takes it in turn (patch 0085: the app's shared session, so a listing never waits a whole pass)
+                                 Nas.WithSession(nas, Nas.Password(nas.User, password), open =>
+                                 {
+-                                    try { var (stream, size) = open(f.Remote); using (stream) r = ReadOne(how, stream, size); }
++                                    try
++                                    {
++                                        var (stream, size) = open(f.Remote);
++                                        using (stream) r = ReadOne(how, stream, size);
++                                        if (stream is RemoteReadStream rs) lines.Add(RemoteReadStream.Line(f.Name, CloudWords(f).Where, rs.Requests, rs.Fetched));   // patch 0090: its cost
++                                    }
+                                     catch (Exception e) { r = (null, 0, (e.InnerException ?? e).Message, true); }
+                                 });
+                                 Land(f, r);
+diff -ruN k/GameAppField.cs l/GameAppField.cs
+--- k/GameAppField.cs	2026-11-22 00:09:15
++++ l/GameAppField.cs	2026-11-22 01:10:22
+@@ -5,6 +5,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Globalization;
++using System.IO;
+ using System.Linq;
+ using System.Text.RegularExpressions;
+ using System.Threading;
+@@ -435,4 +436,103 @@
+     /// `began`: the local wall-clock time the no-op was posted (the stall's start, give or take PingMs).
+     public static string Line(double waitedMs, DateTime began) =>
+         "main thread stalled " + Math.Round(waitedMs).ToString("0", CultureInfo.InvariantCulture) + " ms at " + began.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture);
++}
++
++/// Patch 0090 (the owner's log of 2026-11-21 23:51: every .nsp and .nsz cover on the NAS "read failed: ResultFsOutOfRange (2002-3005)"): LibHac's StreamStorage reads with ONE
++/// Stream.Read and takes a short count as the whole answer (measured: a stream that gives 7 bytes per Read makes PartitionFileSystem.Initialize fail with exactly
++/// ResultFsOutOfRange), and SSH.NET's SftpFileStream.Read gives what one SFTP reply holds. A file in Files gives full counts, which is why the same packages read from Files had covers.
++/// This stream is put between a remote stream and anything that expects full reads: every Read fills what was asked (up to the end of the file), from aligned blocks fetched with as
++/// few requests as the remote stream needs and kept in a small LRU (LibHac's many small header reads cost few round trips); its Length is the size the remote listing gave.
++public sealed class RemoteReadStream : Stream
++{
++    private readonly Stream inner;
++    private readonly long length;
++    private readonly int block;
++    private readonly int maxBlocks;
++    private readonly bool leaveOpen;
++    private readonly LinkedList<(long Index, byte[] Data)> lru = new LinkedList<(long, byte[])>();
++    private readonly Dictionary<long, LinkedListNode<(long Index, byte[] Data)>> byIndex = new Dictionary<long, LinkedListNode<(long, byte[])>>();
++    private long position;
++
++    public const int DefaultBlock = 256 * 1024, DefaultBlocks = 16;
++
++    /// The remote stream's Read calls (each one a round trip or less) and the bytes they gave.
++    public int Requests { get; private set; }
++    public long Fetched { get; private set; }
++
++    public RemoteReadStream(Stream inner, long length, int blockSize = DefaultBlock, int maxBlocks = DefaultBlocks, bool leaveOpen = false)
++    {
++        this.inner = inner ?? throw new ArgumentNullException(nameof(inner));
++        this.length = Math.Max(0, length);
++        block = Math.Max(1, blockSize);
++        this.maxBlocks = Math.Max(1, maxBlocks);
++        this.leaveOpen = leaveOpen;
++    }
++
++    public override bool CanRead => true;
++    public override bool CanSeek => true;
++    public override bool CanWrite => false;
++    public override long Length => length;
++    public override long Position { get => position; set => position = value < 0 ? throw new ArgumentOutOfRangeException(nameof(value)) : value; }
++    public override void Flush() { }
++    public override void SetLength(long value) => throw new NotSupportedException();
++    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
++
++    public override long Seek(long offset, SeekOrigin origin)
++    {
++        long to = origin switch { SeekOrigin.Begin => offset, SeekOrigin.Current => position + offset, _ => length + offset };
++        if (to < 0) throw new IOException("a seek before the start of the file");
++        return position = to;
++    }
++
++    public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
++
++    public override int Read(Span<byte> destination)
++    {
++        int done = 0;
++        while (done < destination.Length && position < length)
++        {
++            long index = position / block;
++            var data = Block(index);
++            int at = (int) (position - index * block);
++            int n = Math.Min(destination.Length - done, data.Length - at);
++            if (n <= 0) break;   // the remote file ended before its listed size
++            data.AsSpan(at, n).CopyTo(destination.Slice(done));
++            done += n;
++            position += n;
++        }
++        return done;
++    }
++
++    private byte[] Block(long index)
++    {
++        if (byIndex.TryGetValue(index, out var node)) { lru.Remove(node); lru.AddFirst(node); return node.Value.Data; }
++        long start = index * block;
++        var data = new byte[(int) Math.Min(block, length - start)];
++        inner.Position = start;
++        int got = 0;
++        while (got < data.Length)
++        {
++            int n = inner.Read(data, got, data.Length - got);
++            Requests++;
++            if (n <= 0) break;
++            got += n;
++            Fetched += n;
++        }
++        if (got < data.Length) Array.Resize(ref data, got);   // shorter than listed: what there is (a later Read ends there)
++        var added = lru.AddFirst((index, data));
++        byIndex[index] = added;
++        while (lru.Count > maxBlocks) { var last = lru.Last; lru.RemoveLast(); byIndex.Remove(last.Value.Index); }
++        return data;
++    }
++
++    protected override void Dispose(bool disposing)
++    {
++        if (disposing && !leaveOpen) inner.Dispose();
++        base.Dispose(disposing);
++    }
++
++    /// "cover: Zelda … (On the NAS): read in 12 requests, 1,536 KB".
++    public static string Line(string name, string where, int requests, long bytes) =>
++        $"cover: {name} ({where}): read in {requests.ToString(CultureInfo.InvariantCulture)} request{(requests == 1 ? "" : "s")}, {(Math.Max(0, bytes) / 1024).ToString("N0", CultureInfo.InvariantCulture)} KB";
+ }
+diff -ruN k/GameAppNas.cs l/GameAppNas.cs
+--- k/GameAppNas.cs	2026-11-22 00:09:15
++++ l/GameAppNas.cs	2026-11-22 01:10:22
+@@ -399,13 +399,19 @@
+     /// Patch 0084: ONE connection for several remote reads (the covers of a listing: it was one SSH connection per cover). `work` gets an opener: a seekable stream over a remote path (only
+     /// the bytes read cross the network) and its size. The connection ends when `work` returns.
+     public static void WithSession(NasConfig cfg, AuthenticationMethod auth, Action<Func<string, (Stream Stream, long Size)>> work) =>
+-        WithShared<int>(cfg, auth, null, client => { work(remote => (client.OpenRead(remote), client.GetAttributes(remote).Size)); return 0; });   // patch 0085: the shared session
++        WithShared<int>(cfg, auth, null, client =>
++        {
++            // patch 0090: full reads over aligned cached blocks (RemoteReadStream, GameAppField.cs): SftpFileStream gives one SFTP reply per Read, and LibHac takes a short read as the answer
++            work(remote => { long size = client.GetAttributes(remote).Size; return (new RemoteReadStream(client.OpenRead(remote), size), size); });
++            return 0;
++        });   // patch 0085: the shared session
+ 
+     /// Runs `read` on a seekable stream over `remote` (only the bytes it reads cross the network), then disconnects.
+     public static T WithReadStream<T>(NasConfig cfg, AuthenticationMethod auth, string remote, Func<Stream, T> read)
+     {
+         using var client = Connect(cfg, auth, null, out _);
+-        using var stream = client.OpenRead(remote);
++        long size = client.GetAttributes(remote).Size;
++        using var stream = new RemoteReadStream(client.OpenRead(remote), size);   // patch 0090: full reads (see WithSession)
+         try { return read(stream); }
+         finally { client.Disconnect(); }
+     }

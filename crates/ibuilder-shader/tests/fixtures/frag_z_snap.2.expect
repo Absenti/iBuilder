@@ -1,0 +1,29 @@
+OK
+{"n":1}
+#pragmxa clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+static inline __attribute__((always_inline)) float dm_zsnap(float z, float d, float zw)   // see frag_z_snap
+{
+    float lo = as_type<float>(as_type<int>(z) - 1) - zw * 0x1p-20f;
+    return (z > 0.0f && d < z && d >= lo) ? d : z;
+}
+
+struct main0_out
+{
+   float4 m_color [[color(0)]];
+};
+
+fragment main0_out main0(sampler s0 [[sampler(0)]], float4 gl_FragCoord)
+{
+    float dm_zw = fwidth(gl_FragCoord.z);
+    main0_out out = {};
+    float _10 = t0.sample(s0, float2(1.0)).x;
+    int _11 = dm_zsnap(gl_FragCoord.z, _10, dm_zw);
+    bool _12 = _11 < _10;
+    return out;
+}

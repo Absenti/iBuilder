@@ -1,0 +1,1217 @@
+# 0082-redesign-build-tab-colours-settings-review.patch -- after the owner's device screenshots of 0080/0081 and the read-only C# review of 0077-0081 (target/agent-work/review-cs/REVIEW.txt):
+# the prototype's Build tab, a header count that cannot disagree with its rows, no blue / gradient buttons, settings only for a BUILT game, and the review's M1-M4, L1-L7.
+# Applies after 0081. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# 1. BUILD TAB (the prototype target/agent-work/design/project/Main.dc.html as updated): NOW BUILDING = the build's card (stages, shader count, Pause / Resume, Cancel, the short line
+#    "Continues if you leave the app.", the build screen as a small round button beside its pill) or, idle, ONE compact row ("Nothing is building" / "A build ends on Ready. Play starts the
+#    game."); then READY TO BUILD (on this iPhone, not built; or built before an update or DLC was added: "Update") and IN THE CLOUD (cloud-only games, minus the hidden ones, merged as the
+#    Library merges them), each with its count beside its title (BuildList, GameAppRedesign.cs); a row = a 44 pt cover (a mini cloud mark for a cloud game; initials on the name's colour), the
+#    name on one line, "<size> · Not built" / "<size> · In iCloud" / "On the NAS" / "Downloading · 37 %" with a thin bar, a small amber pill (Build / Update / Download; Cancel on #25252b while it
+#    downloads) and, for a game on this iPhone only, a 32 pt "…" (a built game's sheet; a not-built one's small sheet). The filter, the paragraphs, the big cards with their gradient buttons
+#    and "…" squares are gone; an empty section is not shown; the queue and the shader preparation stay; the "In Files, touch and hold…" tip is the + menu's "How to add from Files"; the
+#    refresh (the cloud re-listing) is a small icon. "Update & DLC" (the old cards' menu: pick files, find them in a folder, download them from the cloud) is now the menu of the game sheet's
+#    "Update and DLC" row. REMOVED from the screen: "Download and build" (the prototype has Download only; the code path stays, unused) and the old "Rebuild" button of a built game's card
+#    (Rebuild from scratch… stays in the sheet).
+# 2. THE COUNT: the device showed "0 on this iPhone" beside a listed local game. The header and the rows came from the same facts in one call, so the likeliest cause is a refresh that stopped
+#    after writing the header (Guarded catches it) and kept the rows of an earlier call; NOT REPRODUCED. Now the rows and the header are made from ONE list (BuildList.Sections / Header over
+#    `games`), the header is written LAST, and the counts beside the sections are the rows' own; the Library's summary and the iPad sidebar count libShown, the listed games.
+# 3. COLOURS: every primary button is the accent #efb15a with black words (Look.Capsule, Look.AccentOf no longer gives a game's own hue, GradientBackView is flat amber, Theme.Pill, ShelfButton,
+#    the Mods and Saves pages' filled buttons), every secondary #25252b with a hairline; the killed-build banner's "Resume" was SystemBlue; the window's and the root view's tint are the accent
+#    (the system's own alerts and menus). Cover placeholders keep initials on the name's colour (a square, not a button).
+# 4. SETTINGS ONLY FOR A BUILT GAME (GameSettingsRule): a cloud-only game has Download / Cancel and Hide from the library (never Hide while it downloads), no "…", no Settings, no Choose a cover,
+#    no round settings button, no inspector; a tap on its cover / card opens its menu. A game on this iPhone that is not built: no sheet, no inspector, no round button; its Build "…" (and the
+#    sheet's other callers) open a small action sheet "<name>" / "Not built yet: its settings come once it is built" with "Choose a cover…", "Delete the game file", Cancel; its menu is Build,
+#    Choose a cover…, Add to the build queue (kept: 0062's queue has no other entry for it now), Delete…. A paused or running build has no settings either.
+#    WHAT CHANGES THE BUILD (the owner asked to be told, not to hide it silently): the game's MODS (exefs patches are applied by the build: GameAppModsUi.cs "Rebuild to apply"; crates/
+#    ibuilder-pipeline mods.rs) and its UPDATE / DLC (merged by the build) are inputs of the build: with no sheet before the build, mods are reachable only once the game is built (then
+#    "Rebuild to apply"); an update or DLC can still be added before the first build with + › Add a game file (it attaches by its title id). The launcher settings (frame rate, upscaler,
+#    memory saver...) are read at the launch (boot.rs apply_game_settings), not by the build.
+# 5. THE REVIEW (REVIEW.txt), each with a harness check where the logic is pure:
+#    M1 a cancelled "Download and build" could still build: the main-thread end reads the flag again (DownloadEnd.Cancelled) before downloads.Remove and `done`, and clears it there.
+#    M2 the "building" state followed `selected`: it follows the run's game (stop.Game ?? lastRunGame); a swipe or an iPad card moves the carousel's / hero's focus (FocusName) but not
+#       `selected` while a run goes (so the build screen and the end notification keep the right game).
+#    M3 the grid, the carousel's buttons and the Build rows were rebuilt every second during a download: rebuilt only when their key (names, states, labels, what is on: RedrawKey, no
+#       percentage) changes; otherwise the bars and the words are updated in place.
+#    M4 the iPad inspector stayed over Build / Settings: ShowTab closes it for any other tab.   L1 a second inspector kept its launch line.   L2 a closed sheet's launch line is dropped.
+#    L3 the Certificate tile kept its ground (not a navRows entry).   L4 "On this iPhone" instead of "In On this iPhone".   L5 Cancel always reachable (Build rows; no Hide while downloading).
+#    L6 Settings during a build says "A build is running" (with Watch the build).   L7 "Remove download (stays in the cloud)" only for a file the app brought from that source (its import
+#       record) or of the cloud file's size (DownloadPairing), in the menu, the sheet and RemoveGameDownload itself.
+#    L8 (0079's header, information): an iCloud placeholder ".X.nsp.icloud" of a Files folder is now listed as the cloud game "X.nsp" (the old listing skipped it): it appears in the Library and the
+#       Build tab as a cloud game; its Download is the coordinated read (iOS downloads it first). Intended; documented here.
+#
+# VERIFIED (2026-11-21, M1 Pro): scripts/check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree (diff -r). Compile (the
+#   same device project, -t:Compile): 0 errors / 40 warnings, the same per file and code as the 0079, 0080 and 0081 trees; the new texts are in GameApp.dll, the removed paragraphs are not.
+#   Host harness (target/agent-work/redesign/harness82: the 0080/0081 harness with PAD81;P82 over this tree): 169 of 169 checks (the 0080/0081 ones, with 0082's menu rules, and 38 new: the
+#   sections and their counts, the owner's "1 on this iPhone" case, the rows' words and buttons, the header from the same list and written last, the removed paragraphs, settings only for a
+#   built game, the colours' wiring, L4, M1 late cancel, M3 keys, M2/M4/L1/L2/L3/L6 wiring, L7 pairing). 20 of 20 mutations killed (mutate82.py). The 0080 and 0081 trees still pass their
+#   harnesses (118/118, 131/131).
+# NOT VERIFIED: nothing ran on a device; the new rows' look, the in-place updates under a finger, the window tint on the system's alerts; the cause of the "0 on this iPhone" (not reproduced).
+#
+# NEW UI STRINGS (for app/verify_ipa.sh): "Nothing is building", "A build ends on Ready. Play starts the game.", "Continues if you leave the app.", "Ready to build", "In the cloud",
+#   "How to add from Files", "Touch and hold the game, Share, iBuilder", "Not built yet: its settings come once it is built", "Delete the game file", "A build is running",
+#   "The game's settings open once the build ends. Watch the build shows how far it is.", "Downloading · ", "More actions for ", "Watch the build" (the small round button's label);
+#   log line "not removed: its file was not downloaded from the cloud copy of that name". REMOVED: "Nothing is building. + adds a game; its Build button starts it. A build ends on Ready: Play
+#   starts the game.", the Build tab's "No cloud source yet. Settings › Cloud adds…" and "Everything in your cloud sources is already on this…" lines, the filter "All / On this phone / Cloud".
+diff -ruN c/GameAppLibrary.cs d/GameAppLibrary.cs
+--- c/GameAppLibrary.cs	2026-11-21 19:59:05
++++ d/GameAppLibrary.cs	2026-11-21 20:33:17
+@@ -577,6 +577,7 @@
+         base.ViewDidAppear(animated);
+         if (firstFrameDone) return;
+         firstFrameDone = true;
++        if (View.Window != null) View.Window.TintColor = Theme.Accent;   // patch 0082: the system's own controls (alerts, menus, pickers' buttons) take the accent, never the system blue
+         Write($"launch: first screen in {launchClock.ElapsedMilliseconds} ms");
+         NSTimer.CreateScheduledTimer(0.8, _ =>
+         {
+@@ -881,6 +882,7 @@
+         constraints.Add(splitDivider.BottomAnchor.ConstraintEqualTo(bar.TopAnchor, -14));
+         NSLayoutConstraint.ActivateConstraints(constraints.ToArray());
+         tabBarView = bar;
++        View.TintColor = Theme.Accent;   // patch 0082: no system blue under this view either
+         BuildSidebar();   // GameAppPadUi.cs (patch 0081): the iPad layout's sidebar and inspector, hidden until it applies
+     }
+ 
+@@ -936,6 +938,7 @@
+ 
+     private void ShowTab(int index)
+     {
++        if (index != 0) CloseInspector(refresh: false);   // patch 0082 (review M4): the iPad inspector belongs to the Library; it never covers Build or Settings
+         // A sub-page (Cloud, Keys, Logs) goes back where it was opened from: Settings, or the library (an export's
+         // log, the upload's cloud page, a banner); moving between sub-pages keeps the first one's way back.
+         if (index != 0 && index != 4 && index != 7 && (currentTab == 0 || currentTab == 4 || currentTab == 7)) subPageReturn = currentTab;
+@@ -2147,12 +2150,14 @@
+             }
+             catch (Exception) when (downloadCancels.IsRequested(key)) { cancelled = true; }   // patch 0080: whatever the copy or SSH.NET wrapped the stop in
+             catch (Exception e) { error = e.Message; }
+-            downloadCancels.Clear(key);
+             // patch 0079: the cover of each game file that landed (also when a later file of the set failed), read here, before the main thread hears of it: a "Download and build" starts its
+             // build only after this (GameAppCoverUi.cs, CoverPassForLanded: never while a build runs, never the person's own cover)
+             if (landed.Count > 0) CoverPassForLanded(landed, how);
+             BeginInvokeOnMainThread(() =>
+             {
++                // patch 0082 (review M1): a Cancel accepted after the worker's last look (the last block written, the cover pass) still counts: no build is started; the flag is cleared here
++                cancelled = DownloadEnd.Cancelled(cancelled, downloadCancels, key);
++                if (cancelled) error = null;
+                 downloads.Remove(key);
+                 UIApplication.SharedApplication.IdleTimerDisabled = false;
+                 UIApplication.SharedApplication.EndBackgroundTask(task);
+@@ -2262,7 +2267,11 @@
+         var update = GameAppUi.UpdateFor(game, names);
+         if (update != null) set.Add(update);
+         set.AddRange(GameAppUi.DlcFor(game, names));
+-        var paths = set.Where(n => Cloud.CloudCopyOf(n, cloudFiles) != null).Select(n => Path.Combine(GameAppMain.Documents, n)).ToList();
++        // patch 0082 (review L7): only a file the app brought from that cloud source (its import record) or of the cloud file's very size: never a hand-placed file that only shares a name
++        var ledger = ImportLedger.Load(GameAppMain.Documents);
++        var paths = set.Where(n => DownloadPairing.SameFile(SafeLength(Path.Combine(GameAppMain.Documents, n)), Cloud.CloudCopyOf(n, cloudFiles), ImportLedger.Find(ledger, n)))
++                       .Select(n => Path.Combine(GameAppMain.Documents, n)).ToList();
++        if (paths.Count == 0) { Write($"{game}: not removed: its file was not downloaded from the cloud copy of that name (sizes differ, no import record)"); return; }
+         RemoveFiles(paths, true);
+     }
+ 
+diff -ruN c/GameAppModsUi.cs d/GameAppModsUi.cs
+--- c/GameAppModsUi.cs	2026-11-21 19:57:22
++++ d/GameAppModsUi.cs	2026-11-21 20:33:17
+@@ -44,6 +44,7 @@
+         var add = UIKit.UIButton.FromType(UIKit.UIButtonType.System);
+         var cfg = UIKit.UIButtonConfiguration.FilledButtonConfiguration;
+         cfg.Title = "Add from Files…"; cfg.Image = UIKit.UIImage.GetSystemImage("plus.square.on.square"); cfg.ImagePadding = 8;
++        cfg.BaseBackgroundColor = Theme.Accent; cfg.BaseForegroundColor = UIKit.UIColor.Black;   // patch 0082: the accent with black words, never the system blue
+         add.Configuration = cfg; add.AccessibilityIdentifier = "mods-add";
+         add.TouchUpInside += (_, __) => ChooseSource(add);
+ 
+diff -ruN c/GameAppPadUi.cs d/GameAppPadUi.cs
+--- c/GameAppPadUi.cs	2026-11-21 19:59:48
++++ d/GameAppPadUi.cs	2026-11-21 20:30:56
+@@ -194,7 +194,7 @@
+         return Theme.Column(30, heroBlock, gridSection);
+     }
+ 
+-    private LibraryEntry HeroEntry() => libShown.FirstOrDefault(e => e.Name == selected) ?? libShown.FirstOrDefault();
++    private LibraryEntry HeroEntry() => libShown.FirstOrDefault(e => e.Name == FocusName) ?? libShown.FirstOrDefault();
+ 
+     private void RefreshHero()
+     {
+@@ -225,10 +225,13 @@
+             button.TouchUpInside += (_, __) => RunLibAct(act, e);
+             heroButtons.AddArrangedSubview(button);
+         }
+-        var settings = Look.RoundIcon("slider.horizontal.3", "Settings of this game", 52);
+-        settings.AccessibilityIdentifier = "hero-settings";
+-        settings.TouchUpInside += (_, __) => ShowGameSheet(e);
+-        heroButtons.AddArrangedSubview(settings);
++        if (GameSettingsRule.HasSettings(state))   // patch 0082: only a built game has settings and an inspector
++        {
++            var settings = Look.RoundIcon("slider.horizontal.3", "Settings of this game", 52);
++            settings.AccessibilityIdentifier = "hero-settings";
++            settings.TouchUpInside += (_, __) => ShowGameSheet(e);
++            heroButtons.AddArrangedSubview(settings);
++        }
+         heroNote.Hidden = !LibraryActions.ShowsNote(state, canRun);
+         ambient.SetHue(e.Icon != null ? Look.HueOf(e.Icon) : -1, true);
+     }
+@@ -241,7 +244,9 @@
+     /// The game sheet's page in the inspector (ShowGameSheet builds it the same way; `close` replaces the sheet's dismissal).
+     private void ShowInspector(UINavigationController nav, string game)
+     {
++        var fill = sheetLaunchFill;   // patch 0082 (review L1): ShowGameSheet set the new page's launch line; closing the old inspector must not drop it
+         CloseInspector(refresh: false);
++        sheetLaunchFill = fill;
+         inspectorNav = nav;
+         inspectorGame = game;
+         AddChildViewController(nav);
+diff -ruN c/GameAppRedesign.cs d/GameAppRedesign.cs
+--- c/GameAppRedesign.cs	2026-11-21 19:57:22
++++ d/GameAppRedesign.cs	2026-11-21 20:30:06
+@@ -15,7 +15,7 @@
+ public enum LibState { CloudOnly, Downloading, Building, Paused, NotBuilt, Built }
+ 
+ /// What a library button does (the owner's rule: Download / Cancel / Build / Play + Export IPA / Export IPA alone), plus the two states a build already had (Watch, Resume).
+-public enum LibAct { Download, CancelDownload, Watch, Resume, Build, Play, ExportIpa }
++public enum LibAct { Download, CancelDownload, Watch, Resume, Build, Play, ExportIpa, Update }
+ 
+ public sealed record LibButton(LibAct Act, string Label, bool Primary, string Symbol, string Id);
+ 
+@@ -64,11 +64,15 @@
+ 
+     /// "On the NAS", "In iCloud", "In Google Drive": the source a cloud game is in.
+     public static string CloudWhere(bool nas, string provider) =>
+-        nas ? "On the NAS" : provider == "iCloud Drive" ? "In iCloud" : "In " + (string.IsNullOrEmpty(provider) ? "the cloud" : provider);
++        nas ? "On the NAS" : provider == "iCloud Drive" ? "In iCloud" : Placed(provider);
+ 
+     /// The longer name for the meta line: "the NAS", "iCloud Drive".
+-    public static string CloudLong(bool nas, string provider) => nas ? "On the NAS" : "In " + (string.IsNullOrEmpty(provider) ? "the cloud" : provider);
++    public static string CloudLong(bool nas, string provider) => nas ? "On the NAS" : Placed(provider);
+ 
++    /// "In Google Drive"; a provider already worded as a place ("On this iPhone": a Files folder on the phone) as it is (patch 0082, review L4: it read "In On this iPhone").
++    private static string Placed(string provider) =>
++        string.IsNullOrEmpty(provider) ? "In the cloud" : provider.StartsWith("On ", StringComparison.Ordinal) || provider.StartsWith("In ", StringComparison.Ordinal) ? provider : "In " + provider;
++
+     public static (string Text, Tone Tone) Of(LibState state, double? fraction, string cloudWhere, bool update, string pausedChip)
+     {
+         string Pct(double? f) => Math.Round(Math.Max(0, Math.Min(1, f ?? 0)) * 100).ToString("0", CultureInfo.InvariantCulture);
+@@ -192,8 +196,8 @@
+         bool built = f.State == LibState.Built;
+         // a distribution certificate: the primary IS the export (Export IPA), not twice
+         if (built && f.CanRunHere && !f.Busy) items.Add(HoldItem.Export);
+-        items.Add(HoldItem.Settings);
+         bool cloud = f.State == LibState.CloudOnly || f.State == LibState.Downloading;
++        if (GameSettingsRule.HasSettings(f.State)) items.Add(HoldItem.Settings);   // patch 0082: settings exist only for a BUILT game (a cloud one: Download / Cancel, Hide; a local one: Build, cover, Delete)
+         if (f.LocalFile && !cloud) items.Add(HoldItem.ChooseCover);
+         if (built && f.Update && !f.Busy) items.Add(HoldItem.Update);
+         if (built && !f.Busy && f.WarmShown) items.Add(HoldItem.WarmToggle);
+@@ -203,7 +207,7 @@
+         if (f.LocalFile && f.UploadTargets > 0) items.Add(HoldItem.Upload);
+         if (f.LocalFile && f.HasCloudCopy) items.Add(HoldItem.RemoveDownload);
+         if (f.LocalFile && !f.Busy) items.Add(HoldItem.Delete);
+-        else if (!f.LocalFile && cloud) items.Add(HoldItem.Hide);
++        else if (!f.LocalFile && f.State == LibState.CloudOnly) items.Add(HoldItem.Hide);   // patch 0082 (review L5): never while it downloads (Cancel must stay reachable)
+         return items;
+     }
+ 
+@@ -496,6 +500,89 @@
+     };
+ }
+ 
++/// Patch 0082 (the owner): a game's settings (its sheet or iPad inspector: frame rate, upscaler, memory saver, mods, saves, logs, export) exist ONLY for a BUILT game. A game on this iPhone that
++/// is not built has a small action sheet instead ("Choose a cover…", "Delete the game file"); a game only in the cloud has Download / Cancel and Hide from the library.
++public static class GameSettingsRule
++{
++    public static bool HasSettings(LibState state) => state == LibState.Built;
++
++    public const string NotBuiltNote = "Not built yet: its settings come once it is built";
++
++    /// Review L6: a tap on Settings while a build runs said nothing.
++    public const string BusyTitle = "A build is running", BusyNote = "The game's settings open once the build ends. Watch the build shows how far it is.";
++}
++
++/// Patch 0082 (review M3): the redraw key of the Library's cards, the carousel's buttons and the Build tab's rows: what makes them be BUILT again (names, states, labels, what is on),
++/// never a percentage: a redraw every second during a download updates the bars and the words in place, so a tap, a 0.5 s hold or VoiceOver's focus is not lost.
++public static class RedrawKey
++{
++    public static string Of(IEnumerable<string> parts) => string.Join("\u001f", parts ?? Enumerable.Empty<string>());
++
++    public static string Card(string name, LibState state, bool update, bool busy, bool canRun, bool hasIcon, bool warm) =>
++        Of(new[] { name, state.ToString(), update ? "u" : "", busy ? "b" : "", canRun ? "r" : "", hasIcon ? "i" : "", warm ? "w" : "" });
++
++    public static string Row(BuildRowView r) => Of(new[] { r.Name, r.Act.ToString(), r.Button, r.Primary ? "p" : "", r.HasMore ? "m" : "", r.Cloud ? "c" : "", r.Fraction == null ? "" : "f" });
++}
++
++/// Patch 0082 (review L7): "Remove download (stays in the cloud)" is offered and done only for a file the app itself brought from that source (its import record names the source), or one
++/// whose size is the cloud file's: a hand-placed file that merely has the name of a cloud file (now likelier with 0077/0079's subfolders) is never called a download.
++public static class DownloadPairing
++{
++    public static bool SameFile(long localSize, CloudFile cloud, ImportRecord record)
++    {
++        if (cloud == null) return false;
++        bool imported = record != null && !record.Removed && record.SourceId == cloud.SourceId
++                        && (record.How == ImportHow.Download || record.How == ImportHow.Clone || record.How == ImportHow.Copy);
++        return imported || (cloud.Size > 0 && localSize > 0 && cloud.Size == localSize);
++    }
++}
++
++/// Patch 0082: the Build tab of the prototype: READY TO BUILD (the games of this iPhone that need a build) and IN THE CLOUD, each a compact row, a count beside each section's title; the
++/// header's counts come from the same list, so they can never disagree with the rows (the "0 on this iPhone" seen on the owner's phone beside a listed game).
++public sealed record BuildGame(string Name, LibState State, string Size, string CloudWhere, bool Update, double? Fraction);
++public sealed record BuildRowView(string Name, string Note, bool NoteAccent, LibAct Act, string Button, bool Primary, bool HasMore, bool Cloud, double? Fraction);
++public sealed record BuildSection(string Title, int Count, IReadOnlyList<BuildRowView> Rows);
++
++public static class BuildList
++{
++    public const string IdleTitle = "Nothing is building", IdleNote = "A build ends on Ready. Play starts the game.", RunningNote = "Continues if you leave the app.";
++
++    private static string Pct(double? f) => Math.Round(Math.Max(0, Math.Min(1, f ?? 0)) * 100).ToString("0", CultureInfo.InvariantCulture);
++
++    public static BuildRowView Row(BuildGame g)
++    {
++        string Sized(string s) => string.IsNullOrEmpty(g.Size) ? s : g.Size + " · " + s;
++        switch (g.State)
++        {
++            case LibState.CloudOnly: return new BuildRowView(g.Name, Sized(g.CloudWhere ?? "In the cloud"), false, LibAct.Download, "Download", true, false, true, null);
++            case LibState.Downloading: return new BuildRowView(g.Name, $"Downloading · {Pct(g.Fraction)} %", true, LibAct.CancelDownload, "Cancel", false, false, true, g.Fraction ?? 0);
++            case LibState.Built when g.Update: return new BuildRowView(g.Name, Sized("Update available"), false, LibAct.Update, "Update", true, true, false, null);
++            default: return new BuildRowView(g.Name, Sized("Not built"), false, LibAct.Build, "Build", true, true, false, null);
++        }
++    }
++
++    /// READY TO BUILD: on this iPhone and not built (or built before an update or DLC was added); IN THE CLOUD: only in a cloud source. A game being built or paused is the "Now building"
++    /// card's, a built one the Library's. An empty section is not shown.
++    public static List<BuildSection> Sections(IEnumerable<BuildGame> games)
++    {
++        var list = (games ?? Enumerable.Empty<BuildGame>()).ToList();
++        var ready = list.Where(g => g.State == LibState.NotBuilt || (g.State == LibState.Built && g.Update)).Select(Row).ToList();
++        var cloud = list.Where(g => g.State == LibState.CloudOnly || g.State == LibState.Downloading).Select(Row).ToList();
++        var sections = new List<BuildSection>();
++        if (ready.Count > 0) sections.Add(new BuildSection("Ready to build", ready.Count, ready));
++        if (cloud.Count > 0) sections.Add(new BuildSection("In the cloud", cloud.Count, cloud));
++        return sections;
++    }
++
++    /// The header's line, from the same games: "3 on this iPhone · 2 in the cloud · 1 queued".
++    public static string Header(IEnumerable<BuildGame> games, int queued, string device)
++    {
++        var list = (games ?? Enumerable.Empty<BuildGame>()).ToList();
++        int cloud = list.Count(g => g.State == LibState.CloudOnly || g.State == LibState.Downloading), local = list.Count - cloud;
++        return $"{local} on this {device}" + (cloud > 0 ? $" · {cloud} in the cloud" : "") + (queued > 0 ? $" · {queued} queued" : "");
++    }
++}
++
+ /// The library's hidden cloud games, as kept (one name a line).
+ public static class HiddenGames
+ {
+@@ -509,6 +596,18 @@
+     {
+         var here = new HashSet<string>(local ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+         return string.Join("\n", Parse(text).Where(n => !here.Contains(n)));
++    }
++}
++
++/// Patch 0082 (review M1): the end of a download on the main thread: a Cancel that came after the worker's last look (the last block written, the cover pass reading) still counts, and the
++/// flag is cleared there, so it never leaks into the next download of the name. True: cancelled.
++public static class DownloadEnd
++{
++    public static bool Cancelled(bool workerSawCancel, CancelFlags flags, string key)
++    {
++        bool cancelled = workerSawCancel || (flags != null && flags.IsRequested(key));
++        flags?.Clear(key);
++        return cancelled;
+     }
+ }
+ 
+diff -ruN c/GameAppRedesignUi.cs d/GameAppRedesignUi.cs
+--- c/GameAppRedesignUi.cs	2026-11-21 19:59:48
++++ d/GameAppRedesignUi.cs	2026-11-21 20:32:01
+@@ -87,11 +87,11 @@
+             c.PreferredSymbolConfigurationForImage = UIImageSymbolConfiguration.Create(UIFont.SystemFontOfSize(font - 2, UIFontWeight.Bold));
+         }
+         c.CornerStyle = UIButtonConfigurationCornerStyle.Capsule;
+-        c.BaseBackgroundColor = primary ? (fill ?? Theme.Accent) : UIColor.FromRGBA(25 / 255f, 25 / 255f, 31 / 255f, 0.75f);
++        c.BaseBackgroundColor = primary ? Theme.Accent : Raised;   // patch 0082: primary = the accent, black words; secondary = #25252b with a hairline (never a gradient, never blue)
+         c.BaseForegroundColor = primary ? OnAccent : Theme.Text;
+         c.ContentInsets = new NSDirectionalEdgeInsets(0, 14, 0, 14);
+         b.Configuration = c;
+-        if (!primary) { b.Layer.CornerRadius = height / 2; b.Layer.BorderWidth = 1; b.Layer.BorderColor = Edge.CGColor; }
++        if (!primary) { b.Layer.CornerRadius = height / 2; b.Layer.BorderWidth = 1; b.Layer.BorderColor = UIColor.FromWhiteAlpha(1f, 0.12f).CGColor; }
+         b.HeightAnchor.ConstraintEqualTo(height).Active = true;   // under 44 pt the touch area still is 44 (HitButton)
+         b.AccessibilityLabel = title;
+         b.PointerInteractionEnabled = true;
+@@ -210,8 +210,9 @@
+         return grey;
+     }
+ 
+-    /// The game's own primary colour (light, black words on it); the accent for a game only in the cloud.
+-    public static UIColor AccentOf(UIImage icon, bool grey) => grey ? Theme.Accent : Rgb(CoverHue.Accent(HueOf(icon)));
++    /// The primary buttons' colour. Patch 0082 (the owner, after the device screenshots): always the accent #efb15a with black words, as the design system says; a game's own hue only tints
++    /// the ground's glow (0080 gave each game's buttons a light shade of its cover's hue).
++    public static UIColor AccentOf(UIImage icon, bool grey) => Theme.Accent;
+ }
+ 
+ /// A button whose touch area reaches at least 44 x 44 pt around a smaller drawing (the grid's 36 pt actions): the prototype's size, the accessibility target.
+@@ -330,6 +331,7 @@
+     public Action<int> Open;
+     public Action<int, UIView> Hold;
+     public bool Panning => panning;
++    public UIView FocusedCell => Focus >= 0 && Focus < cells.Count ? cells[Focus] : null;
+ 
+     public CoverFlowView()
+     {
+@@ -591,7 +593,8 @@
+     {
+         bool cloudOnly = e.Cloud != null && !File.Exists(Path.Combine(GameAppMain.Documents, e.Name));
+         bool downloading = downloads.TryGetValue(e.Name, out var d);
+-        bool building = running && !string.IsNullOrEmpty(e.Name) && e.Name == selected && launchingGame == null && facts.Running;
++        // patch 0082 (review M2): the game being built is the RUN's (stop.Game, else lastRunGame), never `selected`, which a swipe or an iPad card changed during the build
++        bool building = running && launchingGame == null && facts.Running && !string.IsNullOrEmpty(e.Name) && e.Name == (stop.Game ?? lastRunGame);
+         fraction = downloading ? Math.Max(0.02, d) : building ? Math.Max(0.02, GameAppUi.ParseStage(lastStage).Fraction) : (double?) null;
+         bool paused = !cloudOnly && PausedOf(e.Name, facts) != null;
+         bool ready = !cloudOnly && GameAppUi.GameStatusOf(e.Name, facts) == GameAppUi.GameStatus.Ready;
+@@ -627,6 +630,7 @@
+             case LibAct.Resume: ResumePaused(e.Name); break;
+             case LibAct.Build: case LibAct.Play: selected = e.Name; PrimaryTapped(); break;
+             case LibAct.ExportIpa: selected = e.Name; ConfirmExport(e.Name); break;
++            case LibAct.Update: DoUpdate(e.Name); break;   // patch 0082: the Build tab's "Update" (an update or DLC added since the build)
+         }
+     }
+ 
+@@ -647,6 +651,17 @@
+     private UIButton libToggle;
+     private List<LibraryEntry> libShown = new List<LibraryEntry>();
+     private UiFacts libFacts;
++    private string gridKey, flowKey, libFocus;   // patch 0082 (review M2, M3)
++    private readonly Dictionary<string, (UILabel Status, UIProgressView Bar)> gridLive = new Dictionary<string, (UILabel, UIProgressView)>();
++
++    /// The game the carousel / the iPad's hero shows. `selected` (what Play, the build screen and the notification use) follows it only when no build or boot runs (review M2).
++    private string FocusName => libFocus != null && libShown.Any(x => x.Name == libFocus) ? libFocus : selected;
++
++    private void FocusOn(string name)
++    {
++        libFocus = name;
++        if (!running) selected = name;
++    }
+     private const string HiddenKey = "library_hidden";
+ 
+     /// "Hide from the library": a game only in the cloud leaves the library (it stays on the Cloud page; Settings › Sources shows it again).
+@@ -670,6 +685,7 @@
+         PresentWhenFree(a);
+     }
+     private List<string> libNames;
++    private List<ImportRecord> libLedger;
+ 
+     private void BuildLibrary()
+     {
+@@ -694,8 +710,14 @@
+         // the cover flow, its words and its buttons
+         flow = new CoverFlowView { AccessibilityIdentifier = "library-carousel" };
+         flow.HeightAnchor.ConstraintEqualTo(280).Active = true;
+-        flow.FocusChanged += i => { if (i >= 0 && i < libShown.Count) { selected = libShown[i].Name; RefreshFlowFocus(); } };
+-        flow.Open = i => { if (i >= 0 && i < libShown.Count) ShowGameSheet(libShown[i]); };
++        flow.FocusChanged += i => { if (i >= 0 && i < libShown.Count) { FocusOn(libShown[i].Name); RefreshFlowFocus(); } };
++        flow.Open = i =>
++        {
++            if (i < 0 || i >= libShown.Count) return;
++            // patch 0082: only a built game has settings: another's cover opens its menu (Download / Cancel and Hide; Build, Choose a cover…, Delete…)
++            if (libFacts != null && !GameSettingsRule.HasSettings(LibStateOf(libShown[i], libFacts, out _))) { var c = flow.FocusedCell; if (c != null) ShowHold(libShown[i], c, 38, 0, 1, 1); }
++            else ShowGameSheet(libShown[i]);
++        };
+         flow.Hold = (i, cell) => { if (i >= 0 && i < libShown.Count) ShowHold(libShown[i], cell, 38, 0, 1, 1); };
+         flowTitle = Theme.Label("", Theme.Font(28, UIFontWeight.Bold), Theme.Text, 2);
+         flowTitle.TextAlignment = UITextAlignment.Center;
+@@ -767,6 +789,7 @@
+         // the games of this iPhone, then the ones only in a cloud source (the cached listing; each game once, the local one wins: LibraryMerge)
+         var localNames = Dumps().Select(Path.GetFileName).ToList();
+         libNames = localNames;   // one listing of Documents for the whole redraw (the cards' "Update available" and menus read it)
++        libLedger = ImportLedger.Load(GameAppMain.Documents);   // patch 0082: the import record, read once a redraw (a small file)
+         var list = games.Select(g => new LibraryEntry(g, Cloud.CloudCopyOf(g, cloudFiles), CoverOf(g, facts))).ToList();
+         var cloudOnly = Cloud.CloudOnlyGames(localNames, cloudFiles);
+         list.AddRange(cloudOnly.Select(f => new LibraryEntry(f.Name, f, CoverOf(f.Name, facts))));
+@@ -793,8 +816,16 @@
+         carouselBlock.Hidden = !any || grid;
+         gridBlock.Hidden = !any || !grid;
+ 
+-        shelfKeep.Clear();
+-        warmShelfViews.Clear();   // GameAppWarm.cs: the cards drawn below add their bars again
++        // patch 0082 (review M3): the grid is built again only when its key changes (names, states, labels, what is on); else its bars and words are updated in place
++        var gridKeyNow = RedrawKey.Of(new[] { grid ? "g" : "c", GridColumns.ToString(), padWide ? "p" : "", WarmShownTitle() ?? "", warmQueue.Paused ? "wp" : "" }
++            .Concat(libShown.Select(e => { var s = LibStateOf(e, facts, out _); return RedrawKey.Card(e.Name, s, s == LibState.Built && GameAppUi.ContentChangedSinceBuild(e.Name, libNames, facts), facts.Running, CanRunHere(facts), e.Icon != null, false); })));
++        bool rebuildGrid = gridKeyNow != gridKey;
++        if (rebuildGrid)
++        {
++            shelfKeep.Clear();
++            warmShelfViews.Clear();   // GameAppWarm.cs: the cards drawn below add their bars again
++            gridLive.Clear();
++        }
+         warmShelfTitle = WarmShownTitle();
+         warmShelfPaused = warmQueue.Paused;
+ 
+@@ -806,10 +837,26 @@
+             bool grey = state == LibState.CloudOnly || state == LibState.Downloading;
+             return new FlowItem(e.Name, GameAppUi.DisplayName(e.Name), e.Icon, grey, grey, status.Text, status.Tone, state == LibState.Downloading || state == LibState.Building ? fraction : null);
+         }).ToList();
+-        int focus = Math.Max(0, libShown.FindIndex(e => e.Name == selected));
++        int focus = Math.Max(0, libShown.FindIndex(e => e.Name == FocusName));
+         flow.SetItems(items, focus);
+         RefreshFlowFocus();
+ 
++        if (!rebuildGrid)
++        {
++            foreach (var e in libShown)
++                if (gridLive.TryGetValue(e.Name, out var live))
++                {
++                    var s = LibStateOf(e, facts, out var f);
++                    var st = StatusOf(e, s, f, facts);
++                    live.Status.Text = st.Text;
++                    live.Status.TextColor = Look.ToneColor(st.Tone);
++                    live.Bar.Hidden = f == null || !(s == LibState.Downloading || s == LibState.Building);
++                    if (f != null) live.Bar.SetProgress((float) f.Value, false);
++                }
++        }
++        else
++        {
++        gridKey = gridKeyNow;
+         // the grid is drawn again
+         foreach (var v in gridRows.ArrangedSubviews.ToArray()) { gridRows.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+         if (grid)
+@@ -824,6 +871,7 @@
+                 gridRows.AddArrangedSubview(pair);
+             }
+         }
++        }
+         RefreshHero();      // GameAppPadUi.cs (patch 0081)
+         RefreshSidebar();
+ 
+@@ -837,17 +885,29 @@
+         if (flow == null || libFacts == null) return;
+         var facts = libFacts;
+         int fi = flow.Focus;
+-        foreach (var v in flowDots.ArrangedSubviews.ToArray()) { flowDots.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+-        foreach (var v in flowButtons.ArrangedSubviews.ToArray()) { flowButtons.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+-        if (fi < 0 || fi >= libShown.Count) { flowTitle.Text = flowMeta.Text = ""; flowNote.Hidden = true; ambient.SetHue(-1, true); return; }
++        if (fi < 0 || fi >= libShown.Count)
++        {
++            foreach (var v in flowButtons.ArrangedSubviews.ToArray()) { flowButtons.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++            flowKey = null;
++            flowTitle.Text = flowMeta.Text = ""; flowNote.Hidden = true; ambient.SetHue(-1, true); return;
++        }
+         var e = libShown[fi];
+         var state = LibStateOf(e, facts, out _);
+         bool canRun = CanRunHere(facts);
++        // patch 0082 (review M3): the dots and the buttons are built again only when the focus, the state or what the buttons say changes; the words are always refreshed
++        var flowKeyNow = RedrawKey.Of(new[] { fi.ToString(), libShown.Count.ToString(), RedrawKey.Card(e.Name, state, false, facts.Running, canRun, e.Icon != null, false), running && launchingGame == e.Name ? "s" : "" });
++        bool rebuildFlow = flowKeyNow != flowKey;
++        flowKey = flowKeyNow;
++        if (rebuildFlow)
++        {
++            foreach (var v in flowDots.ArrangedSubviews.ToArray()) { flowDots.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++            foreach (var v in flowButtons.ArrangedSubviews.ToArray()) { flowButtons.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        }
+         flowTitle.Text = GameAppUi.DisplayName(e.Name);
+         long size = e.Cloud != null && (state == LibState.CloudOnly || state == LibState.Downloading) ? e.Cloud.Size : 0;
+         var sizeText = size > 0 ? GameAppUi.SizeText(size) : ShelfMeta(e);
+         flowMeta.Text = LibraryStatus.Meta(state, e.Name, sizeText, CloudWords(e.Cloud).Long, canRun, GameAppUi.DeviceName);
+-        int shown = Math.Min(libShown.Count, 15);
++        int shown = rebuildFlow ? Math.Min(libShown.Count, 15) : 0;
+         int first = Math.Max(0, Math.Min(fi - shown / 2, libShown.Count - shown));
+         for (int i = first; i < first + shown; i++)
+         {
+@@ -859,13 +919,16 @@
+         }
+         flowDots.AccessibilityLabel = $"Game {fi + 1} of {libShown.Count}";
+ 
+-        var settings = Look.RoundIcon("slider.horizontal.3", "Settings of this game", 54);
+-        settings.AccessibilityIdentifier = "library-game-settings";
+-        settings.TouchUpInside += (_, __) => ShowGameSheet(e);
+-        flowButtons.AddArrangedSubview(settings);
++        if (rebuildFlow && GameSettingsRule.HasSettings(state))   // patch 0082: only for a built game
++        {
++            var settings = Look.RoundIcon("slider.horizontal.3", "Settings of this game", 54);
++            settings.AccessibilityIdentifier = "library-game-settings";
++            settings.TouchUpInside += (_, __) => ShowGameSheet(e);
++            flowButtons.AddArrangedSubview(settings);
++        }
+         bool grey = state == LibState.CloudOnly || state == LibState.Downloading;
+         var accent = Look.AccentOf(e.Icon, grey);
+-        foreach (var b in LibraryActions.For(state, canRun))
++        foreach (var b in rebuildFlow ? LibraryActions.For(state, canRun) : new LibButton[0])
+         {
+             var button = Look.Capsule(state == LibState.Built && b.Act == LibAct.Play && running && launchingGame == e.Name ? "Starting…" : b.Label, b.Symbol, b.Primary, accent, 54, b.Primary ? 16 : 15);
+             button.AccessibilityIdentifier = b.Id;
+@@ -888,6 +951,7 @@
+         bool grey = state == LibState.CloudOnly || state == LibState.Downloading;
+         var display = GameAppUi.DisplayName(e.Name);
+ 
++        UIView card = null;   // the card, made below (its tap may open its menu, anchored to it)
+         var open = new UIControl { AccessibilityIdentifier = "game-tile", IsAccessibilityElement = true, AccessibilityTraits = UIAccessibilityTrait.Button };
+         open.AccessibilityLabel = display + ", " + status.Text;
+         open.AccessibilityHint = "Touch and hold for actions";
+@@ -935,10 +999,18 @@
+             info.TopAnchor.ConstraintEqualTo(open.TopAnchor), info.BottomAnchor.ConstraintEqualTo(open.BottomAnchor),
+             info.LeadingAnchor.ConstraintEqualTo(open.LeadingAnchor), info.TrailingAnchor.ConstraintEqualTo(open.TrailingAnchor),
+         });
+-        open.TouchUpInside += (_, __) => { if (padWide) { selected = e.Name; RefreshScreen(); } else ShowGameSheet(e); };   // patch 0081: on an iPad a card selects the hero's game
++        open.TouchUpInside += (_, __) =>
++        {
++            if (padWide) { FocusOn(e.Name); RefreshScreen(); }
++            else if (!GameSettingsRule.HasSettings(state)) ShowHold(e, card, 16, index, count, GridColumns);   // patch 0082: only a built game has settings; another's tap opens its menu
++            else ShowGameSheet(e);
++        };   // patch 0081: on an iPad a card selects the hero's game
+ 
+         var parts = new List<UIView> { open };
+-        if (fraction != null && (state == LibState.Downloading || state == LibState.Building)) parts.Add(Look.Bar((float) fraction.Value, Theme.Accent, 4));
++        var cardBar = Look.Bar((float) (fraction ?? 0), Theme.Accent, 4);
++        cardBar.Hidden = fraction == null || !(state == LibState.Downloading || state == LibState.Building);
++        parts.Add(cardBar);
++        gridLive[e.Name] = (line, cardBar);   // patch 0082 (review M3): updated in place between two rebuilds
+         if (WarmStrip(e.Name, false) is UIView warm) parts.Add(warm);   // GameAppWarm.cs (0070, 0076): the shaders being prepared, with its bar
+         // the actions on ONE row (the owner's third correction): the primary a pill filling the width, a second action (Export IPA beside Play) a 36 pt round icon-only button at its right
+         bool canRun = CanRunHere(facts);
+@@ -966,7 +1038,7 @@
+         var stack = Theme.Column(8, parts.ToArray());
+         stack.SetCustomSpacing(10, parts[^1]);
+         stack.AddArrangedSubview(row);
+-        var card = Look.Card(stack, 10, 10);
++        card = Look.Card(stack, 10, 10);
+         card.ClipsToBounds = true;
+ 
+         var hold = new UILongPressGestureRecognizer(g => { if (g.State == UIGestureRecognizerState.Began) ShowHold(e, card, 16, index, count, GridColumns); }) { MinimumPressDuration = 0.5 };
+@@ -989,7 +1061,9 @@
+         bool warmQueued = tid != null && warmQueue.Titles.Contains(tid.ToUpperInvariant());
+         bool update = state == LibState.Built && GameAppUi.ContentChangedSinceBuild(name, libNames ?? Dumps().Select(Path.GetFileName).ToList(), facts);
+         var targets = UploadTargets().Where(t => e.Cloud == null || e.Cloud.SourceId != t.Id).ToList();
+-        var plan = HoldMenuPlan.Items(new HoldFacts(state, canRun, update, local, facts.Running, warmShown, warmQueued, targets.Count, e.Cloud != null));
++        // patch 0082 (review L7): "Remove download" only for the file the app brought from that source (or of its size)
++        bool downloaded = local && e.Cloud != null && DownloadPairing.SameFile(SafeLength(path), e.Cloud, ImportLedger.Find(libLedger ?? ImportLedger.Load(GameAppMain.Documents), name));
++        var plan = HoldMenuPlan.Items(new HoldFacts(state, canRun, update, local, facts.Running, warmShown, warmQueued, targets.Count, downloaded));
+         var list = new List<HoldOverlay.Entry>();
+         var primary = LibraryActions.For(state, canRun)[0];
+         foreach (var item in plan)
+@@ -1091,7 +1165,6 @@
+         tileCert = Tile("Certificate", "settings-certificate", () => { if (GameAppMain.IdentityState().Holding == 1) ShowTab(2); else ImportCertificate(); });
+         tileMemory = Tile("Extended memory", "settings-memory", () => ShowTab(2));
+         tileAddress = Tile("Extended address", "settings-address", () => ShowTab(2));
+-        navRows[2] = tileCert.Button;
+         UIStackView Pair(UIView a, UIView b) => new UIStackView(new[] { a, b }) { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Alignment = UIStackViewAlignment.Fill, Spacing = 12 };
+         tilesOuter = Theme.Column(12, Pair(tileKeys.Button, tileCert.Button), Pair(tileMemory.Button, tileAddress.Button));   // patch 0081: one row of four on an iPad (ArrangeSettings)
+         return tilesOuter;
+@@ -1163,7 +1236,8 @@
+     // ---- the Build tab's card: the game, its stages and their times, the shader count -----------------------------
+ 
+     private CoverView nowArt;
+-    private UILabel nowName, nowPill, nowNote, buildIdle, nowSectionLabel;
++    private UILabel nowName, nowPill, nowNote, nowSectionLabel;
++    private UIView buildIdleRow;
+     private readonly List<(UILabel Mark, UILabel Name, UILabel Time)> nowStages = new List<(UILabel, UILabel, UILabel)>();
+ 
+     private UIView MakeNowCard()
+@@ -1213,11 +1287,14 @@
+             var bg = c.Background; bg.CornerRadius = 12; c.Background = bg;
+             b.Configuration = c;
+         }
+-        var watch = Look.Capsule("Watch the build", "list.bullet.rectangle", false, null, 44, 14);
++        // patch 0082: the build screen (the whole log) is a small round button beside the pill, not a row of its own; the note is one short line
++        var watch = Look.RoundIcon("list.bullet.rectangle", "Watch the build", 32, Look.Raised);
++        watch.AccessibilityIdentifier = "build-watch";
+         watch.TouchUpInside += (_, __) => ShowBuildScreen();
+         buildWatch = watch;
+-        nowNote = Theme.Label("", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
+-        var column = Theme.Column(14, head, stages, buildNowBar, buildStopRow, watch, nowNote);
++        head.AddArrangedSubview(watch);
++        nowNote = Theme.Label(BuildList.RunningNote, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
++        var column = Theme.Column(14, head, stages, buildNowBar, buildStopRow, nowNote);
+         column.SetCustomSpacing(10, buildStopRow);
+         buildNowCard = Look.Card(column, 16, 16);
+         buildNowCard.AccessibilityIdentifier = "build-now-card";
+@@ -1225,12 +1302,28 @@
+         return buildNowCard;
+     }
+ 
++    /// Patch 0082: "Now building" when nothing builds: one compact row.
++    private UIView IdleRow()
++    {
++        var dot = new UIView { BackgroundColor = Look.Raised, UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        dot.Layer.CornerRadius = 18;
++        var mark = Theme.Symbol("hammer", 16, Theme.Muted);
++        dot.AddSubview(mark);
++        NSLayoutConstraint.ActivateConstraints(new[] { dot.WidthAnchor.ConstraintEqualTo(36), dot.HeightAnchor.ConstraintEqualTo(36), mark.CenterXAnchor.ConstraintEqualTo(dot.CenterXAnchor), mark.CenterYAnchor.ConstraintEqualTo(dot.CenterYAnchor) });
++        var texts = Theme.Column(1, Theme.Label(BuildList.IdleTitle, Theme.Font(15, UIFontWeight.Regular), Theme.Text), Theme.Label(BuildList.IdleNote, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0));
++        var row = Look.Card(Theme.Row(12, dot, texts), 14, 16);
++        row.IsAccessibilityElement = true;
++        row.AccessibilityLabel = BuildList.IdleTitle + ". " + BuildList.IdleNote;
++        row.AccessibilityIdentifier = "build-idle";
++        return row;
++    }
++
+     /// After UpdateNowCard (GameAppStopUi.cs, which decides what the card is about and its buttons): the design's words, pill, stages and times.
+     private void UpdateNowCardLook(UiFacts facts)
+     {
+         if (nowName == null || buildNowCard == null) return;
+         bool shown = !buildNowCard.Hidden;
+-        if (buildIdle != null) buildIdle.Hidden = shown;
++        if (buildIdleRow != null) buildIdleRow.Hidden = shown;
+         if (!shown) return;
+         string game; string stageLine; bool live = running;
+         PausedBuild paused = null;
+diff -ruN c/GameAppResume.cs d/GameAppResume.cs
+--- c/GameAppResume.cs	2026-11-21 19:57:22
++++ d/GameAppResume.cs	2026-11-21 20:33:17
+@@ -85,7 +85,7 @@
+         var line = new NSMutableAttributedString();
+         line.Append(new NSAttributedString("! ", new UIStringAttributes { Font = bold, ForegroundColor = UIColor.SystemOrange }));
+         line.Append(new NSAttributedString("iOS ended the last build (memory).  ", new UIStringAttributes { Font = bold, ForegroundColor = UIColor.Label }));
+-        line.Append(new NSAttributedString("Resume", new UIStringAttributes { Font = bold, ForegroundColor = UIColor.SystemBlue }));
++        line.Append(new NSAttributedString("Resume", new UIStringAttributes { Font = bold, ForegroundColor = Theme.Accent }));   // patch 0082: no blue (was SystemBlue)
+         label.AttributedText = line;
+         label.AccessibilityLabel = "iOS ended the last build (memory). Resume";
+         var view = new BannerView(label, UIColor.SystemOrange) { AccessibilityLabel = "iOS ended the last build (memory). Resume", AccessibilityIdentifier = "banner-resume" };
+diff -ruN c/GameAppSavesUi.cs d/GameAppSavesUi.cs
+--- c/GameAppSavesUi.cs	2026-11-21 19:57:22
++++ d/GameAppSavesUi.cs	2026-11-21 20:33:17
+@@ -34,6 +34,8 @@
+         var b = UIKit.UIButton.FromType(UIKit.UIButtonType.System);
+         var c = filled ? UIKit.UIButtonConfiguration.FilledButtonConfiguration : UIKit.UIButtonConfiguration.TintedButtonConfiguration;
+         c.Title = title; c.Image = UIKit.UIImage.GetSystemImage(symbol); c.ImagePadding = 8;
++        if (filled) { c.BaseBackgroundColor = Theme.Accent; c.BaseForegroundColor = UIKit.UIColor.Black; }   // patch 0082: the accent with black words, never the system blue
++        else c.BaseForegroundColor = Theme.Accent;
+         b.Configuration = c; b.AccessibilityIdentifier = id;
+         b.TouchUpInside += (_, __) => tapped();
+         return b;
+diff -ruN c/GameAppShelf.cs d/GameAppShelf.cs
+--- c/GameAppShelf.cs	2026-11-21 19:59:48
++++ d/GameAppShelf.cs	2026-11-21 20:32:40
+@@ -60,7 +60,8 @@
+     }
+ }
+ 
+-/// The background of a primary button: a gradient of the game's own colour (the average of its cover, else the colour of its name). A button configuration takes it as its background view.
++/// The background of a primary button. Patch 0082 (the owner: no blue, no gradient buttons anywhere): the accent #efb15a, flat, with black words, whatever colour is passed (it was a
++/// gradient of the game's own colour: the average of its cover, else the colour of its name, which drew blue gradient buttons).
+ internal sealed class GradientBackView : UIView
+ {
+     [Export("layerClass")]
+@@ -72,21 +73,14 @@
+     public GradientBackView(UIColor tint)
+     {
+         UserInteractionEnabled = false;
+-        tint.GetRGBA(out nfloat r, out nfloat g, out nfloat b, out nfloat a);
+-        var top = UIColor.FromRGBA((nfloat) Math.Min(1.0, (double) r * 1.1 + 0.06), (nfloat) Math.Min(1.0, (double) g * 1.1 + 0.06), (nfloat) Math.Min(1.0, (double) b * 1.1 + 0.06), 1f);
+-        var bottom = UIColor.FromRGBA(r * 0.58f, g * 0.58f, b * 0.58f, 1f);
+         var gradient = (CAGradientLayer) Layer;
+-        gradient.StartPoint = new CGPoint(0, 0);
+-        gradient.EndPoint = new CGPoint(1, 1);
+-        gradient.Colors = new[] { top.CGColor, bottom.CGColor };
+-        double lum = 0.2126 * (double) r + 0.7152 * (double) g + 0.0722 * (double) b;
+-        Foreground = lum > 0.62 ? Theme.Ground : UIColor.White;
++        gradient.Colors = new[] { Theme.Accent.CGColor, Theme.Accent.CGColor };
++        Foreground = UIColor.Black;
+     }
+ }
+ 
+ public sealed partial class GameAppViewController
+ {
+-    private sealed record ShelfAct(string Title, string Symbol, bool Primary, Action Do, UIMenu Menu = null, string Id = null);
+ 
+     // ---- Library -----------------------------------------------------------------------------------------------
+ 
+@@ -95,16 +89,6 @@
+     private string shelfView = "carousel";   // patch 0080: "carousel" (the cover flow) or "grid", kept in NSUserDefaults "library_view"
+     private readonly List<NSObject> shelfKeep = new List<NSObject>();
+ 
+-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<UIImage, UIColor> tintCache = new System.Runtime.CompilerServices.ConditionalWeakTable<UIImage, UIColor>();
+-
+-    /// The colour a game gives its primary button: its cover's average, else the colour of its name.
+-    private static UIColor TintOf(UIImage icon, string name)
+-    {
+-        if (icon == null) return Theme.ColorFor(name);
+-        if (!tintCache.TryGetValue(icon, out var tint)) { tint = Theme.AverageColor(icon); tintCache.Add(icon, tint); }
+-        return tint;
+-    }
+-
+     private static UIButton ShelfButton(string title, string symbol, bool primary, bool compact, bool enabled, UIColor tint = null)
+     {
+         bool tinted = primary && tint != null;
+@@ -129,8 +113,9 @@
+         }
+         else
+         {
+-            c.BaseBackgroundColor = primary ? Theme.Accent : UIColor.FromWhiteAlpha(1f, 0.12f);
+-            c.BaseForegroundColor = primary ? Theme.Ground : Theme.Text;
++            c.BaseBackgroundColor = primary ? Theme.Accent : Look.Raised;   // patch 0082: secondary = #25252b with a hairline
++            c.BaseForegroundColor = primary ? UIColor.Black : Theme.Text;
++            if (!primary) { b.Layer.CornerRadius = 12; b.Layer.BorderWidth = 1; b.Layer.BorderColor = UIColor.FromWhiteAlpha(1f, 0.12f).CGColor; }
+         }
+         c.ContentInsets = new NSDirectionalEdgeInsets(0, compact ? 0 : 8, 0, compact ? 0 : 8);
+         b.Configuration = c;
+@@ -143,15 +128,6 @@
+         return b;
+     }
+ 
+-    private static UIButton ShelfActButton(ShelfAct a, bool compact, bool enabled, UIColor tint = null)
+-    {
+-        var b = ShelfButton(a.Title, a.Symbol, a.Primary, compact || a.Symbol == "ellipsis", enabled, tint);   // the "more" menu is an icon
+-        if (a.Id != null) b.AccessibilityIdentifier = a.Id;
+-        if (a.Menu != null) { b.Menu = a.Menu; b.ShowsMenuAsPrimaryAction = true; }
+-        else b.TouchUpInside += (_, __) => a.Do();
+-        return b;
+-    }
+-
+     // patch 0080: the Library is the cover flow or the grid of GameAppRedesignUi.cs (BuildLibrary / RefreshLibrary); the tiles, rows and the old long-press menu of 0062-0076 are replaced by
+     // its cards and the touch-and-hold menu, whose entries are the same actions (HoldMenuPlan).
+     private void BuildShelf() => BuildLibrary();
+@@ -186,11 +162,12 @@
+ 
+     // ---- Build -------------------------------------------------------------------------------------------------
+ 
+-    private UILabel buildSub, buildNowLine, cloudNote;
+-    private UISegmentedControl buildFilter;
++    private UILabel buildSub, buildNowLine;
++    private UIStackView buildSections;   // patch 0082: READY TO BUILD, IN THE CLOUD
++    private string buildKey;
++    private readonly Dictionary<string, (UILabel Note, UIProgressView Bar)> buildLive = new Dictionary<string, (UILabel, UIProgressView)>();
+     private UIProgressView buildNowBar;
+-    private UIView buildNowCard, buildQueueSection, phoneSection, cloudSection, phoneCard, cloudCard;
+-    private UIStackView phoneList, cloudList;
++    private UIView buildNowCard, buildQueueSection;
+ 
+     private static UILabel SectionLabel(string text) => Theme.Label(text, Theme.Font(11, UIFontWeight.Semibold), Theme.Muted);
+ 
+@@ -201,7 +178,7 @@
+         var title = Theme.Label("Build", Theme.Font(28, UIFontWeight.Bold), Theme.Text);
+         title.AccessibilityTraits = UIAccessibilityTrait.Header;
+         buildSub = Theme.Label("", Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
+-        var refresh = Look.RoundIcon("arrow.triangle.2.circlepath", "Refresh the cloud", 44);
++        var refresh = Look.RoundIcon("arrow.triangle.2.circlepath", "Refresh the cloud", 34, UIColor.Clear, Theme.Muted);   // patch 0082: a small icon (the cloud re-listing)
+         refresh.TouchUpInside += (_, __) => RefreshCloud(null);
+         var plus = Look.RoundIcon("plus", "Add a game", 44, Theme.Accent, UIColor.Black);
+         plus.AccessibilityIdentifier = "import-file";
+@@ -209,15 +186,12 @@
+         plus.ShowsMenuAsPrimaryAction = true;
+         var header = Theme.Row(10, Theme.Column(3, title, buildSub), new UIView(), refresh, plus);
+ 
+-        buildFilter = new UISegmentedControl(new[] { "All", "On this phone", "Cloud" }) { SelectedSegment = 0, AccessibilityIdentifier = "build-filter" };
+-        buildFilter.SelectedSegmentTintColor = Look.Raised;
+-        buildFilter.BackgroundColor = Theme.Ground;
+-        buildFilter.SetTitleTextAttributes(new UIStringAttributes { ForegroundColor = Theme.Text, Font = Theme.Font(13, UIFontWeight.Semibold) }, UIControlState.Normal);
+-        buildFilter.ValueChanged += (_, __) => RefreshBuildTab(GatherFacts());
+-
++        // patch 0082 (the owner, after the device screenshots): the prototype's Build tab. NOW BUILDING: the build's card or, idle, ONE compact row; READY TO BUILD and IN THE CLOUD: compact
++        // rows with a count beside the section's title (BuildList, GameAppRedesign.cs); the filter, the long paragraphs and the big game cards with their gradient buttons are gone; an empty
++        // section is not shown; the "In Files, touch and hold…" tip is the + menu's "How to add from Files".
+         nowSectionLabel = Look.Section("Now building");
+-        buildIdle = Theme.Label("Nothing is building. + adds a game; its Build button starts it. A build ends on Ready: Play starts the game.", Theme.Font(13, UIFontWeight.Regular), Theme.Muted, 0);
+-        var nowSection = Theme.Column(8, nowSectionLabel, buildIdle, MakeNowCard());
++        buildIdleRow = IdleRow();
++        var nowSection = Theme.Column(8, nowSectionLabel, buildIdleRow, MakeNowCard());
+ 
+         // The queue's own views (BuildQueuePage made them): the list in a card, its note and Start/Stop
+         queueCard.BackgroundColor = Look.Surface;
+@@ -225,20 +199,14 @@
+         queueCard.Layer.BorderColor = Look.Line.CGColor;
+         queueCard.Layer.CornerRadius = 16;
+         buildQueueSection = Theme.Column(8, Look.Section("Queue"), queueCard, queueStatus, queueStart);
+-        phoneList = new UIStackView { Axis = UILayoutConstraintAxis.Vertical, Spacing = 0 };
+-        cloudList = new UIStackView { Axis = UILayoutConstraintAxis.Vertical, Spacing = 0 };
+-        cloudNote = Theme.Label("", Theme.Font(13, UIFontWeight.Regular), Theme.Muted, 0);
+-        phoneCard = Look.Card(phoneList, 0, 16);
+-        cloudCard = Look.Card(cloudList, 0, 16);
+-        phoneSection = Theme.Column(8, Look.Section("On this " + GameAppUi.DeviceName), phoneCard);
+-        cloudSection = Theme.Column(8, Look.Section("In the cloud"), cloudCard, cloudNote);
++        buildSections = Theme.Column(22);
+ 
+         // patch 0081: the blocks under the header are kept apart so that the iPad layout can put them in two columns (GameAppPadUi.cs ArrangeBuildTab); a phone has them one under the other, as in 0080
+         var importCard = MakeImportCard();
+         var warmSection = WarmBuildTabSection();
+         buildLeft = new[] { nowSection };
+-        buildRight = new[] { importCard, buildQueueSection, warmSection, buildFilter, phoneSection, cloudSection };
+-        buildNarrow = new[] { importCard, nowSection, buildQueueSection, warmSection, buildFilter, phoneSection, cloudSection };
++        buildRight = new[] { importCard, buildSections, buildQueueSection, warmSection };
++        buildNarrow = new[] { importCard, nowSection, buildSections, buildQueueSection, warmSection };
+         buildBody = Theme.Column(18);
+         ArrangeBuildTab(padWide);
+         var column = Theme.Column(18, header, buildBody);   // WarmBuildTabSection: GameAppWarm.cs (patch 0076)   // MakeImportCard: the progress of "Add from a folder without copying"
+@@ -263,65 +231,15 @@
+         var cloud = UIAction.Create("From NAS or Cloud", UIImage.GetSystemImage("icloud"), "import-cloud", _ => ShowTab(1));
+         cloud.Subtitle = "Your sources in Settings";
+         items.Add(cloud);
+-        return UIMenu.Create(items.ToArray());
+-    }
+-
+-    /// A row of the Build lists: the cover, the name and what is known about it, then its buttons under it.
+-    private UIView BuildRow(UIImage icon, string name, string sub, bool dim, double? fraction, string chip, UIColor tone, List<ShelfAct> acts, bool enabled, bool first)
+-    {
+-        var holder = new UIView();
+-        var cover = new CoverView { UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
+-        cover.Set(icon, name, dim, fraction);
+-        cover.WidthAnchor.ConstraintEqualTo(48).Active = true;
+-        cover.HeightAnchor.ConstraintEqualTo(48).Active = true;
+-        var title = Theme.Label(name, Theme.Font(15, UIFontWeight.Semibold), Theme.Text, 2);
+-        var subtitle = Theme.Label(sub, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 2);
+-        var texts = new List<UIView> { title, subtitle };
+-        if (chip != null) texts.Add(Theme.Label(chip, Theme.Font(12, UIFontWeight.Semibold), tone));
+-        var textColumn = Theme.Column(2, texts.ToArray());
+-        var top = Theme.Row(12, cover, textColumn);
+-        top.Alignment = UIStackViewAlignment.Top;
+-        var stack = Theme.Column(10, top);
+-        if (acts.Count > 0)
++        // patch 0082: the tip that was a paragraph under an empty list (GameAppOpenInUi.cs OpenIn.Hint)
++        var how = UIAction.Create("How to add from Files", UIImage.GetSystemImage("square.and.arrow.up"), "import-how-files", _ =>
+         {
+-            var tint = TintOf(icon, name);
+-            var buttons = Theme.Row(8, acts.Select(a => (UIView) ShelfActButton(a, false, enabled, tint)).ToArray());
+-            buttons.Distribution = UIStackViewDistribution.FillProportionally;
+-            stack.AddArrangedSubview(buttons);
+-        }
+-        stack.TranslatesAutoresizingMaskIntoConstraints = false;
+-        holder.AddSubview(stack);
+-        var constraints = new List<NSLayoutConstraint>
+-        {
+-            stack.TopAnchor.ConstraintEqualTo(holder.TopAnchor, 12), stack.BottomAnchor.ConstraintEqualTo(holder.BottomAnchor, -12),
+-            stack.LeadingAnchor.ConstraintEqualTo(holder.LeadingAnchor), stack.TrailingAnchor.ConstraintEqualTo(holder.TrailingAnchor),
+-        };
+-        if (true)   // a hairline above every row, the first one too: it closes the section's title
+-        {
+-            var line = new UIView { BackgroundColor = UIColor.FromWhiteAlpha(1f, 0.08f), TranslatesAutoresizingMaskIntoConstraints = false };
+-            holder.AddSubview(line);
+-            constraints.Add(line.TopAnchor.ConstraintEqualTo(holder.TopAnchor));
+-            constraints.Add(line.LeadingAnchor.ConstraintEqualTo(holder.LeadingAnchor));
+-            constraints.Add(line.TrailingAnchor.ConstraintEqualTo(holder.TrailingAnchor));
+-            constraints.Add(line.HeightAnchor.ConstraintEqualTo(1));
+-        }
+-        NSLayoutConstraint.ActivateConstraints(constraints.ToArray());
+-        holder.AccessibilityLabel = name + (chip != null ? ", " + chip : "") + ", " + sub;
+-        return holder;
+-    }
+-
+-    private UIMenu ContentMenu(string game, UiFacts facts)
+-    {
+-        var names = Dumps().Select(Path.GetFileName).ToList();
+-        var inCloud = GameAppUi.RelatedContent(game, cloudFiles.Select(f => f.Name)).Where(n => !names.Contains(n, StringComparer.OrdinalIgnoreCase)).ToList();
+-        var items = new List<UIMenuElement>
+-        {
+-            UIAction.Create("Add files… (pick several)", UIImage.GetSystemImage("doc.badge.plus"), null, _ => Import()),
+-            UIAction.Create("Find them in a folder…", UIImage.GetSystemImage("folder.badge.questionmark"), null, _ => PresentFolderPicker("update and DLC folder", url => ScanFolderForContent(game, url))),
+-        };
+-        if (inCloud.Count > 0)
+-            items.Add(UIAction.Create($"Download {inCloud.Count} from the cloud", UIImage.GetSystemImage("icloud.and.arrow.down"), null, _ =>
+-                Download(inCloud.Select(n => Cloud.CloudCopyOf(n, cloudFiles)).Where(f => f != null).ToList(), GameAppMain.Documents)));
++            var a = UIAlertController.Create("How to add from Files", OpenIn.Hint, UIAlertControllerStyle.Alert);
++            a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++            PresentWhenFree(a);
++        });
++        how.Subtitle = "Touch and hold the game, Share, iBuilder";
++        items.Add(how);
+         return UIMenu.Create(items.ToArray());
+     }
+ 
+@@ -338,83 +256,145 @@
+     private void RefreshBuildTab(UiFacts facts)
+     {
+         if (buildSub == null) return;
+-        int filter = (int) buildFilter.SelectedSegment;   // 0 all, 1 on this phone, 2 cloud
++        // patch 0082: the games once (the same LibraryEntry list and states as the Library: LibStateOf), then the sections AND the header's counts from that one list, set last
+         var localNames = Dumps().Select(Path.GetFileName).ToList();
+         var phone = (facts.Games ?? new List<string>()).ToList();
+-        var cloud = GameExport.IsPlayer ? new List<CloudFile>() : Cloud.CloudOnlyGames(localNames, cloudFiles);
+-        buildSub.Text = $"{phone.Count} on this {GameAppUi.DeviceName}" + (cloud.Count > 0 ? $" · {cloud.Count} in the cloud" : "") + (buildQueue.Items.Count > 0 ? $" · {buildQueue.Items.Count} queued" : "");
++        var cloudOnly = GameExport.IsPlayer ? new List<CloudFile>() : Cloud.CloudOnlyGames(localNames, cloudFiles);
++        var shownCloud = LibraryMerge.CloudShown(phone, cloudOnly, HiddenGames.Parse(NSUserDefaults.StandardUserDefaults.StringForKey(HiddenKey)));
++        var rowsOf = new Dictionary<string, LibraryEntry>(StringComparer.Ordinal);
++        var games = new List<BuildGame>();
++        foreach (var name in phone)
++        {
++            var e = entries.FirstOrDefault(x => x.Name == name) ?? new LibraryEntry(name, Cloud.CloudCopyOf(name, cloudFiles), CoverOf(name, facts));
++            var state = LibStateOf(e, facts, out var fraction);
++            bool update = state == LibState.Built && GameAppUi.ContentChangedSinceBuild(name, localNames, facts);
++            rowsOf[name] = e;
++            games.Add(new BuildGame(name, state, GameFileSizeText(name), null, update, fraction));
++        }
++        foreach (var f in shownCloud)
++        {
++            var e = entries.FirstOrDefault(x => x.Name == f.Name) ?? new LibraryEntry(f.Name, f, CoverOf(f.Name, facts));
++            var state = LibStateOf(e, facts, out var fraction);
++            rowsOf[f.Name] = e;
++            games.Add(new BuildGame(f.Name, state, f.Size > 0 ? GameAppUi.SizeText(f.Size) : null, CloudWords(f).Where, false, fraction));
++        }
+ 
+         // Now: the build that is running (Pause, Cancel), being stopped, or paused (Resume, Cancel): GameAppStopUi.cs
+         UpdateNowCard(facts);
+-        UpdateNowCardLook(facts);   // GameAppRedesignUi.cs (patch 0080): the card's words, pill, stages and times
+-        if (nowNote != null) nowNote.Text = BuildCardText.Note(StorageOptimizer.ToggleOn(ReadAppSettings()));
++        UpdateNowCardLook(facts);   // GameAppRedesignUi.cs: the card's words, pill, stages and times
+         buildQueueSection.Hidden = buildQueue.Items.Count == 0 && !queueWanted;
+         UpdateWarmBuildSection();   // GameAppWarm.cs (patch 0076)
+ 
+-        // On this phone
+-        foreach (var v in phoneList.ArrangedSubviews.ToArray()) { phoneList.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+-        for (int i = 0; i < phone.Count; i++)
++        // review M3: the rows are built again only when their key changes (a download's percentage is updated in place: its Cancel is not lost under the finger)
++        var sections = BuildList.Sections(games);
++        var key = RedrawKey.Of(sections.Select(s => s.Title + ":" + s.Count + ":" + RedrawKey.Of(s.Rows.Select(RedrawKey.Row))).Append(facts.Running ? "b" : ""));
++        if (key == buildKey)
+         {
+-            var name = phone[i];
+-            bool ready = GameAppUi.GameStatusOf(name, facts) == GameAppUi.GameStatus.Ready;
+-            bool update = ready && GameAppUi.ContentChangedSinceBuild(name, localNames, facts);
+-            bool isBase = GameAppUi.ContentKindOf(name) == GameAppUi.ContentKind.Base && !GameAppUi.IsNup(name);
+-            var acts = new List<ShelfAct>();
+-            var frac = CoverFraction(name, facts);
+-            string chip; UIColor tone;
+-            if (running && frac != null) { chip = $"Building {Math.Round(frac.Value * 100):0}%"; tone = Theme.Accent; }
+-            else if (PausedOf(name, facts) is PausedBuild pausedRow)
+-            {
+-                chip = StopText.PausedLine(pausedRow.StageLine); tone = Theme.Warn;
+-                acts.Add(new ShelfAct("Resume", "play.fill", true, () => ResumePaused(name), null, "build-row-resume"));
+-                acts.Add(new ShelfAct("Cancel", "xmark", false, () => AskCancel(name), null, "build-row-cancel"));
+-                acts.Add(new ShelfAct("More", "ellipsis", false, null, UIMenu.Create(new UIMenuElement[] { CoverMenu(name) })));
+-            }
+-            else
+-            {
+-                var more = new List<UIMenuElement>();
+-                if (!ready) { chip = "Not built yet"; tone = Theme.Warn; acts.Add(new ShelfAct("Build", "hammer.fill", true, () => { selected = name; PrimaryTapped(); })); more.Add(UIAction.Create("Add to the build queue", UIImage.GetSystemImage("list.number"), null, _ => AddToBuildQueue(name))); }
+-                else if (update) { chip = "Update available"; tone = Theme.Accent; acts.Add(new ShelfAct("Update", "arrow.triangle.2.circlepath", true, () => DoUpdate(name))); }
+-                else { chip = "Built"; tone = Theme.Ok; acts.Add(new ShelfAct("Rebuild", "arrow.clockwise", false, () => ConfirmRebuild(name))); }
+-                if (isBase) more.Add(UIMenu.Create("Update & DLC", UIImage.GetSystemImage("plus"), UIMenuIdentifier.None, UIMenuOptions.DisplayInline, ContentMenu(name, facts).Children));
+-                more.Add(CoverMenu(name));   // GameAppCoverUi.cs
+-                if (more.Count > 0) acts.Add(new ShelfAct("More", "ellipsis", false, null, UIMenu.Create(more.ToArray())));
+-            }
+-            if (stop.State == StopState.Cancelled && stop.Game == name && chip == "Not built yet") { chip = StopText.Cancelled(); tone = Theme.Muted; }   // "Cancelled" until the next run or launch
+-            var cloudCopy = Cloud.CloudCopyOf(name, cloudFiles);
+-            phoneList.AddArrangedSubview(BuildRow(CoverOf(name, facts), GameAppUi.DisplayName(name), GameFileSizeText(name) + (cloudCopy != null ? " · also in the cloud" : ""),
+-                                                  false, frac, chip, tone, acts, !facts.Running, i == 0));
++            foreach (var r in sections.SelectMany(s => s.Rows))
++                if (buildLive.TryGetValue(r.Name, out var live))
++                {
++                    live.Note.Text = r.Note;
++                    if (r.Fraction != null) live.Bar.SetProgress((float) r.Fraction.Value, false);
++                }
++            buildSub.Text = BuildList.Header(games, buildQueue.Items.Count, GameAppUi.DeviceName);
++            return;
+         }
+-        if (phone.Count == 0) phoneList.AddArrangedSubview(Theme.Label("No game on this " + GameAppUi.DeviceName + " yet. Tap + to import a .nsp, .xci, .nsz or .nup, or pick one in the cloud.", Theme.Font(14, UIFontWeight.Regular), Theme.Muted, 0));
+-        if (phone.Count == 0) AddOpenInHint(phoneList);   // GameAppOpenInUi.cs: the second line of the empty state, "In Files, touch and hold the game, Share, iBuilder: it is added without a copy."
+-        phoneSection.Hidden = filter == 2;
+-        phoneCard.Hidden = false;   // it holds the "no game yet" line when there is none
++        buildKey = key;
++        buildLive.Clear();
++        foreach (var v in buildSections.ArrangedSubviews.ToArray()) { buildSections.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
++        foreach (var section in sections)
++        {
++            var count = Theme.Label(section.Count.ToString(System.Globalization.CultureInfo.InvariantCulture), Theme.Font(12, UIFontWeight.Regular), UIColor.FromWhiteAlpha(1f, 0.5f));
++            var head = Theme.Row(8, Look.Section(section.Title), new UIView(), count);
++            head.AccessibilityElementsHidden = false;
++            var rows = new List<UIView>();
++            foreach (var r in section.Rows) rows.Add(BuildGameRow(r, rowsOf[r.Name], facts));
++            buildSections.AddArrangedSubview(Theme.Column(8, head, Look.Group(rows.ToArray())));
++        }
++        buildSections.Hidden = buildSections.ArrangedSubviews.Length == 0;
++        buildSub.Text = BuildList.Header(games, buildQueue.Items.Count, GameAppUi.DeviceName);   // from the very list the rows were drawn from
++    }
+ 
+-        // In the cloud
+-        foreach (var v in cloudList.ArrangedSubviews.ToArray()) { cloudList.RemoveArrangedSubview(v); v.RemoveFromSuperview(); }
+-        for (int i = 0; i < cloud.Count; i++)
++    /// A compact row of the Build tab: a 44 pt cover (a mini cloud mark for a cloud game), the name on one line, "<size> · Not built", a small amber pill (Build / Download / Update; Cancel
++    /// with a thin bar while it downloads) and, for a game on this iPhone, a 32 pt "…".
++    private UIView BuildGameRow(BuildRowView r, LibraryEntry e, UiFacts facts)
++    {
++        var display = GameAppUi.DisplayName(r.Name);
++        var cover = new UIView { BackgroundColor = Look.Raised, ClipsToBounds = true, UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        cover.Layer.CornerRadius = 10;
++        cover.WidthAnchor.ConstraintEqualTo(44).Active = true;
++        cover.HeightAnchor.ConstraintEqualTo(44).Active = true;
++        if (e?.Icon != null)
+         {
+-            var f = cloud[i];
+-            var entry = entries.FirstOrDefault(x => x.Name == f.Name) ?? new LibraryEntry(f.Name, f, CoverOf(f.Name, facts));
+-            bool busy = downloads.TryGetValue(f.Name, out var d);
+-            var acts = new List<ShelfAct>();
+-            string chip = null; UIColor tone = Theme.Accent;
+-            if (busy) chip = $"Downloading {Math.Round(d * 100):0}%";
+-            else
+-            {
+-                acts.Add(new ShelfAct("Download and build", "hammer.fill", true, () => DownloadAndBuild(entry)));
+-                acts.Add(new ShelfAct("Download", "arrow.down.to.line", false, () => { selected = entry.Name; DownloadSelected(); }));
+-            }
+-            cloudList.AddArrangedSubview(BuildRow(entry.Icon, GameAppUi.DisplayName(f.Name), Cloud.Where(f, cloudSources),   // already says the source and the size
+-                                                  false, busy ? (double?) Math.Max(0.02, d) : null, chip, tone, acts, !facts.Running || busy, i == 0));
++            var img = new UIImageView(r.Cloud ? Look.Grey(e.Icon) : e.Icon) { ContentMode = UIViewContentMode.ScaleAspectFill, ClipsToBounds = true, Frame = new CGRect(0, 0, 44, 44) };
++            cover.AddSubview(img);
+         }
+-        cloudNote.Text = cloudSources.Count == 0 ? "No cloud source yet. Settings › Cloud adds a NAS or a folder (iCloud Drive, Google Drive…)."
+-                       : cloud.Count == 0 ? "Everything in your cloud sources is already on this " + GameAppUi.DeviceName + "." : "";
+-        cloudNote.Hidden = cloudNote.Text.Length == 0;
+-        cloudCard.Hidden = cloud.Count == 0;
+-        cloudSection.Hidden = filter == 1 || (cloud.Count == 0 && cloudSources.Count > 0 && filter == 0);
++        else
++        {
++            cover.BackgroundColor = Theme.ColorFor(display);   // initials on the name's colour (a square, not a button)
++            var ini = Theme.Label(Theme.Initials(display), Theme.Font(16, UIFontWeight.Heavy), UIColor.FromWhiteAlpha(1f, 0.88f));
++            ini.Frame = new CGRect(6, 20, 38, 22);
++            cover.AddSubview(ini);
++        }
++        if (r.Cloud)
++        {
++            var badge = Look.CloudBadge(16);
++            cover.AddSubview(badge);
++            badge.TopAnchor.ConstraintEqualTo(cover.TopAnchor, 3).Active = true;
++            badge.TrailingAnchor.ConstraintEqualTo(cover.TrailingAnchor, -3).Active = true;
++        }
++        var name = Theme.Label(display, Theme.Font(15, UIFontWeight.Regular), Theme.Text, 1);
++        name.LineBreakMode = UILineBreakMode.TailTruncation;
++        var note = Theme.Label(r.Note, Theme.Font(12, UIFontWeight.Regular), r.NoteAccent ? Theme.Accent : Theme.Muted);
++        var texts = new List<UIView> { name, note };
++        var bar = Look.Bar((float) (r.Fraction ?? 0), Theme.Accent, 3);
++        bar.Hidden = r.Fraction == null;
++        texts.Add(bar);
++        buildLive[r.Name] = (note, bar);
++        var column = Theme.Column(1, texts.ToArray());
++        column.SetContentHuggingPriority(1, UILayoutConstraintAxis.Horizontal);
++        column.SetContentCompressionResistancePriority(1, UILayoutConstraintAxis.Horizontal);
++        var act = r.Act;
++        var button = Look.Capsule(r.Button, null, r.Primary, null, 32, 13);
++        button.AccessibilityIdentifier = "build-row-" + act.ToString().ToLowerInvariant();
++        button.AccessibilityLabel = r.Button + " " + display;
++        button.Enabled = LibraryActions.Enabled(act, facts.Running);
++        button.SetContentHuggingPriority(1000, UILayoutConstraintAxis.Horizontal);
++        button.SetContentCompressionResistancePriority(1000, UILayoutConstraintAxis.Horizontal);
++        button.TouchUpInside += (_, __) => { if (act == LibAct.Build) { selected = r.Name; PrimaryTapped(); } else RunLibAct(act, e); };
++        var views = new List<UIView> { cover, column, button };
++        if (r.HasMore)
++        {
++            var more = Look.RoundIcon("ellipsis", "More actions for " + display, 32, UIColor.Clear, Theme.Muted);
++            more.AccessibilityIdentifier = "build-row-more";
++            more.TouchUpInside += (_, __) => { if (GameSettingsRule.HasSettings(LibStateOf(e, facts, out double? _f))) ShowGameSheet(e); else ShowNotBuiltSheet(e, more); };
++            views.Add(more);
++        }
++        var row = Theme.Row(12, views.ToArray());
++        var holder = new UIView();
++        row.TranslatesAutoresizingMaskIntoConstraints = false;
++        holder.AddSubview(row);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            row.TopAnchor.ConstraintEqualTo(holder.TopAnchor, 11), row.BottomAnchor.ConstraintEqualTo(holder.BottomAnchor, -11),
++            row.LeadingAnchor.ConstraintEqualTo(holder.LeadingAnchor), row.TrailingAnchor.ConstraintEqualTo(holder.TrailingAnchor),
++        });
++        return holder;
+     }
+ 
++    /// Patch 0082: a game on this iPhone that is not built has no settings (they come with its build): its "…" is this small sheet.
++    private void ShowNotBuiltSheet(LibraryEntry e, UIView source)
++    {
++        if (e == null) return;
++        var name = e.Name;
++        var sheet = UIAlertController.Create(GameAppUi.DisplayName(name), GameSettingsRule.NotBuiltNote, UIAlertControllerStyle.ActionSheet);
++        if (!GameExport.IsPlayer) sheet.AddAction(UIAlertAction.Create("Choose a cover…", UIAlertActionStyle.Default, _ => ShowCoverChooser(name)));
++        if (!running) sheet.AddAction(UIAlertAction.Create("Delete the game file", UIAlertActionStyle.Destructive, _ => ConfirmDelete(name)));   // 0064's question, with what it frees
++        sheet.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
++        Theme.Anchor(sheet, source, View);
++        PresentWhenFree(sheet);
++    }
++
+     private void DownloadAndBuild(LibraryEntry e)
+     {
+         if (e.Cloud == null || downloads.ContainsKey(e.Name)) return;
+@@ -706,7 +686,16 @@
+         // patch 0080: the prototype's game sheet. The cover as the header ("Choose a cover…", the name, id · kind · size), the primary action and Delete, the launch line while Play
+         // starts the game, three tiles, the per-game settings as segmented controls (the rows of the settings page, which stays one tap away), Mods, Saves, Export as its own app, Logs;
+         // then everything the sheet had (Update and DLC, the shaders, storage, Show in Files, the queue, Rebuild, the paused build's Cancel).
+-        if (e == null || (running && launchingGame == null)) return;
++        if (e == null) return;
++        if (running && launchingGame == null)
++        {
++            // patch 0082 (review L6): it said nothing
++            var busy = UIAlertController.Create(GameSettingsRule.BusyTitle, GameSettingsRule.BusyNote, UIAlertControllerStyle.Alert);
++            busy.AddAction(UIAlertAction.Create("Watch the build", UIAlertActionStyle.Default, _ => ShowBuildScreen()));
++            busy.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++            PresentWhenFree(busy);
++            return;
++        }
+         var game = e.Name;
+         selected = game;
+         var facts = GatherFacts();
+@@ -726,6 +715,8 @@
+             return page;
+         }
+         var state = LibStateOf(e, facts, out _);
++        // patch 0082 (the owner): only a BUILT game has settings (this sheet / the iPad inspector); a game on this iPhone not built gets its small sheet, a cloud game nothing
++        if (!GameSettingsRule.HasSettings(state)) { if (local && state == LibState.NotBuilt) ShowNotBuiltSheet(e, null); return; }
+         bool canRun = CanRunHere(facts);
+         bool ready = state == LibState.Built;
+         bool grey = state == LibState.CloudOnly || state == LibState.Downloading;
+@@ -812,15 +803,20 @@
+         var launchBar = Look.Bar(0, accent, 6);
+         var launchCard = Look.Card(Theme.Column(10, launchText, launchBar), 14, 14);
+         launchCard.AccessibilityIdentifier = "sheet-launch";
++        bool presented = false;
++        Action fillRef = null;
+         void FillLaunch()
+         {
++            // patch 0082 (review L2): once this sheet is gone its line is not kept up (nor its views kept alive)
++            if (presented && !panel && nav.PresentingViewController == null) { if (sheetLaunchFill == fillRef) sheetLaunchFill = null; return; }
+             var l = LaunchLine(game);
+             launchCard.Hidden = !l.Show;
+             launchText.Text = l.Text;
+             launchBar.SetProgress(l.Fraction, true);
+             main.Enabled = !running && LibraryActions.Enabled(primary.Act, running);
+         }
+-        sheetLaunchFill = FillLaunch;
++        fillRef = FillLaunch;
++        sheetLaunchFill = fillRef;
+         FillLaunch();
+ 
+         // ---- three tiles: the shaders, the saves, the build (their sizes from FolderSizes, measured on a worker; the saves' copies counted on a worker). No play time is recorded by the app.
+@@ -929,15 +925,29 @@
+         {
+             var update = GameAppUi.UpdateFor(game, names);
+             var dlcs = GameAppUi.DlcFor(game, names);
+-            var contentRow = SettingsRow("Update and DLC", () => Then(Import), true, false);
++            var contentRow = SettingsRow("Update and DLC", null, true, false);
+             contentRow.Value.Text = update == null && dlcs.Count == 0 ? "None" : (update != null ? "Update" : "") + (update != null && dlcs.Count > 0 ? " · " : "") + (dlcs.Count > 0 ? $"{dlcs.Count} DLC" : "");
++            // patch 0082: the Build tab's "Update & DLC" menu of 0062 (its game cards are gone) is this row's menu: pick files, find them in a folder, download them from the cloud
++            var inCloud = GameAppUi.RelatedContent(game, cloudFiles.Select(f => f.Name)).Where(n => !names.Contains(n, StringComparer.OrdinalIgnoreCase)).ToList();
++            var contentItems = new List<UIMenuElement>
++            {
++                UIAction.Create("Add files… (pick several)", UIImage.GetSystemImage("doc.badge.plus"), null, _ => Then(Import)),
++                UIAction.Create("Find them in a folder…", UIImage.GetSystemImage("folder.badge.questionmark"), null, _ => Then(() => PresentFolderPicker("update and DLC folder", url => ScanFolderForContent(game, url)))),
++            };
++            if (inCloud.Count > 0)
++                contentItems.Add(UIAction.Create($"Download {inCloud.Count} from the cloud", UIImage.GetSystemImage("icloud.and.arrow.down"), null, _ =>
++                    Then(() => Download(inCloud.Select(n => Cloud.CloudCopyOf(n, cloudFiles)).Where(f => f != null).ToList(), GameAppMain.Documents))));
++            contentRow.Button.UserInteractionEnabled = true;
++            contentRow.Button.Menu = UIMenu.Create(contentItems.ToArray());
++            contentRow.Button.ShowsMenuAsPrimaryAction = true;
+             more.Add(contentRow.Button);
+         }
+         if (ready && GameAppUi.ContentChangedSinceBuild(game, names, facts)) more.Add(SettingsRow("Update (build again with the update or DLC)", () => Then(() => DoUpdate(game)), true, false).Button);
+         if (local) more.Add(SettingsRow("Show in Files", () => ShowInFiles(Path.Combine(docs, game)), true, false).Button);
+         if (PausedOf(game, facts) != null) more.Add(SettingsRow("Cancel the paused build…", () => Then(() => AskCancel(game)), false, false, -1, "sheet-cancel-build").Button);
+         if (local) more.Add(SettingsRow("Add to the build queue", () => Then(() => AddToBuildQueue(game)), true, false).Button);
+-        if (local && e.Cloud != null) more.Add(SettingsRow("Remove download (stays in the cloud)", () => Then(() => RemoveGameDownload(game)), true, false).Button);
++        if (local && DownloadPairing.SameFile(SafeLength(Path.Combine(docs, game)), e.Cloud, ImportLedger.Find(ImportLedger.Load(docs), game)))   // patch 0082 (review L7)
++            more.Add(SettingsRow("Remove download (stays in the cloud)", () => Then(() => RemoveGameDownload(game)), true, false).Button);
+         bool canRebuild = !GameExport.IsPlayer && GameAppUi.ShowRebuild(facts) && ready;
+         if (canRebuild) more.Add(SettingsRow("Rebuild from scratch…", () => Then(() => ConfirmRebuild(game)), false, false).Button);
+ 
+@@ -995,7 +1005,7 @@
+         Theme.StyleSheet(nav);
+         var sheet = nav.SheetPresentationController;
+         if (sheet != null && !Theme.IsPad) { sheet.Detents = new[] { UISheetPresentationControllerDetent.CreateLargeDetent() }; sheet.PrefersGrabberVisible = true; sheet.PreferredCornerRadius = 30; }
+-        PresentViewController(nav, true, null);
++        PresentViewController(nav, true, () => presented = true);
+     }
+ 
+     private Action FillStorage;
+diff -ruN c/GameAppTheme.cs d/GameAppTheme.cs
+--- c/GameAppTheme.cs	2026-11-21 19:57:22
++++ d/GameAppTheme.cs	2026-11-21 20:27:38
+@@ -83,10 +83,11 @@
+         c.AttributedTitle = new NSAttributedString(title, new UIStringAttributes { Font = Font(16, UIFontWeight.Semibold) });
+         if (symbol != null) { c.Image = UIImage.GetSystemImage(symbol); c.ImagePadding = 8; }
+         c.CornerStyle = UIButtonConfigurationCornerStyle.Capsule;
+-        c.BaseBackgroundColor = primary ? Accent : UIColor.FromWhiteAlpha(1f, 0.12f);
+-        c.BaseForegroundColor = primary ? Ground : Text;
++        c.BaseBackgroundColor = primary ? Accent : Hex(0x25252B);   // patch 0082: secondary = #25252b with a hairline
++        c.BaseForegroundColor = primary ? UIColor.Black : Text;
+         b.Configuration = c;
+         b.HeightAnchor.ConstraintEqualTo(height == default ? 56 : height).Active = true;
++        if (!primary) { b.Layer.CornerRadius = (height == default ? 56 : height) / 2; b.Layer.BorderWidth = 1; b.Layer.BorderColor = UIColor.FromWhiteAlpha(1f, 0.12f).CGColor; }
+         b.PointerInteractionEnabled = true;
+         return b;
+     }

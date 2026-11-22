@@ -1,0 +1,24 @@
+[package]
+name = "ibuilder-pipeline"
+description = "The chain driver (port of gameapp/gameapp_pipeline.py): stage model, settings table, run markers, resume state machine, timings, memory/thermal gates. No exec/fork/Command."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+# deterministic stand-in stage workers (used by this crate's tests, the C ABI test and the CLI's mock mode)
+mock = []
+
+[dependencies]
+libc = { workspace = true }
+sha2 = { workspace = true }
+# launcher.json / resume.json; preserve_order keeps json.dump's insertion order (the app's settings sheet reads the file)
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+# shader packs (<id>.shaders.tar); default features off: no xattr / filetime, nothing macOS-only
+tar = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+# the integration tests use the stand-in stage workers (feature `mock`)
+ibuilder-pipeline = { path = ".", features = ["mock"] }

@@ -1,0 +1,19 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    constant _16* vp_c0 [[id(0)]];
+};
+
+struct main0_out
+{
+    float4 m_20 [[user(locn0)]];
+    float6 m_21 [[user(locn1)]];
+    float4 m_22 [[user(locn2)]];
+    float4 gl_Position [[position, invariant]];
+    float g

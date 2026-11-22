@@ -1,0 +1,52 @@
+name: Feature request
+description: Suggest an improvement or a new capability.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Requests that need game files, keys or firmware to be included in the project, or that make
+        piracy easier, will be declined. For a security problem, see the [security policy](https://github.com/Absenti/iBuilder/security/policy).
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Your proposal
+      description: What should change? Say how you would use it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve it, or workarounds you use today.
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - The app (interface, library, build, export)
+        - The conversion chain (rewrite, shaders, assembly, signing)
+        - Installing (SideStore source, releases)
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: This request does not ask for game files, keys, firmware or fonts to be included in the project.
+          required: true

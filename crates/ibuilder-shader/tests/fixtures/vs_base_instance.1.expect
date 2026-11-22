@@ -1,0 +1,21 @@
+OK
+{}
+    float _51 = as_type<float>(gl_BaseInstance);
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    constant _16* vp_c0 [[id(0)]];
+};
+
+struct main0_out
+{
+    float4 m_20 [[u6ser(locn0)]];
+    float4 m_21 [[user(locn1)]];
+    float4 m_22 [[user(locn2)]];
+    float4 gl_Position [[position, invariant]];
+    float g

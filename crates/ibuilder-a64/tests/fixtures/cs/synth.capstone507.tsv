@@ -1,0 +1,951 @@
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	cmp	w0, #3	00000	0	Rw0;I3		nzcv,w0
+0x2c	b.hi	#0x80	10000	0	I128	nzcv	
+0x30	adrp	x17, #0x1000	00000	0	Rx17;I4096		x17
+0x34	add	x17, x17, #0x80	00000	0	Rx17;Rx17;I128	x17	x17
+0x38	adr	x18, #0x48	00000	0	Rx18;I72		x18
+0x3c	ldrsw	x1, [x17, x0, lsl #2]	00000	0	Rx1;Mx17,x0,0	x17,x0	x1
+0x40	add	x18, x18, x1	00000	0	Rx18;Rx18;Rx1	x18,x1	x18
+0x44	br	x18	10000	0	Rx18	x18	
+0x48	nop		00000	0			
+0x50	ret		00100	0			
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	adrp	x17, #0x1000	00000	0	Rx17;I4096		x17
+0x2c	add	x17, x17, #0x80	00000	0	Rx17;Rx17;I128	x17	x17
+0x30	adr	x18, #0x40	00000	0	Rx18;I64		x18
+0x34	ldrb	w1, [x17, x0]	00000	0	Rw1;Mx17,x0,0	x17,x0	w1
+0x38	add	x18, x18, x1, lsl #2	00000	0	Rx18;Rx18;Rx1	x18,x1	x18
+0x3c	br	x18	10000	0	Rx18	x18	
+0x40	nop		00000	0			
+0x4c	ret		00100	0			
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	cmp	w0, #3	00000	0	Rw0;I3		nzcv,w0
+0x2c	b.hi	#0x80	10000	0	I128	nzcv	
+0x30	adrp	x17, #0x1000	00000	0	Rx17;I4096		x17
+0x34	add	x17, x17, #0x80	00000	0	Rx17;Rx17;I128	x17	x17
+0x38	adr	x18, #0x48	00000	0	Rx18;I72		x18
+0x3c	ldrh	w1, [x17, x0, lsl #1]	00000	0	Rw1;Mx17,x0,0	x17,x0	w1
+0x40	add	x18, x18, x1, lsl #2	00000	0	Rx18;Rx18;Rx1	x18,x1	x18
+0x44	br	x18	10000	0	Rx18	x18	
+0x48	nop		00000	0			
+0x50	ret		00100	0			
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	cmp	w0, #2	00000	0	Rw0;I2		nzcv,w0
+0x2c	b.hi	#0x60	10000	0	I96	nzcv	
+0x30	adrp	x17, #0x1000	00000	0	Rx17;I4096		x17
+0x34	add	x17, x17, #0x80	00000	0	Rx17;Rx17;I128	x17	x17
+0x38	ldrsw	x18, [x17, x0, lsl #2]	00000	0	Rx18;Mx17,x0,0	x17,x0	x18
+0x3c	add	x18, x18, x17	00000	0	Rx18;Rx18;Rx17	x18,x17	x18
+0x40	br	x18	10000	0	Rx18	x18	
+0x44	nop		00000	0			
+0x48	ret		00100	0			
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	nop		00000	0			
+0x2c	cmp	w0, #6	00000	0	Rw0;I6		nzcv,w0
+0x30	b.hi	#0xac	10000	0	I172	nzcv	
+0x34	adrp	x17, #0x1000	00000	0	Rx17;I4096		x17
+0x38	add	x17, x17, #0x80	00000	0	Rx17;Rx17;I128	x17	x17
+0x40	ldrsw	x18, [x17, x0, lsl #2]	00000	0	Rx18;Mx17,x0,0	x17,x0	x18
+0x44	add	x18, x18, x17	00000	0	Rx18;Rx18;Rx17	x18,x17	x18
+0x48	br	x18	10000	0	Rx18	x18	
+0x54	ret		00100	0			
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	nop		00000	0			
+0x2c	cmp	w0, #7	00000	0	Rw0;I7		nzcv,w0
+0x30	b.hi	#0xb8	10000	0	I184	nzcv	
+0x34	adrp	x17, #0x1000	00000	0	Rx17;I4096		x17
+0x38	add	x17, x17, #0x80	00000	0	Rx17;Rx17;I128	x17	x17
+0x3c	ldrsw	x18, [x17, x0, lsl #2]	00000	0	Rx18;Mx17,x0,0	x17,x0	x18
+0x40	add	x18, x18, x17	00000	0	Rx18;Rx18;Rx17	x18,x17	x18
+0x44	br	x18	10000	0	Rx18	x18	
+0x50	ret		00100	0			
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	and	w16, w0, #7	00000	0	Rw16;Rw0;I7	w0	w16
+0x2c	cmp	w16, #2	00000	0	Rw16;I2		nzcv,w16
+0x30	b.hi	#0x74	10000	0	I116	nzcv	
+0x34	adrp	x17, #0x1000	00000	0	Rx17;I4096		x17
+0x38	add	x17, x17, #0x80	00000	0	Rx17;Rx17;I128	x17	x17
+0x3c	and	x1, x0, #7	00000	0	Rx1;Rx0;I7	x0	x1
+0x40	ldrsw	x18, [x17, x1, lsl #2]	00000	0	Rx18;Mx17,x1,0	x17,x1	x18
+0x44	add	x18, x18, x17	00000	0	Rx18;Rx18;Rx17	x18,x17	x18
+0x48	br	x18	10000	0	Rx18	x18	
+0x4c	nop		00000	0			
+0x54	ret		00100	0			
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	cmp	w0, #8	00000	0	Rw0;I8		nzcv,w0
+0x2c	b.hi	#0xc4	10000	0	I196	nzcv	
+0x30	mov	w1, w0	00000	0	Rw1;Rw0	w0	w1
+0x34	adrp	x17, #0x1000	00000	0	Rx17;I4096		x17
+0x38	add	x17, x17, #0x80	00000	0	Rx17;Rx17;I128	x17	x17
+0x3c	ldrsw	x18, [x17, x1, lsl #2]	00000	0	Rx18;Mx17,x1,0	x17,x1	x18
+0x40	add	x18, x18, x17	00000	0	Rx18;Rx18;Rx17	x18,x17	x18
+0x44	br	x18	10000	0	Rx18	x18	
+0x48	nop		00000	0			
+0x50	ret		00100	0			
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	ldr	x18, [x0, #0x18]	00000	0	Rx18;Mx0,,24	x0	x18
+0x2c	nop		00000	0			
+0x30	br	x18	10000	0	Rx18	x18	
+0x34	ret		00100	0			
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	-
+0x10	udf	#0	00000	0	I0		
+0x18	-
+0x1c	-
+0x28	ret		00100	0			
+0x2c	nop		00000	0			
+0x24550	sub	sp, sp, #0x80	00000	0	Rsp;Rsp;I128	sp	sp
+0x24de0	sub	sp, sp, #0x70	00000	0	Rsp;Rsp;I112	sp	sp
+0x25110	stp	x28, x27, [sp, #-0x60]!	00000	1	Rx28;Rx27;Msp,,-96	x28,x27,sp	sp
+0x29120	str	x20, [sp, #-0x20]!	00000	1	Rx20;Msp,,-32	x20,sp	sp
+0x29330	ldr	x8, [x0, #0x3070]	00000	0	Rx8;Mx0,,12400	x0	x8
+0x2d640	sub	sp, sp, #0x90	00000	0	Rsp;Rsp;I144	sp	sp
+0x2df18	adrp	x8, #0x7e75000	00000	0	Rx8;I132599808		x8
+0x2df1c	ldr	x8, [x8, #0x1e0]	00000	0	Rx8;Mx8,,480	x8	x8
+0x353c0	str	x22, [sp, #-0x30]!	00000	1	Rx22;Msp,,-48	x22,sp	sp
+0x35510	sub	sp, sp, #0x40	00000	0	Rsp;Rsp;I64	sp	sp
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	-
+0x10	udf	#0	00000	0	I0		
+0x18	-
+0x1c	-
+0x28	ret		00100	0			
+0x2c	nop		00000	0			
+0x2e77a4	mov	w9, #2	00000	0	Rw9;I2		w9
+0x2e77f8	str	s0, [x19, #0x44]	00000	0	Rs0;Mx19,,68	s0,x19	
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1068	00000	0	I4200		
+0x1c	udf	#0x108c	00000	0	I4236		
+0x28	cbz	w1, #0x4c	10000	0	Rw1;I76	nzcv,w1	
+0x2c	cbz	w1, #0x18	10000	0	Rw1;I24	nzcv,w1	
+0x30	mrs	x18, tpidrro_el0	00000	0	Rx18;T68		x18
+0x34	ldar	x4, [x0]	00000	0	Rx4;Mx0,,0	x0	x4
+0x38	cbz	w17, #0x40	10000	0	Rw17;I64	nzcv,w17	
+0x3c	cbnz	x18, #0x44	10000	0	Rx18;I68	nzcv,x18	
+0x40	ldp	x29, x30, [sp], #0x10	00000	1	Rfp;Rlr;Msp,,0;I16	sp	fp,lr,sp
+0x44	ldr	w18, [x17, #0x6c]	00000	0	Rw18;Mx17,,108	x17	w18
+0x48	cbnz	x0, #0x4c	10000	0	Rx0;I76	nzcv,x0	
+0x4c	add	x18, x18, #0	00000	0	Rx18;Rx18;I0	x18	x18
+0x50	tbz	w18, #0, #0x30	10000	0	Rw18;I0;I48	w18	
+0x54	nop		00000	0			
+0x58	caspal	x18, x19, x4, x5, [x16]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx16,,0	x16	
+0x5c	sub	sp, sp, x5	00000	0	Rsp;Rsp;Rx5	sp,x5	sp
+0x60	ldr	w15, [x18, #0x8c]	00000	0	Rw15;Mx18,,140	x18	w15
+0x64	mul	x0, x0, x18	00000	0	Rx0;Rx0;Rx18	x0,x18	x0
+0x68	ldrb	w10, [x18]	00000	0	Rw10;Mx18,,0	x18	w10
+0x6c	tbz	w0, #0, #0x74	10000	0	Rw0;I0;I116	w0	
+0x70	cbz	w1, #0x44	10000	0	Rw1;I68	nzcv,w1	
+0x78	cbnz	x1, #0x80	10000	0	Rx1;I128	nzcv,x1	
+0x7c	cbnz	x9, #0xa8	10000	0	Rx9;I168	nzcv,x9	
+0x80	b.gt	#0x88	10000	0	I136	nzcv	
+0x84	tbz	w1, #0, #0xb0	10000	0	Rw1;I0;I176	w1	
+0x88	ldr	w18, [x1, #0x94]	00000	0	Rw18;Mx1,,148	x1	w18
+0x8c	casp	x2, x3, x18, x19, [x0]	00000	0	Rx2;Rx3;Rx18;Rx19;Mx0,,0	x0	
+0x90	ldxr	x18, [x0]	00000	0	Rx18;Mx0,,0	x0	x18
+0x94	brk	#0	00000	0	I0		
+0x98	mrs	x0, tpidrro_el0	00000	0	Rx0;T68		x0
+0x9c	ldr	w13, [x3, #0x4c]	00000	0	Rw13;Mx3,,76	x3	w13
+0xa0	ldr	w19, [x18, #0x10]	00000	0	Rw19;Mx18,,16	x18	w19
+0xa4	ldr	w11, [x16, #8]	00000	0	Rw11;Mx16,,8	x16	w11
+0xa8	str	x10, [x18]	00000	0	Rx10;Mx18,,0	x10,x18	
+0xb8	bc.hs	#0xac	00000	0	I172		
+0xc0	ldr	w4, [x23, #0x40]	00000	0	Rw4;Mx23,,64	x23	w4
+0xc4	add	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0xd0	msr	tpidr_el0, x18	00000	0	T68;Rx18	x18	
+0xd4	mrs	x18, ctr_el0	00000	0	Rx18;T68		x18
+0xd8	mov	x29, sp	00000	0	Rfp;Rsp	sp	fp
+0xdc	ldr	w24, [x20, #0x4c]	00000	0	Rw24;Mx20,,76	x20	w24
+0xe0	tbz	w18, #3, #0xe8	10000	0	Rw18;I3;I232	w18	
+0xe4	msr	tpidr_el0, x2	00000	0	T68;Rx2	x2	
+0xe8	ldr	w11, [x3, #0x28]	00000	0	Rw11;Mx3,,40	x3	w11
+0xf0	tbnz	w18, #3, #0xf8	10000	0	Rw18;I3;I248	w18	
+0x100	mrs	x4, tpidrro_el0	00000	0	Rx4;T68		x4
+0x104	ldr	w10, [x1, #0x28]	00000	0	Rw10;Mx1,,40	x1	w10
+0x108	ldr	w23, [x17, #0x20]	00000	0	Rw23;Mx17,,32	x17	w23
+0x10c	ret		00100	0			
+0x110	ldr	w27, [x29, #0x24]	00000	0	Rw27;Mfp,,36	fp	w27
+0x11c	ldxr	w17, [x0]	00000	0	Rw17;Mx0,,0	x0	w17
+0x124	b.eq	#0x138	10000	0	I312	nzcv	
+0x128	cbnz	x16, #0x13c	10000	0	Rx16;I316	nzcv,x16	
+0x134	b	#0x110	10000	0	I272		
+0x138	cbnz	x18, #0x110	10000	0	Rx18;I272	nzcv,x18	
+0x13c	mrs	x0, tpidr_el0	00000	0	Rx0;T68		x0
+0x140	ldr	x12, [x18]	00000	0	Rx12;Mx18,,0	x18	x12
+0x144	mov	x4, x18	00000	0	Rx4;Rx18	x18	x4
+0x148	casp	x18, x19, x4, x5, [x0]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx0,,0	x0	
+0x14c	sub	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0x154	b	#0x164	10000	0	I356		
+0x16c	adr	x18, #0x174	00000	0	Rx18;I372		x18
+0x170	stxr	w1, w18, [x0]	00000	0	Rw1;Rw18;Mx0,,0	w18,x0	w1
+0x174	tbz	w0, #0, #0x194	10000	0	Rw0;I0;I404	w0	
+0x178	ldr	w24, [x0, #0x24]	00000	0	Rw24;Mx0,,36	x0	w24
+0x17c	b.ne	#0x194	10000	0	I404	nzcv	
+0x184	ldr	w7, [x8, #0x7c]	00000	0	Rw7;Mx8,,124	x8	w7
+0x188	cbz	x18, #0x190	10000	0	Rx18;I400	nzcv,x18	
+0x194	stxrb	w1, w0, [x1]	00000	0	Rw1;Rw0;Mx1,,0	w0,x1	w1
+0x198	ldr	w0, [x23, #0x18]	00000	0	Rw0;Mx23,,24	x23	w0
+0x1a8	cbz	w16, #0x188	10000	0	Rw16;I392	nzcv,w16	
+0x1b8	ldr	w16, [x14, #0x44]	00000	0	Rw16;Mx14,,68	x14	w16
+0x1bc	ldr	w0, [x3, x18, lsl #2]	00000	0	Rw0;Mx3,x18,0	x3,x18	w0
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1038	00000	0	I4152		
+0x1c	udf	#0x104c	00000	0	I4172		
+0x28	b	#0x48	10000	0	I72		
+0x2c	ldr	w23, [x8, #0x40]	00000	0	Rw23;Mx8,,64	x8	w23
+0x30	adr	x18, #0x38	00000	0	Rx18;I56		x18
+0x34	nop		00000	0			
+0x38	ldr	w24, [x12, #0x1c]	00000	0	Rw24;Mx12,,28	x12	w24
+0x40	add	x18, x18, #0	00000	0	Rx18;Rx18;I0	x18	x18
+0x44	cbz	w0, #0x34	10000	0	Rw0;I52	nzcv,w0	
+0x48	b	#0x24	10000	0	I36		
+0x4c	stxr	w1, w18, [x0]	00000	0	Rw1;Rw18;Mx0,,0	w18,x0	w1
+0x50	ldr	w12, [x12, #0x94]	00000	0	Rw12;Mx12,,148	x12	w12
+0x54	ldr	w28, [x14, #0x98]	00000	0	Rw28;Mx14,,152	x14	w28
+0x58	stxr	w1, x18, [x0]	00000	0	Rw1;Rx18;Mx0,,0	x18,x0	w1
+0x5c	ldr	w27, [x23, #0x7c]	00000	0	Rw27;Mx23,,124	x23	w27
+0x64	str	x14, [x18]	00000	0	Rx14;Mx18,,0	x14,x18	
+0x68	mov	x29, sp	00000	0	Rfp;Rsp	sp	fp
+0x6c	casp	x18, x19, x4, x5, [x0]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx0,,0	x0	
+0x70	cbz	w2, #0x78	10000	0	Rw2;I120	nzcv,w2	
+0x74	ldr	x2, [x18]	00000	0	Rx2;Mx18,,0	x18	x2
+0x78	ldr	w17, [x5, #0x60]	00000	0	Rw17;Mx5,,96	x5	w17
+0x84	ldr	x3, [x18]	00000	0	Rx3;Mx18,,0	x18	x3
+0x88	mrs	x18, ctr_el0	00000	0	Rx18;T68		x18
+0x94	brk	#0	00000	0	I0		
+0x98	b.ls	#0x9c	10000	0	I156	nzcv	
+0x9c	tbz	w9, #0, #0x98	10000	0	Rw9;I0;I152	w9	
+0xa0	stp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18,x2	
+0xa8	ret		00100	0			
+0xb0	mov	x0, x18	00000	0	Rx0;Rx18	x18	x0
+0xb4	ldr	w8, [x11, #0x1c]	00000	0	Rw8;Mx11,,28	x11	w8
+0xb8	mrs	x18, tpidr_el0	00000	0	Rx18;T68		x18
+0xbc	stxrb	w1, w0, [x1]	00000	0	Rw1;Rw0;Mx1,,0	w0,x1	w1
+0xc0	b.ne	#0xd8	10000	0	I216	nzcv	
+0xc4	stp	x29, x30, [sp, #-0x10]!	00000	1	Rfp;Rlr;Msp,,-16	fp,lr,sp	sp
+0xc8	tbnz	w18, #3, #0xd0	10000	0	Rw18;I3;I208	w18	
+0xd0	str	x12, [x18]	00000	0	Rx12;Mx18,,0	x12,x18	
+0xd4	ldr	w1, [x19, #0x3c]	00000	0	Rw1;Mx19,,60	x19	w1
+0xd8	tbz	w9, #0, #0xdc	10000	0	Rw9;I0;I220	w9	
+0xdc	ldxr	w2, [x0]	00000	0	Rw2;Mx0,,0	x0	w2
+0xe0	caspal	x18, x19, x4, x5, [x16]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx16,,0	x16	
+0xec	sub	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0xf0	msr	tpidr_el0, x1	00000	0	T68;Rx1	x1	
+0xf8	str	x18, [x18, #0]!	00000	1	Rx18;Mx18,,0	x18	x18
+0xfc	bc.eq	#0x110	00000	0	I272		
+0x100	cbz	x18, #0x108	10000	0	Rx18;I264	nzcv,x18	
+0x104	ldr	w11, [x27, #0xc]	00000	0	Rw11;Mx27,,12	x27	w11
+0x108	ldr	w29, [x20, #0x88]	00000	0	Rw29;Mx20,,136	x20	w29
+0x110	ldar	x0, [x3]	00000	0	Rx0;Mx3,,0	x3	x0
+0x114	b.eq	#0xf8	10000	0	I248	nzcv	
+0x120	ldr	w25, [x14, #0x7c]	00000	0	Rw25;Mx14,,124	x14	w25
+0x124	cbnz	x0, #0xf4	10000	0	Rx0;I244	nzcv,x0	
+0x128	ldr	w9, [x7, #0x94]	00000	0	Rw9;Mx7,,148	x7	w9
+0x12c	b	#0xfc	10000	0	I252		
+0x130	ldr	w23, [x7]	00000	0	Rw23;Mx7,,0	x7	w23
+0x134	ldr	w3, [x28, #0x1c]	00000	0	Rw3;Mx28,,28	x28	w3
+0x138	cbnz	x18, #0x140	10000	0	Rx18;I320	nzcv,x18	
+0x13c	b.ls	#0x134	10000	0	I308	nzcv	
+0x148	ldr	w28, [x0, #0x10]	00000	0	Rw28;Mx0,,16	x0	w28
+0x14c	ldr	w18, [x10, #0x60]	00000	0	Rw18;Mx10,,96	x10	w18
+0x150	ldp	x29, x30, [sp], #0x10	00000	1	Rfp;Rlr;Msp,,0;I16	sp	fp,lr,sp
+0x158	blr	x18	11000	0	Rx18	x18	lr
+0x168	ldxr	w0, [x0]	00000	0	Rw0;Mx0,,0	x0	w0
+0x16c	b	#0x190	10000	0	I400		
+0x170	tbz	w18, #0, #0x1a0	10000	0	Rw18;I0;I416	w18	
+0x174	b.gt	#0x17c	10000	0	I380	nzcv	
+0x178	cbnz	x18, #0x1a0	10000	0	Rx18;I416	nzcv,x18	
+0x17c	bc.eq	#0x188	00000	0	I392		
+0x180	tbz	w18, #3, #0x188	10000	0	Rw18;I3;I392	w18	
+0x18c	ldar	w2, [x14]	00000	0	Rw2;Mx14,,0	x14	w2
+0x194	ldr	w1, [x17, #0x24]	00000	0	Rw1;Mx17,,36	x17	w1
+0x198	str	x0, [x18]	00000	0	Rx0;Mx18,,0	x0,x18	
+0x19c	strb	w18, [x18]	00000	0	Rw18;Mx18,,0	w18,x18	
+0x1a0	ldr	w4, [x5, #4]	00000	0	Rw4;Mx5,,4	x5	w4
+0x1a4	stxr	w2, w2, [x2]	00000	0	Rw2;Rw2;Mx2,,0	w2,x2	w2
+0x1ac	ldr	w27, [x9, #0x64]	00000	0	Rw27;Mx9,,100	x9	w27
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	nop		00000	0			
+0x2c	mrs	x18, cntpct_el0	00000	0	Rx18;T68		x18
+0x30	ldr	w4, [x21, #0x5c]	00000	0	Rw4;Mx21,,92	x21	w4
+0x34	b.gt	#0x3c	10000	0	I60	nzcv	
+0x38	cbnz	x18, #0x40	10000	0	Rx18;I64	nzcv,x18	
+0x40	ldaxrb	w18, [x0]	00000	0	Rw18;Mx0,,0	x0	w18
+0x48	ldp	x29, x30, [sp], #0x10	00000	1	Rfp;Rlr;Msp,,0;I16	sp	fp,lr,sp
+0x4c	add	x0, x18, #8	00000	0	Rx0;Rx18;I8	x18	x0
+0x50	b	#0x60	10000	0	I96		
+0x54	ldr	w15, [x2, #4]	00000	0	Rw15;Mx2,,4	x2	w15
+0x58	casp	x2, x3, x18, x19, [x0]	00000	0	Rx2;Rx3;Rx18;Rx19;Mx0,,0	x0	
+0x60	sub	sp, sp, x5	00000	0	Rsp;Rsp;Rx5	sp,x5	sp
+0x68	ldr	w5, [x7, #0x88]	00000	0	Rw5;Mx7,,136	x7	w5
+0x6c	ldr	w2, [x11, #0x3c]	00000	0	Rw2;Mx11,,60	x11	w2
+0x70	blr	x18	11000	0	Rx18	x18	lr
+0x74	ldr	w27, [x10, #0x70]	00000	0	Rw27;Mx10,,112	x10	w27
+0x78	stp	x29, x30, [sp, #-0x10]!	00000	1	Rfp;Rlr;Msp,,-16	fp,lr,sp	sp
+0x7c	ret		00100	0			
+0x88	caspal	x18, x19, x4, x5, [x16]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx16,,0	x16	
+0x8c	stlr	x17, [x15]	00000	0	Rx17;Mx15,,0	x17,x15	
+0x90	ldr	w16, [x1, #0xc]	00000	0	Rw16;Mx1,,12	x1	w16
+0xa0	bc.eq	#0x90	00000	0	I144		
+0xa4	add	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0xa8	adr	x18, #0xb0	00000	0	Rx18;I176		x18
+0xb0	mrs	x18, tpidr_el0	00000	0	Rx18;T68		x18
+0xb4	ldr	w11, [x29, #0x9c]	00000	0	Rw11;Mfp,,156	fp	w11
+0xbc	stxrb	w1, w0, [x1]	00000	0	Rw1;Rw0;Mx1,,0	w0,x1	w1
+0xc0	tbz	w9, #0, #0xb8	10000	0	Rw9;I0;I184	w9	
+0xc4	tbz	w18, #3, #0xcc	10000	0	Rw18;I3;I204	w18	
+0xc8	ldr	w5, [x27, #0x80]	00000	0	Rw5;Mx27,,128	x27	w5
+0xcc	b	#0xa8	10000	0	I168		
+0xd0	mrs	x9, cntpct_el0	00000	0	Rx9;T68		x9
+0xd8	ldr	w29, [x12, #0x94]	00000	0	Rw29;Mx12,,148	x12	w29
+0xdc	ldar	x17, [x4]	00000	0	Rx17;Mx4,,0	x4	x17
+0xe0	tbnz	w18, #3, #0xe8	10000	0	Rw18;I3;I232	w18	
+0xe4	-
+0xe8	stlr	x17, [x10]	00000	0	Rx17;Mx10,,0	x17,x10	
+0xec	tbz	w0, #0, #0x104	10000	0	Rw0;I0;I260	w0	
+0xf4	ldr	w14, [x1, #0x94]	00000	0	Rw14;Mx1,,148	x1	w14
+0xfc	cbz	w3, #0x104	10000	0	Rw3;I260	nzcv,w3	
+0x100	tbz	w1, #0, #0x12c	10000	0	Rw1;I0;I300	w1	
+0x104	ldr	w10, [x7, #0x28]	00000	0	Rw10;Mx7,,40	x7	w10
+0x108	cbnz	x18, #0xdc	10000	0	Rx18;I220	nzcv,x18	
+0x10c	cbnz	x9, #0x114	10000	0	Rx9;I276	nzcv,x9	
+0x128	mov	x13, x18	00000	0	Rx13;Rx18	x18	x13
+0x12c	ldr	w21, [x7, #4]	00000	0	Rw21;Mx7,,4	x7	w21
+0x134	strb	w18, [x18]	00000	0	Rw18;Mx18,,0	w18,x18	
+0x13c	mrs	x18, tpidrro_el0	00000	0	Rx18;T68		x18
+0x14c	ldr	w29, [x14, #0x78]	00000	0	Rw29;Mx14,,120	x14	w29
+0x150	stxr	w1, w18, [x0]	00000	0	Rw1;Rw18;Mx0,,0	w18,x0	w1
+0x158	mov	x29, sp	00000	0	Rfp;Rsp	sp	fp
+0x15c	ldr	w0, [x3, x18, lsl #2]	00000	0	Rw0;Mx3,x18,0	x3,x18	w0
+0x160	stxr	w1, x18, [x0]	00000	0	Rw1;Rx18;Mx0,,0	x18,x0	w1
+0x164	ldr	w28, [x8, #0x68]	00000	0	Rw28;Mx8,,104	x8	w28
+0x168	ldxr	x18, [x0]	00000	0	Rx18;Mx0,,0	x0	x18
+0x170	ldr	w14, [x4, #0x80]	00000	0	Rw14;Mx4,,128	x4	w14
+0x174	mov	x0, x18	00000	0	Rx0;Rx18	x18	x0
+0x178	ldr	w7, [x20, #0x34]	00000	0	Rw7;Mx20,,52	x20	w7
+0x17c	ldp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18	x18,x2
+0x180	ldrb	w10, [x18]	00000	0	Rw10;Mx18,,0	x18	w10
+0x184	tbz	w1, #0, #0x190	10000	0	Rw1;I0;I400	w1	
+0x194	cbz	w16, #0x16c	10000	0	Rw16;I364	nzcv,w16	
+0x198	cbz	w1, #0x188	10000	0	Rw1;I392	nzcv,w1	
+0x1a0	ldr	w5, [x27, #0x3c]	00000	0	Rw5;Mx27,,60	x27	w5
+0x1a8	ldr	w28, [x5, #0x84]	00000	0	Rw28;Mx5,,132	x5	w28
+0x1ac	b	#0x194	10000	0	I404		
+0x1b0	ldr	w24, [x19, #0x54]	00000	0	Rw24;Mx19,,84	x19	w24
+0x1b4	b.ls	#0x1d0	10000	0	I464	nzcv	
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1038	00000	0	I4152		
+0x1c	udf	#0x104c	00000	0	I4172		
+0x28	ldr	w16, [x3, #0x30]	00000	0	Rw16;Mx3,,48	x3	w16
+0x2c	str	x18, [x18, #0]!	00000	1	Rx18;Mx18,,0	x18	x18
+0x30	cbz	x18, #0x38	10000	0	Rx18;I56	nzcv,x18	
+0x34	ldr	w3, [x26, #0x50]	00000	0	Rw3;Mx26,,80	x26	w3
+0x38	ldr	w18, [x0, #0x9c]	00000	0	Rw18;Mx0,,156	x0	w18
+0x3c	mrs	x3, tpidr_el0	00000	0	Rx3;T68		x3
+0x40	nop		00000	0			
+0x44	sub	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0x48	mov	x13, x18	00000	0	Rx13;Rx18	x18	x13
+0x4c	b	#0x40	10000	0	I64		
+0x50	ldr	w5, [x26, #0x68]	00000	0	Rw5;Mx26,,104	x26	w5
+0x54	blr	x18	11000	0	Rx18	x18	lr
+0x58	mrs	x17, cntpct_el0	00000	0	Rx17;T68		x17
+0x64	ldr	w15, [x28, #0x98]	00000	0	Rw15;Mx28,,152	x28	w15
+0x68	tbnz	w18, #3, #0x70	10000	0	Rw18;I3;I112	w18	
+0x6c	stxrb	w1, w0, [x1]	00000	0	Rw1;Rw0;Mx1,,0	w0,x1	w1
+0x70	mov	x14, x18	00000	0	Rx14;Rx18	x18	x14
+0x74	ldr	x8, [x18]	00000	0	Rx8;Mx18,,0	x18	x8
+0x78	cbz	w4, #0x80	10000	0	Rw4;I128	nzcv,w4	
+0x7c	adr	x18, #0x84	00000	0	Rx18;I132		x18
+0x80	b.ne	#0x54	10000	0	I84	nzcv	
+0x84	mov	x18, x13	00000	0	Rx18;Rx13	x13	x18
+0x88	stxr	w1, x18, [x0]	00000	0	Rw1;Rx18;Mx0,,0	x18,x0	w1
+0x8c	svc	#0x1f	00010	0	I31		lr
+0x90	stxr	w2, w4, [x13]	00000	0	Rw2;Rw4;Mx13,,0	w4,x13	w2
+0x98	add	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0x9c	cbz	w0, #0xbc	10000	0	Rw0;I188	nzcv,w0	
+0xa0	ldr	w20, [x19, #0x48]	00000	0	Rw20;Mx19,,72	x19	w20
+0xa4	ldr	w1, [x29, #0x90]	00000	0	Rw1;Mfp,,144	fp	w1
+0xac	caspal	x18, x19, x4, x5, [x16]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx16,,0	x16	
+0xb4	mrs	x18, ctr_el0	00000	0	Rx18;T68		x18
+0xbc	stp	x29, x30, [sp, #-0x10]!	00000	1	Rfp;Rlr;Msp,,-16	fp,lr,sp	sp
+0xc4	cbnz	x16, #0xf0	10000	0	Rx16;I240	nzcv,x16	
+0xc8	mrs	x18, cntpct_el0	00000	0	Rx18;T68		x18
+0xcc	ldr	w4, [x7, #8]	00000	0	Rw4;Mx7,,8	x7	w4
+0xd4	ldr	w18, [x16, #0x18]	00000	0	Rw18;Mx16,,24	x16	w18
+0xd8	ldr	w0, [x14, x18, lsl #2]	00000	0	Rw0;Mx14,x18,0	x14,x18	w0
+0xdc	mov	x11, x18	00000	0	Rx11;Rx18	x18	x11
+0xe0	ldr	w23, [x10, #0x18]	00000	0	Rw23;Mx10,,24	x10	w23
+0xe4	b	#0x108	10000	0	I264		
+0xec	-
+0xf0	cbnz	x9, #0xc4	10000	0	Rx9;I196	nzcv,x9	
+0xf4	msr	tpidr_el0, x18	00000	0	T68;Rx18	x18	
+0xf8	ldr	w15, [x5, #0x8c]	00000	0	Rw15;Mx5,,140	x5	w15
+0x118	cbz	w9, #0x120	10000	0	Rw9;I288	nzcv,w9	
+0x120	add	x18, x18, #0	00000	0	Rx18;Rx18;I0	x18	x18
+0x12c	ret		00100	0			
+0x130	ldr	w2, [x19, #0x7c]	00000	0	Rw2;Mx19,,124	x19	w2
+0x134	cbnz	x18, #0x13c	10000	0	Rx18;I316	nzcv,x18	
+0x138	ldr	w1, [x14, #0x84]	00000	0	Rw1;Mx14,,132	x14	w1
+0x140	stp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18,x2	
+0x144	mov	x18, x7	00000	0	Rx18;Rx7	x7	x18
+0x148	casp	x18, x19, x4, x5, [x0]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx0,,0	x0	
+0x14c	ldp	x29, x30, [sp], #0x10	00000	1	Rfp;Rlr;Msp,,0;I16	sp	fp,lr,sp
+0x158	ldr	w23, [x0, #0x3c]	00000	0	Rw23;Mx0,,60	x0	w23
+0x160	cbz	w2, #0x168	10000	0	Rw2;I360	nzcv,w2	
+0x174	b	#0x180	10000	0	I384		
+0x178	ldr	w9, [x7, #0x2c]	00000	0	Rw9;Mx7,,44	x7	w9
+0x17c	mov	x29, sp	00000	0	Rfp;Rsp	sp	fp
+0x180	ldr	w3, [x0, #0x10]	00000	0	Rw3;Mx0,,16	x0	w3
+0x188	ldr	w26, [x2, #0x60]	00000	0	Rw26;Mx2,,96	x2	w26
+0x18c	cbnz	x9, #0x180	10000	0	Rx9;I384	nzcv,x9	
+0x194	mrs	x2, tpidr_el0	00000	0	Rx2;T68		x2
+0x198	cbnz	x9, #0x1a4	10000	0	Rx9;I420	nzcv,x9	
+0x19c	bc.eq	#0x1a4	00000	0	I420		
+0x1a0	ldr	w18, [x25, #0x34]	00000	0	Rw18;Mx25,,52	x25	w18
+0x1a4	cbnz	x4, #0x1ac	10000	0	Rx4;I428	nzcv,x4	
+0x1b0	strb	w18, [x18]	00000	0	Rw18;Mx18,,0	w18,x18	
+0x1b8	ldxr	x18, [x0]	00000	0	Rx18;Mx0,,0	x0	x18
+0x1bc	cbz	w9, #0x194	10000	0	Rw9;I404	nzcv,w9	
+0x1c0	stxr	w1, w18, [x0]	00000	0	Rw1;Rw18;Mx0,,0	w18,x0	w1
+0x1c8	ldr	w13, [x16, #0x58]	00000	0	Rw13;Mx16,,88	x16	w13
+0x1cc	b	#0x1c4	10000	0	I452		
+0x1d0	ldar	x0, [x6]	00000	0	Rx0;Mx6,,0	x6	x0
+0x1d4	ldr	w8, [x22, #0x4c]	00000	0	Rw8;Mx22,,76	x22	w8
+0x1e4	stlr	x0, [x12]	00000	0	Rx0;Mx12,,0	x0,x12	
+0x1ec	b	#0x1f4	10000	0	I500		
+0x1f0	brk	#0	00000	0	I0		
+0x1f4	ldr	x10, [x18]	00000	0	Rx10;Mx18,,0	x18	x10
+0x200	ldar	w1, [x3]	00000	0	Rw1;Mx3,,0	x3	w1
+0x204	sub	sp, sp, x5	00000	0	Rsp;Rsp;Rx5	sp,x5	sp
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1038	00000	0	I4152		
+0x1c	udf	#0x104c	00000	0	I4172		
+0x28	caspal	x18, x19, x4, x5, [x16]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx16,,0	x16	
+0x2c	bc.eq	#0x48	00000	0	I72		
+0x30	tbz	w9, #0, #0x34	10000	0	Rw9;I0;I52	w9	
+0x34	nop		00000	0			
+0x38	stlr	x0, [x8]	00000	0	Rx0;Mx8,,0	x0,x8	
+0x3c	blr	x18	11000	0	Rx18	x18	lr
+0x40	stxrb	w1, w0, [x1]	00000	0	Rw1;Rw0;Mx1,,0	w0,x1	w1
+0x44	stxr	w1, x18, [x0]	00000	0	Rw1;Rx18;Mx0,,0	x18,x0	w1
+0x48	mov	x11, x18	00000	0	Rx11;Rx18	x18	x11
+0x4c	mov	x29, sp	00000	0	Rfp;Rsp	sp	fp
+0x50	ldr	w11, [x24, #0x94]	00000	0	Rw11;Mx24,,148	x24	w11
+0x54	cbnz	x2, #0x5c	10000	0	Rx2;I92	nzcv,x2	
+0x58	str	x14, [x18]	00000	0	Rx14;Mx18,,0	x14,x18	
+0x5c	strb	w18, [x18]	00000	0	Rw18;Mx18,,0	w18,x18	
+0x60	ldr	w28, [x28, #0x74]	00000	0	Rw28;Mx28,,116	x28	w28
+0x68	stxr	w2, w2, [x10]	00000	0	Rw2;Rw2;Mx10,,0	w2,x10	w2
+0x6c	ldr	w24, [x8, #0x78]	00000	0	Rw24;Mx8,,120	x8	w24
+0x70	b.ne	#0x88	10000	0	I136	nzcv	
+0x74	ret		00100	0			
+0x7c	ldr	w23, [x6, #0x18]	00000	0	Rw23;Mx6,,24	x6	w23
+0x80	-
+0x84	ldar	w2, [x3]	00000	0	Rw2;Mx3,,0	x3	w2
+0x88	add	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0x8c	ldr	w1, [x24, #0xc]	00000	0	Rw1;Mx24,,12	x24	w1
+0x90	ldr	w0, [x5, x18, lsl #2]	00000	0	Rw0;Mx5,x18,0	x5,x18	w0
+0x94	mrs	x18, tpidrro_el0	00000	0	Rx18;T68		x18
+0x9c	mov	x0, x18	00000	0	Rx0;Rx18	x18	x0
+0xa0	b	#0xac	10000	0	I172		
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	cbnz	x18, #0x48	10000	0	Rx18;I72	nzcv,x18	
+0x2c	ldp	x29, x30, [sp], #0x10	00000	1	Rfp;Rlr;Msp,,0;I16	sp	fp,lr,sp
+0x30	mov	x29, sp	00000	0	Rfp;Rsp	sp	fp
+0x34	mrs	x18, tpidr_el0	00000	0	Rx18;T68		x18
+0x38	msr	tpidr_el0, x1	00000	0	T68;Rx1	x1	
+0x3c	nop		00000	0			
+0x40	ldr	w1, [x22, #0x6c]	00000	0	Rw1;Mx22,,108	x22	w1
+0x44	ldr	w24, [x23, #0x68]	00000	0	Rw24;Mx23,,104	x23	w24
+0x48	cbnz	x16, #0x1c	10000	0	Rx16;I28	nzcv,x16	
+0x50	msr	tpidr_el0, x0	00000	0	T68;Rx0	x0	
+0x54	b.eq	#0x2c	10000	0	I44	nzcv	
+0x60	stxr	w1, x18, [x0]	00000	0	Rw1;Rx18;Mx0,,0	x18,x0	w1
+0x64	cbz	w0, #0x70	10000	0	Rw0;I112	nzcv,w0	
+0x6c	b	#0x90	10000	0	I144		
+0x70	ldr	w3, [x2, #0x8c]	00000	0	Rw3;Mx2,,140	x2	w3
+0x7c	casp	x2, x3, x18, x19, [x0]	00000	0	Rx2;Rx3;Rx18;Rx19;Mx0,,0	x0	
+0x80	cbz	x18, #0x88	10000	0	Rx18;I136	nzcv,x18	
+0x84	ldr	w8, [x12, #4]	00000	0	Rw8;Mx12,,4	x12	w8
+0x8c	bc.hs	#0x98	00000	0	I152		
+0x90	add	x18, x18, #0	00000	0	Rx18;Rx18;I0	x18	x18
+0x94	ldr	w5, [x3, #0x28]	00000	0	Rw5;Mx3,,40	x3	w5
+0x98	cbnz	x16, #0x90	10000	0	Rx16;I144	nzcv,x16	
+0x9c	ldr	w3, [x7, #0x28]	00000	0	Rw3;Mx7,,40	x7	w3
+0xa0	tbnz	w18, #3, #0xa8	10000	0	Rw18;I3;I168	w18	
+0xa4	sub	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0xa8	ldr	w30, [x5, #0x94]	00000	0	Rw30;Mx5,,148	x5	w30
+0xac	ldr	w11, [x18]	00000	0	Rw11;Mx18,,0	x18	w11
+0xb0	ldxr	x18, [x0]	00000	0	Rx18;Mx0,,0	x0	x18
+0xb8	mrs	x18, cntpct_el0	00000	0	Rx18;T68		x18
+0xbc	ret		00100	0			
+0xc0	ldr	w9, [x21, #8]	00000	0	Rw9;Mx21,,8	x21	w9
+0xc4	mrs	x18, ctr_el0	00000	0	Rx18;T68		x18
+0xc8	ldr	w28, [x20, #0x24]	00000	0	Rw28;Mx20,,36	x20	w28
+0xcc	ldr	w23, [x23, #0x78]	00000	0	Rw23;Mx23,,120	x23	w23
+0xd0	mrs	x18, tpidrro_el0	00000	0	Rx18;T68		x18
+0xd4	ldr	w26, [x28, #0x5c]	00000	0	Rw26;Mx28,,92	x28	w26
+0xd8	stp	x29, x30, [sp, #-0x10]!	00000	1	Rfp;Rlr;Msp,,-16	fp,lr,sp	sp
+0xdc	tbz	w18, #0, #0xe0	10000	0	Rw18;I0;I224	w18	
+0xe0	b	#0xf0	10000	0	I240		
+0xe8	ldar	w3, [x10]	00000	0	Rw3;Mx10,,0	x10	w3
+0xec	ldr	w8, [x13, #0x64]	00000	0	Rw8;Mx13,,100	x13	w8
+0xf4	mrs	x16, cntpct_el0	00000	0	Rx16;T68		x16
+0xfc	ldr	w9, [x20, #0x20]	00000	0	Rw9;Mx20,,32	x20	w9
+0x100	str	x10, [x18]	00000	0	Rx10;Mx18,,0	x10,x18	
+0x104	ldr	w5, [x19, #0x2c]	00000	0	Rw5;Mx19,,44	x19	w5
+0x108	b.gt	#0x110	10000	0	I272	nzcv	
+0x10c	bc.eq	#0x13c	00000	0	I316		
+0x110	b.eq	#0x13c	10000	0	I316	nzcv	
+0x114	cbnz	x16, #0x11c	10000	0	Rx16;I284	nzcv,x16	
+0x11c	ldr	w8, [x7, #0x98]	00000	0	Rw8;Mx7,,152	x7	w8
+0x120	blr	x18	11000	0	Rx18	x18	lr
+0x124	add	x0, x18, #8	00000	0	Rx0;Rx18;I8	x18	x0
+0x128	mov	x0, x18	00000	0	Rx0;Rx18	x18	x0
+0x12c	ldp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18	x18,x2
+0x138	ldr	w2, [x20, #0x70]	00000	0	Rw2;Mx20,,112	x20	w2
+0x140	ldr	w20, [x21, #0x70]	00000	0	Rw20;Mx21,,112	x21	w20
+0x150	strb	w18, [x18]	00000	0	Rw18;Mx18,,0	w18,x18	
+0x160	str	x12, [x18]	00000	0	Rx12;Mx18,,0	x12,x18	
+0x164	ldr	x2, [x18]	00000	0	Rx2;Mx18,,0	x18	x2
+0x16c	ldr	x8, [x18]	00000	0	Rx8;Mx18,,0	x18	x8
+0x170	ldr	w9, [x12, #0x9c]	00000	0	Rw9;Mx12,,156	x12	w9
+0x178	svc	#0x1f	00010	0	I31		lr
+0x180	cbz	w16, #0x188	10000	0	Rw16;I392	nzcv,w16	
+0x184	cbz	w18, #0x160	10000	0	Rw18;I352	nzcv,w18	
+0x188	ldrb	w10, [x18]	00000	0	Rw10;Mx18,,0	x18	w10
+0x198	ldr	w4, [x30, #0x80]	00000	0	Rw4;Mlr,,128	lr	w4
+0x1a0	ldr	w12, [x14, #0x6c]	00000	0	Rw12;Mx14,,108	x14	w12
+0x1a8	cbz	w18, #0x1cc	10000	0	Rw18;I460	nzcv,w18	
+0x1ac	cbz	w1, #0x188	10000	0	Rw1;I392	nzcv,w1	
+0x1b8	stxrb	w1, w0, [x1]	00000	0	Rw1;Rw0;Mx1,,0	w0,x1	w1
+0x1bc	ldr	w17, [x30, #0x24]	00000	0	Rw17;Mlr,,36	lr	w17
+0x1c0	mov	x18, x9	00000	0	Rx18;Rx9	x9	x18
+0x1c8	adr	x18, #0x1d0	00000	0	Rx18;I464		x18
+0x1cc	ldaxrb	w18, [x0]	00000	0	Rw18;Mx0,,0	x0	w18
+0x1d8	ldr	w25, [x28, #4]	00000	0	Rw25;Mx28,,4	x28	w25
+0x1dc	bc.hs	#0x1b4	00000	0	I436		
+0x1e0	ldr	w24, [x23, #0x30]	00000	0	Rw24;Mx23,,48	x23	w24
+0x1e4	ldr	x15, [x18]	00000	0	Rx15;Mx18,,0	x18	x15
+0x1e8	cbnz	x1, #0x20c	10000	0	Rx1;I524	nzcv,x1	
+0x1f0	b.eq	#0x1c0	10000	0	I448	nzcv	
+0x1f8	msr	tpidr_el0, x18	00000	0	T68;Rx18	x18	
+0x20c	ldr	w7, [x18]	00000	0	Rw7;Mx18,,0	x18	w7
+0x214	tbz	w1, #0, #0x220	10000	0	Rw1;I0;I544	w1	
+0x218	ldr	w25, [x14, #4]	00000	0	Rw25;Mx14,,4	x14	w25
+0x21c	ldr	w1, [x21, #0x34]	00000	0	Rw1;Mx21,,52	x21	w1
+0x220	b	#0x240	10000	0	I576		
+0x228	ldr	w12, [x9, #0x34]	00000	0	Rw12;Mx9,,52	x9	w12
+0x22c	ldr	w22, [x29, #0x5c]	00000	0	Rw22;Mfp,,92	fp	w22
+0x238	b	#0x21c	10000	0	I540		
+0x248	add	x9, x5, x18	00000	0	Rx9;Rx5;Rx18	x5,x18	x9
+0x24c	b	#0x248	10000	0	I584		
+0x250	-
+0x258	b	#0x240	10000	0	I576		
+0x260	ldr	w9, [x16, #0x1c]	00000	0	Rw9;Mx16,,28	x16	w9
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	mul	x0, x0, x18	00000	0	Rx0;Rx0;Rx18	x0,x18	x0
+0x2c	ldaxrb	w18, [x0]	00000	0	Rw18;Mx0,,0	x0	w18
+0x30	str	x18, [x18, #0]!	00000	1	Rx18;Mx18,,0	x18	x18
+0x34	add	x0, x18, #8	00000	0	Rx0;Rx18;I8	x18	x0
+0x38	ldr	w8, [x18, #0x4c]	00000	0	Rw8;Mx18,,76	x18	w8
+0x3c	-
+0x40	nop		00000	0			
+0x44	b.ls	#0x5c	10000	0	I92	nzcv	
+0x48	cbz	w18, #0x38	10000	0	Rw18;I56	nzcv,w18	
+0x4c	brk	#0	00000	0	I0		
+0x50	mrs	x18, cntpct_el0	00000	0	Rx18;T68		x18
+0x54	caspal	x18, x19, x4, x5, [x16]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx16,,0	x16	
+0x70	svc	#0x1f	00010	0	I31		lr
+0x74	ldr	w3, [x11, #0x6c]	00000	0	Rw3;Mx11,,108	x11	w3
+0x78	ret		00100	0			
+0x7c	ldr	w6, [x30, #0x80]	00000	0	Rw6;Mlr,,128	lr	w6
+0x80	mov	x18, x0	00000	0	Rx18;Rx0	x0	x18
+0x84	ldr	w0, [x5, #0x88]	00000	0	Rw0;Mx5,,136	x5	w0
+0x88	cbnz	x18, #0x90	10000	0	Rx18;I144	nzcv,x18	
+0x8c	b.eq	#0x94	10000	0	I148	nzcv	
+0x98	b.ne	#0x74	10000	0	I116	nzcv	
+0x9c	msr	tpidr_el0, x18	00000	0	T68;Rx18	x18	
+0xa0	ldp	x29, x30, [sp], #0x10	00000	1	Rfp;Rlr;Msp,,0;I16	sp	fp,lr,sp
+0xa4	b	#0x84	10000	0	I132		
+0xa8	b.ne	#0xc0	10000	0	I192	nzcv	
+0xb0	stp	x29, x30, [sp, #-0x10]!	00000	1	Rfp;Rlr;Msp,,-16	fp,lr,sp	sp
+0xb4	ldr	w5, [x0, #0x80]	00000	0	Rw5;Mx0,,128	x0	w5
+0xb8	mrs	x9, cntpct_el0	00000	0	Rx9;T68		x9
+0xbc	stxr	w1, x18, [x0]	00000	0	Rw1;Rx18;Mx0,,0	x18,x0	w1
+0xc0	ldr	w0, [x6, x18, lsl #2]	00000	0	Rw0;Mx6,x18,0	x6,x18	w0
+0xc4	str	x6, [x18]	00000	0	Rx6;Mx18,,0	x6,x18	
+0xc8	ldr	w0, [x5, #0x44]	00000	0	Rw0;Mx5,,68	x5	w0
+0xcc	mov	x29, sp	00000	0	Rfp;Rsp	sp	fp
+0xd4	cbz	w1, #0xdc	10000	0	Rw1;I220	nzcv,w1	
+0xd8	ldr	w26, [x16, #0x2c]	00000	0	Rw26;Mx16,,44	x16	w26
+0xdc	stxr	w1, w18, [x0]	00000	0	Rw1;Rw18;Mx0,,0	w18,x0	w1
+0xec	casp	x18, x19, x4, x5, [x0]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx0,,0	x0	
+0xf0	ldr	w21, [x29, #0x90]	00000	0	Rw21;Mfp,,144	fp	w21
+0xf8	mrs	x18, tpidrro_el0	00000	0	Rx18;T68		x18
+0x100	tbz	w0, #0, #0xd4	10000	0	Rw0;I0;I212	w0	
+0x104	stp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18,x2	
+0x118	b	#0xfc	10000	0	I252		
+0x124	ldar	x9, [x5]	00000	0	Rx9;Mx5,,0	x5	x9
+0x130	stlr	x9, [x12]	00000	0	Rx9;Mx12,,0	x9,x12	
+0x134	ldr	w12, [x2, #0x84]	00000	0	Rw12;Mx2,,132	x2	w12
+0x13c	ldr	w7, [x10, #0xc]	00000	0	Rw7;Mx10,,12	x10	w7
+0x144	ldr	w6, [x4, #0x8c]	00000	0	Rw6;Mx4,,140	x4	w6
+0x148	b	#0x158	10000	0	I344		
+0x150	ldr	w1, [x21, #0x10]	00000	0	Rw1;Mx21,,16	x21	w1
+0x15c	ldr	w29, [x29, #0x68]	00000	0	Rw29;Mfp,,104	fp	w29
+0x174	ldr	w9, [x21]	00000	0	Rw9;Mx21,,0	x21	w9
+0x178	cbz	x18, #0x180	10000	0	Rx18;I384	nzcv,x18	
+0x17c	mrs	x9, tpidr_el0	00000	0	Rx9;T68		x9
+0x184	sub	sp, sp, x5	00000	0	Rsp;Rsp;Rx5	sp,x5	sp
+0x188	stxrb	w1, w0, [x1]	00000	0	Rw1;Rw0;Mx1,,0	w0,x1	w1
+0x190	ldr	w29, [x30, #0x5c]	00000	0	Rw29;Mlr,,92	lr	w29
+0x194	ldr	w30, [x14, #0x44]	00000	0	Rw30;Mx14,,68	x14	w30
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1068	00000	0	I4200		
+0x1c	udf	#0x108c	00000	0	I4236		
+0x28	blr	x18	11000	0	Rx18	x18	lr
+0x2c	nop		00000	0			
+0x30	mov	x6, x18	00000	0	Rx6;Rx18	x18	x6
+0x34	mrs	x0, cntpct_el0	00000	0	Rx0;T68		x0
+0x38	mrs	x18, tpidrro_el0	00000	0	Rx18;T68		x18
+0x40	b.ne	#0x3c	10000	0	I60	nzcv	
+0x44	mov	x29, sp	00000	0	Rfp;Rsp	sp	fp
+0x48	cbz	w3, #0x50	10000	0	Rw3;I80	nzcv,w3	
+0x4c	strb	w18, [x18]	00000	0	Rw18;Mx18,,0	w18,x18	
+0x50	ldr	w2, [x18, #0x78]	00000	0	Rw2;Mx18,,120	x18	w2
+0x54	ldr	w0, [x15, x18, lsl #2]	00000	0	Rw0;Mx15,x18,0	x15,x18	w0
+0x58	cbz	w16, #0x3c	10000	0	Rw16;I60	nzcv,w16	
+0x5c	svc	#0x1f	00010	0	I31		lr
+0x60	add	x0, x18, #8	00000	0	Rx0;Rx18;I8	x18	x0
+0x64	tbnz	w18, #3, #0x6c	10000	0	Rw18;I3;I108	w18	
+0x68	ldr	w9, [x17, #0x74]	00000	0	Rw9;Mx17,,116	x17	w9
+0x70	b.gt	#0x78	10000	0	I120	nzcv	
+0x74	ldp	x29, x30, [sp], #0x10	00000	1	Rfp;Rlr;Msp,,0;I16	sp	fp,lr,sp
+0x7c	stp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18,x2	
+0x88	b	#0x5c	10000	0	I92		
+0x8c	ldr	w23, [x14, #0x14]	00000	0	Rw23;Mx14,,20	x14	w23
+0x90	ldxr	w17, [x0]	00000	0	Rw17;Mx0,,0	x0	w17
+0x94	add	x18, x18, #0	00000	0	Rx18;Rx18;I0	x18	x18
+0x98	stxr	w1, w18, [x0]	00000	0	Rw1;Rw18;Mx0,,0	w18,x0	w1
+0x9c	caspal	x18, x19, x4, x5, [x16]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx16,,0	x16	
+0xa0	ret		00100	0			
+0xa4	cbnz	x17, #0xac	10000	0	Rx17;I172	nzcv,x17	
+0xa8	ldp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18	x18,x2
+0xac	b.ne	#0xb0	10000	0	I176	nzcv	
+0xb4	brk	#0	00000	0	I0		
+0xb8	tbz	w18, #3, #0xc0	10000	0	Rw18;I3;I192	w18	
+0xbc	ldr	w26, [x23, #0x6c]	00000	0	Rw26;Mx23,,108	x23	w26
+0xc4	cbz	w16, #0xa0	10000	0	Rw16;I160	nzcv,w16	
+0xc8	ldr	w14, [x25, #0x44]	00000	0	Rw14;Mx25,,68	x25	w14
+0xd0	ldr	w27, [x23, #0x64]	00000	0	Rw27;Mx23,,100	x23	w27
+0xd4	ldrb	w10, [x18]	00000	0	Rw10;Mx18,,0	x18	w10
+0xd8	sub	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0xdc	b	#0xe8	10000	0	I232		
+0xe0	b	#0xf4	10000	0	I244		
+0xf0	cbnz	x18, #0xe4	10000	0	Rx18;I228	nzcv,x18	
+0xf8	stxr	w2, w16, [x1]	00000	0	Rw2;Rw16;Mx1,,0	w16,x1	w2
+0x100	stp	x29, x30, [sp, #-0x10]!	00000	1	Rfp;Rlr;Msp,,-16	fp,lr,sp	sp
+0x108	cbz	w9, #0x114	10000	0	Rw9;I276	nzcv,w9	
+0x10c	ldr	w16, [x4, #0x5c]	00000	0	Rw16;Mx4,,92	x4	w16
+0x110	casp	x18, x19, x4, x5, [x0]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx0,,0	x0	
+0x11c	ldr	w24, [x7, #0x90]	00000	0	Rw24;Mx7,,144	x7	w24
+0x120	tbz	w0, #0, #0xf4	10000	0	Rw0;I0;I244	w0	
+0x128	stxr	w1, x18, [x0]	00000	0	Rw1;Rx18;Mx0,,0	x18,x0	w1
+0x130	bc.eq	#0x124	00000	0	I292		
+0x134	ldr	w19, [x20, #0x28]	00000	0	Rw19;Mx20,,40	x20	w19
+0x13c	ldr	x4, [x18]	00000	0	Rx4;Mx18,,0	x18	x4
+0x140	ldr	w18, [x9, #0xc]	00000	0	Rw18;Mx9,,12	x9	w18
+0x150	add	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0x154	ldr	w19, [x24, #0x38]	00000	0	Rw19;Mx24,,56	x24	w19
+0x15c	ldr	w21, [x13, #0x5c]	00000	0	Rw21;Mx13,,92	x13	w21
+0x164	stxr	w2, w17, [x9]	00000	0	Rw2;Rw17;Mx9,,0	w17,x9	w2
+0x168	cbz	w9, #0x188	10000	0	Rw9;I392	nzcv,w9	
+0x16c	str	x9, [x18]	00000	0	Rx9;Mx18,,0	x9,x18	
+0x174	msr	tpidr_el0, x18	00000	0	T68;Rx18	x18	
+0x17c	stxrb	w1, w0, [x1]	00000	0	Rw1;Rw0;Mx1,,0	w0,x1	w1
+0x180	ldr	w21, [x1, #0x48]	00000	0	Rw21;Mx1,,72	x1	w21
+0x188	add	x0, x15, x18	00000	0	Rx0;Rx15;Rx18	x15,x18	x0
+0x18c	ldr	w13, [x20, #0x98]	00000	0	Rw13;Mx20,,152	x20	w13
+0x19c	mrs	x18, cntpct_el0	00000	0	Rx18;T68		x18
+0x1a0	tbz	w9, #0, #0x1a4	10000	0	Rw9;I0;I420	w9	
+0x1a4	ldr	w21, [x23, #0x44]	00000	0	Rw21;Mx23,,68	x23	w21
+0x1a8	b	#0x188	10000	0	I392		
+0x1ac	ldr	w18, [x24, #0x80]	00000	0	Rw18;Mx24,,128	x24	w18
+0x1b8	mrs	x4, tpidr_el0	00000	0	Rx4;T68		x4
+0x1bc	b	#0x1ec	10000	0	I492		
+0x1c0	cbz	w9, #0x1d4	10000	0	Rw9;I468	nzcv,w9	
+0x1cc	ldr	w25, [x30, #0x88]	00000	0	Rw25;Mlr,,136	lr	w25
+0x1d4	cbz	w0, #0x1e8	10000	0	Rw0;I488	nzcv,w0	
+0x1d8	b.ls	#0x1b8	10000	0	I440	nzcv	
+0x1dc	ldr	w30, [x3, #0x94]	00000	0	Rw30;Mx3,,148	x3	w30
+0x1e0	b.ne	#0x1f8	10000	0	I504	nzcv	
+0x1e8	ldr	w16, [x1, #0x40]	00000	0	Rw16;Mx1,,64	x1	w16
+0x1ec	stxr	w2, w0, [x13]	00000	0	Rw2;Rw0;Mx13,,0	w0,x13	w2
+0x1f0	ldr	w23, [x29, #0x10]	00000	0	Rw23;Mfp,,16	fp	w23
+0x1f4	cbz	w1, #0x1d4	10000	0	Rw1;I468	nzcv,w1	
+0x1fc	cbnz	x0, #0x1dc	10000	0	Rx0;I476	nzcv,x0	
+0x200	bc.eq	#0x20c	00000	0	I524		
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	nop		00000	0			
+0x2c	str	x18, [x18, #0]!	00000	1	Rx18;Mx18,,0	x18	x18
+0x30	add	x18, x18, #0	00000	0	Rx18;Rx18;I0	x18	x18
+0x34	sub	sp, sp, x5	00000	0	Rsp;Rsp;Rx5	sp,x5	sp
+0x38	cbz	w1, #0x18	10000	0	Rw1;I24	nzcv,w1	
+0x3c	ldr	w12, [x16]	00000	0	Rw12;Mx16,,0	x16	w12
+0x40	cbz	w16, #0x18	10000	0	Rw16;I24	nzcv,w16	
+0x44	ldr	x0, [x18]	00000	0	Rx0;Mx18,,0	x18	x0
+0x4c	ldr	w22, [x12, #0x6c]	00000	0	Rw22;Mx12,,108	x12	w22
+0x50	stxr	w2, w2, [x14]	00000	0	Rw2;Rw2;Mx14,,0	w2,x14	w2
+0x54	str	x1, [x18]	00000	0	Rx1;Mx18,,0	x1,x18	
+0x58	sub	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0x60	-
+0x64	ldar	w0, [x10]	00000	0	Rw0;Mx10,,0	x10	w0
+0x68	add	x9, x5, x18	00000	0	Rx9;Rx5;Rx18	x5,x18	x9
+0x6c	ldr	w3, [x18, #0x34]	00000	0	Rw3;Mx18,,52	x18	w3
+0x70	cbnz	x9, #0x88	10000	0	Rx9;I136	nzcv,x9	
+0x74	svc	#0x1f	00010	0	I31		lr
+0x78	msr	tpidr_el0, x16	00000	0	T68;Rx16	x16	
+0x7c	stlr	x16, [x13]	00000	0	Rx16;Mx13,,0	x16,x13	
+0x80	b.gt	#0x88	10000	0	I136	nzcv	
+0x8c	ldr	w16, [x8, #0x3c]	00000	0	Rw16;Mx8,,60	x8	w16
+0x90	ldr	w0, [x9, #0x10]	00000	0	Rw0;Mx9,,16	x9	w0
+0x98	mul	x0, x0, x18	00000	0	Rx0;Rx0;Rx18	x0,x18	x0
+0x9c	tbnz	w18, #3, #0xa4	10000	0	Rw18;I3;I164	w18	
+0xa0	ldr	w27, [x28, #0x60]	00000	0	Rw27;Mx28,,96	x28	w27
+0xa4	ldp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18	x18,x2
+0xa8	ldr	w16, [x25, #0x44]	00000	0	Rw16;Mx25,,68	x25	w16
+0xac	add	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0xb0	ldr	w9, [x16, #0x8c]	00000	0	Rw9;Mx16,,140	x16	w9
+0xb4	mrs	x18, tpidrro_el0	00000	0	Rx18;T68		x18
+0xb8	stp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18,x2	
+0xbc	cbnz	x9, #0xc4	10000	0	Rx9;I196	nzcv,x9	
+0xc0	tbz	w0, #0, #0xb0	10000	0	Rw0;I0;I176	w0	
+0xc8	ldr	w30, [x0, #0x5c]	00000	0	Rw30;Mx0,,92	x0	w30
+0xd0	cbnz	x1, #0xb4	10000	0	Rx1;I180	nzcv,x1	
+0xd4	adr	x18, #0xdc	00000	0	Rx18;I220		x18
+0xd8	ret		00100	0			
+0xe0	ldr	w23, [x21, #0x20]	00000	0	Rw23;Mx21,,32	x21	w23
+0xe4	stxrb	w1, w0, [x1]	00000	0	Rw1;Rw0;Mx1,,0	w0,x1	w1
+0xe8	mrs	x1, cntpct_el0	00000	0	Rx1;T68		x1
+0xec	cbz	w18, #0xe4	10000	0	Rw18;I228	nzcv,w18	
+0xf4	casp	x18, x19, x4, x5, [x0]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx0,,0	x0	
+0xf8	mov	x0, x18	00000	0	Rx0;Rx18	x18	x0
+0xfc	ldr	w25, [x10, #0x90]	00000	0	Rw25;Mx10,,144	x10	w25
+0x108	stp	x29, x30, [sp, #-0x10]!	00000	1	Rfp;Rlr;Msp,,-16	fp,lr,sp	sp
+0x110	cbnz	x18, #0x118	10000	0	Rx18;I280	nzcv,x18	
+0x114	tbz	w18, #0, #0x108	10000	0	Rw18;I0;I264	w18	
+0x118	ldxr	w2, [x0]	00000	0	Rw2;Mx0,,0	x0	w2
+0x11c	msr	tpidr_el0, x18	00000	0	T68;Rx18	x18	
+0x120	b	#0x150	10000	0	I336		
+0x124	ldr	w10, [x17, #0x38]	00000	0	Rw10;Mx17,,56	x17	w10
+0x128	ldr	w18, [x27, #0x48]	00000	0	Rw18;Mx27,,72	x27	w18
+0x130	ldr	w16, [x22, #0x30]	00000	0	Rw16;Mx22,,48	x22	w16
+0x134	ldr	w13, [x28, #0x90]	00000	0	Rw13;Mx28,,144	x28	w13
+0x138	ldxr	x18, [x0]	00000	0	Rx18;Mx0,,0	x0	x18
+0x140	mrs	x18, cntpct_el0	00000	0	Rx18;T68		x18
+0x144	ldr	w3, [x19, #0x54]	00000	0	Rw3;Mx19,,84	x19	w3
+0x150	brk	#0	00000	0	I0		
+0x154	ldr	w20, [x15, #0x90]	00000	0	Rw20;Mx15,,144	x15	w20
+0x158	ldr	w24, [x1, #0x44]	00000	0	Rw24;Mx1,,68	x1	w24
+0x15c	ldr	x13, [x18]	00000	0	Rx13;Mx18,,0	x18	x13
+0x160	b	#0x170	10000	0	I368		
+0x164	mrs	x18, ctr_el0	00000	0	Rx18;T68		x18
+0x16c	cbz	x18, #0x174	10000	0	Rx18;I372	nzcv,x18	
+0x170	blr	x18	11000	0	Rx18	x18	lr
+0x178	mrs	x16, tpidr_el0	00000	0	Rx16;T68		x16
+0x188	tbz	w0, #0, #0x19c	10000	0	Rw0;I0;I412	w0	
+0x18c	b.ls	#0x190	10000	0	I400	nzcv	
+0x190	cbnz	x18, #0x1c0	10000	0	Rx18;I448	nzcv,x18	
+0x194	ldr	w14, [x13, #4]	00000	0	Rw14;Mx13,,4	x13	w14
+0x19c	stxr	w2, w2, [x13]	00000	0	Rw2;Rw2;Mx13,,0	w2,x13	w2
+0x1a8	strb	w18, [x18]	00000	0	Rw18;Mx18,,0	w18,x18	
+0x1bc	ldr	w26, [x5, #4]	00000	0	Rw26;Mx5,,4	x5	w26
+0x1c0	ldar	w0, [x3]	00000	0	Rw0;Mx3,,0	x3	w0
+0x1dc	ldr	w7, [x20, #0x74]	00000	0	Rw7;Mx20,,116	x20	w7
+0x1e0	tbz	w9, #0, #0x210	10000	0	Rw9;I0;I528	w9	
+0x1e8	ldr	w2, [x18]	00000	0	Rw2;Mx18,,0	x18	w2
+0x1f4	tbz	w1, #0, #0x204	10000	0	Rw1;I0;I516	w1	
+0x1f8	cbz	w0, #0x1d8	10000	0	Rw0;I472	nzcv,w0	
+0x204	b	#0x20c	10000	0	I524		
+0x208	cbz	w9, #0x1ec	10000	0	Rw9;I492	nzcv,w9	
+0x218	b	#0x21c	10000	0	I540		
+0x21c	ldr	w8, [x18, #0x34]	00000	0	Rw8;Mx18,,52	x18	w8
+0x238	mov	x29, sp	00000	0	Rfp;Rsp	sp	fp
+0x240	tbz	w1, #0, #0x214	10000	0	Rw1;I0;I532	w1	
+0x244	ldr	w22, [x20, #0x10]	00000	0	Rw22;Mx20,,16	x20	w22
+0x248	ldr	w8, [x27, #0x3c]	00000	0	Rw8;Mx27,,60	x27	w8
+0x24c	ldr	w8, [x24, #0x20]	00000	0	Rw8;Mx24,,32	x24	w8
+0x254	ldr	w5, [x10, #0x6c]	00000	0	Rw5;Mx10,,108	x10	w5
+0x264	b.eq	#0x25c	10000	0	I604	nzcv	
+0x268	str	x13, [x18]	00000	0	Rx13;Mx18,,0	x13,x18	
+0x26c	mrs	x16, tpidrro_el0	00000	0	Rx16;T68		x16
+0x278	mrs	x4, cntpct_el0	00000	0	Rx4;T68		x4
+0x0	b	#0x28	10000	0	I40		
+0x4	udf	#8	00000	0	I8		
+0x8	adr	x13, #0x889f1	00000	0	Rx13;I559601		x13
+0xc	udf	#0xff8	00000	0	I4088		
+0x10	udf	#0	00000	0	I0		
+0x18	udf	#0x1050	00000	0	I4176		
+0x1c	udf	#0x106c	00000	0	I4204		
+0x28	msr	tpidr_el0, x17	00000	0	T68;Rx17	x17	
+0x2c	add	x18, x18, #0	00000	0	Rx18;Rx18;I0	x18	x18
+0x30	ldr	w24, [x25, #0xc]	00000	0	Rw24;Mx25,,12	x25	w24
+0x34	b	#0x44	10000	0	I68		
+0x38	stxr	w1, w18, [x0]	00000	0	Rw1;Rw18;Mx0,,0	w18,x0	w1
+0x3c	ldr	w26, [x0, #0x40]	00000	0	Rw26;Mx0,,64	x0	w26
+0x40	nop		00000	0			
+0x44	svc	#0x1f	00010	0	I31		lr
+0x48	stp	x29, x30, [sp, #-0x10]!	00000	1	Rfp;Rlr;Msp,,-16	fp,lr,sp	sp
+0x4c	cbz	w1, #0x5c	10000	0	Rw1;I92	nzcv,w1	
+0x50	brk	#0	00000	0	I0		
+0x54	ldr	w26, [x17, #0x4c]	00000	0	Rw26;Mx17,,76	x17	w26
+0x58	ldar	w4, [x9]	00000	0	Rw4;Mx9,,0	x9	w4
+0x60	mov	x9, x18	00000	0	Rx9;Rx18	x18	x9
+0x68	ret		00100	0			
+0x6c	mul	x0, x0, x18	00000	0	Rx0;Rx0;Rx18	x0,x18	x0
+0x70	sub	sp, sp, #0x98	00000	0	Rsp;Rsp;I152	sp	sp
+0x74	ldr	w20, [x20, #0x70]	00000	0	Rw20;Mx20,,112	x20	w20
+0x78	cbz	w16, #0x80	10000	0	Rw16;I128	nzcv,w16	
+0x80	cbnz	x0, #0x68	10000	0	Rx0;I104	nzcv,x0	
+0x88	tbz	w18, #3, #0x90	10000	0	Rw18;I3;I144	w18	
+0x8c	ldr	w14, [x9, #4]	00000	0	Rw14;Mx9,,4	x9	w14
+0x90	cbz	w4, #0x98	10000	0	Rw4;I152	nzcv,w4	
+0x94	b.ls	#0x8c	10000	0	I140	nzcv	
+0x98	stlr	x16, [x4]	00000	0	Rx16;Mx4,,0	x16,x4	
+0x9c	ldr	w21, [x19, #0x10]	00000	0	Rw21;Mx19,,16	x19	w21
+0xa0	casp	x2, x3, x18, x19, [x0]	00000	0	Rx2;Rx3;Rx18;Rx19;Mx0,,0	x0	
+0xac	tbnz	w18, #3, #0xb4	10000	0	Rw18;I3;I180	w18	
+0xb4	ldr	w3, [x18, #0x70]	00000	0	Rw3;Mx18,,112	x18	w3
+0xb8	ldr	w29, [x13, #0x34]	00000	0	Rw29;Mx13,,52	x13	w29
+0xbc	cbz	w0, #0xc4	10000	0	Rw0;I196	nzcv,w0	
+0xc0	add	x0, x4, x18	00000	0	Rx0;Rx4;Rx18	x4,x18	x0
+0xc8	ldar	x1, [x1]	00000	0	Rx1;Mx1,,0	x1	x1
+0xd0	ldp	x29, x30, [sp], #0x10	00000	1	Rfp;Rlr;Msp,,0;I16	sp	fp,lr,sp
+0xd4	tbz	w1, #0, #0xbc	10000	0	Rw1;I0;I188	w1	
+0xd8	msr	tpidr_el0, x18	00000	0	T68;Rx18	x18	
+0xdc	ldrb	w10, [x18]	00000	0	Rw10;Mx18,,0	x18	w10
+0xe0	ldr	w6, [x26, #0x7c]	00000	0	Rw6;Mx26,,124	x26	w6
+0xe4	caspal	x18, x19, x4, x5, [x16]	00000	0	Rx18;Rx19;Rx4;Rx5;Mx16,,0	x16	
+0xec	ldr	w10, [x4, #0xc]	00000	0	Rw10;Mx4,,12	x4	w10
+0xf0	ldr	w18, [x10, #0x1c]	00000	0	Rw18;Mx10,,28	x10	w18
+0xf4	ldr	w30, [x12, #8]	00000	0	Rw30;Mx12,,8	x12	w30
+0x108	ldr	w15, [x30, #0x10]	00000	0	Rw15;Mlr,,16	lr	w15
+0x10c	ldr	w30, [x8, #0x30]	00000	0	Rw30;Mx8,,48	x8	w30
+0x114	strb	w18, [x18]	00000	0	Rw18;Mx18,,0	w18,x18	
+0x118	ldr	w5, [x27, #0x74]	00000	0	Rw5;Mx27,,116	x27	w5
+0x120	cbz	w0, #0x12c	10000	0	Rw0;I300	nzcv,w0	
+0x124	ldp	x18, x2, [x18]	00000	0	Rx18;Rx2;Mx18,,0	x18	x18,x2
+0x128	ldr	w12, [x3, #0x60]	00000	0	Rw12;Mx3,,96	x3	w12
+0x12c	ldr	w1, [x17, #0x30]	00000	0	Rw1;Mx17,,48	x17	w1
+0x130	mov	x0, x18	00000	0	Rx0;Rx18	x18	x0
+0x140	ldr	w24, [x19, #0x20]	00000	0	Rw24;Mx19,,32	x19	w24
+0x144	adr	x18, #0x14c	00000	0	Rx18;I332		x18
+0x154	mrs	x16, cntpct_el0	00000	0	Rx16;T68		x16
+0x15c	ldr	w14, [x24, #0x10]	00000	0	Rw14;Mx24,,16	x24	w14
+0x160	cbnz	x18, #0x148	10000	0	Rx18;I328	nzcv,x18	
+0x164	stlr	x9, [x5]	00000	0	Rx9;Mx5,,0	x9,x5	
+0x168	str	x4, [x18]	00000	0	Rx4;Mx18,,0	x4,x18	
+0x16c	ldr	w17, [x8]	00000	0	Rw17;Mx8,,0	x8	w17
+0x170	cbnz	x0, #0x140	10000	0	Rx0;I320	nzcv,x0	

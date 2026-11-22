@@ -1,0 +1,812 @@
+# 0069-open-in-ibuilder.patch -- "Open in iBuilder": a game file handed over by the Files app's Share sheet (or any app's Open In) is added WITHOUT a picker and without a copy: the original arrives as a security-scoped URL
+# and is cloned into Documents (patch 0066's GameImport.Place); a copy iOS made in this app's own container is moved (a rename).
+# Applies after 0068 (the tree with 0010..0068 applied). UNTESTED ON DEVICE: compiled (dotnet build, ios-arm64, Release: rc 0, no error, the same warnings as the tree without it: this patch adds none; the final count is in the build log) and the pure classes
+# run in a host harness (a net console program built from the real source text of GameAppOpenIn.cs and the files it uses: 262 checks, including the REAL clonefile and a REAL rename on this Mac's APFS, the plist transform on the
+# REAL Info.plist.fragment and on the Info.plist the real build produced, Apple's plutil as the independent reader; 48 mutations of the classes and of the wiring's text, each caught); no iPhone run. Measured and assumed are told apart below.
+#
+# WHY (field facts on the owner's iPhone 15 Pro, iOS 27.2.1, app installed through SideStore): NO Open-mode document picker delivers its selection any more: "Add from Files without copying" logs `import: the picker is open (in
+#   place)` and then nothing, and the folder pickers (Settings > Cloud > Add a folder, for iCloud Drive and for On My iPhone > Downloads) do nothing on Open; only the Import-mode picker works (it copies the whole 11-26 GB file:
+#   minutes). The simulator (iOS 27.2) works, so it is a real-device issue. This patch is a route that does not depend on a picker at all: in Files, touch and hold the game, Share, iBuilder. When the app declares document types
+#   for the game containers and LSSupportsOpeningDocumentsInPlace, iOS hands the app the ORIGINAL file in place; the app clones it into Documents (instant, no extra space), or copies it when a clone is refused.
+#
+# WHAT IT DOES
+#   * Info.plist.fragment: UTImportedTypeDeclarations (dev.nxpocket.ibuilder.nsp / .xci / .nsz / .nup: public.filename-extension, conforming to public.data) and ONE CFBundleDocumentTypes entry ("Switch game", role Viewer, LSHandlerRank
+#       Alternate: iBuilder is offered, never made the default of anybody's files) whose LSItemContentTypes are those four. UIFileSharingEnabled and LSSupportsOpeningDocumentsInPlace (both true, the keys verify_ipa.sh looks
+#       for) were already there and are unchanged. Nothing else is touched. prod.keys is NOT a document type: only the four game extensions.
+#   * GameAppMain.cs (small): GameAppAppDelegate gets `application:openURL:options:` (a scene-less delivery: iOS does not use it for a scene app, it is the safety net) and GameAppSceneDelegate gets `scene:openURLContexts:` (the
+#       app is running or suspended) and, in WillConnect, reads options.UrlContexts (a COLD start through Open in delivers the URL there) after the window is key and visible. All three only queue the URLs (a few property
+#       reads); nothing else runs in the callbacks.
+#   * GameAppOpenIn.cs (new; no UIKit, run by the harness): OpenIn (which names are game files: .nsp .xci .nsz .nup in any case, never prod.keys, InPlaceImport.SafeName's rules; the plan of a batch with the log line of every
+#       skipped file; the ROUTE of a file: AlreadyThere / MoveFromInbox / InPlace, decided from the path with /private and ".." resolved and whole folders compared: only a file inside THIS app's Documents/Inbox, tmp/ or temp folder is
+#       ever moved, anything else is somebody's original and is only read; the move delegate; the words), OpenInQueue (FIFO, thread-safe: the same file twice is queued once, a delivery while a batch runs waits behind it), OpenInPlist
+#       (the transform of the exported player's Info.plist).
+#   * GameAppOpenInUi.cs (new): GameAppOpenInEntry (the three doors into one queue, plus a note list for what arrives before the library exists), and GameAppViewController's pump and worker. The pump (main thread, property
+#       reads only): nothing queued -> nothing; a player -> every URL is refused in the log; a batch running -> it waits (its end pumps again); another import (a picker's) running -> a 1 s look, one log line `open-in: waiting for
+#       the import that is running`; else everything that waits is ONE batch: `open-in: received <name> (in place: yes/no)` for each, `open-in: not a game file: <name>` for the others, then the worker. The worker (Task.Run) is 0066's
+#       "Add from Files without copying" with the same card (`import-progress`), the same awake-screen rule, a UIApplication background task whose handler ends the TASK, and per file: IN PLACE (iOS's original or any URL not in
+#       our container): StartAccessingSecurityScopedResource (stopped in a finally), an NSFileCoordinator read (a file only in iCloud is downloaded first), GameImport.Place into Documents/<the file's own name> (the other import
+#       paths' naming; update, DLC and the title id are read from the name by the refresh that follows), `import: cloned ...` / `import: copied ...` (0066's lines); the original is never changed or deleted. NOT in place (iOS copied
+#       it into Documents/Inbox or tmp/): a MOVE (a rename onto <name>.part, then the one rename over the old file), `import: moved <name> (<size>) in <ms> ms (...)`, no coordination, no copy, no space; if the rename is refused
+#       Place copies and the Inbox copy is deleted after it. The Build tab is shown only when the library is on screen. When the batch ends: the summary line (`open-in: imported: A.nsp (cloned), B.nsp (moved) ...`), RefreshGames,
+#       RefreshScreen, 0066's "Not all were added" alert for failures, and the next batch if one arrived meanwhile. A set of URLs has no order: the files of one delivery are taken by name.
+#   * GameAppShelf.cs (2 lines): the + button's menu is ImportMenuWithOpenIn(): 0066's two entries unchanged, then, apart, a row "How to add from Files" (alert with the steps and an "Open Files" button); the Build tab's empty
+#       state gets a second muted line with the hint.
+#   * GameAppExport.cs (1 line): InfoPlist() of an export ends with OpenInPlist.ForPlayerOrAsIs(<the XML NSPropertyListSerialization wrote>): the player drops CFBundleDocumentTypes and the four game types of
+#       UTImportedTypeDeclarations (another imported type would stay, and the key with it) and keeps everything else byte for byte: UTExportedTypeDeclarations (its .romfs type), UIFileSharingEnabled, the scene manifest...
+#       If the plist could not be read as XML (not expected) it is exported as it is and `[gameapp] open-in: the player's Info.plist keeps its document types: ...` goes to stderr: an export is not refused for it.
+#
+# DECISION THAT DIFFERS FROM THE BRIEF: LSSupportsOpeningDocumentsInPlace is KEPT in the player's Info.plist (the brief said to strip it). Together with UIFileSharingEnabled it is what shows an app's Documents folder in the
+#   Files app (the fragment's own comment and GameAppMain.cs's header say so: "the folder invisible over Files" was the first device run's stop), and the exported player's first screen is "Open Files" on its own folder (patch
+#   0060: the copy made in Files is the only route that works in a FlareStore-installed player). Without CFBundleDocumentTypes the key makes the player an "Open in" target for nothing. OpenInPlist.ForPlayer(xml,
+#   dropInPlaceKey: true) removes it too: one argument if a device shows the player does not need it.
+#
+# NEW STRINGS: "How to add from Files" (+ menu row; subtitle "Touch and hold the game, Share, iBuilder"), alert "Add from Files": "In Files, touch and hold the game, tap Share, then iBuilder. The game is added where it is,
+#   without a copy.\n\nSeveral files (a game with its update and DLC) can be shared together." with the buttons "Open Files" and "Close"; the Build tab's hint "In Files, touch and hold the game, Share, iBuilder: it is added
+#   without a copy."; reused from 0066: "Adding", "Copying", "Not all were added", "OK". Log lines: `open-in: <door> delivered <N> URL(s)` (door = scene:willConnectToSession, scene:openURLContexts, application:openURL:options:),
+#   `open-in: received <name> (in place: yes|no)`, `open-in: not a game file: <name>`, `open-in: <name> skipped: <why>`, `open-in: <name> is already waiting or being added: ignored`, `open-in: waiting for the import that is
+#   running`, `import: moved <name> (<size>) in <ms> ms (...)`, 0066's `import: cloned ...` / `import: copied ...`, `open-in: <name> could not be added: <why>`, `open-in: imported: ... (cloned|moved|copied|already there)`.
+#   ACCESSIBILITY IDS: import-howto (the menu row), open-in-hint (the empty-state line); import-progress (0066's card) is shared; import-file is the + button, as before.
+#
+# MEASURED (host harness, .NET 11, Apple silicon Mac, APFS; 262 checks): the names (the four extensions in any case, prod.keys / .part / .icloud / a folder / a name too long for the .part refused; a batch planned in order with an iCloud
+#   placeholder's real name, a name twice skipped with its line); the route over twenty-odd path shapes (iOS's copy in Documents/Inbox or tmp/ also spelled under /private/var is MoveFromInbox; Inbox-old, Inboxes, tmpfile, a ".." that leaves Inbox,
+#   a folder named Inbox in iCloud Drive, another app's Documents are InPlace; the library's own file is AlreadyThere; a temp folder of "/" is refused); the queue (FIFO, the same file twice once, a delivery during a batch waits behind it,
+#   8 threads x 500 files delivered twice each: every file arrived, none twice in one batch); the REAL clonefile through GameImport.Place: a 200 MB original in a "file provider" folder is cloned into a fake container's Documents in 1.1 ms,
+#   free space change 0.0 MB, SHA-256 identical, the original untouched (content and time), writing into the clone leaves the original as it was; iOS's copy of 300 MB in Documents/Inbox is MOVED in 0.42 ms, the SAME inode (a rename),
+#   free space change 0.0 MB, the Inbox neighbour untouched; a refused rename falls back to the copy and says why; a rename and a copy that both fail leave the old game and iOS's copy; a copy that cannot fit is refused up front and a
+#   rename needs no room; a file that is gone is reported and nothing is created. The plist: the REAL fragment is valid for plutil and xmllint (the strict check build-app.sh runs), plutil (Apple's reader) agrees on the document type
+#   (one entry, Alternate, Viewer, the four UTIs) and on the four imported types (public.data, public.filename-extension nsp xci nsz nup); the player's transform leaves NO CFBundleDocumentTypes and NO UTImportedTypeDeclarations, every
+#   other top-level key identical in order and in value (read by plutil), UIFileSharingEnabled / LSSupportsOpeningDocumentsInPlace / its .romfs type kept, idempotent, a foreign imported type kept with its key, a nested key of the same
+#   name untouched, 20,000 keys in a few ms, garbage refused (FormatException; ForPlayerOrAsIs returns it as it is and says so), an external entity never read; the same transform on the Info.plist of the REAL build (the SDK merged the
+#   fragment: the built binary plist has the document type and the four types) passes plutil -lint with every other key identical. The UIKit files are read as text for what the host cannot run: the three doors and the cold start, the
+#   export going through the transform, no file work or wait on the main thread in any callback or in the pump, every file operation inside the worker, the security scope stopped in a finally, the background task ended, the only
+#   File.Delete is of iOS's own copy, the + menu row added to the menu the button has (the pickers' file is not touched). 48 mutations (the classes, the fragment and that wiring text), each caught by at least one check.
+#   COMPILED: dotnet build gameapp.csproj -c Release -r ios-arm64 on a copy of the main agent's proj folder with the patched sources (paths rewritten, Compile list regenerated, clean obj/bin): rc 0, 0 errors, 47 warnings, the same
+#   warning set as the tree without this patch (the normalised lists are identical); the same on top of the other agent's 0067 draft (rc 0); this patch applies on that draft without a rejected hunk. In the built GameApp.dll: the UTF-16
+#   strings "In Files, touch and hold the game, Share, iBuilder: it is added without a copy.", "How to add from Files", "open-in: received ", "open-in: not a game file: ", "import: moved ", and the metadata names
+#   application:openURL:options:, scene:openURLContexts:, GameAppOpenInEntry, OpenInPlist (candidates for verify_ipa.sh).
+# NOT EXERCISED / ASSUMED (no device run, no simulator run): everything UIKit (the callbacks, the pump, the card, the menu row, the alert, the hint, the timer); that iOS offers iBuilder in the Files app's Share sheet for a .nsp / .xci / .nsz
+#   / .nup (the types are declared as IMPORTED ones with the app's own identifiers: if another installed app exports a type for the same extension with another identifier, Files may resolve the file to that one and not list this
+#   app); the registration of the new types by an installer (SideStore) at install; that the delivery is in place (the flag is read and logged: `(in place: yes/no)`) and the URL is the original; the cold start through Open in (options.
+#   UrlContexts); that the sandbox lets clonefile read a security-scoped original on the phone (a refusal is the copy, and the line says why); where iOS puts a copy that is not in place (Documents/Inbox or tmp/ is assumed from Apple's
+#   documentation; any other place is read as an original: cloned or copied, never moved or deleted); a 26 GB file; the progress card while the app is in the background; that the player's Documents folder stays visible in Files with
+#   the key kept (assumed from the repo's own record of the first device run); a delivery while a game is on screen.
+# RISKS: iBuilder now appears in the Share sheet / Open In list of any app for .nsp, .xci, .nsz and .nup files (rank Alternate: never the default; only those four extensions; the exported players do not); the types are declared with the
+#   app's own identifiers, so another app that declares the same extensions competes for the file's type; a SideStore-installed app has a team-suffixed bundle id, which does not touch the type identifiers; a URL set from a cold start has
+#   no order, so the files of one delivery are taken by name; a file the person shares twice while it is being added is dropped (the log says so), shared again afterwards it is replaced in one rename; an Inbox copy is renamed away,
+#   so Files' Inbox folder of this app is empty after an add; each file added here IS recorded in the 0068 ledger (gameapp.imports.tsv, source "Open in iBuilder", how clone or copy), so with Settings > "Remove the game file after a successful build" on, it is replaced by a
+#   zero-byte stub after its successful build like any other import (the original in Files is never touched; a file that was already the library's own is never recorded); with 0067 in the tree the in-place branch of OpenInRun could call 0067's RunImportJobs instead of its own loop (it has no per-URL security scope there: the scope of each URL would have to be started
+#   by the caller).
+diff -ruN a/GameAppExport.cs b/GameAppExport.cs
+--- a/GameAppExport.cs
++++ b/GameAppExport.cs
+@@ -386,7 +386,8 @@
+         }
+         var data = NSPropertyListSerialization.DataWithPropertyList(dict, NSPropertyListFormat.Xml, NSPropertyListWriteOptions.Immutable, out NSError error);
+         if (data == null) throw new InvalidOperationException("the exported Info.plist could not be written: " + error?.LocalizedDescription);
+-        return data.ToArray();
++        // The player is no "Open in" target for game files: iBuilder's document types and the game types' declarations stay out of its plist (GameAppOpenIn.cs, OpenInPlist; its own .romfs type and the file sharing stay).
++        return OpenInPlist.ForPlayerOrAsIs(data.ToArray(), text => Console.Error.WriteLine("[gameapp] " + text));
+     }
+ 
+     /// Writes Documents/Exports/<Name>.ipa (and, `slim`, the game files beside it: Exports/<Name>/<Name> [<id>].romfs).
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -337,6 +337,14 @@
+         return true;
+     }
+ 
++    /// "Open in iBuilder" for an app without scenes: with a scene delegate iOS uses GameAppSceneDelegate.OpenUrlContexts instead, so this is only the second door (GameAppOpenInUi.cs). Does nothing but queue the URL.
++    [Export("application:openURL:options:")]
++    public bool OpenUrl(UIApplication application, NSUrl url, NSDictionary options)
++    {
++        GameAppOpenInEntry.FromApplication(url, options);
++        return true;
++    }
++
+     [Export("application:configurationForConnectingSceneSession:options:")]
+     public UISceneConfiguration GetConfiguration(UIApplication application, UISceneSession session,
+                                                  UISceneConnectionOptions options)
+@@ -365,6 +373,16 @@
+         if (Array.IndexOf(args, "-GameAppDebugTv") >= 0) GameAppExternal.UseDebugDisplay((UIWindowScene) scene);
+         if (Array.IndexOf(args, "-GameAppDebugGame") >= 0)
+             NSTimer.CreateScheduledTimer(0.8, _ => GameAppDebugGame.Show(Window.RootViewController));
++        // "Open in iBuilder" (GameAppOpenInUi.cs): a COLD start through the Share sheet delivers its URL here, in the connection options. Both calls only queue; the import starts on the next turn of the run loop, on a worker.
++        GameAppOpenInEntry.Attach(Window.RootViewController as GameAppViewController);
++        GameAppOpenInEntry.FromScene(options?.UrlContexts, "scene:willConnectToSession");
++    }
++
++    /// "Open in iBuilder" while the app is running or suspended (the first door; GameAppOpenInUi.cs). Only queues.
++    [Export("scene:openURLContexts:")]
++    public void OpenUrlContexts(UIScene scene, NSSet<UIOpenUrlContext> urlContexts)
++    {
++        GameAppOpenInEntry.FromScene(urlContexts, "scene:openURLContexts");
+     }
+ }
+ 
+diff -ruN a/GameAppOpenIn.cs b/GameAppOpenIn.cs
+--- a/GameAppOpenIn.cs
++++ b/GameAppOpenIn.cs
+@@ -0,0 +1,311 @@
++// gameapp/GameAppOpenIn.cs -- "Open in iBuilder": a game file handed over by the Files app's Share sheet (or any app's Open In), with no UIKit (patch 0069; the host harness compiles this file as it is).
++//
++// Why: on the owner's iPhone (iOS 27.2.1) no Open-mode document picker delivers its selection any more, so a game that is already on the phone cannot be added through a picker. The route that does not depend on a picker is
++// the other direction: in Files, touch and hold the game, Share, iBuilder. When the app says it can open documents in place (LSSupportsOpeningDocumentsInPlace, and a document type for the game containers), iOS hands over
++// the ORIGINAL file as a security-scoped URL; GameImport.Place (patch 0066) then clones it into Documents (instant, no extra space), or copies it when a clone is refused.
++//
++//   OpenIn         which names are game files (the four containers, nothing else: not prod.keys), what a batch of received URLs becomes (accepted / skipped, with the log line of each), where a file is (in place, or a copy iOS
++//                  made inside this app's own container: Documents/Inbox or tmp/), the way it goes in (clone/copy for a file where it is, a MOVE for iOS's copy), and the words of the log and of the hint.
++//   OpenInQueue    the URLs that arrived and wait: FIFO, a second delivery of the same file is dropped, a delivery while an import runs waits behind it (nothing is lost, nothing runs twice).
++//   OpenInPlist    the exported player's Info.plist (it must not become an "Open in" target for game files): the transform of the plist's XML text, the same function the app runs at an export.
++// The UIKit half is GameAppOpenInUi.cs (the callbacks of the app and scene delegates, the worker, the menu row and the hint).
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using System.Text;
++using System.Xml;
++using System.Xml.Linq;
++
++/// One URL that was handed to the app. Path is where iOS says the file is (NSUrl.Path), Name its last component as iOS gave it (an iCloud placeholder's ".X.nsp.icloud" is made "X.nsp" by Plan), InPlace what the delivery
++/// said (UIApplicationOpenURLOptionsOpenInPlaceKey / UISceneOpenURLOptions.openInPlace), Handle the NSUrl itself (the UI keeps it: its security scope belongs to it; the harness leaves it null).
++public sealed record OpenInRequest(string Path, string Name, bool InPlace, object Handle);
++
++/// What a batch of requests becomes: the ones that are imported (with their real names), and for every other one the line the log gets.
++public sealed record OpenInPlan(IReadOnlyList<OpenInRequest> Accepted, IReadOnlyList<(OpenInRequest Request, string Line)> Skipped);
++
++/// How a file goes in: AlreadyThere = it IS the library's own file (nothing to do); MoveFromInbox = iOS copied it into this app's container (Documents/Inbox, tmp/), a rename puts it in the library; InPlace = it is
++/// where its owner keeps it (a clone, else a copy, and the original is never touched).
++public enum OpenInRoute { AlreadyThere, MoveFromInbox, InPlace }
++
++public static class OpenIn
++{
++    public static readonly string[] Extensions = { ".nsp", ".xci", ".nsz", ".nup" };
++
++    /// The UTIs the Info.plist declares for the four extensions (UTImportedTypeDeclarations, patch 0069), in the order of Extensions.
++    public static readonly string[] TypeIdentifiers = { "dev.nxpocket.ibuilder.nsp", "dev.nxpocket.ibuilder.xci", "dev.nxpocket.ibuilder.nsz", "dev.nxpocket.ibuilder.nup" };
++
++    // ---- the words (also in the harness: a changed sentence is a changed test) ----------------------------------------------------------------------------------------------------------------------------
++
++    public const string Hint = "In Files, touch and hold the game, Share, iBuilder: it is added without a copy.";
++    public const string MenuTitle = "How to add from Files";
++    public const string MenuSubtitle = "Touch and hold the game, Share, iBuilder";
++    public const string HowToTitle = "Add from Files";
++    public const string HowToMessage = "In Files, touch and hold the game, tap Share, then iBuilder. The game is added where it is, without a copy.\n\nSeveral files (a game with its update and DLC) can be shared together.";
++    public const string HowToOpenFiles = "Open Files";
++    public const string HowToClose = "Close";
++
++    private static string Inv(FormattableString text) => text.ToString(CultureInfo.InvariantCulture);
++
++    public static string ReceivedLine(string name, bool inPlace) => $"open-in: received {name} (in place: {(inPlace ? "yes" : "no")})";
++
++    public static string NotAGameLine(string name) => $"open-in: not a game file: {name}";
++
++    public static string SkippedLine(string name, string why) => $"open-in: {name} skipped: {why}";
++
++    public static string DuplicateLine(string name) => $"open-in: {name} is already waiting or being added: ignored";
++
++    public static string MovedLine(string name, long bytes, long milliseconds) =>
++        Inv($"import: moved {name} ({GameAppUi.SizeText(bytes)}) in {milliseconds} ms (iOS had copied it into this app, not in place: renamed into the library, nothing copied again)");
++
++    // ---- which files ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
++
++    /// A game container by its name: .nsp .xci .nsz .nup in any case, and a name Documents can hold (InPlaceImport.SafeName: no separator, room for the .part). prod.keys is NOT accepted here: the Info.plist declares the four
++    /// extensions only, so nothing else is offered the app, and a keys file arrives by the pickers.
++    public static bool Accepts(string name)
++    {
++        if (!InPlaceImport.SafeName(name)) return false;
++        var extension = Path.GetExtension(name);
++        return name.Length > extension.Length && Extensions.Contains(extension, StringComparer.OrdinalIgnoreCase);
++    }
++
++    /// What a batch of received URLs becomes. Every request gets its real name (Cloud.RealName); a request with no path, an unusable name, not one of the four extensions, or a name that came twice in this batch (Documents is
++    /// case-insensitive: two of one name are one file) is skipped with the log line that says so. Order is kept: the accepted ones are imported in the order they came.
++    public static OpenInPlan Plan(IReadOnlyList<OpenInRequest> requests)
++    {
++        var accepted = new List<OpenInRequest>();
++        var skipped = new List<(OpenInRequest, string)>();
++        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++        foreach (var request in requests)
++        {
++            var name = Cloud.RealName(request.Name ?? "");
++            var real = request with { Name = name };
++            if (string.IsNullOrEmpty(request.Path)) skipped.Add((real, SkippedLine(string.IsNullOrEmpty(name) ? "(no name)" : name, "it is not a file on this device")));
++            else if (!InPlaceImport.SafeName(name)) skipped.Add((real, SkippedLine(string.IsNullOrEmpty(name) ? "(no name)" : name, "its name cannot be used")));
++            else if (!Accepts(name)) skipped.Add((real, NotAGameLine(name)));
++            else if (!seen.Add(name)) skipped.Add((real, SkippedLine(name, "it came twice in one go")));
++            else accepted.Add(real);
++        }
++        return new OpenInPlan(accepted, skipped);
++    }
++
++    // ---- where the file is, and how it goes in ---------------------------------------------------------------------------------------------------------------------------------------------------------------
++
++    /// True for a file iOS copied into this app's own container when the source did not hand it over in place: Documents/Inbox/, the container's tmp/, the process's temp folder. Only such a file may be MOVED (it is iOS's copy,
++    /// ours to take): anything else is somebody's original and is only ever read. Paths are compared as the file system sees them (/private/var and /var are one place, ".." is resolved), and by whole folders (Inbox-x is not Inbox).
++    public static bool IsContainerCopy(string path, string home, string temp)
++    {
++        if (string.IsNullOrEmpty(path)) return false;
++        string p;
++        try { p = GameImport.Normal(path); } catch (Exception) { return false; }
++        foreach (var root in CopyFolders(home, temp))
++            if (p.StartsWith(root + "/", StringComparison.Ordinal)) return true;
++        return false;
++    }
++
++    private static IEnumerable<string> CopyFolders(string home, string temp)
++    {
++        var roots = new List<string>();
++        if (!string.IsNullOrEmpty(home)) { roots.Add(Path.Combine(home, "Documents", "Inbox")); roots.Add(Path.Combine(home, "tmp")); }
++        if (!string.IsNullOrEmpty(temp)) roots.Add(temp);
++        foreach (var root in roots)
++        {
++            string normal;
++            try { normal = GameImport.Normal(root).TrimEnd('/'); } catch (Exception) { continue; }
++            if (normal.Length > 1) yield return normal;   // never "/" itself: that would make every file a copy of ours
++        }
++    }
++
++    /// The route of one file. `destination` is where the library keeps it (Documents/<name>).
++    public static OpenInRoute Route(string path, string destination, string home, string temp)
++    {
++        if (GameImport.SamePath(path, destination)) return OpenInRoute.AlreadyThere;
++        return IsContainerCopy(path, home, temp) ? OpenInRoute.MoveFromInbox : OpenInRoute.InPlace;
++    }
++
++    /// The log line when a batch is over: what was added (and how: moved, cloned, copied) and what was not (and why). The files that failed are listed by InPlaceImport.Failures for the alert.
++    public static string Summary(IReadOnlyList<(ImportOutcome Outcome, OpenInRoute Route)> done)
++    {
++        var added = done.Where(d => d.Outcome.Placed != null).ToList();
++        var failed = done.Where(d => d.Outcome.Placed == null).ToList();
++        if (added.Count == 0 && failed.Count == 0) return "open-in: nothing was added";
++        var parts = new List<string>();
++        if (added.Count > 0)
++            parts.Add("imported: " + string.Join(", ", added.Select(d => d.Outcome.Name + (d.Outcome.Placed.How == PlacedHow.Cloned ? (d.Route == OpenInRoute.MoveFromInbox ? " (moved)" : " (cloned)")
++                                                                                                 : d.Outcome.Placed.How == PlacedHow.Copied ? " (copied)" : " (already there)"))));
++        if (failed.Count > 0)
++            parts.Add("import failed: " + string.Join("; ", failed.Select(d => $"{d.Outcome.Name}: {d.Outcome.Error}")));
++        return "open-in: " + string.Join(" · ", parts);
++    }
++
++    /// The "clone" delegate of GameImport.Place for iOS's own copy: rename it onto Place's `<dest>.part` (the same volume: rename(2), instant, no space). null = done, else why not (Place then copies, and the line says why).
++    public static string TryMove(string source, string part)
++    {
++        try { File.Move(source, part, false); return null; }
++        catch (Exception e) { return $"{e.GetType().Name}: {e.Message}"; }
++    }
++}
++
++/// The URLs that arrived and wait to be imported. Thread-safe (the callbacks come on the main thread, the harness uses several).
++public sealed class OpenInQueue
++{
++    private readonly object gate = new object();
++    private readonly List<OpenInRequest> pending = new List<OpenInRequest>();
++    private readonly HashSet<string> flying = new HashSet<string>(StringComparer.Ordinal);   // the paths of the batch that is being imported
++    private bool running;
++
++    public int Pending { get { lock (gate) return pending.Count; } }
++
++    public bool Running { get { lock (gate) return running; } }
++
++    private static string Key(string path) => string.IsNullOrEmpty(path) ? null : GameImport.Normal(path);
++
++    /// Queues the requests, in order. A request whose file (the same path) already waits, or is in the batch that is being imported, is NOT queued: it is returned, so the caller can say so. (iOS delivers a URL once; this is the
++    /// safety for a delivery through both of its doors.)
++    public IReadOnlyList<OpenInRequest> Add(IEnumerable<OpenInRequest> requests)
++    {
++        var ignored = new List<OpenInRequest>();
++        lock (gate)
++            foreach (var request in requests)
++            {
++                var key = Key(request.Path);
++                if (key != null && (flying.Contains(key) || pending.Any(p => Key(p.Path) == key))) ignored.Add(request);
++                else pending.Add(request);
++            }
++        return ignored;
++    }
++
++    /// Everything that waits, in order, and the queue is now "running" until Finish. Empty when nothing waits or a batch is still running: the caller starts the next one when the running one ends.
++    public IReadOnlyList<OpenInRequest> TakeBatch()
++    {
++        lock (gate)
++        {
++            if (running || pending.Count == 0) return Array.Empty<OpenInRequest>();
++            var batch = pending.ToList();
++            pending.Clear();
++            flying.Clear();
++            foreach (var request in batch) { var key = Key(request.Path); if (key != null) flying.Add(key); }
++            running = true;
++            return batch;
++        }
++    }
++
++    /// The batch is done (whatever became of it): the next one may start.
++    public void Finish()
++    {
++        lock (gate) { running = false; flying.Clear(); }
++    }
++}
++
++/// The Info.plist of an exported player. A player is made of this app's own bundle and Info.plist; the "Open in" door is for game files of iBuilder itself, so a player must not carry it: its document types (and the
++/// types the game files are declared with) go. What the player needs stays: its own .romfs type (UTExportedTypeDeclarations), UIFileSharingEnabled, and LSSupportsOpeningDocumentsInPlace (see below).
++public static class OpenInPlist
++{
++    /// Top-level keys removed from a player's plist. Without CFBundleDocumentTypes the app is offered nowhere in a Share sheet or an Open In list.
++    public static readonly string[] PlayerRemovedKeys = { "CFBundleDocumentTypes" };
++
++    public const string ImportedTypes = "UTImportedTypeDeclarations";
++    public const string InPlaceKey = "LSSupportsOpeningDocumentsInPlace";
++
++    /// `dropInPlaceKey`: also remove LSSupportsOpeningDocumentsInPlace. It stays by default: together with UIFileSharingEnabled it is what shows a player's own Documents folder in Files (the exported player's "Open Files"
++    /// button, patch 0060, lands there), and without CFBundleDocumentTypes it makes the player an "Open in" target for nothing.
++    public static string ForPlayer(string xml, bool dropInPlaceKey = false) => Encoding.UTF8.GetString(ForPlayer(Encoding.UTF8.GetBytes(xml), dropInPlaceKey));
++
++    /// The same on the bytes of an XML property list (what NSPropertyListSerialization writes). Everything that is not removed is kept as it is, comments and white space included. Throws FormatException for what is not a plist.
++    public static byte[] ForPlayer(byte[] xml, bool dropInPlaceKey = false)
++    {
++        var doc = Load(xml);
++        var dict = RootDict(doc);
++        var nodes = dict.Elements().ToList();
++        var gone = new List<XElement>();
++        for (int i = 0; i + 1 < nodes.Count; i += 2)
++        {
++            if (nodes[i].Name.LocalName != "key") throw new FormatException("a property list's dictionary alternates key and value");
++            var key = nodes[i].Value;
++            var value = nodes[i + 1];
++            if (PlayerRemovedKeys.Contains(key, StringComparer.Ordinal) || (dropInPlaceKey && key == InPlaceKey)) { gone.Add(nodes[i]); gone.Add(value); }
++            else if (key == ImportedTypes && value.Name.LocalName == "array")
++            {
++                foreach (var entry in value.Elements("dict").Where(d => OpenIn.TypeIdentifiers.Contains(ValueOf(d, "UTTypeIdentifier"), StringComparer.Ordinal)).ToList()) Remove(entry);
++                if (!value.Elements().Any()) { gone.Add(nodes[i]); gone.Add(value); }   // nothing else was declared there: the key goes
++            }
++        }
++        foreach (var node in gone) Remove(node);
++        return Save(doc, xml);
++    }
++
++    /// What the export calls: the transform, and when the plist cannot be read as one (not expected: NSPropertyListSerialization wrote it a moment ago) the plist as it is, with the reason said: an export is not refused for a
++    /// player that would also be offered game files.
++    public static byte[] ForPlayerOrAsIs(byte[] xml, Action<string> problem = null)
++    {
++        try { return ForPlayer(xml); }
++        catch (Exception e) { problem?.Invoke($"open-in: the player's Info.plist keeps its document types: {e.GetType().Name}: {e.Message}"); return xml; }
++    }
++
++    /// The top-level keys of a plist's XML, in order.
++    public static IReadOnlyList<string> TopLevelKeys(string xml) => RootDict(Load(Encoding.UTF8.GetBytes(xml))).Elements("key").Select(k => k.Value).ToList();
++
++    /// The content types the plist's document types handle (CFBundleDocumentTypes > LSItemContentTypes), in order.
++    public static IReadOnlyList<string> DocumentTypeIdentifiers(string xml)
++    {
++        var dict = RootDict(Load(Encoding.UTF8.GetBytes(xml)));
++        var types = ValueElement(dict, "CFBundleDocumentTypes");
++        if (types == null) return Array.Empty<string>();
++        return types.Elements("dict").SelectMany(d => ValueElement(d, "LSItemContentTypes")?.Elements("string").Select(s => s.Value) ?? Enumerable.Empty<string>()).ToList();
++    }
++
++    /// The identifiers of the types the plist imports (UTImportedTypeDeclarations > UTTypeIdentifier), in order.
++    public static IReadOnlyList<string> ImportedTypeIdentifiers(string xml)
++    {
++        var array = ValueElement(RootDict(Load(Encoding.UTF8.GetBytes(xml))), ImportedTypes);
++        return array == null ? Array.Empty<string>() : array.Elements("dict").Select(d => ValueOf(d, "UTTypeIdentifier")).Where(s => s != null).ToList();
++    }
++
++    private static XDocument Load(byte[] xml)
++    {
++        try
++        {
++            var settings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Ignore, XmlResolver = null };   // the plist's DOCTYPE names a DTD on apple.com: never fetched
++            using var reader = XmlReader.Create(new MemoryStream(xml), settings);
++            return XDocument.Load(reader, LoadOptions.PreserveWhitespace);
++        }
++        catch (XmlException e) { throw new FormatException("not an XML property list: " + e.Message); }
++    }
++
++    private static XElement RootDict(XDocument doc)
++    {
++        if (doc.Root == null || doc.Root.Name.LocalName != "plist") throw new FormatException("not a property list (no <plist>)");
++        return doc.Root.Elements("dict").FirstOrDefault() ?? throw new FormatException("a property list with no top-level dictionary");
++    }
++
++    /// The value element that follows `key` in `dict` (null when the key is not there).
++    private static XElement ValueElement(XElement dict, string key)
++    {
++        var nodes = dict.Elements().ToList();
++        for (int i = 0; i + 1 < nodes.Count; i += 2)
++            if (nodes[i].Name.LocalName == "key" && nodes[i].Value == key) return nodes[i + 1];
++        return null;
++    }
++
++    private static string ValueOf(XElement dict, string key) => ValueElement(dict, key)?.Value;
++
++    /// Removes the element and the white space in front of it, so no blank line is left.
++    private static void Remove(XNode node)
++    {
++        if (node.PreviousNode is XText before && string.IsNullOrWhiteSpace(before.Value)) before.Remove();
++        node.Remove();
++    }
++
++    private static byte[] Save(XDocument doc, byte[] original)
++    {
++        // The prolog is written by hand (an XDocument does not keep the line breaks between the declaration, the DOCTYPE and <plist>); the root keeps every white space node, comment and attribute it had. DtdProcessing.Ignore drops the
++        // DOCTYPE, so it is written back, always the plist DTD of Apple's own files, when the original had one.
++        var text = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
++        if (Encoding.UTF8.GetString(original, 0, Math.Min(original.Length, 2048)).Contains("<!DOCTYPE"))
++            text.Append("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
++        text.Append(doc.Root.ToString(SaveOptions.DisableFormatting)).Append('\n');
++        return new UTF8Encoding(false).GetBytes(text.ToString());
++    }
++}
+diff -ruN a/GameAppOpenInUi.cs b/GameAppOpenInUi.cs
+--- a/GameAppOpenInUi.cs
++++ b/GameAppOpenInUi.cs
+@@ -0,0 +1,253 @@
++// gameapp/GameAppOpenInUi.cs -- "Open in iBuilder": the UIKit half (patch 0069). The decisions (which files, the queue, in place or iOS's copy, the words, the player's plist) are in GameAppOpenIn.cs (no UIKit, run by the host harness).
++//
++//   * The doors. iOS hands a file to the app in one of three ways, and all three end in GameAppOpenInEntry.Deliver: GameAppSceneDelegate.WillConnect (a COLD start through the Share sheet: options.UrlContexts),
++//     GameAppSceneDelegate.OpenUrlContexts (the app is running or suspended) and GameAppAppDelegate.OpenUrl (an app without scenes; iOS does not use it for this one, it is there so a delivery is never lost). A delivery
++//     only queues the URLs (a few property reads); the work is on a worker.
++//   * The pump (main thread, a few property reads): when nothing is being added it takes everything that waits as ONE batch, logs what was received, and starts the worker. A delivery that arrives while a batch runs waits
++//     behind it and starts when it ends; one that arrives while another import (a picker's) runs is looked at again every second. Nothing runs twice, nothing is lost.
++//   * The worker (Task.Run), the same steps as "Add from Files without copying" (GameAppImportUi.cs, patch 0066) and the same progress card, background task and awake screen: for a file that is where its owner keeps it, a security
++//     scope and an NSFileCoordinator read, then GameImport.Place (an APFS clone into Documents/<name>, the copy as the fallback, always through <name>.part and one rename); for a file iOS copied into this app's own container
++//     (Documents/Inbox, tmp/: not in place) a MOVE (a rename onto the .part), never a clone and never a second copy. The original of a file in place is never touched. Naming is the other import paths': the file's own name in
++//     Documents; update, DLC and title id are read from it by the refresh that follows (RefreshGames, RefreshScreen).
++//   * The hint: a row "How to add from Files" at the end of the + menu (an alert with the steps and an "Open Files" button; added to the menu the button HAS, once, when the first delivery or the scene's attach pumps), and the same
++//     sentence in the Build tab's empty state (one line GameAppShelf.cs calls).
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Threading.Tasks;
++
++using Foundation;
++using UIKit;
++
++/// The three doors of "Open in", and what they have in common: queue the URLs, then wake the library's pump.
++internal static class GameAppOpenInEntry
++{
++    internal static readonly OpenInQueue Queue = new OpenInQueue();
++    private static readonly object gate = new object();
++    private static readonly List<string> notes = new List<string>();   // what the doors say before the library exists (a cold start): written to the log by the pump, in order
++    private static GameAppViewController target;
++
++    /// The scene delegate, once its window and the library are up: what came before them (a cold start) starts now.
++    internal static void Attach(GameAppViewController owner)
++    {
++        if (owner == null) return;
++        target = owner;
++        owner.OpenInPump();
++    }
++
++    /// scene:willConnectToSession:options: (cold start) and scene:openURLContexts:. A set has no order: the files are taken by name, so a game and its update come the same way every time.
++    internal static void FromScene(IEnumerable<UIOpenUrlContext> contexts, string door)
++    {
++        var urls = (contexts ?? Enumerable.Empty<UIOpenUrlContext>()).Where(c => c?.Url != null)
++                   .Select(c => (Url: c.Url, InPlace: c.Options?.OpenInPlace ?? false))
++                   .OrderBy(u => u.Url.LastPathComponent ?? "", StringComparer.OrdinalIgnoreCase).ToList();
++        Deliver(urls, door);
++    }
++
++    /// application:openURL:options: -- the options carry UIApplicationOpenURLOptionsOpenInPlaceKey (a bool).
++    internal static void FromApplication(NSUrl url, NSDictionary options)
++    {
++        if (url == null) return;
++        bool inPlace = options != null && new UIApplicationOpenUrlOptions(options).OpenInPlace == true;   // the SDK's typed view of the options dictionary (UIApplicationOpenURLOptionsOpenInPlaceKey)
++        Deliver(new List<(NSUrl Url, bool InPlace)> { (url, inPlace) }, "application:openURL:options:");
++    }
++
++    private static void Deliver(List<(NSUrl Url, bool InPlace)> urls, string door)
++    {
++        if (urls.Count == 0) return;
++        var requests = urls.Select(u => new OpenInRequest(u.Url.IsFileUrl ? (u.Url.Path ?? "") : "", u.Url.LastPathComponent ?? "", u.InPlace, u.Url)).ToList();
++        var ignored = Queue.Add(requests);
++        lock (gate)
++        {
++            notes.Add($"open-in: {door} delivered {urls.Count} URL(s)");
++            foreach (var request in ignored) notes.Add(OpenIn.DuplicateLine(Cloud.RealName(request.Name)));
++        }
++        target?.OpenInPump();
++    }
++
++    internal static List<string> TakeNotes()
++    {
++        lock (gate) { var taken = notes.ToList(); notes.Clear(); return taken; }
++    }
++}
++
++public sealed partial class GameAppViewController
++{
++    private bool openInRetry;
++
++    /// Wakes the pump on the next turn of the run loop (a delivery is never worked on inside UIKit's callback).
++    internal void OpenInPump() => BeginInvokeOnMainThread(OpenInPumpNow);
++
++    private void OpenInPumpNow()
++    {
++        EnsureOpenInMenu();   // once: the + menu's row "How to add from Files"
++        foreach (var note in GameAppOpenInEntry.TakeNotes()) Write(note);
++        var queue = GameAppOpenInEntry.Queue;
++        if (queue.Pending == 0) return;
++        if (GameExport.IsPlayer)   // an exported player is no door for game files (its Info.plist has no document type either)
++        {
++            foreach (var request in queue.TakeBatch()) Write(OpenIn.SkippedLine(Cloud.RealName(request.Name), "this app only plays its game"));
++            queue.Finish();
++            return;
++        }
++        if (queue.Running) return;   // a batch of "Open in" is going: its end pumps again
++        if (importBusy)               // an import of a picker is going: the next look is in a second (a bool read: nothing else is done)
++        {
++            if (!openInRetry)
++            {
++                openInRetry = true;
++                Write("open-in: waiting for the import that is running");
++                NSTimer.CreateScheduledTimer(1.0, _ => { openInRetry = false; OpenInPumpNow(); });
++            }
++            return;
++        }
++        var batch = queue.TakeBatch();
++        var plan = OpenIn.Plan(batch);
++        foreach (var request in batch) Write(OpenIn.ReceivedLine(Cloud.RealName(request.Name), request.InPlace));
++        foreach (var (_, line) in plan.Skipped) Write(line);
++        if (plan.Accepted.Count == 0) { queue.Finish(); OpenInPumpNow(); return; }
++        OpenInRun(plan.Accepted);
++    }
++
++    /// One batch, on a worker. Main thread: planning and the card; every result comes back with BeginInvokeOnMainThread.
++    private void OpenInRun(IReadOnlyList<OpenInRequest> jobs)
++    {
++        importBusy = true;   // the pickers' imports say "Still adding" meanwhile, and one card is shared
++        bool awake = !UIApplication.SharedApplication.IdleTimerDisabled;   // not undone when a build already keeps the screen awake
++        if (awake) UIApplication.SharedApplication.IdleTimerDisabled = true;
++        // The background task keeps the copy going when the app is left (a clone or a rename is over before that matters). When the system's time for it runs out the task is ended, not the app.
++        nint task = UIApplication.BackgroundTaskInvalid;
++        void EndTask() { var t = task; task = UIApplication.BackgroundTaskInvalid; if (t != UIApplication.BackgroundTaskInvalid) UIApplication.SharedApplication.EndBackgroundTask(t); }
++        task = UIApplication.SharedApplication.BeginBackgroundTask("open-in", EndTask);   // the handler runs on the main thread and must end the task before it returns
++        if (currentTab == 0) ShowTab(7);   // the library: show the Build tab, where the card is (never taken from a screen the person is using: the build, Settings)
++        ShowImportProgress(0, jobs.Count, jobs[0].Name, 0, "Adding");
++        var documents = GameAppMain.Documents;
++        var home = Environment.GetEnvironmentVariable("HOME") ?? "";
++        var temp = Path.GetTempPath();
++        Action<string> log = line => BeginInvokeOnMainThread(() => Write(line));
++        Task.Run(() =>
++        {
++            var done = new List<(ImportOutcome Outcome, OpenInRoute Route)>();
++            try
++            {
++                for (int k = 0; k < jobs.Count; k++)
++                {
++                    int index = k;
++                    var request = jobs[k];
++                    var name = request.Name;
++                    var destination = Path.Combine(documents, name);
++                    var route = OpenIn.Route(request.Path, destination, home, temp);
++                    BeginInvokeOnMainThread(() => ShowImportProgress(index, jobs.Count, name, 0, "Adding"));
++                    Action<string, string> copy = (from, part) => GameImport.CopyBytes(from, part, (written, total) =>
++                        BeginInvokeOnMainThread(() => ShowImportProgress(index, jobs.Count, name, total > 0 ? written / (double) total : 0, "Copying")));
++                    Placed placed = null;
++                    string error = null;
++                    try
++                    {
++                        if (route == OpenInRoute.MoveFromInbox)
++                        {
++                            // iOS's own copy, in this container: renamed onto the .part (nothing copied again). Place's one log line is replaced by ours, which says "moved".
++                            placed = GameImport.Place(request.Path, destination, OpenIn.TryMove, copy, null, FreeBytes);
++                            if (placed.How == PlacedHow.Cloned) log(OpenIn.MovedLine(name, placed.Bytes, (long) placed.Took.TotalMilliseconds));
++                            else if (placed.How == PlacedHow.Copied)
++                            {
++                                log(GameImport.CopiedLine(name, placed.Bytes, placed.Took.TotalSeconds, placed.Why));   // the rename was refused: copied, and iOS's copy is ours to remove
++                                try { File.Delete(request.Path); } catch (Exception) { }
++                            }
++                        }
++                        else
++                        {
++                            var url = request.Handle as NSUrl;
++                            bool scoped = url != null && url.StartAccessingSecurityScopedResource();
++                            try
++                            {
++                                if (url == null) placed = GameImport.Place(request.Path, destination, FileClone.Try, copy, log, FreeBytes);
++                                else
++                                {
++                                    new NSFileCoordinator().CoordinateRead(url, (NSFileCoordinatorReadingOptions) 0, out NSError coordination, readable =>
++                                    {
++                                        try { placed = GameImport.Place(readable.Path, destination, FileClone.Try, copy, log, FreeBytes); }   // an original: cloned or copied, never changed or deleted
++                                        catch (Exception e) { error = e.Message; }
++                                    });
++                                    if (placed == null && error == null) error = coordination?.LocalizedDescription ?? "the file could not be read";
++                                }
++                            }
++                            finally { if (scoped) url.StopAccessingSecurityScopedResource(); }
++                        }
++                    }
++                    catch (Exception e) { error ??= e.Message; }
++                    if (error != null) log($"open-in: {name} could not be added: {error}");
++                    // the app made this file (a clone of the original, or iOS's own copy moved here): patch 0068 may free it after a successful build; an AlreadyThere file was the library's own and is never recorded
++                    if (error == null && placed != null && placed.How != PlacedHow.AlreadyThere)
++                        RecordImportFile(destination, route != OpenInRoute.MoveFromInbox && placed.How == PlacedHow.Cloned ? ImportHow.Clone : ImportHow.Copy, "Open in iBuilder");
++                    done.Add((new ImportOutcome(name, placed, error), route));
++                }
++            }
++            catch (Exception e) { log($"open-in: stopped: {e.GetType().Name}: {e.Message}"); }   // not expected: every file has its own catch
++            BeginInvokeOnMainThread(() =>
++            {
++                importBusy = false;
++                GameAppOpenInEntry.Queue.Finish();
++                if (importCard != null) importCard.Hidden = true;
++                if (awake) UIApplication.SharedApplication.IdleTimerDisabled = false;
++                EndTask();
++                Write(OpenIn.Summary(done));
++                RefreshGames();
++                RefreshScreen();
++                var failures = InPlaceImport.Failures(done.Select(d => d.Outcome).ToList());
++                if (failures != null)
++                {
++                    var alert = UIAlertController.Create("Not all were added", failures, UIAlertControllerStyle.Alert);
++                    alert.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++                    PresentWhenFree(alert);
++                }
++                OpenInPumpNow();   // what arrived while this batch ran
++            });
++        });
++    }
++
++    // ---- the hint ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
++
++    private bool openInMenuDone;
++
++    /// The + button of the Build tab (id import-file, built in BuildBuildTab with the pickers' entries, GameAppImportUi.cs) gets, apart at the end of the menu it HAS, the row "How to add from Files": an alert with the steps and an
++    /// "Open Files" button. Done once, by looking the button up and adding to its current menu, so whatever entries the pickers' file offers stay exactly as they are.
++    private void EnsureOpenInMenu()
++    {
++        if (openInMenuDone) return;
++        if (GameExport.IsPlayer) { openInMenuDone = true; return; }   // a player has no Build tab
++        if (!(OpenInFindView(pages[7], "import-file") is UIButton plus) || plus.Menu == null) return;   // not built yet: the next pump looks again
++        openInMenuDone = true;
++        var howTo = UIAction.Create(OpenIn.MenuTitle, UIImage.GetSystemImage("questionmark.circle"), "import-howto", _ => ShowOpenInHowTo());
++        howTo.Subtitle = OpenIn.MenuSubtitle;
++        var apart = UIMenu.Create("", null, UIMenuIdentifier.None, UIMenuOptions.DisplayInline, new UIMenuElement[] { howTo });
++        plus.Menu = UIMenu.Create(plus.Menu.Children.Concat(new UIMenuElement[] { apart }).ToArray());
++    }
++
++    private static UIView OpenInFindView(UIView root, string identifier)
++    {
++        if (root == null) return null;
++        if (root.AccessibilityIdentifier == identifier) return root;
++        foreach (var child in root.Subviews)
++            if (OpenInFindView(child, identifier) is UIView found) return found;
++        return null;
++    }
++
++    private void ShowOpenInHowTo()
++    {
++        var alert = UIAlertController.Create(OpenIn.HowToTitle, OpenIn.HowToMessage, UIAlertControllerStyle.Alert);
++        alert.AddAction(UIAlertAction.Create(OpenIn.HowToOpenFiles, UIAlertActionStyle.Default, _ => UIApplication.SharedApplication.OpenUrl(new NSUrl("shareddocuments://"), new UIApplicationOpenUrlOptions(), null)));
++        alert.AddAction(UIAlertAction.Create(OpenIn.HowToClose, UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(alert);
++    }
++
++    /// The Build tab's empty state, second line, under the line that is already there: flat, muted.
++    private static void AddOpenInHint(UIStackView list)
++    {
++        if (list.ArrangedSubviews.Length > 0) list.SetCustomSpacing(8, list.ArrangedSubviews[list.ArrangedSubviews.Length - 1]);
++        var hint = Theme.Label(OpenIn.Hint, Theme.Font(13, UIFontWeight.Regular), Theme.Muted, 0);
++        hint.AccessibilityIdentifier = "open-in-hint";
++        list.AddArrangedSubview(hint);
++    }
++}
+diff -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs
++++ b/GameAppShelf.cs
+@@ -658,6 +658,7 @@
+                                                   false, frac, chip, tone, acts, !facts.Running, i == 0));
+         }
+         if (phone.Count == 0) phoneList.AddArrangedSubview(Theme.Label("No game on this " + GameAppUi.DeviceName + " yet. Tap + to import a .nsp, .xci, .nsz or .nup, or pick one in the cloud.", Theme.Font(14, UIFontWeight.Regular), Theme.Muted, 0));
++        if (phone.Count == 0) AddOpenInHint(phoneList);   // GameAppOpenInUi.cs: the second line of the empty state, "In Files, touch and hold the game, Share, iBuilder: it is added without a copy."
+         phoneSection.Hidden = filter == 2;
+         phoneCard.Hidden = false;   // it holds the "no game yet" line when there is none
+ 
+diff -ruN a/Info.plist.fragment b/Info.plist.fragment
+--- a/Info.plist.fragment
++++ b/Info.plist.fragment
+@@ -55,6 +55,99 @@
+ 			</dict>
+ 		</dict>
+ 	</array>
++	<!-- "Open in iBuilder" (gameapp/GameAppOpenIn.cs, GameAppOpenInUi.cs): in Files, touch and hold a game, Share, iBuilder. The game files have no type of Apple's, so the app declares one for each of the four extensions
++	     (imported: nobody owns the format, and a real owner's declaration wins over these) and one document type that handles them. The rank is Alternate: iBuilder is offered, never made the default of anybody's
++	     files. LSSupportsOpeningDocumentsInPlace (below, with UIFileSharingEnabled) is what makes iOS hand over the ORIGINAL file as a security-scoped URL instead of a copy in Inbox; the app then clones it into
++	     Documents. An exported player drops the first two entries (GameAppExport.cs, OpenInPlist) and keeps that key: with UIFileSharingEnabled it is what shows the player's own Documents folder in Files. -->
++	<key>UTImportedTypeDeclarations</key>
++	<array>
++		<dict>
++			<key>UTTypeIdentifier</key>
++			<string>dev.nxpocket.ibuilder.nsp</string>
++			<key>UTTypeDescription</key>
++			<string>Switch game (NSP)</string>
++			<key>UTTypeConformsTo</key>
++			<array>
++				<string>public.data</string>
++			</array>
++			<key>UTTypeTagSpecification</key>
++			<dict>
++				<key>public.filename-extension</key>
++				<array>
++					<string>nsp</string>
++				</array>
++			</dict>
++		</dict>
++		<dict>
++			<key>UTTypeIdentifier</key>
++			<string>dev.nxpocket.ibuilder.xci</string>
++			<key>UTTypeDescription</key>
++			<string>Switch game (XCI)</string>
++			<key>UTTypeConformsTo</key>
++			<array>
++				<string>public.data</string>
++			</array>
++			<key>UTTypeTagSpecification</key>
++			<dict>
++				<key>public.filename-extension</key>
++				<array>
++					<string>xci</string>
++				</array>
++			</dict>
++		</dict>
++		<dict>
++			<key>UTTypeIdentifier</key>
++			<string>dev.nxpocket.ibuilder.nsz</string>
++			<key>UTTypeDescription</key>
++			<string>Switch game (NSZ)</string>
++			<key>UTTypeConformsTo</key>
++			<array>
++				<string>public.data</string>
++			</array>
++			<key>UTTypeTagSpecification</key>
++			<dict>
++				<key>public.filename-extension</key>
++				<array>
++					<string>nsz</string>
++				</array>
++			</dict>
++		</dict>
++		<dict>
++			<key>UTTypeIdentifier</key>
++			<string>dev.nxpocket.ibuilder.nup</string>
++			<key>UTTypeDescription</key>
++			<string>Switch game (NUP)</string>
++			<key>UTTypeConformsTo</key>
++			<array>
++				<string>public.data</string>
++			</array>
++			<key>UTTypeTagSpecification</key>
++			<dict>
++				<key>public.filename-extension</key>
++				<array>
++					<string>nup</string>
++				</array>
++			</dict>
++		</dict>
++	</array>
++	<key>CFBundleDocumentTypes</key>
++	<array>
++		<dict>
++			<key>CFBundleTypeName</key>
++			<string>Switch game</string>
++			<key>CFBundleTypeRole</key>
++			<string>Viewer</string>
++			<key>LSHandlerRank</key>
++			<string>Alternate</string>
++			<key>LSItemContentTypes</key>
++			<array>
++				<string>dev.nxpocket.ibuilder.nsp</string>
++				<string>dev.nxpocket.ibuilder.xci</string>
++				<string>dev.nxpocket.ibuilder.nsz</string>
++				<string>dev.nxpocket.ibuilder.nup</string>
++			</array>
++		</dict>
++	</array>
+ 	<!-- The in-game menu's Capture items save a screenshot or a clip to Photos, add-only: the app can put pictures there and cannot
+ 	     read the library (load/front_capture.m, PHAccessLevelAddOnly). -->
+ 	<key>NSPhotoLibraryAddUsageDescription</key>

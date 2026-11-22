@@ -1,0 +1,30 @@
+build-app.sh: bundle the two more small INPUT tables of the shader build that the Rust build reads from a registered game's folder (docs/CONFORMITY-AUDIT.md, row D-TABLES).
+Apply from the repository root:   patch -p1 < app/patches/build-app-input-tables.diff     (NOT a *.patch: scripts/build-app.sh applies app/patches/*.patch to the C# project copy, not to itself)
+Not applied by the audit: scripts/build-app.sh is another package's file and the audit may not build. Check it with:   patch -p1 --dry-run < app/patches/build-app-input-tables.diff
+
+--- a/scripts/build-app.sh
++++ b/scripts/build-app.sh
+@@ -313,9 +313,11 @@
+   d="$(basename "$(dirname "$p")")"; mkdir -p "$APP/dm/games/$d"; cp "$p" "$APP/dm/games/$d/game.tsv"; tables=$((tables + 1))
+   # The game's other small INPUTS of the shader build and of the first boot, which the stage-3 pack takes from this folder (every *.tsv of it): `bf_want.tsv` / `dual_want.tsv` (which pixel
+   # shaders get the extra variants), `pso_manifest.tsv` (the pipeline prewarm seed list: without it a first start builds every pipeline of the first frames on demand, minutes of black screen
+-  # on a cold Metal cache: device log 2026-11-19, Mario Kart 8 Deluxe "[RED] pipeline prewarm: seed list does not exist"), `bench.tsv`. The split's own tables (shader_map, shader_pairs,
+-  # pso_pairs, shader_facts) are made on the phone from the game's files and are NOT copied.
+-  for extra in bf_want.tsv dual_want.tsv pso_manifest.tsv bench.tsv; do
++  # on a cold Metal cache: device log 2026-11-19, Mario Kart 8 Deluxe "[RED] pipeline prewarm: seed list does not exist"), `bench.tsv`; and the two inputs the Rust build READS from the game's
++  # folder as the engine's Mac build does: `geo_mesh.tsv` (vertex/geometry pairs that get a mesh library: dmsh_chain.INPUT_TABLES, mesh_pairs) and `shader_facts_manual.tsv` (hand-written
++  # facts merged over the split's: shader_split.py). The list is the one of ibuilder-pipeline's PACK_INPUT_TABLES (a pack made before a table was bundled is topped up from it at the boot).
++  # The split's own tables (shader_map, shader_pairs, pso_pairs, shader_facts) are made on the phone from the game's files and are NOT copied.
++  for extra in bf_want.tsv dual_want.tsv geo_mesh.tsv shader_facts_manual.tsv pso_manifest.tsv bench.tsv; do
+     [ -f "$(dirname "$p")/$extra" ] && cp "$(dirname "$p")/$extra" "$APP/dm/games/$d/$extra" && extras=$((extras + 1))
+   done
+ done
+@@ -336,7 +338,7 @@
+ else
+   die "no fontTools for $FONT_PYTHON: make the shared-font stand-ins (python3 -m venv V && V/bin/pip install fonttools, then FONT_PYTHON=V/bin/python3) or set ALLOW_NO_FONTS=1 to build without them"
+ fi
+-echo "  registered game tables: $tables game.tsv + $extras build-input tables (bf_want, dual_want, pso_manifest, bench); host sources: dm/host $(ls "$APP/dm/host" | wc -l | tr -d ' ') .c, dm/gfx $(ls "$APP/dm/gfx" | wc -l | tr -d ' ') .c" >&2
++echo "  registered game tables: $tables game.tsv + $extras build-input tables (bf_want, dual_want, geo_mesh, shader_facts_manual, pso_manifest, bench); host sources: dm/host $(ls "$APP/dm/host" | wc -l | tr -d ' ') .c, dm/gfx $(ls "$APP/dm/gfx" | wc -l | tr -d ' ') .c" >&2
+ # the whole point: nothing of the interpreter is in the bundle
+ badpy="$(find "$APP" \( -name '*.py' -o -name '*.pyc' -o -name '*.fwork' -o -name 'Python.framework' -o -name 'pyext' -o -name 'lib-dynload' -o -name 'shaderengine' -o -name 'libpyext*' \) | head -5)"
+ [ -z "$badpy" ] || die "the bundle carries Python pieces: $badpy"

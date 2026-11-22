@@ -1,0 +1,711 @@
+# nvn/pso: the prewarm tail goes on from where an earlier session left the seed list (pso_tail.tsv), and its seed rows wait while the device is hot (DM_PSO_TAIL_RESUME, DM_PSO_TAIL_HOT)
+#
+# Origin:  written in this repository after the Ocarina of Time (Switch 2) device session of 2026-11-20 (iPhone 15 Pro). No upstream commit. Applies after 0414 (patch -p1 --forward,
+#          no fuzz); it needs 0413 for "this device's rows" (pso_user.tsv first). paches/0007, 0008, 0009 still apply on top and land where they did.
+# Licence: the licence of the tree it patches (the engine's MIT licence, Copyright (c) 2026 seedds and contributors).
+#
+# WHAT THE LOG SHOWS (0412's tail)
+#   Session 1 (SIGTERM about 90 s in): "pipeline prewarm stopped: the process is ending (570 lines done)" = the head's 464 + 106 of the tail. Session 2: the tail started again
+#   at the same task ("22727 tasks (24699 lines)"), redid session 1's rows and more in its first 60 s ("954 of 22727 tasks done ... after 60 s": the libraries already in Metal's
+#   compile cache take 1-4 ms) and then compiled for 37 minutes, 5,506 tasks by the end of the log, one worker at utility QoS, while the session ran at thermal state 2 for its first
+#   1,150 s and its draws waited 930 s for compiles of their own: the tail's compiles share the Metal compiler (4 concurrent compilations on this phone) and the heat with them.
+#   The tail's rows of the seed list are speculative (rows this device never drew); with 0413 the device's own rows come first in the list, before the seed's.
+#
+# WHAT IT CHANGES
+#   * WarmTask records its list (src) and the line of its first row; warm_start notes which list is the seed (the pso_manifest.tsv beside the shader map; none under DM_PSO_MANIFEST).
+#   * Resume (DM_PSO_TAIL_RESUME, default on): the line after the last seed task the tail built WHOLE (a render pair cut by a stop is not counted) is kept in pso_tail.tsv beside
+#     pso_user.tsv, with the seed's size, modification time and the shader chain; written as a .tmp renamed over the file, every 60 s (with the progress line), when the tail ends
+#     (the seed's end) and when it stops. The next start's tail leaves out the seed tasks before that line (the head before the first frame is unchanged, so are this device's rows) and
+#     goes on from there; once the seed was walked to its end, the tail builds only this device's rows. Another seed list (size, time or chain) starts again. =0: walks them again.
+#     A tail that left rows out ends with warm_finish_ex(0, 0): no archive sweep (Metal 4 path only), since those rows were not asked for in this run.
+#   * Heat (DM_PSO_TAIL_HOT=1 turns it off): before each SEED task the tail reads NSProcessInfo.thermalState; at serious (2) or critical (3) it waits, looking again every 2 s,
+#     and ends at once if the process or the graphics end meanwhile. This device's rows do not wait. The head, the draws' own compiles and the prefetch are not touched.
+#   * DM_PSO_PREPARE_TAIL=user (new value; 0 and on as in 0412): the tail builds this device's rows only and none of the seed's, and keeps no position: what this device drew in
+#     earlier sessions, built in the background, nothing speculative (for a game bound by memory, where the Memory saver profile sets DM_PSO_PREPARE_TAIL=0).
+#   * Log: "pipeline prewarm tail: earlier sessions walked the seed list to its line L (pso_tail.tsv): K of the tail's N seed tasks are left out[, only this device's rows are built]",
+#     "... the device is hot (thermal state T): the seed list's rows wait", "... cool again after S s", "finished ... (the seed tasks earlier sessions walked left out)",
+#     "pipeline prewarm done (the seed rows earlier sessions walked were left out): ...".
+#   Who owns the background work: the engine's tail runs only while the game runs (the app stops its own preparation at Play, BeginRun -> StopWarm: 0070 / 0076), and loads into the
+#   process what the game is about to need (libraries and pipelines in memory, pipelines into 0414's archive); the app's preparation in iBuilder compiles libraries into Metal's compile
+#   cache while no game runs. They never run at the same time; a library the app compiled is a cache hit (1-4 ms) for the tail.
+#
+# MEASURED on this Mac (M1 Pro): dm/gfx/tests t_pso_tail_resume, 40 checks, 0 failed, with DM_PSO_MTL4=0 and =1, on the GPU with t_pso_head's synthetic libraries (40 tasks, a head of
+#   10): a tail stopped inside task 21 keeps the line after task 20; the next start leaves tasks 10..20 out and builds 21..39 (no sweep), keeps the end; the start after builds only the
+#   head; DM_PSO_TAIL_RESUME=0 and a changed seed walk all again; at thermal state 2 (a test hook) this device's rows (25..39) are built and the seed's wait until cool, a stop while it
+#   waits ends it, DM_PSO_TAIL_HOT=1 does not wait; DM_PSO_PREPARE_TAIL=user builds rows 25..39 (this device's) and no seed row. t_pso_head (348), t_pso_user_first (44), t_pso_warm,
+#   t_pso_archive unchanged. Mutations (target/agent-work/eng/tools/mutate.py): a pair cut by a stop counted as walked fails 3 checks, no wait while hot fails 5.
+#   dm/gfx/tests/t_pso_user_first.m (0413's test) now sets DM_PSO_TAIL_RESUME=0 and DM_PSO_TAIL_HOT=1: its second prepare run otherwise found the first
+#   run's pso_tail.tsv and left its seed tasks out (2 of its 44 checks failed), and its tail would wait on a hot Mac.
+# REVISION 2 (2026-11-21, after the read-only review target/agent-work/review-eng/REVIEW.txt, findings M2 (1), L3, L7):
+#   * M2 (1): mtl_warm_pause(on), called first thing by dm_gfx_suspend (hle_nvn.c; a weak empty one there where nvn_mtl.m is not linked, the simulator host): while graphics are
+#     suspended (the app in the background, app patch 0030) the tail finishes the task under way and takes no new one, so 0414's background write is not beside its compiles and the
+#     process does no speculative work in the background; dm_gfx_suspend(0) lets it go on. Logged ("paused (graphics suspended ...)", "goes on (graphics resumed)").
+#   * L3: the hot and paused waits look again every 250 ms (was 2 s), so a stop or dm_gfx_teardown waits at most that.
+#   * L7: dm/host/dm_envflag.h (new, pure C: dm_flag_text, dm_env_flag, dm_flag_is): 1 / on / true / yes and 0 / off / false / no, any case, blanks allowed; anything else keeps the
+#     default and is logged. Used here for DM_PSO_PREPARE_TAIL (0412's prepare_tail_on: "off" and "false" now turn the tail off as "0" did; "user" as before), DM_PSO_TAIL_RESUME and
+#     DM_PSO_TAIL_HOT; engine-patches 0453, 0503 and 0504 include it for their own switches (so they need this patch before them, as the series has it).
+#   MEASURED (this Mac): t_pso_tail_resume 55 checks, 0 failed, both compilers (the 40 before, plus: the pause holds the tail between two tasks and it goes on when resumed, a stop while
+#   paused ends it in under a second, DM_PSO_TAIL_HOT=on does not wait, DM_PSO_PREPARE_TAIL=off skips the tail); t_env_flag 102 checks, 0 failed (every word, case, blank, bad value).
+# NOT VERIFIED (iPhone only): the heat and frame-time effect of pausing at thermal state 2, whether the seed's rows left out are still in Metal's compile cache at a later session (it
+#   keeps about 5,500-5,800 of this game's libraries, DEVICE-FINDINGS), how long a whole walk of the seed takes over sessions.
+# RISKS: a row left out of the tail because an earlier session walked it, and evicted from Metal's cache since, is compiled when drawn (then it is in pso_user.tsv, so the next start
+#   builds it first). A long hot spell leaves the seed's rows unbuilt in that session.
+# Roll back: DM_PSO_TAIL_RESUME=0 and DM_PSO_TAIL_HOT=1 give 0412's tail back (=user is new: leave it unset); or remove this file from engine-patches/ and run scripts/build-host.sh again.
+
+# REVISION 3 (2026-11-21, review L8, the trivial part): dm_gfx_teardown sets back the state of 0413's learned list and of this patch's tail seed (mtl_session_reset, after the background work is
+#   waited for): the open pso_user.tsv file, its "seen" set, g_warm_seed_src, g_warm_tail_skipped. A second game in the same process (the engine's own shell; unreachable in iBuilder, where
+#   quitting is SIGTERM then _exit) no longer writes its rows into the first game's file. NOT done, not trivial: the pipeline archive of 0414 (made once per process, with its observer and
+#   atexit handler) and the prewarm's lists (g_warm_started), which a second game would still share. Test: t_session_reset (9 checks, through dm_gfx_teardown itself).
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -66,6 +66,7 @@
+ #include "nvn_hmap.h"
+ #include "nvn_owner.h"   // the serial tables (serial_put, tex_put, tex_get, the pins, the held counts) and their lock g_smu
+ #include "../../host/dm.h"
++#include "../../host/dm_envflag.h"   // engine-patches/0415: one reading of on / off switches
+ #import <CommonCrypto/CommonDigest.h>
+ #include <stdarg.h>
+ #include <mach-o/dyld.h>
+@@ -12180,7 +12181,7 @@
+ // The prewarm runs the lines of its lists as tasks: a shader (S), a compute pipeline (C), or every render pipeline (R) of one shader pair. The pipelines of a pair share their
+ // bases, so one worker builds them one after the other. A native mesh pipeline (M) is a separate task. The tasks keep the lists' order (a render pair at its first line).
+ // Shaders share one dictionary. Only one worker prepares a key, including its pulling entry; a failed warm load stays NSNull for this prewarm only.
+-@interface WarmTask : NSObject { @public int kind, stage; NSString *key, *vkey, *fkey, *tkey; NSMutableArray<NSData *> *rs; } @end
++@interface WarmTask : NSObject { @public int kind, stage; NSString *key, *vkey, *fkey, *tkey; NSMutableArray<NSData *> *rs; int src; long line; } @end   // src, line: the list (its index in warm_parse's paths) and the line of the task's first row (engine-patches/0415)
+ @implementation WarmTask @end
+ static NSMutableDictionary *g_warm_dict; static os_unfair_lock g_warm_dict_lock = OS_UNFAIR_LOCK_INIT;
+ @interface WarmLoad : NSObject { @public dispatch_group_t done; id shader; } @end
+@@ -12240,12 +12241,15 @@
+     NSMutableSet<NSData *> *seen_k = [NSMutableSet set];   // rows recorded before pso_key_norm that are one pipeline now
+     NSMutableSet<NSString *> *seen_shader = [NSMutableSet set];
+     NSMutableSet<NSArray *> *seen_mesh = [NSMutableSet set];
++    int src = -1;
+     for (NSString *path in paths) {
++        src++; long lno = 0;
+         NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+         if (!txt) { MLOG("[RED] cannot read prewarm list: %s", path.UTF8String); continue; }
+         { unsigned long nl = 0; for (NSString *l in [txt componentsSeparatedByString:@"\n"]) nl += l.length && ![l hasPrefix:@"#"];
+           MLOG("pipeline prewarm list %s: %lu lines", path.UTF8String, nl); }   // Diagnostics: how many lines each manifest gave (when a device warms up 0, shows which one was missing)
+         for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
++            lno++;
+             if (!line.length || [line hasPrefix:@"#"] || [seen containsObject:line]) continue;
+             [seen addObject:line];
+             NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
+@@ -12256,7 +12260,7 @@
+                 int stage = stage_of(warm_map_stage(c[1]));   // Same stage as the live loader: NVN2 task/mesh 6/7 occupy host slots 3/4. Warm loads share one object per name.
+                 if (stage < 0 || (!shader && stage != 5) || (shader && [seen_shader containsObject:c[1]])) continue;
+                 if (shader) [seen_shader addObject:c[1]];
+-                t = [WarmTask new]; t->kind = shader ? 0 : 2; t->key = c[1]; t->stage = stage; [tasks addObject:t];
++                t = [WarmTask new]; t->kind = shader ? 0 : 2; t->key = c[1]; t->stage = stage; t->src = src; t->line = lno; [tasks addObject:t];
+             } else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
+                 pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) continue;
+                 NSData *kd = [NSData dataWithBytes:&sk length:sizeof sk]; if ([seen_k containsObject:kd]) continue;
+@@ -12265,7 +12269,7 @@
+                 if (!vkey.length || warm_stale(vkey, stale) || (fkey.length && warm_stale(fkey, stale))) continue;
+                 NSString *pk = [NSString stringWithFormat:@"%@|%@", vkey, fkey];
+                 t = pairs[pk];
+-                if (!t) { t = [WarmTask new]; t->kind = 1; t->vkey = vkey; t->fkey = fkey; t->rs = [NSMutableArray array]; pairs[pk] = t; [tasks addObject:t]; }
++                if (!t) { t = [WarmTask new]; t->kind = 1; t->vkey = vkey; t->fkey = fkey; t->rs = [NSMutableArray array]; t->src = src; t->line = lno; pairs[pk] = t; [tasks addObject:t]; }
+                 [t->rs addObject:kd];
+             } else if ([c[0] isEqualToString:@"M"] && c.count == 3) {
+                 pso_skey sk; if (pso_mesh_skey_parse(c[2].UTF8String, &sk)) continue;
+@@ -12281,7 +12285,7 @@
+                 NSArray *identity = @[c[1], kd];   // The same mesh state with a different task shader is a different pipeline.
+                 if ([seen_mesh containsObject:identity]) continue;
+                 [seen_mesh addObject:identity];
+-                t = [WarmTask new]; t->kind = 3; t->vkey = vkey; t->fkey = fkey; t->tkey = tkey;
++                t = [WarmTask new]; t->kind = 3; t->vkey = vkey; t->fkey = fkey; t->tkey = tkey; t->src = src; t->line = lno;
+                 t->rs = [NSMutableArray arrayWithObject:kd];
+                 [tasks addObject:t];
+             } else continue;
+@@ -12348,10 +12352,11 @@
+ // The end of a prewarm. walked_all: every line of the lists was asked for (warm_finish: the prewarm that ran whole, before the first frame, in the background, or as the tail of a split one),
+ // and only then may the archive's sweep run: with DM_PSO_PREPARE_PERCENT the head alone is not "the lists' pipelines were asked for", and a file only a tail pipeline lives in would go.
+ // keep_dict: the head of a split prewarm ends here and its tail goes on with warm_shader, whose dictionary and load table must stay until the tail has joined (the tail's own end drops them)
++static int g_warm_tail_skipped;   // engine-patches/0415: the tail left out rows walked in earlier sessions (no sweep: those rows were not asked for in this run)
+ static void warm_finish_ex(int walked_all, int keep_dict) {
+     if (walked_all && g_warm_rps + g_warm_cps + g_warm_mps) { atomic_store(&g_sweep_warm, 1); arch_sweep(); }   // the lists asked for their pipelines: the files none was taken from go
+     MLOG("pipeline prewarm %s: shaders %llu / render pipelines %llu (specialized fragment skipped %llu) / compute pipelines %llu, background time %.1f ms; shader keys not in the shader map (another game version) %llu",
+-         walked_all ? "done" : "head done", (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_skip_fz, (unsigned long long)g_warm_cps, (bp_now() - g_warm_t0) / 1e6, (unsigned long long)g_warm_skip_stale);
++         walked_all ? "done" : g_warm_tail_skipped ? "done (the seed rows earlier sessions walked were left out)" : "head done", (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_skip_fz, (unsigned long long)g_warm_cps, (bp_now() - g_warm_t0) / 1e6, (unsigned long long)g_warm_skip_stale);
+     if (g_warm_mps) MLOG("pipeline prewarm: %llu native task / mesh pipelines; so far %llu taken from the pipeline archive, %llu built and captured for it, %llu built without it",
+                          (unsigned long long)g_warm_mps, (unsigned long long)g_mtk_arch, (unsigned long long)g_mtk_built, (unsigned long long)g_mtk_dev);
+     char again[96] = "";   // only a compacting start captures bases again
+@@ -12418,7 +12423,12 @@
+     if (!p) { MLOG("DM_PSO_PREPARE_PERCENT=%s is not a whole number from 1 to 100: ignored, every line of the prewarm lists is built before the first frame", e); return 100; }
+     return p;
+ }
+-static int prepare_tail_on(void) { const char *e = getenv("DM_PSO_PREPARE_TAIL"); return !(e && !strcmp(e, "0")); }
++static int prepare_tail_on(void) {   // engine-patches/0415: read by dm_envflag.h (0 / off / false / no turn it off; "user" is on, with this device's rows only: warm_tail_start)
++    const char *e = getenv("DM_PSO_PREPARE_TAIL"); if (dm_flag_is(e, "user")) return 1;
++    int bad = 0, on = dm_flag_text(e, 1, &bad);
++    if (bad) { static int told; if (!told++) MLOG("DM_PSO_PREPARE_TAIL=%s is neither on / off nor user: the tail runs (the default)", e); }
++    return on;
++}
+ // The lines a task stands for: a render task is one line per pipeline of its pair (every one is counted into g_warm_done), any other task one line
+ static long warm_task_lines(const WarmTask *t) { return t->kind == 1 ? (long)t->rs.count : 1; }
+ // head: how many of the tasks, from the first, this step builds (all of them unless DM_PSO_PREPARE_PERCENT split the list); lines: the lines those tasks stand for, the screen's total
+@@ -12586,35 +12596,111 @@
+ //    says every line was asked for. The head's end cleared g_warm_running, so the prebuild that follows it ran as it always did
+ // A draw that comes before the worker reached its pipeline builds it on demand, as for any pipeline the lists do not hold: the pipeline the worker builds later is claimed only if no
+ // one is there yet (warm_claim)
++// engine-patches/0415: the tail's rows of the SEED list (pso_manifest.tsv: rows this device has not drawn, which may never be drawn) are speculative work, so
++//  - they wait while the device is hot (thermal state serious or critical: the frame step is already held at 30 fps then, the clocks are down, and a compile adds heat and competes with
++//    the draws' own compiles for the Metal compiler), checked before each of them; this device's rows (pso_user.tsv, engine-patches/0413) go on. DM_PSO_TAIL_HOT=1: they do not wait;
++//  - the tail does not walk them again at every start: how far it got in the seed list (the line after the last seed task it built) is kept in pso_tail.tsv beside pso_user.tsv, written
++//    (a .tmp renamed over it) every 60 s and when the tail ends or stops, with the seed's size, modification time and the shader chain; the next start's tail leaves out the seed tasks
++//    before that line (the head before the first frame is not changed) and goes on from there, and a list that reached its end leaves only this device's rows for the tail. Another seed
++//    list (size, time or chain) starts again from its first line. DM_PSO_TAIL_RESUME=0: every seed row is walked again (the position is still kept);
++//  - DM_PSO_PREPARE_TAIL=user: the tail builds this device's rows only, never the seed's (what the game will draw again, nothing speculative: for a memory-bound game).
++// On Ocarina of Time's 2026-11-20 device session (iPhone 15 Pro) the tail walked the same first rows at every start (session 2 redid session 1's in its first minute) and compiled for the
++// 37 minutes of play at thermal state 2 (serious) for the first 1,150 s, beside 930 s of compiles the draws waited for.
++static int (*g_warm_thermal)(void);   // the thermal state (NSProcessInfoThermalState's values); tests set it, NULL: the system's
++static int warm_thermal(void) { return g_warm_thermal ? g_warm_thermal() : (int)NSProcessInfo.processInfo.thermalState; }
++static int g_warm_seed_src = -1;   // the seed list's index in the paths warm_parse read (warm_start), -1: none
++static NSString *g_warm_seed_path;
++static int g_warm_tail_poll_ms = 250;   // how often a hot or paused tail looks again (tests lower it): a stop or a teardown waits at most that (the review's L3; was 2 s)
++// Graphics suspended (dm_gfx_suspend(1): the app went to the background): the tail takes no new task until they resume, so the archive's write is not beside its compiles and
++// the process does no speculative work in the background (the review's M2)
++static _Atomic int g_warm_pause;
++#define DM_MTL_WARM_PAUSE 1   // hle_nvn.c's weak stand-in is left out when a test includes both files
++void mtl_warm_pause(int on) {
++    if (atomic_exchange(&g_warm_pause, on != 0) != (on != 0) && atomic_load(&g_warm_running) && atomic_load(&g_warm_bg))
++        MLOG("pipeline prewarm tail: %s", on ? "paused (graphics suspended: the app is in the background)" : "goes on (graphics resumed)");
++}
++static NSString *warm_tail_state_path(void) { NSString *u = pso_user_path(); return u ? [u.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_tail.tsv"] : nil; }
++static NSString *warm_seed_identity(void) {   // the seed list the position belongs to
++    struct stat st; if (!g_warm_seed_path || stat(g_warm_seed_path.fileSystemRepresentation, &st)) return nil;
++    return [NSString stringWithFormat:@"seed\t%lld\t%lld\t%s", (long long)st.st_size, (long long)st.st_mtimespec.tv_sec, DMSH_CHAIN];
++}
++static long warm_tail_resume_line(void) {   // the seed line the last start's tail got to (0: none, or another seed list)
++    NSString *p = warm_tail_state_path(), *id_ = warm_seed_identity(); if (!p || !id_) return 0;
++    NSString *t = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil]; if (!t) return 0;
++    long next = 0; int same = 0;
++    for (NSString *l in [t componentsSeparatedByString:@"\n"]) { if ([l isEqualToString:id_]) same = 1; else if ([l hasPrefix:@"next\t"]) next = [[l substringFromIndex:5] longLongValue]; }
++    return same && next > 0 ? next : 0;
++}
++static void warm_tail_save(long next) {   // crash-safe: a .tmp renamed over the file
++    NSString *p = warm_tail_state_path(), *id_ = warm_seed_identity(); if (!p || !id_ || next <= 0) return;
++    NSString *t = [NSString stringWithFormat:@"# the pipeline prewarm tail's position in the seed list (engine-patches/0415): the seed's size, time and shader chain, then the first line not walked yet\n%@\nnext\t%ld\n", id_, next];
++    NSString *tmp = [p stringByAppendingString:@".tmp"];
++    if ([t writeToFile:tmp atomically:NO encoding:NSUTF8StringEncoding error:nil]) rename(tmp.fileSystemRepresentation, p.fileSystemRepresentation);
++}
+ static void warm_tail_start(NSArray<WarmTask *> *tasks, long from, int percent, long head_lines, long total_lines) {
+     long n = (long)tasks.count, tail_lines = total_lines - head_lines;
+     if (atomic_load(&g_gfx_teardown) || atomic_load(&g_warm_stop)) return;   // the process or the graphics are ending: the tail is built at the next start
+     dispatch_queue_t q = dispatch_queue_create("dm.nvn.pso-warm-tail", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+     atomic_store(&g_warm_bg, 1); atomic_store(&g_warm_running, 1);
+     uint64_t t0 = bp_now();
++    int bad_r = 0, bad_h = 0, resume = dm_env_flag("DM_PSO_TAIL_RESUME", 1, &bad_r), hot_ok = dm_env_flag("DM_PSO_TAIL_HOT", 0, &bad_h), seed = g_warm_seed_src;   // dm_envflag.h: on / off / 1 / 0 ...
++    if (bad_r || bad_h) MLOG("pipeline prewarm tail: %s=%s is not on / off: the default is used", bad_r ? "DM_PSO_TAIL_RESUME" : "DM_PSO_TAIL_HOT", getenv(bad_r ? "DM_PSO_TAIL_RESUME" : "DM_PSO_TAIL_HOT"));
++    int user_only = seed >= 0 && dm_flag_is(getenv("DM_PSO_PREPARE_TAIL"), "user");   // DM_PSO_PREPARE_TAIL=user: this device's rows only, none of the seed's (a memory-saving tail)
++    long skip_line = seed >= 0 && !user_only ? warm_tail_resume_line() : 0, skipping = 0, seed_end = 0, seed_tasks = 0;
++    if (user_only) { resume = 1; skip_line = LONG_MAX; }
++    for (long i = from; i < n; i++) { WarmTask *t = tasks[(NSUInteger)i]; if (t->src != seed) continue; seed_tasks++; if (t->line >= seed_end) seed_end = t->line + 1; if (resume && t->line < skip_line) skipping++; }
++    g_warm_tail_skipped = skipping > 0;
+     MLOG("pipeline prewarm tail: started in the background, %ld tasks (%ld lines), one worker at utility QoS, %.1f s after the prewarm began (DM_PSO_PREPARE_PERCENT=%d)", n - from, tail_lines, (t0 - g_warm_t0) / 1e9, percent);
++    if (user_only) MLOG("pipeline prewarm tail: DM_PSO_PREPARE_TAIL=user: only this device's rows (%ld tasks), the seed list's %ld tasks are left out", n - from - seed_tasks, seed_tasks);
++    else if (seed >= 0 && skip_line && resume) MLOG("pipeline prewarm tail: earlier sessions walked the seed list to its line %ld (pso_tail.tsv): %ld of the tail's %ld seed tasks are left out%s (DM_PSO_TAIL_RESUME=0 walks them again)",
++                                                skip_line, skipping, seed_tasks, skipping == seed_tasks ? ", only this device's rows are built" : "");
++    else if (seed >= 0 && skip_line) MLOG("pipeline prewarm tail: earlier sessions walked the seed list to its line %ld (pso_tail.tsv); DM_PSO_TAIL_RESUME=0: walked again", skip_line);
+     bg_async(q, ^{ @autoreleasepool {
+-        _Atomic long next = from; long ran = 0; uint64_t last = t0;
++        _Atomic long next = from; long ran = 0, left_out = 0, at = skip_line; uint64_t last = t0; int waited = 0;
+         for (;;) {
+             if (atomic_load(&g_gfx_teardown) || atomic_load(&g_warm_stop)) break;
++            while (atomic_load(&g_warm_pause) && !atomic_load(&g_gfx_teardown) && !atomic_load(&g_warm_stop)) usleep((useconds_t)g_warm_tail_poll_ms * 1000);   // graphics suspended
++            if (atomic_load(&g_gfx_teardown) || atomic_load(&g_warm_stop)) break;
+             long i = warm_claim_index(&next, n); if (i < 0) break;
+-            warm_task(tasks[(NSUInteger)i]); ran++;
++            WarmTask *t = tasks[(NSUInteger)i];
++            if (t->src == seed) {
++                if (resume && t->line < skip_line) { left_out++; continue; }
++                if (!hot_ok) {   // speculative work waits while the device is hot
++                    int th = warm_thermal(); uint64_t w0 = bp_now();
++                    if (th >= 2) { MLOG("pipeline prewarm tail: the device is hot (thermal state %d): the seed list's rows wait (this device's rows do not; DM_PSO_TAIL_HOT=1: no wait)", th); waited++; }
++                    while (th >= 2 && !atomic_load(&g_gfx_teardown) && !atomic_load(&g_warm_stop)) { usleep((useconds_t)g_warm_tail_poll_ms * 1000); th = warm_thermal(); }
++                    if (atomic_load(&g_gfx_teardown) || atomic_load(&g_warm_stop)) break;
++                    if (bp_now() - w0 > 1000000000ull) MLOG("pipeline prewarm tail: cool again after %.0f s: the seed list's rows go on", (bp_now() - w0) / 1e9);
++                }
++            }
++            warm_task(t); ran++;
++            int whole = !atomic_load(&g_gfx_teardown) && !atomic_load(&g_warm_stop);   // a stop met inside a render task leaves its other pipelines out: that task is not counted as walked
++            if (whole && t->src == seed && t->line + 1 > at) at = t->line + 1;
+             uint64_t now = bp_now();
+-            if (now - last >= 60 * NSEC_PER_SEC) { last = now; MLOG("pipeline prewarm tail: %ld of %ld tasks done, %ld of %ld lines, after %.0f s", ran, n - from, (long)atomic_load(&g_warm_done) - head_lines, tail_lines, (now - t0) / 1e9); }
++            if (now - last >= 60 * NSEC_PER_SEC) { last = now; if (seed >= 0 && !user_only && at > skip_line) warm_tail_save(at);
++                MLOG("pipeline prewarm tail: %ld of %ld tasks done, %ld of %ld lines, after %.0f s", ran, n - from - skipping, (long)atomic_load(&g_warm_done) - head_lines, tail_lines, (now - t0) / 1e9); }
+         }
+         if (!atomic_load(&g_gfx_teardown) && !atomic_load(&g_warm_stop)) {
+-            MLOG("pipeline prewarm tail: finished, %ld tasks (%ld lines) in %.1f s", ran, tail_lines, (bp_now() - t0) / 1e9);
+-            warm_finish();
++            if (seed >= 0 && seed_end && !user_only) warm_tail_save(seed_end > at ? seed_end : at);   // the seed list walked to its end
++            MLOG("pipeline prewarm tail: finished, %ld tasks (%ld lines) in %.1f s%s", ran, tail_lines, (bp_now() - t0) / 1e9, left_out ? " (the seed tasks earlier sessions walked left out)" : "");
++            if (left_out) warm_finish_ex(0, 0); else warm_finish();
+         } else {
+-            MLOG("pipeline prewarm tail: stopped after %ld of %ld tasks, %.1f s (the process or the graphics are ending): the rest is built at the next start or on demand", ran, n - from, (bp_now() - t0) / 1e9);
++            if (seed >= 0 && !user_only && at > skip_line) warm_tail_save(at);
++            MLOG("pipeline prewarm tail: stopped after %ld of %ld tasks, %.1f s (the process or the graphics are ending): the rest is built at the next start or on demand", ran, n - from - skipping, (bp_now() - t0) / 1e9);
+             g_warm_dict = nil; g_warm_loads = nil; atomic_store(&g_warm_running, 0);
+         }
++        (void)waited;
+     } });
+ }
+ static void warm_start(void) {
+     if (g_warm_started++) return;
+     NSArray<NSString *> *paths = warm_paths(getenv("DM_PSO_MANIFEST"));
+     if (!paths) return;
++    {   // engine-patches/0415: which of the lists is the seed (the tail's speculative rows)
++        const char *em = getenv("DM_PSO_MANIFEST"); NSString *sp = em && *em ? nil : [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_manifest.tsv"];
++        NSUInteger ix = sp ? [paths indexOfObject:sp] : NSNotFound; g_warm_seed_src = ix == NSNotFound ? -1 : (int)ix;
++        g_warm_seed_path = g_warm_seed_src >= 0 ? sp : nil;
++    }
+     warm_load_begin();
+     pso4_init();   // the pipeline archive opens before the prewarm builds from it
+     g_warm_t0 = bp_now();
+@@ -21105,11 +21191,23 @@
+ void dm_gl_teardown(void);
+ void nvn_hle_teardown(void);
+ 
++// The per-game state of the learned prewarm list and the prewarm tail, set back at teardown (engine-patches/0415, review L8): a game started in this process after another (the engine's own shell
++// can; iBuilder's quit is SIGTERM then _exit, where it cannot happen) would otherwise write its rows into the first game's pso_user.tsv through the file kept open, skip rows already "seen"
++// there, and carry the first game's seed index. NOT reset here, not trivial: the pipeline archive of 0414 (its state, observers and atexit handler are made once per process) and the
++// prewarm's own state (g_warm_started and the lists), so a second game in the same process still shares those with the first
++static void mtl_session_reset(void) {
++    os_unfair_lock_lock(&g_pso_user_lock);
++    if (g_pso_user_fd >= 0) close(g_pso_user_fd);
++    g_pso_user_fd = -1; g_pso_user_checked = 0; g_pso_user_seen = nil;
++    os_unfair_lock_unlock(&g_pso_user_lock);
++    g_warm_seed_src = -1; g_warm_tail_skipped = 0;
++}
+ void dm_gfx_teardown(void) { @autoreleasepool {
+     atomic_store(&g_gfx_teardown, 1);
+     atomic_fetch_add(&g_defer_gen, 1);
+     mtl_present_discard(1);
+     dispatch_group_wait(bg_group(), DISPATCH_TIME_FOREVER);
++    mtl_session_reset();   // the background work is done (bg_group): nothing reads these any more
+     dispatch_source_t msrc = g_rh_mem_src;
+     dispatch_queue_t mq = g_rh_mem_q;
+     if (msrc) dispatch_source_cancel(msrc);
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -553,6 +553,16 @@
+ .PHONY: check_t_pso_binary_archive
+ check_t_pso_binary_archive: t_pso_binary_archive
+ 	MTL_DEBUG_LAYER=1 ./t_pso_binary_archive
++# DM_PSO_TAIL_RESUME / DM_PSO_TAIL_HOT (engine-patches/0415): the tail goes on from where an earlier session left the seed list (pso_tail.tsv), its seed rows wait while the device is hot
++t_pso_tail_resume: t_pso_tail_resume.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_tail_resume.m $(MTL_T_SRC) $(FW)
++.PHONY: check_t_pso_tail_resume
++check_t_pso_tail_resume: t_pso_tail_resume
++	DM_PSO_MTL4=0 MTL_DEBUG_LAYER=1 ./t_pso_tail_resume
++	DM_PSO_MTL4=1 MTL_DEBUG_LAYER=1 ./t_pso_tail_resume
++# dm/host/dm_envflag.h (engine-patches/0415, review L7): one reading of on / off switches, no GPU
++t_env_flag: t_env_flag.c ../../host/dm_envflag.h
++	clang -O1 -Wall -Wextra -Werror -o $@ t_env_flag.c
+ t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_skey.m -framework Foundation
+ t_view_swizzle: t_view_swizzle.m $(MTL_T_DEP)
+@@ -941,3 +951,6 @@
+ t_bc_cpu: t_bc_cpu.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_bc_cpu.m $(MTL_T_SRC) $(FW)
+ check_t_bc_cpu: RUN_ENV = MTL_DEBUG_LAYER=1
++# engine-patches/0415 revision 3 (review L8): the learned list's state is set back at graphics teardown
++t_session_reset: t_session_reset.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_session_reset.m $(MTL_T_SRC) $(FW)
+--- a/dm/gfx/tests/t_pso_user_first.m
++++ b/dm/gfx/tests/t_pso_user_first.m
+@@ -123,6 +123,7 @@
+     setenv("DM_PSO_ARCHIVE", "off", 1); setenv("DM_NVN_PREDICT", "0", 1); setenv("DM_PSO_PREPARE", "1", 1);
+     unsetenv("DM_PSO_RECORD"); unsetenv("DM_SAVE"); unsetenv("DM_PSO_PREBUILD"); unsetenv("DM_PSO_HYBRID"); unsetenv("DM_PSO_MANIFEST"); unsetenv("DM_PSO_USER_FIRST");
+     unsetenv("DM_PSO_PREPARE_PERCENT"); unsetenv("DM_PSO_PREPARE_TAIL");
++    setenv("DM_PSO_TAIL_RESUME", "0", 1); setenv("DM_PSO_TAIL_HOT", "1", 1);   // engine-patches/0415: this test is 0413's; the tail's position file and heat wait are t_pso_tail_resume's
+     char tmpl[1024]; snprintf(tmpl, sizeof tmpl, "%s/t_pso_user_first.XXXXXX", NSTemporaryDirectory().fileSystemRepresentation);
+     if (!mkdtemp(tmpl)) { perror("mkdtemp"); return 1; }
+     g_dir = @(tmpl);
+--- /dev/null
++++ b/dm/gfx/tests/t_pso_tail_resume.m
+@@ -0,0 +1,262 @@
++// engine-patches/0415: the prewarm tail's seed rows wait while the device is hot, and the tail goes on from where an earlier session left it in the seed list (pso_tail.tsv). On this Mac's
++// GPU with t_pso_head's synthetic libraries: a seed list of 40 tasks (pso_manifest.tsv beside the shader map, no DM_PSO_MANIFEST), DM_PSO_PREPARE_PERCENT=25 (a head of 10 tasks).
++//  - a tail stopped inside task 21 (a pair) keeps "next = the line after task 20's first row"; the next start's tail leaves out tasks 10..20 and builds 21..39, no sweep, keeps "the end";
++//    the start after it builds only the head (the tail has nothing of this device's to build); DM_PSO_TAIL_RESUME=0 walks them all again; a changed seed list starts again;
++//  - at thermal state serious the tail builds this device's rows (pso_user.tsv, engine-patches/0413) and waits before the seed's, goes on once cool, and a stop while it waits ends it;
++//  - DM_PSO_PREPARE_TAIL=user builds this device's rows and none of the seed's;
++//  - mtl_warm_pause (dm_gfx_suspend) holds the tail between two tasks, a stop while paused ends it within a poll step; DM_PSO_TAIL_HOT=on and DM_PSO_PREPARE_TAIL=off are understood.
++#include "../nvn/nvn_mtl.m"
++#include <fcntl.h>
++#include <unistd.h>
++
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++
++static int checks, failed;
++#define EXPECT(name, want, got) do { long long w_ = (long long)(want), g_ = (long long)(got); checks++; \
++    if (w_ != g_) { printf("FAIL %s: expected %lld, got %lld (line %d)\n", name, w_, g_, __LINE__); failed++; } } while (0)
++#define EXPECT_LOG(name, log, needle) do { checks++; if ([(log) rangeOfString:@needle].location == NSNotFound) { printf("FAIL %s: the log has no \"%s\"\n--- log\n%s\n---\n", name, needle, [(log) UTF8String]); failed++; } } while (0)
++#define EXPECT_NOLOG(name, log, needle) do { checks++; if ([(log) rangeOfString:@needle].location != NSNotFound) { printf("FAIL %s: the log has \"%s\"\n", name, needle); failed++; } } while (0)
++
++enum { NT = 40 };
++static NSString *g_dir, *g_seed, *g_user, *g_state;
++static int g_logfd; static off_t g_logmark;
++static NSString *log_since(void) {
++    off_t end = lseek(g_logfd, 0, SEEK_END); NSString *s = @"";
++    if (end > g_logmark) {
++        NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)(end - g_logmark)]; ssize_t n = pread(g_logfd, d.mutableBytes, d.length, g_logmark);
++        if (n > 0) s = [[NSString alloc] initWithBytes:d.bytes length:(NSUInteger)n encoding:NSUTF8StringEncoding] ?: @"";
++    }
++    g_logmark = end; return s;
++}
++static void show(const char *what, NSString *log) {
++    printf("-- %s\n", what);
++    for (NSString *l in [log componentsSeparatedByString:@"\n"]) if ([l containsString:@"prewarm tail"] || [l containsString:@"pipeline prewarm done"]) printf("   %s\n", [l stringByReplacingOccurrencesOfString:@"[dm] [nvn-mtl] " withString:@""].UTF8String);
++}
++@interface TrGate : NSObject { @public id<MTLDevice> device; dispatch_semaphore_t entered, release; _Atomic unsigned calls; unsigned block_at; } @end
++@implementation TrGate
++- (id)forwardingTargetForSelector:(SEL)selector { return device; }
++- (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
++    unsigned n = atomic_fetch_add(&calls, 1) + 1;
++    if (block_at && n == block_at) { dispatch_semaphore_signal(entered); dispatch_semaphore_wait(release, DISPATCH_TIME_FOREVER); }
++    return [device newLibraryWithData:data error:error];
++}
++@end
++static TrGate *g_gate;
++static int build_fixtures(NSString *dir) {
++    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
++        "vertex float4 vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); return float4(uv * 2 - 1, 0, 1); }\n"
++        "fragment float4 fs() { return float4(0.5, 0.25, 1, 0.5); }\n";
++    NSString *metal = [dir stringByAppendingPathComponent:@"fixture.metal"], *library = [dir stringByAppendingPathComponent:@"fixture.metallib"];
++    if (![source writeToFile:metal atomically:YES encoding:NSUTF8StringEncoding error:nil]) return 0;
++    NSTask *compiler = [NSTask new]; compiler.executableURL = [NSURL fileURLWithPath:@"/usr/bin/xcrun"];
++    compiler.arguments = @[@"-sdk", @"macosx", @"metal", metal, @"-o", library];
++    NSError *error = nil;
++    if (![compiler launchAndReturnError:&error]) { printf("fixture compiler: %s\n", error.localizedDescription.UTF8String); return 0; }
++    [compiler waitUntilExit]; if (compiler.terminationStatus) return 0;
++    NSFileManager *fm = NSFileManager.defaultManager; NSMutableDictionary *map = [NSMutableDictionary dictionary];
++    for (int t = 0; t < NT; t++) {
++        NSArray<NSArray *> *libs = t % 4 == 0 ? @[@[[NSString stringWithFormat:@"hs%d", t], @"vs", @"vertex"]]
++                                              : @[@[[NSString stringWithFormat:@"hv%d", t], @"vs", @"vertex"], @[[NSString stringWithFormat:@"hf%d", t], @"fs", @"pixel"]];
++        for (NSArray *l in libs) {
++            NSDictionary *reflection = @{@"chain": @DMSH_CHAIN, @"route": @"B", @"entry": l[1], @"entry_z": l[1], @"bindings": @[], @"vertex_inputs": @[]};
++            NSData *json = [NSJSONSerialization dataWithJSONObject:reflection options:0 error:nil];
++            if (![json writeToFile:[dir stringByAppendingPathComponent:[l[0] stringByAppendingString:@".json"]] atomically:YES]) return 0;
++            if (![fm copyItemAtPath:library toPath:[dir stringByAppendingPathComponent:[l[0] stringByAppendingString:@".metallib"]] error:nil]) return 0;
++            map[l[0]] = l[2];
++        }
++    }
++    g_msl_dir = dir; g_shmap = map;
++    return 1;
++}
++static NSString *rrow(NSString *vkey, NSString *fkey, unsigned chmask) {
++    NvShader *vs = [NvShader new], *fs = [NvShader new];
++    strcpy(vs->key, vkey.UTF8String); strcpy(fs->key, fkey.UTF8String); fs->stage = 1;
++    pso_key key = {0}; key.cfmt[0] = MTLPixelFormatRGBA8Unorm; key.samples = 1; key.chmask = chmask;
++    pso_skey sk; char hex[sizeof sk * 2 + 1]; pso_skey_from(&key, vs, fs, 0, NULL, &sk); pso_skey_hex(&sk, hex);
++    return [NSString stringWithFormat:@"R\t%s\n", hex];
++}
++static NSString *task_rows(int t) {
++    if (t % 4 == 0) return [NSString stringWithFormat:@"S\ths%d\t0\n", t];
++    NSString *v = [NSString stringWithFormat:@"hv%d", t], *f = [NSString stringWithFormat:@"hf%d", t];
++    return [rrow(v, f, 15) stringByAppendingString:rrow(v, f, 7)];
++}
++static long first_line(int t) { long l = 1; for (int u = 0; u < t; u++) l += u % 4 ? 2 : 1; return l; }   // the seed line of task t's first row
++static unsigned libs_upto(int t) { unsigned n = 0; for (int u = 0; u < t; u++) n += u % 4 ? 2 : 1; return n; }   // the libraries tasks 0..t-1 load
++static int task_of_item(WarmItem *it) { return [[(it->kind == 0 ? it->key : it->vs_key) substringFromIndex:2] intValue]; }
++static void reset_warm(void) {
++    nvn_hm_clear(&g_pso, hm_rel); g_shcache = nil; g_warm_items = [NSMutableArray array]; g_warm_dict = nil; g_warm_loads = nil;
++    g_warm_started = 0; atomic_store(&g_warm_bg, 0); atomic_store(&g_warm_stop, 0); atomic_store(&g_warm_ready, 0); atomic_store(&g_warm_running, 0); atomic_store(&g_warm_done, 0);
++    atomic_store(&g_sweep_warm, 0); atomic_store(&g_sweep_pairs, 0); g_warm_tail_skipped = 0; g_pso_user_first = -1;
++    g_warm_shaders = g_warm_rps = g_warm_mps = g_warm_cps = g_warm_skip_fz = g_warm_skip_stale = 0; g_warm_claim_shaders = g_warm_claim_rps = g_warm_claim_cps = 0;
++}
++static NSArray<WarmItem *> *items_now(void) { os_unfair_lock_lock(&g_warm_lock); NSArray<WarmItem *> *a = [g_warm_items copy]; os_unfair_lock_unlock(&g_warm_lock); return a; }
++static NSSet<NSNumber *> *built(void) { NSMutableSet *s = [NSMutableSet set]; for (WarmItem *it in items_now()) [s addObject:@(task_of_item(it))]; return s; }
++static NSSet<NSNumber *> *tasks_set(int from, int to, NSSet *also) { NSMutableSet *s = [NSMutableSet setWithSet:also ?: [NSSet set]]; for (int t = from; t < to; t++) [s addObject:@(t)]; return s; }
++static int wait_idle(double seconds) { uint64_t t0 = bp_now(); while (atomic_load(&g_warm_running)) { if ((bp_now() - t0) > (uint64_t)(seconds * 1e9)) return 0; usleep(2000); } return 1; }
++static long state_next(void) {
++    NSString *t = [NSString stringWithContentsOfFile:g_state encoding:NSUTF8StringEncoding error:nil];
++    for (NSString *l in [t componentsSeparatedByString:@"\n"]) if ([l hasPrefix:@"next\t"]) return [[l substringFromIndex:5] longLongValue];
++    return -1;
++}
++static NSString *start(unsigned block_at) {   // warm_start with PERCENT=25; the gate holds library load block_at (0: none)
++    reset_warm(); (void)log_since();
++    g_gate->entered = dispatch_semaphore_create(0); g_gate->release = dispatch_semaphore_create(0); g_gate->block_at = block_at; atomic_store(&g_gate->calls, 0);
++    setenv("DM_PSO_PREPARE_PERCENT", "25", 1); warm_start(); unsetenv("DM_PSO_PREPARE_PERCENT");
++    return log_since();
++}
++static int th_value; static int th_hook(void) { return th_value; }
++
++int main(void) { @autoreleasepool {
++    alarm(240); setvbuf(stdout, NULL, _IOLBF, 0);
++    setenv("DM_PSO_ARCHIVE", "off", 1); setenv("DM_NVN_PREDICT", "0", 1); setenv("DM_PSO_PREPARE", "1", 1); setenv("DM_PSO_BINARY_ARCHIVE", "0", 1);
++    unsetenv("DM_PSO_RECORD"); unsetenv("DM_SAVE"); unsetenv("DM_PSO_PREBUILD"); unsetenv("DM_PSO_HYBRID"); unsetenv("DM_PSO_MANIFEST"); unsetenv("DM_PSO_USER_FIRST");
++    unsetenv("DM_PSO_TAIL_RESUME"); unsetenv("DM_PSO_TAIL_HOT"); unsetenv("DM_PSO_PREPARE_TAIL");
++    char tmpl[1024]; snprintf(tmpl, sizeof tmpl, "%s/t_pso_tail_resume.XXXXXX", NSTemporaryDirectory().fileSystemRepresentation);
++    if (!mkdtemp(tmpl)) { perror("mkdtemp"); return 1; }
++    g_dir = @(tmpl); NSFileManager *fm = NSFileManager.defaultManager;
++    g_logfd = open([g_dir stringByAppendingPathComponent:@"engine.log"].fileSystemRepresentation, O_RDWR | O_CREAT | O_TRUNC, 0600);
++    if (g_logfd < 0 || dup2(g_logfd, 2) < 0) { perror("log"); return 1; }
++    g_shmap_path = [g_dir stringByAppendingPathComponent:@"shader_map.tsv"];
++    g_seed = [g_dir stringByAppendingPathComponent:@"pso_manifest.tsv"]; g_user = [g_dir stringByAppendingPathComponent:@"pso_user.tsv"]; g_state = [g_dir stringByAppendingPathComponent:@"pso_tail.tsv"];
++    setenv("DM_PSO_USER", g_user.UTF8String, 1);
++    mtl_init();
++    if (!build_fixtures(g_dir)) { printf("failed to make the synthetic shader libraries\n"); [fm removeItemAtPath:g_dir error:nil]; return 1; }
++    g_shmap_path = [g_dir stringByAppendingPathComponent:@"shader_map.tsv"];   // mtl_init does not set it in the tests: the seed is the pso_manifest.tsv beside it
++    NSMutableString *seed = [NSMutableString string]; for (int t = 0; t < NT; t++) [seed appendString:task_rows(t)];
++    [seed writeToFile:g_seed atomically:YES encoding:NSUTF8StringEncoding error:nil];
++    pso4_init();
++    g_gate = [TrGate new]; g_gate->device = g_dev; g_dev = (id<MTLDevice>)g_gate;
++    g_warm_tail_poll_ms = 20; g_warm_thermal = th_hook;
++    NSSet *head = tasks_set(0, 10, nil);
++
++    // ---- 1. a tail stopped after task 20: the position is the line after task 20's first row
++    {
++        NSString *log = start(libs_upto(21) + 1);   // held at task 21's first library
++        EXPECT("stop: the tail reached task 21", 0, dispatch_semaphore_wait(g_gate->entered, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)));
++        atomic_store(&g_warm_stop, 1); dispatch_semaphore_signal(g_gate->release);
++        EXPECT("stop: the tail ends", 1, wait_idle(30)); log = [log stringByAppendingString:log_since()]; show("a tail stopped at task 21", log);
++        EXPECT_NOLOG("stop: no earlier position", log, "earlier sessions walked");
++        EXPECT("stop: the position kept is the line after task 20's first row (task 21, a pair cut by the stop, is not counted)", first_line(20) + 1, state_next());
++        EXPECT("stop: tasks 0..20 built (task 21's pipelines left out by the stop)", 1, [built() isEqualToSet:tasks_set(0, 21, nil)]);
++        atomic_store(&g_warm_stop, 0);
++    }
++    // ---- 2. the next start: the tail leaves tasks 10..20 out, builds 21..39, keeps the end, no sweep
++    {
++        NSString *log = start(0); EXPECT("resume: the tail finishes", 1, wait_idle(60)); log = [log stringByAppendingString:log_since()]; show("the next start", log);
++        EXPECT_LOG("resume: the log says what is left out", log, "earlier sessions walked the seed list to its line ");
++        EXPECT_LOG("resume: 11 of the 30 seed tasks", log, "11 of the tail's 30 seed tasks are left out");
++        EXPECT("resume: built: the head and tasks 21..39", 1, [built() isEqualToSet:tasks_set(21, 40, head)]);
++        EXPECT("resume: the position is the seed's end", first_line(NT - 1) + 1, state_next());
++        EXPECT("resume: no archive sweep (rows were not asked for in this run)", 0, atomic_load(&g_sweep_warm));
++        EXPECT_LOG("resume: its end line", log, "pipeline prewarm done (the seed rows earlier sessions walked were left out)");
++    }
++    // ---- 3. the start after: the seed was walked to its end, the tail builds nothing of it
++    {
++        NSString *log = start(0); EXPECT("end: the tail finishes", 1, wait_idle(60)); log = [log stringByAppendingString:log_since()]; show("the start after", log);
++        EXPECT_LOG("end: only this device's rows", log, "30 of the tail's 30 seed tasks are left out, only this device's rows are built");
++        EXPECT("end: built: the head only", 1, [built() isEqualToSet:head]);
++        EXPECT("end: libraries loaded: the head's", libs_upto(10), atomic_load(&g_gate->calls));
++    }
++    // ---- 4. DM_PSO_TAIL_RESUME=0: all again
++    {
++        setenv("DM_PSO_TAIL_RESUME", "0", 1);
++        NSString *log = start(0); EXPECT("resume=0: the tail finishes", 1, wait_idle(60)); log = [log stringByAppendingString:log_since()];
++        unsetenv("DM_PSO_TAIL_RESUME");
++        EXPECT_LOG("resume=0: said", log, "DM_PSO_TAIL_RESUME=0: walked again");
++        EXPECT("resume=0: built: all 40", 1, [built() isEqualToSet:tasks_set(0, NT, nil)]);
++        EXPECT("resume=0: the sweep is allowed again (every row asked for)", 1, atomic_load(&g_sweep_warm));
++    }
++    // ---- 5. a changed seed list starts again from its first line
++    {
++        [[seed stringByAppendingString:@"# a new pack\n"] writeToFile:g_seed atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        NSString *log = start(0); EXPECT("new seed: the tail finishes", 1, wait_idle(60)); log = [log stringByAppendingString:log_since()];
++        EXPECT_NOLOG("new seed: no position", log, "earlier sessions walked");
++        EXPECT("new seed: built: all 40", 1, [built() isEqualToSet:tasks_set(0, NT, nil)]);
++    }
++    // ---- 6. hot: this device's rows go on, the seed's wait, then go on once cool; with a user list naming tasks 25..39 (head 25..34, tail 35..39 then the seed's 0..24)
++    {
++        [fm removeItemAtPath:g_state error:nil];
++        NSMutableString *user = [NSMutableString string]; for (int t = 25; t < NT; t++) [user appendString:task_rows(t)];
++        [user writeToFile:g_user atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        th_value = 2;
++        NSString *log = start(0);
++        uint64_t t0 = bp_now(); while (built().count < 15 && bp_now() - t0 < 20000000000ull) usleep(5000);
++        usleep(300000);
++        log = [log stringByAppendingString:log_since()]; show("hot (thermal state 2)", log);
++        EXPECT("hot: this device's rows built (head 25..34 and tail 35..39)", 1, [built() isEqualToSet:tasks_set(25, NT, nil)]);
++        EXPECT("hot: no seed row built while hot", libs_upto(NT) - libs_upto(25), atomic_load(&g_gate->calls));
++        EXPECT("hot: the tail still runs", 1, atomic_load(&g_warm_running));
++        EXPECT_LOG("hot: said", log, "the device is hot (thermal state 2): the seed list's rows wait");
++        th_value = 0;
++        EXPECT("hot: the tail finishes once cool", 1, wait_idle(60)); log = log_since(); show("  ... cool", log);
++        EXPECT("hot: then everything is built", 1, [built() isEqualToSet:tasks_set(0, NT, nil)]);
++        // a stop while it waits ends it
++        [fm removeItemAtPath:g_state error:nil]; th_value = 3;
++        (void)start(0);
++        t0 = bp_now(); while (built().count < 15 && bp_now() - t0 < 20000000000ull) usleep(5000);
++        usleep(100000);
++        atomic_store(&g_warm_stop, 1);
++        EXPECT("hot stop: the waiting tail ends", 1, wait_idle(10));
++        EXPECT_LOG("hot stop: it says it stopped", log_since(), "pipeline prewarm tail: stopped after 5 of 30 tasks");
++        atomic_store(&g_warm_stop, 0); th_value = 0;
++        // DM_PSO_TAIL_HOT=1: no wait
++        [fm removeItemAtPath:g_state error:nil]; th_value = 2; setenv("DM_PSO_TAIL_HOT", "1", 1);
++        log = start(0); EXPECT("hot=1: the tail finishes while hot", 1, wait_idle(60)); log = [log stringByAppendingString:log_since()];
++        unsetenv("DM_PSO_TAIL_HOT"); th_value = 0;
++        EXPECT_NOLOG("hot=1: no wait", log, "the device is hot");
++        EXPECT("hot=1: everything built", 1, [built() isEqualToSet:tasks_set(0, NT, nil)]);
++    }
++    // ---- 7. DM_PSO_PREPARE_TAIL=user: this device's rows only (25..39: head 25..34, tail 35..39), no seed row, the position file untouched
++    {
++        [fm removeItemAtPath:g_state error:nil]; setenv("DM_PSO_PREPARE_TAIL", "user", 1);
++        NSString *log = start(0); EXPECT("user: the tail finishes", 1, wait_idle(60)); log = [log stringByAppendingString:log_since()];
++        unsetenv("DM_PSO_PREPARE_TAIL"); show("DM_PSO_PREPARE_TAIL=user", log);
++        EXPECT_LOG("user: said", log, "DM_PSO_PREPARE_TAIL=user: only this device's rows (5 tasks), the seed list's 25 tasks are left out");
++        EXPECT("user: built: this device's rows only", 1, [built() isEqualToSet:tasks_set(25, NT, nil)]);
++        EXPECT("user: libraries: theirs only", libs_upto(NT) - libs_upto(25), atomic_load(&g_gate->calls));
++        EXPECT("user: no position written", 0, [fm fileExistsAtPath:g_state]);
++        EXPECT("user: no sweep", 0, atomic_load(&g_sweep_warm));
++    }
++    // ---- 8. graphics suspended (mtl_warm_pause, called by dm_gfx_suspend(1)): the tail finishes the task under way and takes no new one until resumed (the review's M2)
++    {
++        [fm removeItemAtPath:g_state error:nil]; [fm removeItemAtPath:g_user error:nil];
++        NSString *log = start(libs_upto(10) + 1);   // the tail held at its first library (task 10's)
++        EXPECT("pause: the tail reached its first library", 0, dispatch_semaphore_wait(g_gate->entered, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)));
++        mtl_warm_pause(1); dispatch_semaphore_signal(g_gate->release);
++        usleep(400000); unsigned c1 = atomic_load(&g_gate->calls); usleep(400000);
++        EXPECT("pause: no new library while paused", c1, atomic_load(&g_gate->calls));
++        EXPECT("pause: the task under way finished, no other", 1, [built() isEqualToSet:tasks_set(0, 11, nil)]);
++        EXPECT("pause: still running", 1, atomic_load(&g_warm_running));
++        mtl_warm_pause(0);
++        EXPECT("pause: resumed, the tail finishes", 1, wait_idle(60)); log = [log stringByAppendingString:log_since()]; show("paused and resumed", log);
++        EXPECT_LOG("pause: said", log, "pipeline prewarm tail: paused (graphics suspended");
++        EXPECT_LOG("pause: and resumed", log, "pipeline prewarm tail: goes on (graphics resumed)");
++        EXPECT("pause: then everything", 1, [built() isEqualToSet:tasks_set(0, NT, nil)]);
++        // a stop while paused ends it within a poll step
++        [fm removeItemAtPath:g_state error:nil];
++        (void)start(libs_upto(10) + 1);
++        EXPECT("pause stop: held", 0, dispatch_semaphore_wait(g_gate->entered, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)));
++        mtl_warm_pause(1); dispatch_semaphore_signal(g_gate->release); usleep(100000);
++        uint64_t s0 = bp_now(); atomic_store(&g_warm_stop, 1);
++        EXPECT("pause stop: ends", 1, wait_idle(10)); EXPECT("pause stop: within a second", 1, bp_now() - s0 < 1000000000ull);
++        atomic_store(&g_warm_stop, 0); mtl_warm_pause(0); (void)log_since();
++    }
++    // ---- 9. the switches read on / off words (dm_envflag.h): DM_PSO_TAIL_HOT=on does not wait, DM_PSO_PREPARE_TAIL=off skips the tail
++    {
++        [fm removeItemAtPath:g_state error:nil]; th_value = 2; setenv("DM_PSO_TAIL_HOT", "on", 1);
++        NSString *log = start(0); EXPECT("words: HOT=on, the tail finishes while hot", 1, wait_idle(60)); log = [log stringByAppendingString:log_since()];
++        unsetenv("DM_PSO_TAIL_HOT"); th_value = 0;
++        EXPECT_NOLOG("words: HOT=on: no wait", log, "the device is hot");
++        setenv("DM_PSO_PREPARE_TAIL", "off", 1); log = start(0); usleep(200000); log = [log stringByAppendingString:log_since()]; unsetenv("DM_PSO_PREPARE_TAIL");
++        EXPECT_LOG("words: TAIL=off skips the tail", log, "SKIPPED (DM_PSO_PREPARE_TAIL=0)");
++        EXPECT("words: only the head", 1, [built() isEqualToSet:head]);
++    }
++    g_dev = g_gate->device; g_warm_thermal = NULL;
++    [fm removeItemAtPath:g_dir error:nil];
++    printf("t_pso_tail_resume: %d checks, %d failed; %s\n", checks, failed, g_comp4 ? "Metal 4" : "MTLDevice");
++    return failed != 0;
++} }
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -1848,7 +1848,11 @@
+ void dm_gfx_leave(void) { gfx_leave(); }
+ __attribute__((weak)) void dm_vk_drain(void) {}   // dm/gfx/vk/hle_vk.m: wait for the Vulkan layer's queue (the graphics unit tests do not link it)
+ __attribute__((weak)) void dm_gl_drain(void) {}   // dm/gfx/gl/hle_gl.m: the same for the GL layer
++#ifndef DM_MTL_WARM_PAUSE   // nvn_mtl.m defines it (engine-patches/0415); this weak empty one serves where it is not linked (the simulator host), and is left out where a test includes both files
++__attribute__((weak)) void mtl_warm_pause(int on) { (void)on; }
++#endif
+ void dm_gfx_suspend(int on) {
++    mtl_warm_pause(on);   // engine-patches/0415: the prewarm tail takes no new task while suspended, so the archive's write (mtl_arch_save below) is not beside its compiles
+     pthread_mutex_lock(&g_susp_mu);
+     g_susp = on != 0;
+     if (on) while (g_inflight_api) pthread_cond_wait(&g_susp_cv, &g_susp_mu);
+--- a/dm/gfx/nvn/nvn_mtl.h
++++ b/dm/gfx/nvn/nvn_mtl.h
+@@ -56,6 +56,7 @@
+ void mtl_drain(void);                                // Wait for all commands on the queue (including presents) to complete: submit an empty command buffer and wait for it
+ void mtl_arch_save(int wait_ms, int ending);         // The pipeline archive's unwritten captures, written now even during the prewarm (going to the background, quitting); ending: the process ends after waiting up to wait_ms
+ enum { MTL_QUIT_ARCH_MS = 10000 };   // what quitting gives the archive's write (atexit; the graceful exit: dm.h DM_QUIT_ARCH_MS, the same): a file of 900 bases took 1.8-4 s on Macs
++void mtl_warm_pause(int on);   // engine-patches/0415: dm_gfx_suspend(1) pauses the pipeline prewarm's tail (no new task), (0) lets it go on
+ void mtl_warm_stop(void);   // the process is ending: the pipeline prewarm takes no more lines, and what it has not built is left to the next start (no compiles beside the archive's write)
+ // External producers (the Vulkan layer, dm/gfx/vk): the shared Metal device; a serial for one of their textures; present it once their event reaches ev_val (ticket for mtl_present_wait)
+ void *mtl_device(void);
+--- /dev/null
++++ b/dm/host/dm_envflag.h
+@@ -0,0 +1,34 @@
++// One reading of an on / off switch for every DM_* variable that is one (engine-patches/0415, the review's L7: DM_AUDREN_RT read "on" as off, DM_PSO_PREPARE_TAIL and DM_STALL_DUMP knew
++// only "0", DM_FPS_PAYBACK "off" and "0", DM_PSO_TAIL_HOT only "1"). Pure C, no state: dm/gfx/tests/t_env_flag.c checks it.
++// 1 for 1 / on / true / yes, 0 for 0 / off / false / no (any case; blanks and a line end around it are allowed: the value may come from a line of env.txt), dflt when unset or empty;
++// anything else gives dflt and sets *bad (when bad is not NULL), so the caller can say in its log that the value was not understood
++#ifndef DM_ENVFLAG_H
++#define DM_ENVFLAG_H
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++static inline int dm_flag_text(const char *v, int dflt, int *bad) {
++    if (bad) *bad = 0;
++    if (!v) return dflt;
++    while (*v == ' ' || *v == '\t') v++;
++    size_t n = strlen(v);
++    while (n && (v[n - 1] == ' ' || v[n - 1] == '\t' || v[n - 1] == '\r' || v[n - 1] == '\n')) n--;
++    if (!n) return dflt;
++    static const char *const on[] = {"1", "on", "true", "yes"}, *const off[] = {"0", "off", "false", "no"};
++    for (int i = 0; i < 4; i++) {
++        if (strlen(on[i]) == n && !strncasecmp(v, on[i], n)) return 1;
++        if (strlen(off[i]) == n && !strncasecmp(v, off[i], n)) return 0;
++    }
++    if (bad) *bad = 1;
++    return dflt;
++}
++static inline int dm_env_flag(const char *name, int dflt, int *bad) { return dm_flag_text(getenv(name), dflt, bad); }
++// Whether v is the word w (any case, blanks and a line end around it allowed): for a switch with a third value (DM_PSO_PREPARE_TAIL=user)
++static inline int dm_flag_is(const char *v, const char *w) {
++    if (!v) return 0;
++    while (*v == ' ' || *v == '\t') v++;
++    size_t n = strlen(v);
++    while (n && (v[n - 1] == ' ' || v[n - 1] == '\t' || v[n - 1] == '\r' || v[n - 1] == '\n')) n--;
++    return n == strlen(w) && !strncasecmp(v, w, n);
++}
++#endif
+--- /dev/null
++++ b/dm/gfx/tests/t_env_flag.c
+@@ -0,0 +1,19 @@
++// dm/host/dm_envflag.h (engine-patches/0415, the review's L7): one reading of on / off switches. Pure C, no GPU
++#include "../../host/dm_envflag.h"
++#include <stdio.h>
++static int checks, failed;
++#define EXPECT(name, want, got) do { long w_ = (long)(want), g_ = (long)(got); checks++; if (w_ != g_) { printf("FAIL %s: expected %ld, got %ld (line %d)\n", name, w_, g_, __LINE__); failed++; } } while (0)
++int main(void) {
++    const char *on[] = {"1", "on", "ON", "On", "true", "TRUE", "yes", "Yes", " 1", "on\n", "\ttrue \r\n"}, *off[] = {"0", "off", "OFF", "false", "False", "no", "NO", " 0 ", "off\r\n"};
++    const char *bad[] = {"2", "-1", "onn", "of", "y", "n", "enable", "1x", "o n", "00", "yes!"};
++    int b = 0;
++    for (unsigned i = 0; i < sizeof on / sizeof *on; i++) { EXPECT(on[i], 1, dm_flag_text(on[i], 0, &b)); EXPECT("on: not bad", 0, b); }
++    for (unsigned i = 0; i < sizeof off / sizeof *off; i++) { EXPECT(off[i], 0, dm_flag_text(off[i], 1, &b)); EXPECT("off: not bad", 0, b); }
++    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) for (int d = 0; d < 2; d++) { EXPECT(bad[i], d, dm_flag_text(bad[i], d, &b)); EXPECT("bad: said", 1, b); }
++    for (int d = 0; d < 2; d++) { EXPECT("unset", d, dm_flag_text(NULL, d, &b)); EXPECT("unset: not bad", 0, b); EXPECT("empty", d, dm_flag_text("", d, &b)); EXPECT("blank", d, dm_flag_text("  \n", d, &b)); EXPECT("blank: not bad", 0, b); }
++    EXPECT("NULL bad pointer", 1, dm_flag_text("on", 0, NULL)); EXPECT("NULL bad pointer, bad value", 1, dm_flag_text("what", 1, NULL));
++    EXPECT("is user", 1, dm_flag_is("user", "user")); EXPECT("is USER", 1, dm_flag_is(" USER\n", "user")); EXPECT("is not users", 0, dm_flag_is("users", "user")); EXPECT("is not NULL", 0, dm_flag_is(NULL, "user"));
++    setenv("T_ENV_FLAG", "Off", 1); EXPECT("dm_env_flag", 0, dm_env_flag("T_ENV_FLAG", 1, &b)); unsetenv("T_ENV_FLAG"); EXPECT("dm_env_flag unset", 1, dm_env_flag("T_ENV_FLAG", 1, &b));
++    printf("t_env_flag: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++}
+--- /dev/null
++++ b/dm/gfx/tests/t_session_reset.m
+@@ -0,0 +1,34 @@
++// engine-patches/0415 revision 3 (review L8): the learned list's file, its "seen" set and the tail's seed index are set back when graphics are torn down, so a second game in the same
++// process writes its own pso_user.tsv. No GPU work beyond mtl_init
++#include "../nvn/nvn_mtl.m"
++#include <fcntl.h>
++#include <unistd.h>
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define EXPECT(name, want, got) do { long long w_ = (long long)(want), g_ = (long long)(got); checks++; if (w_ != g_) { printf("FAIL %s: expected %lld, got %lld (line %d)\n", name, w_, g_, __LINE__); failed++; } } while (0)
++static NSString *slurp(NSString *p) { return [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil] ?: @""; }
++int main(void) { @autoreleasepool {
++    char tmpl[1024]; snprintf(tmpl, sizeof tmpl, "%s/t_session_reset.XXXXXX", NSTemporaryDirectory().fileSystemRepresentation); if (!mkdtemp(tmpl)) return 1;
++    NSString *a = [@(tmpl) stringByAppendingPathComponent:@"game_a.tsv"], *b = [@(tmpl) stringByAppendingPathComponent:@"game_b.tsv"];
++    NSString *logp = [@(tmpl) stringByAppendingPathComponent:@"engine.log"]; int lfd = open(logp.fileSystemRepresentation, O_RDWR | O_CREAT | O_TRUNC, 0600); if (lfd < 0 || dup2(lfd, 2) < 0) return 1;
++    mtl_init();
++    setenv("DM_PSO_USER", a.fileSystemRepresentation, 1); unsetenv("DM_SAVE");
++    pso_user_record("row-one\n"); pso_user_record("row-one\n"); pso_user_record("row-two\n");
++    EXPECT("game A: its file has its two distinct rows", 1, [slurp(a) isEqualToString:@"row-one\nrow-two\n"]);
++    EXPECT("game A: the file is held open", 1, g_pso_user_fd >= 0); g_warm_seed_src = 3; g_warm_tail_skipped = 1;
++    // the second game: teardown of the first, then its own list
++    dm_gfx_teardown();
++    EXPECT("teardown: the file is closed", -1, g_pso_user_fd); EXPECT("teardown: asked again", 0, g_pso_user_checked); EXPECT("teardown: the seen set is gone", 1, g_pso_user_seen == nil);
++    EXPECT("teardown: the seed index is back to none", -1, g_warm_seed_src); EXPECT("teardown: the skipped flag is cleared", 0, g_warm_tail_skipped);
++    setenv("DM_PSO_USER", b.fileSystemRepresentation, 1);
++    pso_user_record("row-one\n"); pso_user_record("row-three\n");
++    EXPECT("game B: its own file has its rows, row-one included (a stale seen set would have dropped it)", 1, [slurp(b) isEqualToString:@"row-one\nrow-three\n"]);
++    EXPECT("game A's file did not receive game B's rows", 1, [slurp(a) isEqualToString:@"row-one\nrow-two\n"]);
++    [NSFileManager.defaultManager removeItemAtPath:@(tmpl) error:nil];
++    printf("t_session_reset: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }

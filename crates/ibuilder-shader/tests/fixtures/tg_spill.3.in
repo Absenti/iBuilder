@@ -1,0 +1,12 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+kernel void main0(uint3 g [[threadgroup_position_in_grid]])
+{
+    threadgroup spvUnsafeArray<ulong, 3200> _33;
+    float _9 = 1.0;
+}

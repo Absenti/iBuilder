@@ -1,0 +1,101 @@
+0040-import-and-download-never-delete-first.patch -- a game dump is replaced only by a complete new file (docs/REVIEW-TRIAGE-2026-11-19.md, finding 3.1).
+Applied by scripts/build-app.sh to its copy of the C# snapshot (patch -p1, run in the project folder), after 0010, 0020 and whatever lies between (0030-0039 belong to other work); app/gameapp/ is not edited.
+UNTESTED ON DEVICE: written without a C# compiler; File.Move(string, string, bool) is the overload GameAppMods.WriteState already uses.
+  * GameAppMain.cs CopyIn (the only import path of .nsp/.xci/.nsz/.nup): the old code deleted the existing dump FIRST, then moved the new file in; a move that failed (anything but an
+    IOException, or a copy that ran out of disk) lost both. Now the file lands as <name>.part and replaces the old one in one rename; a failure removes the .part and leaves the old dump.
+  * GameAppLibrary.cs CopyWithProgress (download from iCloud / Files, upload to a folder) and GameAppNas.cs Download: the .part was complete before the old destination was deleted, so
+    the window was small, but the delete is gone (one rename over the old file) and a failed copy no longer leaves a multi-GB .part behind.
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -2068,22 +2068,29 @@
+     private static void CopyWithProgress(string from, string dest, Action<long, long> progress)
+     {
+         var part = dest + ".part";
+-        long total = new FileInfo(from).Length, done = 0;
+-        var buffer = new byte[4 << 20];
+-        using (var input = File.OpenRead(from))
+-        using (var output = File.Create(part))
++        try
+         {
+-            int n;
+-            var last = DateTime.MinValue;
+-            while ((n = input.Read(buffer, 0, buffer.Length)) > 0)
++            long total = new FileInfo(from).Length, done = 0;
++            var buffer = new byte[4 << 20];
++            using (var input = File.OpenRead(from))
++            using (var output = File.Create(part))
+             {
+-                output.Write(buffer, 0, n);
+-                done += n;
+-                if ((DateTime.Now - last).TotalMilliseconds > 300) { progress?.Invoke(done, total); last = DateTime.Now; }
++                int n;
++                var last = DateTime.MinValue;
++                while ((n = input.Read(buffer, 0, buffer.Length)) > 0)
++                {
++                    output.Write(buffer, 0, n);
++                    done += n;
++                    if ((DateTime.Now - last).TotalMilliseconds > 300) { progress?.Invoke(done, total); last = DateTime.Now; }
++                }
+             }
++            File.Move(part, dest, true);   // one rename over the old file (none deleted first); the .part is never left behind by a failure
+         }
+-        if (File.Exists(dest)) File.Delete(dest);
+-        File.Move(part, dest);
++        catch
++        {
++            try { File.Delete(part); } catch (Exception) { }
++            throw;
++        }
+     }
+ 
+     private void UploadTo(CloudSource target, string path, bool isApp)
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -2793,9 +2793,20 @@
+         {
+             var name = url.LastPathComponent;
+             var destination = Path.Combine(GameAppMain.Documents, name);
+-            if (File.Exists(destination)) File.Delete(destination);
+-            try { File.Move(path, destination); }
+-            catch (IOException) { File.Copy(path, destination, true); }
++            // The dump already there is NOT deleted first: the new file lands beside it as <name>.part and replaces it in one rename, so a copy that fails (disk full, an
++            // access error) leaves the old file as it was. (It used to delete the old one, then move: a failure in between lost both.)
++            var part = destination + ".part";
++            try
++            {
++                try { File.Move(path, part, true); }
++                catch (IOException) { File.Copy(path, part, true); }
++                File.Move(part, destination, true);
++            }
++            catch
++            {
++                try { File.Delete(part); } catch (Exception) { }
++                throw;
++            }
+             Write($"imported: {name}");
+             RefreshGames();
+             RefreshScreen();
+--- a/GameAppNas.cs
++++ b/GameAppNas.cs
+@@ -174,10 +174,17 @@
+         using var client = Connect(cfg, auth, log, out _);
+         long total = client.GetAttributes(remote).Size;
+         var part = localPath + ".part";
+-        using (var output = File.Create(part))
+-            client.DownloadFile(remote, output, sent => progress?.Invoke((long) sent, total));
+-        if (File.Exists(localPath)) File.Delete(localPath);
+-        File.Move(part, localPath);
++        try
++        {
++            using (var output = File.Create(part))
++                client.DownloadFile(remote, output, sent => progress?.Invoke((long) sent, total));
++            File.Move(part, localPath, true);   // one rename over the old file (none deleted first)
++        }
++        catch
++        {
++            try { File.Delete(part); } catch (Exception) { }   // a failed download leaves no multi-GB .part behind
++            throw;
++        }
+         client.Disconnect();
+         log?.Invoke($"NAS: {Path.GetFileName(localPath)} downloaded ({total / 1048576.0:0.0} MB)");
+     }

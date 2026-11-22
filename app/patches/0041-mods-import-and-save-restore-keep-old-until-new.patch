@@ -1,0 +1,94 @@
+0041-mods-import-and-save-restore-keep-old-until-new.patch -- two more places that deleted the working copy before the new one was in (docs/REVIEW-TRIAGE-2026-11-19.md, finding 3.1, sibling sites).
+Applied by scripts/build-app.sh to its copy of the C# snapshot (patch -p1, run in the project folder), after 0040; app/gameapp/ is not edited.
+UNTESTED ON DEVICE: written without a C# compiler; only System.IO calls the files already use.
+  * GameAppMods.cs Import: a mod of the same name was deleted, then its entries copied one by one, so a damaged zip entry in the middle destroyed the mod that worked. Now every mod is
+    copied into games/<id>/mods.new (outside mods/: never listed, never read by a build), and only when all of it is there do the old folders go and the new ones move in.
+  * GameAppSaves.cs ReplaceDir (save restore): the live save folder was deleted before the restored one moved in. It is now renamed to <folder>.old, the new one moves in, and a failure puts
+    the old one back (the restore also takes a safety copy of the current save first, so this was never the only copy; it is now not even the only protection).
+--- a/GameAppMods.cs
++++ b/GameAppMods.cs
+@@ -386,21 +386,38 @@
+         var root = ModsDir(documents, titleId);
+         var state = ReadState(documents, titleId);
+         var names = new List<string>();
+-        foreach (var group in placed.GroupBy(p => p.Mod))
++        // In two steps, so that a failure half way (a damaged zip entry, a full disk) changes nothing: every mod is first copied into a staging folder OUTSIDE mods/ (a half copied mod is
++        // never listed, and a build never reads it), and only when all of it is there do the old folders go and the new ones move in. (It used to delete the old folder of a mod first, then
++        // copy entry by entry: a zip that broke in the middle destroyed the mod that worked.)
++        var staging = Path.Combine(GameDir(documents, titleId), "mods.new");
++        if (Directory.Exists(staging)) Directory.Delete(staging, true);
++        try
+         {
+-            var dir = Path.Combine(root, group.Key);
+-            if (Directory.Exists(dir)) Directory.Delete(dir, true);   // the same name again: the new files replace the old ones
+-            foreach (var p in group)
++            foreach (var group in placed.GroupBy(p => p.Mod))
+             {
+-                var dest = Path.Combine(dir, p.Kind, p.Rel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+-                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dest));
+-                using var src = p.Source.Open();
+-                using var dst = File.Create(dest);
+-                src.CopyTo(dst);
++                foreach (var p in group)
++                {
++                    var dest = Path.Combine(staging, group.Key, p.Kind, p.Rel.Replace('/', System.IO.Path.DirectorySeparatorChar));
++                    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dest));
++                    using var src = p.Source.Open();
++                    using var dst = File.Create(dest);
++                    src.CopyTo(dst);
++                }
+             }
+-            if (!state.Mod.ContainsKey(group.Key)) state.Mod[group.Key] = true;
+-            names.Add(group.Key);
++            Directory.CreateDirectory(root);
++            foreach (var group in placed.GroupBy(p => p.Mod))
++            {
++                var dir = Path.Combine(root, group.Key);
++                if (Directory.Exists(dir)) Directory.Delete(dir, true);   // the same name again: the new files replace the old ones
++                Directory.Move(Path.Combine(staging, group.Key), dir);
++                if (!state.Mod.ContainsKey(group.Key)) state.Mod[group.Key] = true;
++                names.Add(group.Key);
++            }
+         }
++        finally
++        {
++            try { if (Directory.Exists(staging)) Directory.Delete(staging, true); } catch (Exception) { }
++        }
+         WriteState(documents, titleId, state);
+         return new ImportResult(names, placed.Count, notes);
+     }
+--- a/GameAppSaves.cs
++++ b/GameAppSaves.cs
+@@ -185,9 +185,29 @@
+ 
+     private static void ReplaceDir(string target, string source)
+     {
+-        if (Directory.Exists(target)) Directory.Delete(target, true);
+-        if (Directory.Exists(source)) Directory.Move(source, target);
+-        else Directory.CreateDirectory(target);
++        // The live folder is moved ASIDE, not deleted, until the new one is in place; a failure puts it back. (The restore has also made a copy of the current save first: `kept`.)
++        var old = target + ".old";
++        if (Directory.Exists(old)) Directory.Delete(old, true);
++        if (Directory.Exists(target)) Directory.Move(target, old);
++        try
++        {
++            if (Directory.Exists(source)) Directory.Move(source, target);
++            else Directory.CreateDirectory(target);
++        }
++        catch
++        {
++            try
++            {
++                if (Directory.Exists(old))
++                {
++                    if (Directory.Exists(target)) Directory.Delete(target, true);
++                    Directory.Move(old, target);
++                }
++            }
++            catch (Exception) { }
++            throw;
++        }
++        if (Directory.Exists(old)) Directory.Delete(old, true);
+     }
+ 
+     /// A zip JKSV takes: the save's own files at its root (the account save; JKSV keeps device saves apart).

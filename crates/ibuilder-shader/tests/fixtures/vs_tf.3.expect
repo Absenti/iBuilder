@@ -1,0 +1,12 @@
+OK
+{}
+
+struct dm_tf_capture { uint4 offset; uint4 args; device const uint* order; uint first, count, base_instance, pad; ulong reserved; };
+
+vertex void main0_tf(, uint dm_vid [[vertex_id]], uint dm_iid [[instance_id]], constant dm_tf_capture& dm_tf [[buffer(14)]])
+{
+uint dm_linear = (dm_iid - dm_tf.base_instance) * dm_tf.count + dm_vid - dm_tf.first;
+
+    main0_out out = {};
+    out.gl_PointSize = 1.0;
+    out

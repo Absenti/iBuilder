@@ -1,0 +1,18 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "6cf2346f7c9392df4d9a501f1c620b666cc9917314140a7267c35bf1a77f8b80",
+  "pkg/ps_other.bin": "3d54e5c29dd2d8e7df15281bc699ff1839b9227f274b0550d89fe96f84512dbe",
+  "pkg/vs_other.bin": "419dc87df155e49d395bfd7b77a9c52b5145635ead6eb13739e32b1b68552eb2",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "92329ebda20ac39a63b674db27c373b45f3a137b0cb445d6721a8efa0c44f97b",
+  "tables/shader_map.tsv": "1b0525242324bd3361a101279af4ba2943a25e244675046ea2e1a06135865490",
+  "tables/shader_pairs.tsv": "50db45d752762c3419d2e1d7ced9419a59b4ebd26332a97720f46d32f150ed5f"
+ },
+ "log": [
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (10b6b3f82b8a4f2f)",
+  "shaders: 7 (compute 1, pixel 4, vertex 2); sources other 6, data 1; compute shader answers 1 rows; variation pairs 2"
+ ],
+ "shaders": 7,
+ "updates": []
+}

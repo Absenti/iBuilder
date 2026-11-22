@@ -1,0 +1,259 @@
+name: Release
+
+# The ONE path from a published GitHub release to the SideStore / AltStore source (apps.json, docs/SIDESTORE.md). It replaces the former sidestore-source.yml.
+#
+# Why the IPA is not built here: scripts/build-app.sh needs the prebuilt engine host and inputs that are not in this repository (docs/APP-RUST.md), so the maintainer builds the IPA on a Mac
+# and uploads it to the release. This workflow then checks what was uploaded before anything points phones at it:
+#
+#   verify (macOS)  1. reads the release: exactly one .ipa asset and its <ipa>.sha256 asset; the sha256 must match the file downloaded here AND the digest GitHub computed for the asset;
+#                   2. runs the IPA verifier of the TAGGED tree (app/verify_ipa.sh at the release's tag, with the scripts/lib-spawn.sh it sources) on the downloaded IPA;
+#                   3. if the release also carries <ipa>.verify.tar.gz or <ipa>.verify.zip (the <ipa>.verify/ folder scripts/build-app.sh writes next to the IPA, with the verifier
+#                      that built it), runs that verifier too; both must pass. At least one verifier must have run;
+#                   4. runs scripts/check-no-spawn.sh on the .app inside the IPA (the no-spawn promise, measured on the real bundle).
+#   source (Linux)  5. only if verify passed: scripts/update-source.py adds the version to apps.json (size and sha256 as verified, version / build / minimum iOS from the IPA's Info.plist,
+#                      date = the release's published_at, downloadURL = the asset's URL), validates the file, and opens a PULL REQUEST release/apps-json-<tag>.
+#                      main is protected by a ruleset (no direct push), so the change is reviewed and merged like any other; merging it is what publishes the update.
+#
+# Release assets the maintainer uploads:  <name>.ipa   <name>.ipa.sha256   and optionally  <name>.ipa.verify.tar.gz  (tar -czf <name>.ipa.verify.tar.gz -C dist <name>.ipa.verify)
+#
+# Needs, once, in the repository settings: Actions > General > Workflow permissions > "Allow GitHub Actions to create and approve pull requests". Without it the branch is pushed and
+# the run prints the link to open the pull request by hand.
+# A pull request opened with the job's GITHUB_TOKEN does NOT trigger the pull_request workflows (a GitHub rule against recursive runs), so ci.yml does not start on it by itself and
+# the required checks stay "Expected". The PR touches apps.json only; to get the checks: close and reopen the PR (as a person), or run  gh workflow run ci.yml --ref release/apps-json-<tag>
+# (a workflow_dispatch run on that branch reports its checks on the PR's head commit).
+#
+# Pre-releases are verified but not listed in the source (it is what everybody who added it is offered); run this workflow by hand with the tag to list one.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify and list in apps.json (for example v1.0.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-source
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  verify:
+    name: verify the IPA
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      ipa: ${{ steps.release.outputs.ipa }}
+      size: ${{ steps.release.outputs.size }}
+      sha256: ${{ steps.release.outputs.sha256 }}
+      url: ${{ steps.release.outputs.url }}
+      published: ${{ steps.release.outputs.published }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Check the tag
+        run: |
+          [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]] || { echo "::error::the tag '$TAG' is not one this workflow accepts (letters, digits, . _ -)"; exit 1; }
+
+      # The tree the release was cut from: its app/verify_ipa.sh and scripts/ are the reviewed verifier.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Read the release and download its IPA
+        id: release
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          release="$RUNNER_TEMP/release.json"
+          gh api "repos/$REPO/releases/tags/$TAG" > "$release" || fail "no published release has the tag $TAG"
+          jq -e '.draft == false' "$release" > /dev/null || fail "the release $TAG is a draft"
+          [ "$(jq '[.assets[] | select(.name | endswith(".ipa"))] | length' "$release")" -eq 1 ] || fail "the release $TAG must have exactly one .ipa asset"
+          ipa="$(jq -r '.assets[] | select(.name | endswith(".ipa")) | .name' "$release")"
+          [[ "$ipa" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}\.ipa$ ]] || fail "the asset name '$ipa' is not acceptable"
+          size="$(jq -r --arg n "$ipa" '.assets[] | select(.name == $n) | .size' "$release")"
+          digest="$(jq -r --arg n "$ipa" '.assets[] | select(.name == $n) | .digest // ""' "$release")"
+          url="$(jq -r --arg n "$ipa" '.assets[] | select(.name == $n) | .browser_download_url' "$release")"
+          published="$(jq -r '.published_at' "$release")"
+          prerelease="$(jq -r '.prerelease' "$release")"
+          [[ "$size" =~ ^[1-9][0-9]*$ ]] || fail "the asset size '$size' is not a number of bytes"
+          [[ "$published" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]] || fail "published_at '$published' is not a UTC timestamp"
+          [[ "$url" == "https://github.com/$REPO/releases/download/"* ]] || fail "unexpected download URL '$url'"
+          [ "$(jq --arg n "$ipa.sha256" '[.assets[] | select(.name == $n)] | length' "$release")" -eq 1 ] || fail "the release $TAG has no asset named $ipa.sha256: upload the .sha256 the build script wrote next to the IPA"
+
+          dl="$RUNNER_TEMP/dl"; mkdir -p "$dl"
+          gh release download "$TAG" --repo "$REPO" --dir "$dl" --clobber --pattern "$ipa" --pattern "$ipa.sha256"
+          for v in "$ipa.verify.tar.gz" "$ipa.verify.zip"; do
+            if [ "$(jq --arg n "$v" '[.assets[] | select(.name == $n)] | length' "$release")" -eq 1 ]; then
+              gh release download "$TAG" --repo "$REPO" --dir "$dl" --clobber --pattern "$v"
+            fi
+          done
+
+          sha="$(awk 'NR == 1 { print tolower($1) }' "$dl/$ipa.sha256")"
+          named="$(awk 'NR == 1 { sub(/^\*/, "", $2); print $2 }' "$dl/$ipa.sha256")"
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || fail "$ipa.sha256 does not start with a sha256 (64 hex digits)"
+          if [ -n "$named" ] && [ "$named" != "$ipa" ]; then fail "$ipa.sha256 is about '$named', not about '$ipa'"; fi
+          got="$(shasum -a 256 "$dl/$ipa" | awk '{ print $1 }')"
+          [ "$got" = "$sha" ] || fail "the downloaded $ipa has sha256 $got, but $ipa.sha256 says $sha"
+          if [ -n "$digest" ] && [ "$digest" != "sha256:$sha" ]; then fail "$ipa.sha256 says $sha, but GitHub computed $digest for $ipa"; fi
+          [ "$(stat -f %z "$dl/$ipa")" = "$size" ] || fail "the downloaded $ipa is not $size bytes"
+
+          {
+            echo "ipa=$ipa"; echo "size=$size"; echo "sha256=$sha"; echo "url=$url"; echo "published=$published"; echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          { echo "IPA=$dl/$ipa"; echo "DL=$dl"; } >> "$GITHUB_ENV"
+          echo "release $TAG: $ipa, $size bytes, sha256 $sha (GitHub's digest: ${digest:-not reported})" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the verifiers
+        run: |
+          set +e -uo pipefail   # every verifier runs and reports; the step's status is decided at the end
+          # what verify_ipa.sh compares CFBundleShortVersionString / CFBundleVersion with: the IPA's own values (the source copies them; the version check belongs to the build)
+          ex="$RUNNER_TEMP/plist"; mkdir -p "$ex"
+          unzip -q -o "$IPA" 'Payload/*.app/Info.plist' -d "$ex"
+          plists=("$ex"/Payload/*.app/Info.plist)
+          plist="${plists[0]}"
+          [ -f "$plist" ] || { echo "::error::no Payload/*.app/Info.plist in the IPA"; exit 1; }
+          APP_VERSION="$(plutil -extract CFBundleShortVersionString raw "$plist")"
+          APP_BUILD_NUMBER="$(plutil -extract CFBundleVersion raw "$plist")"
+          export APP_VERSION APP_BUILD_NUMBER
+          echo "Info.plist: version $APP_VERSION, build $APP_BUILD_NUMBER, minimum iOS $(plutil -extract MinimumOSVersion raw "$plist")"
+          ran=0; bad=0
+          if [ -f app/verify_ipa.sh ]; then
+            echo "::group::app/verify_ipa.sh of the tag $TAG"
+            bash app/verify_ipa.sh "$IPA" 2>&1 | tee "$RUNNER_TEMP/verify-tree.txt"; rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            ran=$((ran + 1)); [ "$rc" -eq 0 ] || { echo "::error::app/verify_ipa.sh of the tag failed (exit $rc)"; bad=1; }
+          else
+            echo "::warning::the tag $TAG has no app/verify_ipa.sh"
+          fi
+          shipped=""
+          for v in "$DL"/*.ipa.verify.tar.gz "$DL"/*.ipa.verify.zip; do
+            [ -f "$v" ] || continue
+            dest="$RUNNER_TEMP/shipped-verifier"; rm -rf "$dest"; mkdir -p "$dest"
+            case "$v" in
+              *.tar.gz) tar -xzf "$v" -C "$dest" ;;
+              *.zip) unzip -q "$v" -d "$dest" ;;
+            esac
+            shipped="$(find "$dest" -type f -name verify_ipa.sh | head -n 1)"
+            [ -n "$shipped" ] || { echo "::error::$(basename "$v") holds no verify_ipa.sh"; bad=1; }
+          done
+          if [ -n "$shipped" ]; then
+            echo "::group::the verifier shipped with the IPA (${shipped#"$RUNNER_TEMP/"})"
+            bash "$shipped" "$IPA" 2>&1 | tee "$RUNNER_TEMP/verify-shipped.txt"; rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            ran=$((ran + 1)); [ "$rc" -eq 0 ] || { echo "::error::the shipped verifier failed (exit $rc)"; bad=1; }
+          fi
+          [ "$ran" -gt 0 ] || { echo "::error::no verifier ran: neither app/verify_ipa.sh at the tag nor a <ipa>.verify archive in the release"; exit 1; }
+          {
+            echo "### IPA verification ($ran verifier(s))"
+            for f in "$RUNNER_TEMP"/verify-tree.txt "$RUNNER_TEMP"/verify-shipped.txt; do
+              [ -f "$f" ] || continue
+              echo "* $(basename "$f" .txt): $(grep -c 'PASS' "$f") PASS, $(grep -c 'FAIL' "$f") FAIL"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$bad"
+
+      - name: scripts/check-no-spawn.sh on the app inside the IPA
+        run: |
+          set -euo pipefail
+          [ -f scripts/check-no-spawn.sh ] || { echo "::warning::the tag $TAG has no scripts/check-no-spawn.sh"; exit 0; }
+          app="$RUNNER_TEMP/app"; mkdir -p "$app"
+          unzip -q "$IPA" -d "$app"
+          bundles=("$app"/Payload/*.app)
+          [ -d "${bundles[0]}" ] || { echo "::error::no Payload/*.app in the IPA"; exit 1; }
+          scripts/check-no-spawn.sh "${bundles[0]}"
+
+  source:
+    name: list it in apps.json (pull request)
+    needs: verify
+    if: needs.verify.outputs.prerelease == 'false' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      BASE: ${{ github.event.repository.default_branch }}
+      IPA: ${{ needs.verify.outputs.ipa }}
+      SIZE: ${{ needs.verify.outputs.size }}
+      SHA256: ${{ needs.verify.outputs.sha256 }}
+      URL: ${{ needs.verify.outputs.url }}
+      PUBLISHED: ${{ needs.verify.outputs.published }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: true # the push below uses the job token; this job is the only one that has write access
+
+      - name: Update apps.json
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/releases/tags/$TAG" --jq '.body // ""' > "$RUNNER_TEMP/notes.txt"
+          python3 -I scripts/update-source.py \
+            --tag "$TAG" --ipa "$IPA" --sha256 "$SHA256" --size "$SIZE" \
+            --from-url "$URL" --date "$PUBLISHED" --repo "$REPO" \
+            --notes-file "$RUNNER_TEMP/notes.txt"
+          python3 -I scripts/update-source.py --validate --require-versions
+
+      - name: Any change?
+        id: change
+        run: |
+          if git diff --quiet -- apps.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "apps.json on $BASE already lists $TAG as it is: nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff -- apps.json
+          fi
+
+      - name: Open the pull request
+        if: steps.change.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          branch="release/apps-json-$TAG"
+          title="apps.json: list $TAG"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch --create "$branch"
+          git add apps.json
+          git commit --message "$title" --message "Made by .github/workflows/release.yml from the release $TAG after its IPA passed the verifier(s) and the no-spawn check (size and sha256 as downloaded and verified, version and build from the IPA's Info.plist)."
+          git push --force origin "$branch"
+          body="$(cat <<EOF
+          Lists the IPA of the release [$TAG](https://github.com/$REPO/releases/tag/$TAG) in \`apps.json\`, the SideStore / AltStore source (docs/SIDESTORE.md).
+
+          * \`$IPA\`, $SIZE bytes, sha256 \`$SHA256\` (equal to \`$IPA.sha256\`, to the file the workflow downloaded and to the digest GitHub computed for the asset)
+          * verified on macOS by \`app/verify_ipa.sh\` of the tag (and the verifier shipped with the IPA, when the release has one) and by \`scripts/check-no-spawn.sh\` on the bundle
+          * date $PUBLISHED; version, build and minimum iOS read from the Info.plist of the IPA by \`scripts/update-source.py\`
+
+          Merging publishes the update to everybody who added the source.
+          This PR was opened with the token of the workflow, so CI does not start by itself: close and reopen it, or run \`gh workflow run ci.yml --ref $branch\`.
+          EOF
+          )"
+          existing="$(gh pr list --repo "$REPO" --head "$branch" --base "$BASE" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --repo "$REPO" --title "$title" --body "$body"
+            echo "Updated pull request #$existing for $TAG." | tee -a "$GITHUB_STEP_SUMMARY"
+          elif pr_url="$(gh pr create --repo "$REPO" --base "$BASE" --head "$branch" --title "$title" --body "$body")"; then
+            echo "Opened $pr_url for $TAG." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::The branch $branch is pushed, but the pull request could not be created. Enable Settings > Actions > General > 'Allow GitHub Actions to create and approve pull requests', or open it by hand: https://github.com/$REPO/compare/$BASE...$branch?expand=1"
+            exit 1
+          fi

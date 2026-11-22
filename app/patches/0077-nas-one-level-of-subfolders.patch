@@ -1,0 +1,348 @@
+# 0077-nas-one-level-of-subfolders.patch -- the NAS source also lists the game files of the sync folder's DIRECT subfolders (one level, never deeper), so games kept one per folder
+# ("games/<game>/<file>.nsz") show in the library, the Cloud page and the Build tab like the ones in the folder itself.
+# Applies after 0076. UNTESTED ON DEVICE, IN THE SIMULATOR AND AGAINST A REAL SFTP SERVER: compiled only, and its pure part ran in a host check (below).
+# Regenerated in place on 2026-11-21 for review r4 §4.5 (REVISED, below); 0078 applies after it.
+#
+# WHY (the owner; his log)
+#   * The owner's sync folder was ".../games" and the games live in subfolders of it; Nas.List read the folder alone (one level), so the NAS listed none of them. He asked for one level of
+#     subfolders, no deeper, to keep the listing light. The owner's example, ".../games/<collection>/<game>",
+#     is TWO levels down: this patch does not reach it with "games" as the sync folder; the owner chooses ".../games/<collection>" (or the game's own
+#     folder) as the sync folder instead, which the folder chooser allows (below).
+#
+# WHAT IT DOES
+#   * GameAppNas.cs, NasScan (pure, no SSH: compiled by the host check with NAS_LOGIC_ONLY, which leaves out `using Renci.SshNet` and the Nas class):
+#       - one list call for the sync folder, then one per subfolder, in name order (OrdinalIgnoreCase), at most MaxSubfolders = 200 per listing; past the cap the rest is left out and logged
+#         ("NAS: <dir> has 250 subfolders: only the first 200 (by name) were looked into; choose a narrower sync folder to see the others"). A subfolder's own folders are never listed.
+#       - looked into (LooksInto): real folders only. Never a symbolic link (the SFTP listing reports the link itself; a link back to the folder or above would list it again or loop), a
+#         hidden folder (".x"), a NAS system folder (@eaDir, #recycle, #snapshot, @Recycle, @Recently-Snapshot, @__thumb, .@__thumb: Synology puts @eaDir in every folder), "Exports"
+#         (any case, like the system folders: NasScan.IsExports), or the folder itself.
+#       - kept: the sync folder's own files exactly as before (TopFile: a game or an .ipa, not .part); Exports' .ipa files as before; in a subfolder (SubfolderFile) game files only (.nsp .xci
+#         .nsz .nup), not hidden ("._Game.nsp" from a Mac), not a link, not .part.
+#       - each CloudFile: SourceId the NAS's, Name the file's own name (the game's name, the name it gets in Documents), Size from the listing, Remote the full path the server gave
+#         (SftpFile.FullName): Nas.Download and Nas.WithReadStream (the covers) read that path, nothing else changes there.
+#       - name clashes (the same file name in two places; Documents holds one file of a name, and the library and DownloadSet match by name): the first stays, in this order: the sync
+#         folder's own files, Exports, then the subfolders by name; every other one is skipped and logged ("NAS: skipped <path>: a file of that name is already listed (<kept path>), the first
+#         one is kept"), at most 10 lines, then "… and N more".
+#       - a subfolder (or Exports) that cannot be listed is skipped and logged ("NAS: could not list <path>: <why> (skipped)"); the sync folder's own listing failing still throws, as before
+#         (RefreshCloud catches it and shows "Could not refresh: …").
+#       - the summary line, which replaces "NAS: N game or .ipa file(s) in <dir>": "NAS: 12 game files in /path and its 7 subfolders" (" and 2 .ipa files" when there are some); the
+#         subfolders counted are the ones READ (one that could not be listed is named on its own line, not counted).
+#   * Nas.List uses NasScan with the real lister (client.ListDirectory -> NasEntry), on the caller's thread: RefreshCloud's worker (Task.Run), as before; no new main-thread work. A folder
+#     "/" no longer becomes "" when its trailing "/" is trimmed.
+#   * GameAppLibrary.cs, RefreshCloud: Nas.List gets a log (posted to the main thread's Write, as the connection test does) instead of null, so the summary, the cap, the clashes and the
+#     unreadable subfolders reach the log. This also logs Connect's "NAS: connected to user@host:port (SHA256:…)" at each NAS refresh.
+#   * Update and DLC grouping: unchanged code. Cloud.CloudOnlyGames, Cloud.DownloadSet, GameAppUi.UpdateFor / DlcFor work on file names and title ids across the whole NAS source, so a
+#     game's update and DLC are found in its own subfolder (and in any other listed place of the NAS); the download set carries each file's real Remote path.
+#   * The folder chooser (BrowseNas): it already went down any number of levels ("›") and offered "Use this folder" at every level; it showed only the first 30 folders of a level, so a game's
+#     folder past the 30th (a games folder holds one folder per game) could not be chosen. It now shows up to 200 (NasFolderRows; the action sheet scrolls), and its message says "The games in
+#     this folder and in its direct subfolders are listed."
+#   * GameAppCloud.cs: the header comment only.
+#
+# REVISED (2026-11-21, review r4 §4.5: three low findings on 0077)
+#   * "Exports" was excluded from the game folders, and found for its .ipa files, with StringComparison.Ordinal while the NAS's own folders used OrdinalIgnoreCase: an "exports" folder was
+#     listed as a GAME folder (its .ipa skipped, its game files listed). Now both use NasScan.IsExports (OrdinalIgnoreCase); when two folders differ only by case, the exact "Exports" is the
+#     one read for .ipa files (else the first by ordinal name), and none of them is a game folder.
+#   * NasScanResult.Subfolders counted the ATTEMPTS (a subfolder whose listing failed was counted), while the summary says "its {Subfolders} subfolders". Subfolders now counts the ones
+#     read; the new Looked counts the attempts, and Capped is SubfoldersFound > Looked (a failure is not a cap).
+#   * The cap is on subfolders (one list call each), not on files: every game file of a subfolder looked into is listed, and so is every file of the sync folder. That is the intended
+#     semantics (the cap bounds round trips); the texts now say so: MaxSubfolders' comment, the cap's log line ("... were looked into (the limit is on subfolders, not on files: each one
+#     looked into has all its games listed); choose a narrower sync folder ...") and the folder chooser's message ("The games in this folder and in its direct subfolders (the first 200 by
+#     name) are listed.").
+#   * Verified after the revision (2026-11-21, M1 Pro): the same compile recipe (a full `dotnet build gameapp.csproj -c Release -r ios-arm64` of a copy of the device project, sources of this
+#     tree): 0 errors, 41 warnings, the same warnings per file and code as the 0077 of 2026-11-20 (the count differs from the 40 below: the device project copy now has one more file of its
+#     own). Host harness (the real GameAppNas.cs with NAS_LOGIC_ONLY, GameAppCloud.cs, GameAppUi.cs, ..., the one 0078's header describes): the Exports case rules, the
+#     counts with an unreadable subfolder, the cap on 250 subfolders with 3 unreadable and 500 files in one (all listed), the cap line, and the unchanged rules (one level, hidden / system /
+#     linked folders, the clash, the sync folder's failure) pass; 5 of 5 mutations of this revision are killed (Ordinal again, attempts counted, Capped on the read count, the cap line
+#     without what it is on, the exact Exports not preferred). The 36 checks below were not re-run (their harness is not in the repository). Re-checked after a reboot wiped that
+#     scratch: compile alone (`-t:Compile`, the project as build-app.sh step 3 makes it, no native references): 0 errors, 40 warnings with and without this patch, the same per file
+#     and code; the same harness and mutations pass and are killed again.
+#
+# VERIFIED (2026-11-20, M1 Pro)
+#   * Compile: a copy of the generated device project (gameapp.csproj, sources re-pointed to the copy, GameAppSlot.cs and GameAppSlotUi.cs added, the project's own GameAppExport.cs and
+#     GameAppBuild.cs kept), `dotnet build gameapp.csproj -c Release -r ios-arm64 -t:Compile -nologo`: the 0076 tree rc 0, 0 errors, 40 warnings; with this patch rc 0, 0 errors, 40 warnings,
+#     the same warnings per file and code (none in GameAppNas.cs). No .ipa was made.
+#   * Host check of the pure part (GameAppNas.cs with NAS_LOGIC_ONLY, GameAppCloud.cs, GameAppUi.cs, GameAppCover.cs, net11.0, a fake lister): 36 of 36 checks (the owner's layout: the South
+#     Park game two levels down not listed and its inner folder never listed; real Remote paths and sizes; hidden, system, linked folders and Exports never listed as game folders; Exports
+#     .ipa only; .part, "._" and .ipa files of a subfolder skipped; an unreadable subfolder skipped and named; one list call per folder; the clash rule (top level first, then folders by
+#     name) and its log lines, capped at 10; the 200 cap on 250 folders (first 200 by name, 201 calls, logged); the summary line; CloudOnlyGames shows the subfolder's base game and not its
+#     update / DLC; DownloadSet gives base + update + DLC with their subfolder paths, minus what Documents has; the cached list round-trips the paths; the sync folder's own failure throws).
+#     8 of 8 mutations killed (links followed, no cap, last of a name wins, hidden folders listed, .ipa kept in subfolders, Exports listed as a game folder, a subfolder's failure fatal,
+#     subfolders unsorted).
+#
+# NOT VERIFIED
+#   * Nothing ran on an iPhone, in the simulator, or against an SFTP server: SSH.NET's ListDirectory attributes (IsSymbolicLink for a link to a folder, FullName as an absolute path) are
+#     read from its API, not observed on the owner's NAS.
+#   * Time of a refresh with many subfolders over the owner's network (one round trip per subfolder, up to 200) is not measured.
+#   * A 200-row action sheet in BrowseNas is not looked at on a phone.
+#   * A file in a subfolder that has the name of a file of ANOTHER source (a Files folder) is not a clash here: CloudOnlyGames keeps the first source, as before.
+#   * The sync folder's own files still accept a link and a "._" name, as before (TopFile is unchanged on purpose).
+diff -ruN a/GameAppCloud.cs b/GameAppCloud.cs
+--- a/GameAppCloud.cs	2026-11-21 13:02:40
++++ b/GameAppCloud.cs	2026-11-21 13:02:40
+@@ -2,7 +2,8 @@
+ //
+ // A source is the NAS (SFTP, gameapp/GameAppNas.cs, the folder chosen in its settings) or a folder picked in the Files
+ // app: iCloud Drive, Google Drive, OneDrive, Dropbox... any app that shows its files there (its File Provider). The app
+-// lists each source's folder (one level), keeps the list (Library/Application Support/gameapp.cloud.tsv, so the library
++// lists each source's folder (a Files folder: one level; the NAS: its folder and the games of its direct subfolders,
++// patch 0077, GameAppNas.cs NasScan), keeps the list (Library/Application Support/gameapp.cloud.tsv, so the library
+ // shows it at once at the next launch), and shows every game or .ipa it holds that is not in Documents greyed, with a
+ // cloud mark. A tap downloads it (with the game's update and DLC from the same source), and a game downloaded from a
+ // source can drop its download again ("Remove download"): it stays in the cloud.
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs	2026-11-21 13:02:40
++++ b/GameAppLibrary.cs	2026-11-21 13:02:40
+@@ -1808,7 +1808,9 @@
+                     if (s.Kind == CloudKind.Nas)
+                     {
+                         if (string.IsNullOrEmpty(password)) { results.Add((s.Id, null, "no password saved: Set up…")); continue; }
+-                        results.Add((s.Id, Nas.List(nas, Nas.Password(nas.User, password), nas.Folder, NasId, null), null));
++                        // the folder and its direct subfolders, one list call each (patch 0077, NasScan); the summary line and any capped,
++                        // clashing or unreadable subfolder reach the log, posted to the main thread like the connection test's lines
++                        results.Add((s.Id, Nas.List(nas, Nas.Password(nas.User, password), nas.Folder, NasId, line => BeginInvokeOnMainThread(() => Write(line))), null));
+                     }
+                     else
+                     {
+@@ -1929,6 +1931,9 @@
+         });
+     }
+ 
++    /// The NAS folder chooser's rows per level (BrowseNas).
++    private const int NasFolderRows = 200;
++
+     private void ChooseNasFolder()
+     {
+         var nas = LoadNas();
+@@ -1952,8 +1957,11 @@
+                 if (seen != null && string.IsNullOrEmpty(LoadNas().HostKey)) { SaveNas(LoadNas() with { HostKey = seen }); Write($"NAS: connected; the server's key is pinned ({seen})"); }
+                 var here = string.IsNullOrEmpty(at) ? "your home folder" : at;
+                 var now = LoadNas().Folder;
++                // Up to NasFolderRows folders as rows (it was 30): a games folder holds one folder per game, and the one the owner wants
++                // as the sync folder (a game's folder, two levels down) must be reachable; the sheet scrolls (patch 0077).
+                 var sheet = UIAlertController.Create("Choose the NAS folder", $"In {here}" + (string.IsNullOrEmpty(now) ? "" : $"\nNow syncing: {now}")
+-                                                     + (folders.Count > 30 ? $"\n({folders.Count} folders: the first 30)" : ""), UIAlertControllerStyle.ActionSheet);
++                                                     + $"\nThe games in this folder and in its direct subfolders (the first {NasScan.MaxSubfolders} by name) are listed."
++                                                     + (folders.Count > NasFolderRows ? $"\n({folders.Count} folders: the first {NasFolderRows})" : ""), UIAlertControllerStyle.ActionSheet);
+                 sheet.AddAction(UIAlertAction.Create("Use this folder", UIAlertActionStyle.Default, _ => UseNasFolder(string.IsNullOrEmpty(at) ? "." : at)));
+                 sheet.AddAction(UIAlertAction.Create("New folder…", UIAlertActionStyle.Default, _ => NewNasFolder(nas, password, at)));
+                 if (!string.IsNullOrEmpty(at) && at != "/")
+@@ -1963,7 +1971,7 @@
+                     var parent = cut > 0 ? up.Substring(0, cut) : cut == 0 ? "/" : "";
+                     sheet.AddAction(UIAlertAction.Create("↑ Up", UIAlertActionStyle.Default, _ => BrowseNas(nas, password, parent)));
+                 }
+-                foreach (var f in folders.Take(30))
++                foreach (var f in folders.Take(NasFolderRows))
+                 {
+                     var folder = f;
+                     sheet.AddAction(UIAlertAction.Create(Path.GetFileName(f.TrimEnd('/')) + "  ›", UIAlertActionStyle.Default, _ => BrowseNas(nas, password, folder)));
+diff -ruN a/GameAppNas.cs b/GameAppNas.cs
+--- a/GameAppNas.cs	2026-11-21 13:02:40
++++ b/GameAppNas.cs	2026-11-21 13:02:40
+@@ -5,6 +5,11 @@
+ // that later shows another key is refused with its fingerprint, as ssh does ("REMOTE HOST IDENTIFICATION HAS CHANGED").
+ // An upload goes to <name>.part, then is renamed: a cut connection never leaves a truncated file under the real name.
+ //
++// The listing (patch 0077) reads the sync folder AND its direct subfolders, never deeper: one directory list call for the
++// folder, one for each subfolder (at most NasScan.MaxSubfolders of them), on the caller's worker thread. The choice of
++// what is listed (NasScan: which subfolders are looked into, which files are kept, the first of two files of one name)
++// has no SSH in it, so a host harness compiles this file with NAS_LOGIC_ONLY and checks it on the Mac.
++//
+ // No UIKit here.
+ 
+ using System;
+@@ -13,7 +18,9 @@
+ using System.Linq;
+ using System.Security.Cryptography;
+ using System.Text;
++#if !NAS_LOGIC_ONLY
+ using Renci.SshNet;
++#endif
+ 
+ public sealed record NasConfig(string Host, int Port, string User, string Folder, string HostKey)
+ {
+@@ -40,6 +47,150 @@
+     }
+ }
+ 
++/// One entry of a NAS folder as the SFTP listing gives it (the attributes come with the listing: no file is opened).
++/// `IsLink`: a symbolic link (the server reports the link itself, not what it points to), never followed into.
++public sealed record NasEntry(string Name, string FullName, bool IsDirectory, bool IsLink, long Size);
++
++/// What a listing found. `Files`: the CloudFile rows, the first of two files of one name kept (the sync folder's own
++/// files first, then the subfolders by name). `Subfolders`: how many subfolders were listed (read: a subfolder whose
++/// listing failed is not counted, it is in `Unreadable`); `Looked`: how many were tried (the cap: at most
++/// MaxSubfolders); `SubfoldersFound`: how many the folder has that would be looked into (more than `Looked` when the cap
++/// was hit). `Clashes`: the full paths of the files skipped because a file of the same name was already listed, with
++/// the one kept ("skipped -> kept"). `Unreadable`: subfolders whose listing failed ("path: why"), skipped.
++public sealed record NasScanResult(List<CloudFile> Files, int Subfolders, int Looked, int SubfoldersFound, List<string> Clashes, List<string> Unreadable)
++{
++    public bool Capped => SubfoldersFound > Looked;
++}
++
++/// The NAS listing's choices, with no SSH in them (the real lister is Nas.List; the host harness hands a fake one).
++///
++/// Why one level and no more: the owner keeps his games one per folder under the sync folder ("games/<game>/
++/// <file>.nsz"); one level of subfolders finds those with one list call per folder, which stays light over SFTP on a
++/// phone. A tree deeper than that is reached by choosing a deeper folder as the sync folder (the folder chooser goes
++/// down any number of levels, ChooseNasFolder / BrowseNas). A subfolder's files keep their own name as the game's name
++/// (that is what the library, the download's destination in Documents and the update / DLC grouping work with:
++/// Cloud.CloudOnlyGames, Cloud.DownloadSet and GameAppUi.UpdateFor / DlcFor match by file name and title id, across
++/// the whole NAS source), and their real full path as Remote, which is what Nas.Download and Nas.WithReadStream read.
++/// Documents holds one file of a name, so two files of one name on the NAS cannot both be listed: the first stays,
++/// the other is skipped and named in the log.
++public static class NasScan
++{
++    /// At most this many subfolders are listed per refresh (by name, the rest are left out and the log says so):
++    /// a folder of thousands of subfolders costs thousands of round trips over SFTP. The cap is on the SUBFOLDERS looked
++    /// into (one list call each), not on files: every game file of a subfolder that is looked into is listed (its one
++    /// call returns them all), and so is every file of the sync folder itself.
++    public const int MaxSubfolders = 200;
++
++    /// Where "Send to the NAS" puts exported apps (GameAppLibrary SendToNas(..., "Exports")): listed for .ipa files
++    /// only, as before, and not counted among the game subfolders. Its name is matched ignoring case, like the NAS's own
++    /// folders (a share seen through a case-insensitive file system may show it as "exports"); a folder of exactly that
++    /// name is preferred when two of them differ only by case.
++    public const string ExportsFolder = "Exports";
++
++    /// `name` is the Exports folder's name, ignoring case.
++    public static bool IsExports(string name) => string.Equals(name, ExportsFolder, StringComparison.OrdinalIgnoreCase);
++
++    /// At most this many clash lines go to the log (then one "… and N more").
++    public const int MaxClashLines = 10;
++
++    // Folders a NAS makes by itself in every share (Synology's thumbnail and recycle-bin folders, QNAP's recycle bin
++    // and snapshots): never games, and @eaDir is in every folder, so each one would cost a list call for nothing.
++    private static readonly HashSet<string> SystemFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
++        { "@eaDir", "#recycle", "#snapshot", "@Recycle", "@Recently-Snapshot", "@__thumb", ".@__thumb" };
++
++    /// A subfolder worth one list call: a real folder (not a link: a link back to the folder or above would list the
++    /// same files again, or loop), not hidden (".something"), not a NAS system folder, not Exports, not the folder itself.
++    public static bool LooksInto(NasEntry e, string dir)
++    {
++        if (e == null || !e.IsDirectory || e.IsLink || string.IsNullOrEmpty(e.Name)) return false;
++        if (e.Name == "." || e.Name == ".." || e.Name.StartsWith(".", StringComparison.Ordinal)) return false;
++        if (SystemFolders.Contains(e.Name) || IsExports(e.Name)) return false;
++        return !string.Equals((e.FullName ?? "").TrimEnd('/'), (dir ?? "").TrimEnd('/'), StringComparison.Ordinal);
++    }
++
++    /// A file of the sync folder itself that the library lists: a game or an .ipa, not an upload in progress (.part).
++    /// Unchanged from before 0077.
++    public static bool TopFile(NasEntry e) => e != null && !e.IsDirectory && Cloud.Wanted(e.Name) && !e.Name.EndsWith(".part");
++
++    /// A file of a subfolder that the library lists: a game file (.nsp .xci .nsz .nup), not hidden (a Mac writes
++    /// "._Game.nsp" next to a game on some shares), not a link, not a .part.
++    public static bool SubfolderFile(NasEntry e) =>
++        e != null && !e.IsDirectory && !e.IsLink && !string.IsNullOrEmpty(e.Name) && !e.Name.StartsWith(".", StringComparison.Ordinal)
++        && Cloud.IsGameFile(e.Name) && !e.Name.EndsWith(".part");
++
++    /// `list(path)`: the entries of a folder (one SFTP list call). The sync folder's own listing failing is the
++    /// caller's error (it throws, as before 0077); a subfolder or Exports that cannot be listed is skipped and named in
++    /// Unreadable. `dir`: the sync folder as the listing names it ("." for the login folder).
++    public static NasScanResult Scan(string sourceId, string dir, Func<string, IEnumerable<NasEntry>> list, int maxSubfolders = MaxSubfolders)
++    {
++        var top = (list(dir) ?? Enumerable.Empty<NasEntry>()).Where(e => e != null).ToList();
++        var files = new List<CloudFile>();
++        var kept = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // name -> the full path listed
++        var clashes = new List<string>();
++        var unreadable = new List<string>();
++
++        void Add(NasEntry e)
++        {
++            if (kept.TryGetValue(e.Name, out var first)) { clashes.Add(e.FullName + " -> " + first); return; }
++            kept[e.Name] = e.FullName;
++            files.Add(new CloudFile(sourceId, e.Name, e.Size, e.FullName));
++        }
++
++        List<NasEntry> Sub(string path)
++        {
++            try { return (list(path) ?? Enumerable.Empty<NasEntry>()).Where(e => e != null).ToList(); }
++            catch (Exception ex) { unreadable.Add(path + ": " + ex.Message); return null; }
++        }
++
++        foreach (var e in top.Where(TopFile)) Add(e);
++
++        bool Folderish(NasEntry e) => e.IsDirectory || e.IsLink;
++        var exports = top.FirstOrDefault(e => string.Equals(e.Name, ExportsFolder, StringComparison.Ordinal) && Folderish(e))
++                      ?? top.Where(e => IsExports(e.Name) && Folderish(e)).OrderBy(e => e.Name, StringComparer.Ordinal).FirstOrDefault();
++        if (exports != null)
++            foreach (var e in (Sub(exports.FullName) ?? new List<NasEntry>()).Where(e => !e.IsDirectory && Cloud.IsIpa(e.Name)).OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase))
++                Add(e);
++
++        var seenFolders = new HashSet<string>(StringComparer.Ordinal);
++        var subfolders = top.Where(e => LooksInto(e, dir) && seenFolders.Add(e.FullName.TrimEnd('/')))
++                            .OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase).ThenBy(e => e.Name, StringComparer.Ordinal).ToList();
++        int cap = Math.Max(0, maxSubfolders);
++        int looked = 0, listed = 0;
++        foreach (var folder in subfolders.Take(cap))
++        {
++            looked++;
++            var entries = Sub(folder.FullName);
++            if (entries == null) continue;   // named in Unreadable, not counted as listed
++            listed++;
++            foreach (var e in entries.Where(SubfolderFile).OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase).ThenBy(e => e.Name, StringComparer.Ordinal))
++                Add(e);   // one level only: a subfolder's own folders are never listed
++        }
++        return new NasScanResult(files, listed, looked, subfolders.Count, clashes, unreadable);
++    }
++
++    /// The log lines of a listing: "NAS: 12 game files in /path and its 7 subfolders" (and the .ipa count when there are
++    /// some), the cap when it was hit, the clashes (at most MaxClashLines), the subfolders that could not be listed.
++    public static List<string> Lines(NasScanResult r, string dir)
++    {
++        var lines = new List<string>();
++        int games = r.Files.Count(f => Cloud.IsGameFile(f.Name));
++        int ipas = r.Files.Count(f => Cloud.IsIpa(f.Name));
++        lines.Add($"NAS: {games} game file{(games == 1 ? "" : "s")}{(ipas > 0 ? $" and {ipas} .ipa file{(ipas == 1 ? "" : "s")}" : "")} in {dir} and its {r.Subfolders} subfolder{(r.Subfolders == 1 ? "" : "s")}");
++        if (r.Capped)
++            lines.Add($"NAS: {dir} has {r.SubfoldersFound} subfolders: only the first {r.Looked} (by name) were looked into (the limit is on subfolders, not on files: each one looked into has all its games listed); choose a narrower sync folder to see the others");
++        foreach (var c in r.Clashes.Take(MaxClashLines))
++        {
++            var cut = c.IndexOf(" -> ", StringComparison.Ordinal);
++            lines.Add(cut < 0 ? $"NAS: skipped {c} (a file of that name is already listed)"
++                              : $"NAS: skipped {c.Substring(0, cut)}: a file of that name is already listed ({c.Substring(cut + 4)}), the first one is kept");
++        }
++        if (r.Clashes.Count > MaxClashLines) lines.Add($"NAS: … and {r.Clashes.Count - MaxClashLines} more file(s) skipped for the same reason");
++        foreach (var u in r.Unreadable) lines.Add($"NAS: could not list {u} (skipped)");
++        return lines;
++    }
++}
++
++#if !NAS_LOGIC_ONLY
+ public static class Nas
+ {
+     /// The server key's fingerprint, as ssh prints it: SHA256:<base64 without padding>.
+@@ -151,20 +302,20 @@
+         return made;
+     }
+ 
+-    /// The games and .ipa files in `folder` (one level): CloudFile rows of `sourceId`, Remote the full path.
++    /// The games and .ipa files in `folder` and the games in its direct subfolders (NasScan: one level, at most
++    /// NasScan.MaxSubfolders subfolders, one list call each): CloudFile rows of `sourceId`, Name the file's own name,
++    /// Remote its full path. Worker threads only (a list call per subfolder over the network). `log` gets the summary,
++    /// the cap, the clashes and the subfolders that could not be listed.
+     public static List<CloudFile> List(NasConfig cfg, AuthenticationMethod auth, string folder, string sourceId, Action<string> log)
+     {
+         using var client = Connect(cfg, auth, log, out _);
+         var dir = string.IsNullOrWhiteSpace(folder) ? "." : folder.TrimEnd('/');
+-        var files = client.ListDirectory(dir).Where(f => !f.IsDirectory && Cloud.Wanted(f.Name) && !f.Name.EndsWith(".part"))
+-                          .Select(f => new CloudFile(sourceId, f.Name, f.Length, f.FullName)).ToList();
+-        var exports = dir + "/Exports";   // where "Send to the NAS" puts exported apps
+-        if (client.Exists(exports))
+-            files.AddRange(client.ListDirectory(exports).Where(f => !f.IsDirectory && Cloud.IsIpa(f.Name))
+-                                 .Select(f => new CloudFile(sourceId, f.Name, f.Length, f.FullName)));
++        if (dir.Length == 0) dir = "/";   // "/" trimmed is the root, not the login folder
++        var result = NasScan.Scan(sourceId, dir, path => client.ListDirectory(path)
++            .Select(f => new NasEntry(f.Name, f.FullName, f.IsDirectory, f.IsSymbolicLink, f.Length)).ToList());
+         client.Disconnect();
+-        log?.Invoke($"NAS: {files.Count} game or .ipa file(s) in {dir}");
+-        return files;
++        foreach (var line in NasScan.Lines(result, dir)) log?.Invoke(line);
++        return result.Files;
+     }
+ 
+     /// Downloads `remote` to `localPath` (as <localPath>.part, renamed at the end: a cut connection never leaves a file
+@@ -200,3 +351,4 @@
+ 
+     public static AuthenticationMethod Password(string user, string password) => new PasswordAuthenticationMethod(user, password ?? "");
+ }
++#endif

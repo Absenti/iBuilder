@@ -1,0 +1,24 @@
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+kernel void main0()
+{
+bool _63;
+do
+{
+    float _45 = as_type<float>(a(b));
+    float _98 = spvFAdd(_45, fma(a, b, c));
+    uint _69 = as_type<uint>(_45);
+    uint _71;
+    do
+    {
+        _71 = _69;
+    } while (!atomic_compare_exchange_weak_explicit((device atomic_uint*)&a(b), &_71, as_type<uint>(_98), memory_order_relaxed, memory_order_relaxed) && _71 == _69);
+    uint _97 = _71;
+    _63 = int(_97) != as_type<int>(_45);
+} while (_63);
+int _65 = _7 + 1;
+}

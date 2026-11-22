@@ -1,0 +1,35 @@
+{
+ "dlc": [
+  "7"
+ ],
+ "files": {
+  "pkg/cs_data.bin": "711203434981864c16d2324111a925ac73165714a7bfe2c0ff5caa694844aca5",
+  "pkg/ds_data.bin": "778f3b3258b18507aac42a259357b966a6d1637bae0dd200c9324aa3d29ad18d",
+  "pkg/gs_data.bin": "87375a9f9c95a325c476bb7868259035027e4c0a71ad7207675de75b531e98b0",
+  "pkg/hs_data.bin": "db47c79ef018a7e653e7922c922014545f749bf0ad8200f2c8113d1576370df1",
+  "pkg/ps_data.bin": "54ee2d1c6da527c75f6293f1ed79973094ce691edfe61e81801c3748d31c3b34",
+  "pkg/ps_main.bin": "25e238f293cbb3f6672509992158133141e3ae5e21d5b11434f7d6bb80861460",
+  "pkg/vs_data.bin": "ce47e79a1b1f9945f8d658cf3d800976a4c5c2dc5d6b55accc8ff70c13bb6345",
+  "pkg/vs_main.bin": "9eab4c8c27e72dadeb6926277729d2a6a7c82067da7959d9f26d008d6dc34005",
+  "pkg/vs_pack.bin": "5a364354b9948f8a76946e9c36cd295822d24697bd16b507e94e57fac879bf2e",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "62f8952834d0d9d94599c0b5e0ff2e3847f70598af418b9c4d8be5ae6f8cb022",
+  "tables/shader_map.tsv": "70f5e6171def4b76669ac76aee964988d3e16ce787875b75a7fbbe7a80de98f6",
+  "tables/shader_pairs.tsv": "195a6c72a09e2e8498ef2e6217d7fd47510c76093823cfae86086179e7c88014"
+ },
+ "log": [
+  "[RED] /Pack/cut_after_first_block.slice Snowdrop zlib record @0x38: block @0x116 not finished (its shaders are left out)",
+  "[RED] /Pack/cut_in_first_block.slice Snowdrop zlib record @0x38: block @0x38 not finished (its shaders are left out)",
+  "[RED] /Pack/cut_in_second_block.slice Snowdrop zlib record @0x38: block @0x116 not finished (its shaders are left out)",
+  "[RED] /Pack/damaged_first_block_check.slice Snowdrop zlib record @0x38, block @0x38: Error -3 while decompressing data: incorrect data check (its shaders are left out)",
+  "[RED] /Pack/damaged_second_block.slice Snowdrop zlib record @0x38, block @0x116: Error -3 while decompressing data: invalid bit length repeat (its shaders are left out)",
+  "[RED] /Pack/empty_second_block.slice Snowdrop zlib record @0x38: block @0x115 not finished (its shaders are left out)",
+  "[RED] /Pack/head_longer_than_stream.slice Snowdrop zlib record @0x38: block @0x77 not finished (its shaders are left out)",
+  "[RED] /Pack/head_shorter_than_stream.slice Snowdrop zlib record @0x38: expected 276 raw bytes, got 14740 (its shaders are left out)",
+  "[RED] 8 file(s) could not be read, their shaders are left out (first: /Pack/cut_after_first_block.slice Snowdrop zlib record @0x38: block @0x116 not finished)",
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (c060aabb3a7a3298)",
+  "shaders: 24 (compute 3, domain 1, geometry 1, hull 1, pixel 7, vertex 11); sources data 16, pack 6, main 2; compute shader answers 3 rows; variation pairs 2"
+ ],
+ "shaders": 24,
+ "updates": []
+}

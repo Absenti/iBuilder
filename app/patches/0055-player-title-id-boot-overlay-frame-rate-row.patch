@@ -1,0 +1,158 @@
+# The exported player, from the device test of 2026-11-19:
+#  * the title id of an exported dump whose file name carries none (a merged XCI) comes from the export manifest, so the settings sheet is enabled and its options appear (GameAppExport PlayerManifest);
+#  * GameAppBootOverlay.cs: a panel (time, libraries compiled so far) while the host prepares the game before its first picture: a black screen with "0 fps" for minutes looked like a hang;
+#  * ParseLauncher adds a Frame rate row (DM_FPS_TARGET: Game's own / 30 / 60, read at the start of the game) to a catalogue that has none.
+# Applies after 0054.
+diff -ruN a/GameAppBootOverlay.cs b/GameAppBootOverlay.cs
+--- a/GameAppBootOverlay.cs
++++ b/GameAppBootOverlay.cs
+@@ -0,0 +1,103 @@
++using System;
++using System.IO;
++using System.Text;
++using System.Text.RegularExpressions;
++using CoreGraphics;
++using Foundation;
++using UIKit;
++
++/// What the player sees while the host prepares the game before its first frame.
++///
++/// The host compiles the game's shader libraries and pipelines from the seed list BEFORE the first picture (a cold Metal cache: 50 s for 1,359 lines on a phone that had never run the game, several minutes
++/// for the 5,000 lines of Mario Kart 8 Deluxe's list in a freshly installed app, device logs 2026-11-19), and its own "progress screen" is not visible on this front end: a black screen with "0 fps" that looks
++/// like a hang. This panel says what is going on, with the time and the number of libraries compiled so far (the host's line "shader libraries from source: N compiled on this device", every 500), and goes
++/// away at the first picture ("present #1" in the guest log). It is a view above the game's; it takes no touch.
++internal sealed class GameBootOverlay
++{
++    private static readonly Regex Compiled = new Regex(@"shader libraries from source: (\d+) compiled", RegexOptions.Compiled);
++    private static readonly Regex Lines = new Regex(@"pipeline prepare: \d+ of (\d+) lines", RegexOptions.Compiled);
++
++    private readonly UIView panel;
++    private readonly UILabel title, detail;
++    private readonly UIActivityIndicatorView spinner;
++    private NSTimer timer;
++    private readonly DateTime started = DateTime.UtcNow;
++    private long offset;
++    private int compiled, lines;
++
++    private GameBootOverlay(UIView parent)
++    {
++        panel = new UIView { UserInteractionEnabled = false, BackgroundColor = UIColor.Black.ColorWithAlpha(0.72f), TranslatesAutoresizingMaskIntoConstraints = false };
++        panel.Layer.CornerRadius = 16;
++        spinner = new UIActivityIndicatorView(UIActivityIndicatorViewStyle.Medium) { Color = UIColor.White, TranslatesAutoresizingMaskIntoConstraints = false };
++        title = new UILabel { Text = "Preparing the game", TextColor = UIColor.White, Font = UIFont.BoldSystemFontOfSize(17), TextAlignment = UITextAlignment.Center, TranslatesAutoresizingMaskIntoConstraints = false };
++        detail = new UILabel
++        {
++            TextColor = UIColor.White.ColorWithAlpha(0.85f), Font = UIFont.SystemFontOfSize(13), TextAlignment = UITextAlignment.Center, Lines = 0,
++            Text = "First start of this app: the phone compiles the game's shaders once. The next starts take a few seconds.",
++            TranslatesAutoresizingMaskIntoConstraints = false,
++        };
++        panel.AddSubview(spinner);
++        panel.AddSubview(title);
++        panel.AddSubview(detail);
++        parent.AddSubview(panel);
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            panel.CenterXAnchor.ConstraintEqualTo(parent.CenterXAnchor), panel.CenterYAnchor.ConstraintEqualTo(parent.CenterYAnchor),
++            panel.WidthAnchor.ConstraintLessThanOrEqualTo(380), panel.LeadingAnchor.ConstraintGreaterThanOrEqualTo(parent.LeadingAnchor, 24),
++            spinner.TopAnchor.ConstraintEqualTo(panel.TopAnchor, 18), spinner.CenterXAnchor.ConstraintEqualTo(panel.CenterXAnchor),
++            title.TopAnchor.ConstraintEqualTo(spinner.BottomAnchor, 8), title.LeadingAnchor.ConstraintEqualTo(panel.LeadingAnchor, 16), title.TrailingAnchor.ConstraintEqualTo(panel.TrailingAnchor, -16),
++            detail.TopAnchor.ConstraintEqualTo(title.BottomAnchor, 6), detail.LeadingAnchor.ConstraintEqualTo(panel.LeadingAnchor, 16), detail.TrailingAnchor.ConstraintEqualTo(panel.TrailingAnchor, -16),
++            detail.BottomAnchor.ConstraintEqualTo(panel.BottomAnchor, -16),
++        });
++        spinner.StartAnimating();
++        try { offset = new FileInfo(Path.Combine(GameAppMain.Documents, "gameapp.guest.log")).Length; } catch (Exception) { offset = 0; }
++        timer = NSTimer.CreateRepeatingScheduledTimer(1.0, _ => Tick());
++    }
++
++    /// Show it over `parent` (the game's view); it removes itself at the first picture.
++    internal static GameBootOverlay Show(UIView parent) => new GameBootOverlay(parent);
++
++    private void Tick()
++    {
++        try
++        {
++            bool first = Scan();
++            var seconds = (int) (DateTime.UtcNow - started).TotalSeconds;
++            var progress = compiled > 0 ? $"{compiled} libraries compiled so far" : "starting";
++            if (lines > 0) progress += $" ({lines} pipelines to prepare)";
++            title.Text = $"Preparing the game  {seconds / 60}:{seconds % 60:00}";
++            detail.Text = $"{progress}.\nFirst start of this app: the phone compiles the game's shaders once. The next starts take a few seconds.";
++            if (first || seconds > 1800) Hide();
++        }
++        catch (Exception) { Hide(); }
++    }
++
++    /// New guest-log lines since the last tick: true once the first picture was presented.
++    private bool Scan()
++    {
++        var path = Path.Combine(GameAppMain.Documents, "gameapp.guest.log");
++        if (!File.Exists(path)) return false;
++        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
++        if (fs.Length < offset) offset = 0;
++        if (fs.Length - offset > (2 << 20)) offset = fs.Length - (2 << 20);
++        fs.Seek(offset, SeekOrigin.Begin);
++        var buffer = new byte[fs.Length - offset];
++        int read = 0;
++        while (read < buffer.Length) { int got = fs.Read(buffer, read, buffer.Length - read); if (got <= 0) break; read += got; }
++        offset += read;
++        var text = Encoding.UTF8.GetString(buffer, 0, read);
++        foreach (Match m in Compiled.Matches(text)) compiled = Math.Max(compiled, int.Parse(m.Groups[1].Value));
++        var l = Lines.Match(text);
++        if (l.Success) lines = int.Parse(l.Groups[1].Value);
++        return text.Contains("present #1:", StringComparison.Ordinal) || text.Contains("present #1 ", StringComparison.Ordinal);
++    }
++
++    private void Hide()
++    {
++        timer?.Invalidate();
++        timer = null;
++        spinner.StopAnimating();
++        UIView.Animate(0.3, () => panel.Alpha = 0, () => panel.RemoveFromSuperview());
++    }
++}
+diff -ruN a/GameAppExport.cs b/GameAppExport.cs
+--- a/GameAppExport.cs
++++ b/GameAppExport.cs
+@@ -45,6 +45,10 @@
+             {
+                 var path = Path.Combine(NSBundle.MainBundle.BundlePath, Folder, "manifest.tsv");
+                 if (File.Exists(path)) manifest = GameAppUi.ParseExportManifest(File.ReadAllText(path));
++                // The exported dump's file name may carry no [title id] (a merged XCI): the manifest has it (written at the export), so the player's settings, saves and mods find the game like any other
++                if (manifest != null && manifest.TryGetValue("dump", out var dumpName) && manifest.TryGetValue("title_id", out var tid)
++                    && ulong.TryParse(tid, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var tidValue))
++                    GameAppUi.SetTitleFromContent(dumpName, tidValue & ~0xFFFUL);
+             }
+             catch (Exception) { manifest = null; }
+             return manifest;
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -798,7 +798,11 @@
+         Write(GameAppAudio.Configure());   // before the guest opens its audio output (see GameAppAudio.cs: the 1024-frame default crackles)
+         UIViewController top = this;
+         while (top.PresentedViewController != null) top = top.PresentedViewController;
+-        top.PresentViewController(gameWindow, false, () => Write("game view on screen (landscape, full screen)"));
++        top.PresentViewController(gameWindow, false, () =>
++        {
++            Write("game view on screen (landscape, full screen)");
++            try { GameBootOverlay.Show(gameWindow.View); } catch (Exception error) { Write("boot overlay: " + error.Message); }   // what the player sees until the first picture
++        });
+         UIApplication.SharedApplication.IdleTimerDisabled = true;   // the screen must not sleep under a game
+     }
+ 
+diff -ruN a/GameAppUi.cs b/GameAppUi.cs
+--- a/GameAppUi.cs
++++ b/GameAppUi.cs
+@@ -981,6 +981,12 @@
+             }
+         }
+         catch (Exception) { rows.Clear(); }
++        // A game's catalogue without a frame-rate row (Mario Kart 8 Deluxe's has none) gets one: the engine's DM_FPS_TARGET (30 or 60, 0 = the game's own), read at the start of the game.
++        // 30 keeps a frame budget of 33 ms when the phone is hot (the GPU slows down at "Serious": 19-21 ms a frame in device logs, 2026-11-19).
++        if (rows.Count > 0 && !rows.Any(r => r.Env == "DM_FPS_TARGET"))
++            rows.Insert(0, new LauncherRow("DM_FPS_TARGET", "choice", "Game", "Frame rate",
++                                           "Caps the frame rate: 30 stays steadier when the phone gets hot, 60 asks for more. Applies the next time the game starts.", "0", true, null, null,
++                                           new (string, string)[] { ("0", "Game's own"), ("30", "30 fps"), ("60", "60 fps") }, null, null, 0, 0, 0, null));
+         return rows;
+     }
+ 

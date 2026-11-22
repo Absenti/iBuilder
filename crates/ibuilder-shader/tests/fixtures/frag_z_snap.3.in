@@ -1,0 +1,17 @@
+struct main0_out
+{
+    float4 m_color [[color(0)]];
+};
+
+fragment main0_out main0(float4  gl_FragCoord [[position]], depth2d<float> d0 [[texture(1)]], constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], main0_in in [[stage_in]])
+{
+    main0_out out = {};
+    if (_5)
+    {
+    float _10 = in.m_20.x;
+    bool _45 = _65 < _40;
+    using namespace metal;
+    x = _25;
+    }
+    return out;
+}

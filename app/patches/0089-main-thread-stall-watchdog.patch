@@ -1,0 +1,110 @@
+# 0089-main-thread-stall-watchdog.patch -- the owner's point J (South Park: the picture and the pad froze together). Applies after 0088. UNTESTED ON DEVICE AND IN THE SIMULATOR:
+# compiled, and its pure part ran in the host harness (below).
+#
+# J. The check asked for: app/gameapp_shim_rust.c live_notify_cb posts "GameAppLiveShader" through CFNotificationCenterGetLocalCenter() from the engine's SUBMIT thread, and a local-center
+#    post runs its observers synchronously on that thread. FOUND: no C# code observes "GameAppLiveShader" (none in app/gameapp/GameApp*.cs or in patches 0001-0089; the harness checks it
+#    stays so), so nothing on the C# side can block that thread through it: no InvokeOnMainThread, no DispatchSync, no lock. No fix was needed there. (The other name-based observers of the
+#    game view, "GameAppQuitRequested" and "DmFrontPictureShape", are posted by the engine's front_pad.m, read-only here; not changed.)
+#    ADDED, to correlate the next field log: while a game is on screen (ShowGameWindowAtBoot -> DismissGameWindow) a watchdog thread posts an empty block to the main queue every 50 ms
+#    (BeginInvokeOnMainThread, asynchronous; one in flight at a time) and measures from two Stopwatch timestamps (posted, ran) how long the main thread took; over 100 ms it logs one line per
+#    stall with the wall-clock time it began: "main thread stalled 230 ms at 23:41:07.512" (GameAppField.cs MainStall). Its cost on the main thread: one empty block every 50 ms.
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile (-t:Compile):
+#   0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness89: … P88;P89): 294 of 294 checks (6 new); 7 of 7 mutations killed (among them a C# observer of
+#   "GameAppLiveShader" added, and the watchdog waiting on the main thread).
+# NOT VERIFIED: nothing ran on a device: the watchdog's lines during a real game, the cause of the owner's freeze (this patch only measures the main thread; a freeze with no stall line
+#   points elsewhere: the engine's own threads).
+# NEW LOG LINES: "main thread stalled ", " ms at ", "main thread watchdog: on while the game is on screen (a stall over 100 ms is logged with its time)".
+diff -ruN j/GameAppField.cs k/GameAppField.cs
+--- j/GameAppField.cs	2026-11-22 00:05:08
++++ k/GameAppField.cs	2026-11-22 00:09:15
+@@ -422,3 +422,17 @@
+     /// The log line: "partial build discarded: South Park, 13.4 GB freed".
+     public static string Line(string name, long freedBytes) => "partial build discarded: " + name + ", " + GameAppUi.SizeText(Math.Max(0, freedBytes)) + " freed";
+ }
++
++/// Patch 0089 (the owner: South Park's picture and pad froze together): while a game is on screen a watchdog thread asks the main queue for a no-op every 50 ms and measures, from two
++/// monotonic timestamps (posted, ran), how long the main thread took to run it; a wait over 100 ms is one line in the log with the wall-clock time it began, to set beside the game's own
++/// log: "main thread stalled 230 ms at 23:41:07.512". One request in flight at a time, so one stall is one line.
++public static class MainStall
++{
++    public const int PingMs = 50, ThresholdMs = 100;
++
++    public static bool Counts(double waitedMs) => waitedMs > ThresholdMs;
++
++    /// `began`: the local wall-clock time the no-op was posted (the stall's start, give or take PingMs).
++    public static string Line(double waitedMs, DateTime began) =>
++        "main thread stalled " + Math.Round(waitedMs).ToString("0", CultureInfo.InvariantCulture) + " ms at " + began.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture);
++}
+diff -ruN j/GameAppFieldUi.cs k/GameAppFieldUi.cs
+--- j/GameAppFieldUi.cs	2026-11-22 00:02:08
++++ k/GameAppFieldUi.cs	2026-11-22 00:09:15
+@@ -3,7 +3,9 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.IO;
++using System.Threading;
+ using Foundation;
+ using UIKit;
+ 
+@@ -82,6 +84,39 @@
+         if (native) { try { GameStopNative.gameapp_request_stop((int) StopKind.None); } catch (Exception) { } }
+         Write("background: back in the app: the pause iOS asked for (its task expired) is withdrawn; the build goes on");
+     }
++
++    // ---- patch 0089: the main-thread watchdog while a game is on screen (GameAppField.cs MainStall) -----------------------------------------------------
++
++    private volatile bool stallWatching;
++    private long stallRanSeq, stallRanTicks;
++
++    /// From ShowGameWindowAtBoot to DismissGameWindow. The thread never waits on the main thread: it posts (BeginInvokeOnMainThread, asynchronous) and looks every 10 ms whether the no-op ran;
++    /// the wait is the difference of the two Stopwatch timestamps, so the watchdog's own scheduling does not count. The main thread's cost: one empty block every 50 ms.
++    private void StartStallWatch()
++    {
++        if (stallWatching) return;
++        stallWatching = true;
++        var thread = new Thread(() =>
++        {
++            long seq = 0;
++            while (stallWatching)
++            {
++                long mine = ++seq, sent = Stopwatch.GetTimestamp();
++                var began = DateTime.Now;
++                BeginInvokeOnMainThread(() => { Volatile.Write(ref stallRanTicks, Stopwatch.GetTimestamp()); Volatile.Write(ref stallRanSeq, mine); });
++                while (stallWatching && Volatile.Read(ref stallRanSeq) != mine) Thread.Sleep(10);
++                if (!stallWatching) return;
++                double waited = (Volatile.Read(ref stallRanTicks) - sent) * 1000.0 / Stopwatch.Frequency;
++                if (MainStall.Counts(waited)) { var line = MainStall.Line(waited, began); BeginInvokeOnMainThread(() => Write(line)); }
++                Thread.Sleep(MainStall.PingMs);
++            }
++        })
++        { IsBackground = true, Name = "main-stall-watch" };
++        thread.Start();
++        Write($"main thread watchdog: on while the game is on screen (a stall over {MainStall.ThresholdMs} ms is logged with its time)");
++    }
++
++    private void StopStallWatch() => stallWatching = false;
+ 
+     /// The shared NAS session (GameAppNas.cs, patch 0085) ends when the app goes to the background; it is made again at the next listing or cover.
+     private void WatchNasSession()
+diff -ruN j/GameAppMain.cs k/GameAppMain.cs
+--- j/GameAppMain.cs	2026-11-22 00:02:08
++++ k/GameAppMain.cs	2026-11-22 00:09:15
+@@ -841,6 +841,7 @@
+         gameWindowShown = true;
+         gameOnScreen = true;   // patch 0085
+         Write("game on screen: app timers and cloud work paused");
++        StartStallWatch();   // patch 0089 (GameAppFieldUi.cs): main-thread stalls over 100 ms, with their time
+         Write(GameAppAudio.Configure());   // before the guest opens its audio output (see GameAppAudio.cs: the 1024-frame default crackles)
+         UIViewController top = this;
+         while (top.PresentedViewController != null) top = top.PresentedViewController;
+@@ -857,6 +858,7 @@
+         if (gameWindow == null) return;
+         if (gameWindowShown) gameWindow.DismissViewController(false, null);
+         gameOnScreen = false;   // patch 0085: the app's own work resumes
++        StopStallWatch();       // patch 0089
+         if (refreshOwed) { refreshOwed = false; RefreshScreen(); }
+         UIApplication.SharedApplication.IdleTimerDisabled = false;
+         gameWindow = null;

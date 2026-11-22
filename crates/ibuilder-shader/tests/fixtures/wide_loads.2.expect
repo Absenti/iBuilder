@@ -1,0 +1,32 @@
+OK
+{}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+   const device _25* vp_s0 [[id(1)]];
+};
+
+kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])
+{
+    int _100 = int(_5);
+    int _102 = _100 + 36;
+    uint _103 = uint(int(uint(_102) >> uint(2)));
+    float _104 = as_type<float>((*spvDescriptorSet0.vp_s0)._m0[int(_103)]);
+    int _111 = _100 + 32;
+    uint _106 = uint(int(uint(_105) >> uint(2)));
+    float _107 = as_type<float>((*spvDescriptorSet0.vp_s0)._m0[int(_106)]);
+    int _108 = _100 + 4;
+    uint _109 = uint(int(uint(_108) >> uint(2)));
+    float _110 = as_type<float>((*spvDescriptorSet0.vp_s0)._m0[int(_109)]) + as_type<float>((*spvDescriptorSet0.vp_s0)._m0[int(_109)]);
+    int _105 = _100 + 4;
+    uint _112 = uint(int(uint(_111) >> uint(2)));
+    float _113 = as_type<float>((*spvDescriptorSet0.vp_s0)._m0[int(_112)]);
+    int _114 = _100 + 6;
+    uint _115 = uint(int(uint(_114) >> uint(2)));
+    float _116 = as_ty

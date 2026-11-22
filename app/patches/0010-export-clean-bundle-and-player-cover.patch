@@ -1,0 +1,60 @@
+--- a/GameAppExport.cs	2026-11-19 16:39:25
++++ b/GameAppExport.cs	2026-11-19 16:39:25
+@@ -208,7 +208,10 @@
+         var profile = Need(Path.Combine(documents, "profile.tsv"), "the game's profile");
+ 
+         // The app itself, minus its signature (the installer writes a new one) and its Info.plist (replaced below).
+-        AddTree(bundle, app, rel => rel.StartsWith("_CodeSignature/") || rel == "Info.plist" || rel.StartsWith(Folder + "/"));
++        // What the installer (SideStore, AltStore) left in the installed bundle is not part of an app to hand over: the signature of every bundle in it (nested frameworks too), the provisioning profile it
++        // embedded and ALTCertificate.p12, the player's own signing certificate (a private key: an exported .ipa must never carry it).
++        AddTree(bundle, app, rel => rel.StartsWith("_CodeSignature/") || rel.Contains("/_CodeSignature/") || rel == "Info.plist" || rel.StartsWith(Folder + "/")
++                                    || rel == "ALTCertificate.p12" || rel.EndsWith(".mobileprovision"));
+         AddTree(framework, app + "Frameworks/DmGameProbe.framework/", rel => rel.StartsWith("_CodeSignature/") || rel == "Info.plist");
+         AddBytes(app + "Frameworks/DmGameProbe.framework/Info.plist",
+                  FrameworkPlist(Path.Combine(framework, "Info.plist"), Path.Combine(bundle, "Info.plist"), titleId));
+@@ -277,11 +280,16 @@
+     /// The framework's Info.plist, complete: in Documents it only needed what zsign reads, inside an app bundle the
+     /// installer also wants an identifier of its own, a version and the platform (the simulator's installd refused it
+     /// without CFBundleIdentifier when the framework had none).
++    /// The bundle identifier the app was built with. An installer rewrites CFBundleIdentifier (a team suffix: dev.nxpocket.gameapp.<TEAM>) and keeps the original in ALTBundleIdentifier; an export
++    /// must start from the original, or its identifier carries the suffix twice and, with ALTBundleIdentifier left in, the installer takes the export for GameApp itself.
++    private static string OriginalBundleId(NSDictionary plist) =>
++        (plist?["ALTBundleIdentifier"] as NSString)?.ToString() ?? (plist?["CFBundleIdentifier"] as NSString)?.ToString() ?? "dev.nxpocket.gameapp";
++
+     private static byte[] FrameworkPlist(string original, string appPlist, string titleId)
+     {
+         var dict = (File.Exists(original) ? NSMutableDictionary.FromFile(original) : null) ?? new NSMutableDictionary();
+         var app = NSDictionary.FromFile(appPlist);
+-        var baseId = (app?["CFBundleIdentifier"] as NSString)?.ToString() ?? "dev.nxpocket.gameapp";
++        var baseId = OriginalBundleId(app);
+         void Set(string key, NSObject value) { if (value != null) dict[key] = value; }
+         Set("CFBundleExecutable", new NSString("DmGameProbe"));
+         Set("CFBundleIdentifier", new NSString(GameAppUi.ExportBundleId(baseId, titleId) + ".DmGameProbe"));
+@@ -301,8 +309,11 @@
+     private static byte[] InfoPlist(string original, string titleId, string name, bool hasIcon)
+     {
+         var dict = NSMutableDictionary.FromFile(original) ?? new NSMutableDictionary();
+-        var baseId = (dict["CFBundleIdentifier"] as NSString)?.ToString() ?? "dev.nxpocket.gameapp";
++        var baseId = OriginalBundleId(dict);
+         dict["CFBundleIdentifier"] = new NSString(GameAppUi.ExportBundleId(baseId, titleId));
++        // the installer's own keys (ALTBundleIdentifier, ALTAppGroups, ALTPairingFile ...) are its to write again at the next install
++        foreach (var key in dict.Keys.Select(k => k.ToString()).Where(k => k.StartsWith("ALT", StringComparison.Ordinal)).ToList())
++            dict.Remove(new NSString(key));
+         dict["CFBundleDisplayName"] = new NSString(name);
+         dict["CFBundleName"] = new NSString(name.Length > 15 ? name.Substring(0, 15) : name);
+         if (hasIcon)
+--- a/GameAppMain.cs	2026-11-19 16:39:25
++++ b/GameAppMain.cs	2026-11-19 16:39:25
+@@ -1455,6 +1455,12 @@
+     {
+         try
+         {
++            // An exported player has no dump in Documents to read a title id from the file name of: its manifest names the title, and its icon is the one the export carried (games/<id>/icon.jpg).
++            if (GameExport.IsPlayer && string.Equals(fileName, GameExport.PlayerDump, StringComparison.Ordinal)
++                && GameExport.PlayerManifest.TryGetValue("title_id", out var playerTitle) && !string.IsNullOrEmpty(playerTitle))
++                foreach (var candidate in new[] { Path.Combine(GameAppMain.Documents, "games", playerTitle, "icon.jpg"),
++                                                  Path.Combine(GameExport.BundleGame, "documents", "games", playerTitle, "icon.jpg") })
++                    if (File.Exists(candidate)) return CoverFile(fileName, candidate);
+             var rel = GameAppUi.IconRelativePath(fileName);
+             if (rel != null)
+             {

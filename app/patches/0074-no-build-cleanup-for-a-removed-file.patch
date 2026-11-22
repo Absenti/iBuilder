@@ -1,0 +1,17 @@
+# 0074-no-build-cleanup-for-a-removed-file.patch -- "Delete the build?" (patch 0066, after a FULL export) is not offered for a game whose file has no content.
+# Applies after 0073. WHY: with Optimize storage (0073) the game's file is an empty stub once it is extracted; the extraction (kept ExeFS, RomFS.img) and the framework are then the
+#   game's only copy on the iPhone, and 0066's message ("the game file ... stay[s]; you can build again whenever you want") would be false: deleting the build would leave nothing to build from.
+# WHAT: OfferBuildCleanup returns at once, with one log line, when ContentMissing(game) is not empty (a stub or an empty file among the base game, its update and its DLC).
+# Compiled with 0010..0074 (dotnet build -t:Compile, ios-arm64, Release). Not run on a device.
+diff --color -ruN a/GameAppBuildCleanupUi.cs b/GameAppBuildCleanupUi.cs
+--- a/GameAppBuildCleanupUi.cs	2026-11-20 17:45:08
++++ b/GameAppBuildCleanupUi.cs	2026-11-20 17:45:08
+@@ -47,6 +47,8 @@
+     private void OfferBuildCleanup(string game, bool slim)
+     {
+         if (GameExport.IsPlayer) return;
++        // Patch 0074: a game whose file has no content (Optimize storage, or removed by hand) plays and rebuilds from its build alone: deleting it would leave nothing to build from
++        if (ContentMissing(game).Count > 0) { Write("build cleanup: not offered: the game's file was removed after its extraction, so the build is its only copy on this iPhone"); return; }
+         var plan = BuildCleanup.For(CleanupFactsFor(game, slim));
+         if (plan.IsEmpty) { Write($"build cleanup: not offered: {BuildCleanupText.WhyNot(plan.Why)}"); return; }
+         var ask = new CleanupAsk { Game = game, Plan = plan };

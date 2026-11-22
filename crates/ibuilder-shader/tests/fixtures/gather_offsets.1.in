@@ -1,0 +1,17 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    float4 _30 = h(spvGatherConstOffsets(spvDescriptorSet0.t0, spvDescriptorSet0.s0, _20, int(_7), float2(1.0)), spvGatherConstOffsets(spvDescriptorSet0.t0, spvDescriptorSet0.s0, _20, int(_7), float2(1.0)));
+    constexpr const thread T& operator []

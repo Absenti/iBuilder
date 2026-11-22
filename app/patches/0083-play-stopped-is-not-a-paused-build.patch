@@ -1,0 +1,125 @@
+# 0083-play-stopped-is-not-a-paused-build.patch -- a stop that ends a BOOT-ONLY run (Play) before the boot is an interrupted Play, not a paused or cancelled build.
+# Applies after 0082. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# WHY (target/agent-work/pl/REPORT-3.txt, H1 of the Rust chain): crates/ibuilder-pipeline boot.rs now returns 131 (RC_PAUSED) / 130 (RC_CANCELLED) from a boot-only run when a stop request
+#   interrupts the shader library's rebuild before the boot ("[stop] stage 5 boot-only: a <pause|cancel> was asked for during stage 3 ...: the game is not booted"); a pause keeps the
+#   boot-only request (a later Play continues the library, then boots), a cancel consumes it. The app took 130 / 131 as a BUILD's: StopEnding() called RecordPaused() (a paused-build record
+#   under the run's label "boot-only (the framework is built and signed)": a "Paused" card, chip and Resume for a build that never was) or ApplyCancel() (a cancelled build's cleanup).
+# WHAT: PlayStop (GameAppRedesign.cs, pure): a boot-only run's Paused / Cancelled outcome is StopEnd.PlayInterrupted; a build's stays BuildPaused / BuildCancelled (unchanged). StopBegin
+#   records the run's kind (runBootOnly); StopEnding switches on PlayStop.Of; PlayInterrupted (GameAppRedesignUi.cs): no paused-build record, no cleanup, the StopMachine back to Idle
+#   (CleanupDone + Forget: no Paused / Cancelled card, chip or Resume), the game stays Ready (its framework and stamp are untouched; 0065 already clears pythonRanThisProcess on 130 / 131, so
+#   Play works again in this process), one log line, and the line "Play was stopped before the game started" ("; Play continues it" for a pause) in the game sheet's launch line and under
+#   the carousel's buttons until the next Play. No notification (a stop by the person), no queue move (a Play is no queue item).
+# VERIFIED (2026-11-21, M1 Pro): check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile (-t:Compile,
+#   ios-arm64): 0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness83: PAD81;P82;P83 over this tree): 178 of 178 checks, 9 new (the table, the lines,
+#   the REAL StopMachine taken through a boot-only 131 and 130 then PlayInterrupted's CleanupDone + Forget to Idle, the wiring, boot.rs's contract text); 6 of 6 mutations killed.
+# NOT VERIFIED: nothing ran; no boot-only run was stopped on a phone (the app has no Pause / Cancel button for a Play: stoppable is false, so only another source of a stop request, such as the
+#   system's task expiring, reaches it).
+# NEW UI STRINGS: "Play was stopped before the game started", "; Play continues it"; log line "play: ".
+diff -ruN d/GameAppMain.cs e/GameAppMain.cs
+--- d/GameAppMain.cs	2026-11-21 20:26:34
++++ e/GameAppMain.cs	2026-11-21 20:48:21
+@@ -2674,6 +2674,7 @@
+                     : bootOnly && !string.IsNullOrEmpty(runFacts.FrameworkGame) ? runFacts.FrameworkGame : null;
+         if (runGame != null) selected = runGame;
+         launchingGame = bootOnly ? runGame ?? name : null;   // patch 0080: a Play is starting this game (the sheet's launch line, the library's "Starting…")
++        if (bootOnly) lastPlayGame = launchingGame;   // patch 0083
+         startedAt = DateTime.Now;
+         StopWarm("a run starts");   // GameAppWarm.cs: the phone is the build's or the game's now
+         PrepareGameWindow();
+diff -ruN d/GameAppRedesign.cs e/GameAppRedesign.cs
+--- d/GameAppRedesign.cs	2026-11-21 20:30:06
++++ e/GameAppRedesign.cs	2026-11-21 20:48:21
+@@ -583,6 +583,23 @@
+     }
+ }
+ 
++/// Patch 0083: what the end of a run that a stop request ended means. The Rust chain now returns 131 (paused) / 130 (cancelled) from a BOOT-ONLY run (Play) too, when a stop interrupts the
++/// shader library's rebuild before the boot (no boot; a pause keeps the boot-only request so a later Play continues, a cancel consumes it): that is an interrupted PLAY, never a paused or
++/// cancelled BUILD (no paused-build record, no cancel cleanup: the game stays Ready and Play is offered again).
++public enum StopEnd { None, PlayInterrupted, BuildPaused, BuildCancelled }
++
++public static class PlayStop
++{
++    public static StopEnd Of(bool bootOnly, StopOutcome outcome) =>
++        outcome == StopOutcome.Paused ? (bootOnly ? StopEnd.PlayInterrupted : StopEnd.BuildPaused)
++        : outcome == StopOutcome.Cancelled ? (bootOnly ? StopEnd.PlayInterrupted : StopEnd.BuildCancelled)
++        : StopEnd.None;
++
++    public const string Stopped = "Play was stopped before the game started";
++
++    public static string Line(bool paused) => paused ? Stopped + "; Play continues it" : Stopped;
++}
++
+ /// The library's hidden cloud games, as kept (one name a line).
+ public static class HiddenGames
+ {
+diff -ruN d/GameAppRedesignUi.cs e/GameAppRedesignUi.cs
+--- d/GameAppRedesignUi.cs	2026-11-21 20:32:01
++++ e/GameAppRedesignUi.cs	2026-11-21 20:48:21
+@@ -587,7 +587,21 @@
+     private readonly CancelFlags downloadCancels = new CancelFlags();   // Cancel while a game downloads (Download, GameAppLibrary.cs, looks at it)
+     private HoldOverlay holdOverlay;
+     private string launchingGame;   // the game a Play is starting (a boot-only run): the sheet's launch line
++    private string lastPlayGame;    // patch 0083: the game of the last boot-only run (launchingGame is cleared by Finish before StopEnding)
++    private bool runBootOnly;
++    private (string Game, string Line)? playStopped;   // patch 0083: "Play was stopped before the game started" for that game, until the next Play
+ 
++    /// Patch 0083: a stop ended a boot-only run before the boot (the chain's 131 / 130): no paused-build record, no cleanup; the game stays Ready, Play is offered again, one honest line.
++    private void PlayInterrupted(bool paused)
++    {
++        var game = lastPlayGame ?? selected;
++        var line = PlayStop.Line(paused);
++        playStopped = (game, line);
++        Write($"play: {line} ({GameAppUi.DisplayName(game ?? "")}: the shader library's rebuild was stopped before the boot; no build was paused or cancelled, the game stays Ready)");
++        stop.CleanupDone();   // a cancel left the machine "Cancelling": nothing to clean up for a Play
++        stop.Forget();        // back to Idle: no "Paused" / "Cancelled" card, chip or Resume for a build that never was
++    }
++
+     /// Where a library entry stands (LibraryActions.StateOf) and its progress.
+     private LibState LibStateOf(LibraryEntry e, UiFacts facts, out double? fraction)
+     {
+@@ -938,6 +952,8 @@
+             flowButtons.AddArrangedSubview(button);
+         }
+         flowNote.Hidden = !LibraryActions.ShowsNote(state, canRun);
++        flowNote.Text = LibraryActions.NoGetTaskAllowNote;
++        if (!running && playStopped is { } ps && ps.Game == e.Name) { flowNote.Text = ps.Line; flowNote.Hidden = false; }   // patch 0083: an interrupted Play, said once under its buttons
+         // the ground's glow: the dominant hue of the cover in focus (a fixed amber when it has none)
+         ambient.SetHue(e.Icon != null ? Look.HueOf(e.Icon) : -1, true);
+         currentTint = accent;
+@@ -1363,6 +1379,7 @@
+     {
+         if (game == null) return ("", 0, false);
+         if (savesCopying && selected == game) return ("Copying the save before the launch", 0.05f, true);
++        if (!running && playStopped is { } ps && ps.Game == game) return (ps.Line, 0, true);   // patch 0083
+         if (!running || launchingGame != game) return ("", 0, false);
+         var s = GameAppUi.ParseStage(lastStage);
+         return (s.Valid ? s.Text : "Loading the game", (float) Math.Max(0.05, s.Valid ? s.Fraction : 0.05), true);
+diff -ruN d/GameAppStopUi.cs e/GameAppStopUi.cs
+--- d/GameAppStopUi.cs	2026-11-21 20:26:34
++++ e/GameAppStopUi.cs	2026-11-21 20:48:21
+@@ -104,6 +104,8 @@
+     private void StopBegin(string name, bool bootOnly, bool extracting)
+     {
+         runOutcome = StopOutcome.Finished;
++        runBootOnly = bootOnly;   // patch 0083: a stop of a boot-only run is an interrupted Play (PlayStop)
++        if (bootOnly) playStopped = null;
+         pauseRecorded = false;
+         resumedFrom = bootOnly ? null : pausedBuilds.FirstOrDefault(r => r.Game == name);
+         stop.Begin(name, stoppable: !bootOnly, extracting);
+@@ -117,10 +119,11 @@
+     {
+         stopNag?.Dispose();
+         stopNag = null;
+-        switch (runOutcome)
++        switch (PlayStop.Of(runBootOnly, runOutcome))   // patch 0083: 130 / 131 of a boot-only run (Play) is an interrupted Play, not a build's pause or cancel
+         {
+-            case StopOutcome.Paused: RecordPaused(); return true;
+-            case StopOutcome.Cancelled: ApplyCancel(stop.Game ?? lastRunGame, stop.Choice, stop.ChainRan); return true;
++            case StopEnd.PlayInterrupted: PlayInterrupted(runOutcome == StopOutcome.Paused); return true;
++            case StopEnd.BuildPaused: RecordPaused(); return true;
++            case StopEnd.BuildCancelled: ApplyCancel(stop.Game ?? lastRunGame, stop.Choice, stop.ChainRan); return true;
+             default: return false;
+         }
+     }

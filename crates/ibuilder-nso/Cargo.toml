@@ -1,0 +1,16 @@
+[package]
+name = "ibuilder-nso"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Nintendo Switch NSO / NRO module loader (port of dm/tools/nso.py)"
+
+[dependencies]
+lz4_flex = { workspace = true }
+sha2 = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+# the C libzstd compresses the stock-zstd test frames the shared machinery of the ZBIC decoder is checked with
+zstd = { version = "0.13", default-features = false }

@@ -1,0 +1,25 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+kernel void main0()
+{
+bool _70;
+do
+{
+    float _34 = as_type<float>(q);z();
+    float _51 = _34 + 1.0;
+    uint _54 = as_type<uint>(_34);
+    uint _92;
+    do
+    {
+        _92 = _54;
+    } while (!atomic_compare_exchange_weak_explicit((device atomic_uint*)&q);z(, &_92, as_type<uint>(_51), memory_order_relaxed, memory_order_relaxed) && _92 == _54);
+    uint _26 = _92;
+    _70 = int(_26) != as_type<int>(_34);
+} while (_70);
+}
+}

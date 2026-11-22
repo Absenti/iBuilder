@@ -1,0 +1,14 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+kernel void main0()
+{
+    threadgroup float4 _33[12288]; 
+threadgroup char _35[12288];
+    a = threadgroup
+    float _9 = 1.0;
+}

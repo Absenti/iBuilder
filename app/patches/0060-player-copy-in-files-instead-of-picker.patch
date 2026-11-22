@@ -1,0 +1,75 @@
+# A player installed by FlareStore cannot complete a document picker: the folder picker opens and navigates, but "Open" returns nothing, and "Cancel" is the only button that closes it (iPhone 15 Pro, iOS 27.0.1,
+# cable test 2026-11-19; the same picker call works in the main app installed by Xcode). What works is the copy the player made himself in Files: the .romfs from iBuilder > Exports into the player's own folder
+# (a copy inside the phone is a clone: free space did not move), which the player finds in its Documents. So the player's first screen now says that, with an "Open Files" button that opens Files on its own
+# folder, and the picker stays as a small second button for an install where it works; the export dialog says the same. Applies after 0058.
+diff --color -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -614,9 +614,14 @@
+ 
+         playerPlay = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "primary-action" };
+         playerPlay.HeightAnchor.ConstraintEqualTo(64).Active = true;
+-        playerPlay.TouchUpInside += (_, __) => { if (PlayerNeedsGameFiles) FindGameFiles(); else PrimaryTapped(); };
++        playerPlay.TouchUpInside += (_, __) => { if (PlayerNeedsGameFiles) ShowInFiles(Path.Combine(GameAppMain.Documents, "x")); else PrimaryTapped(); };
+         playerStatus = Theme.Label("", Theme.Font(13, UIFontWeight.Medium), Theme.Muted, 0);
+         playerStatus.TextAlignment = UITextAlignment.Center;
++        // The picker stays as a second way: it does not complete in a player installed by FlareStore (iOS 27.0.1: "Open" never returns, cable test 2026-11-19), where the copy in Files is the way.
++        playerPick = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "player-pick-folder" };
++        playerPick.SetTitle("Pick the folder from iBuilder instead", UIControlState.Normal);
++        playerPick.TitleLabel.Font = Theme.Font(13, UIFontWeight.Medium);
++        playerPick.TouchUpInside += (_, __) => FindGameFiles();
+ 
+         UIButton Tile(string name, out UILabel line, string id, Action tapped)
+         {
+@@ -650,7 +655,7 @@
+         var footer = Theme.Label("Made with iBuilder", Theme.Font(12, UIFontWeight.Regular), Theme.Dim);
+         footer.TextAlignment = UITextAlignment.Center;
+ 
+-        var column = Theme.Column(18, coverRow, title, playerLast, playerPlay, playerStatus, tiles);
++        var column = Theme.Column(18, coverRow, title, playerLast, playerPlay, playerStatus, playerPick, tiles);
+         column.SetCustomSpacing(6, title);
+         column.SetCustomSpacing(26, playerLast);
+         column.SetCustomSpacing(8, playerPlay);
+@@ -677,6 +682,7 @@
+     private static bool PlayerNeedsGameFiles => GameExport.PlayerRomfsName != null && GameExport.PlayerRomfs == null;
+ 
+     private FolderPickerDelegate gameFilesPicker;
++    private UIButton playerPick;
+ 
+     /// Files, filtered to game files (.romfs, declared in Info.plist): the player picks its game's, opened in place.
+     private void FindGameFiles()
+@@ -714,7 +720,7 @@
+         var next = GameAppUi.GameAction(game, facts);
+         bool needFiles = PlayerNeedsGameFiles;
+         var c = UIButtonConfiguration.FilledButtonConfiguration;
+-        c.AttributedTitle = new NSAttributedString(needFiles ? "Find the game files" : next.Kind == ActionKind.Boot ? "Play" : next.Title,
++        c.AttributedTitle = new NSAttributedString(needFiles ? "Open Files" : next.Kind == ActionKind.Boot ? "Play" : next.Title,
+                                                    new UIStringAttributes { Font = Theme.Font(20, UIFontWeight.Bold) });
+         c.Image = needFiles ? UIImage.GetSystemImage("folder.fill") : next.Kind == ActionKind.Boot ? UIImage.GetSystemImage("play.fill") : null;
+         c.ImagePadding = 10;
+@@ -724,10 +730,11 @@
+         playerPlay.Configuration = c;
+         playerPlay.Enabled = needFiles || next.Enabled;
+         playerStatus.Text = facts.Running ? "Starting the game…"
+-            : needFiles ? $"Once: open On My iPhone › iBuilder › Exports, open the folder “{GameAppUi.ExportFileName(GameAppUi.DisplayName(game))}” (it holds “{GameExport.PlayerRomfsName}”) "
+-                          + "and tap Open, the blue button at the top right. The game is read from there: keep that folder and iBuilder."
++            : needFiles ? $"Once: in Files, open On My iPhone › iBuilder › Exports › “{GameAppUi.ExportFileName(GameAppUi.DisplayName(game))}”, touch and hold “{GameExport.PlayerRomfsName}”, Copy. "
++                          + $"Then open On My iPhone › “{GameAppUi.DisplayName(game)}” (this app's folder: the button opens it), touch and hold, Paste. A copy inside the phone takes no extra space. Come back here: Play appears."
+             : "";
+         playerStatus.Hidden = playerStatus.Text.Length == 0;
++        playerPick.Hidden = !needFiles || facts.Running;
+ 
+         // When it was last saved, how many copies are kept, how the game is set.
+         var tid = GameAppUi.BaseTitleIdOf(game);
+diff --color -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs
++++ b/GameAppMain.cs
+@@ -1860,7 +1860,7 @@
+         var alert = UIAlertController.Create("Export as .ipa",
+             $"{name} becomes an app of its own, in Files › iBuilder › Exports, to install with SideStore or FlareStore.\n\n"
+             + $"Light IPA, {GameAppUi.SizeText(size)}: the game files ({GameAppUi.SizeText(romfs)}) stay beside it, in Exports › {folder} as \"{romfsName}\" "
+-            + "(no extra space). The first time it opens, the app asks for that file once and reads the game from it: keep it, and keep iBuilder.\n\n"
++            + "(no extra space). The first time it opens, it asks you to copy that file into its own folder in Files (a button opens Files there; a copy inside the phone takes no extra space). It reads the game from its own folder after that.\n\n"
+             + $"Full IPA, {GameAppUi.SizeText(size + romfs)}: everything inside, an app that needs nothing else"
+             + (lightFirst ? ". Warning: an installer may not manage to repack an .ipa this large." : ".")
+             + "\n\nWith a free Apple ID an app takes one of your three slots.",

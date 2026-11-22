@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Rust crates: one weekly pull request that groups the updates. Cargo.lock is tracked and pins every version.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+
+  # The actions used by the workflows in .github/workflows/
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

@@ -1,0 +1,1299 @@
+# 0085-field-report-background-build-screen-queue-lag-downloads-space.patch -- the owner's field report on the IPA of 2026-11-21 21:59 and the logs of two more runs (read in ~/Downloads,
+# never copied): the build kept in the background, the build screen, the queue during a build, the lag, the cloud listing, the download meter, the free space, the cover badges.
+# Applies after 0084. UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# B / I. THE BACKGROUND TASK (GameAppBackground.cs). From the log: the BGContinuedProcessingTask was submitted from the foreground at the build's start, accepted and started (its id is
+#   `<bundle id>.build.<n>`, permitted by Info.plist's `<bundle id>.build.*`: the start line proves it), and EXPIRED at the start of stage 3, ~90 s later. Its bar came from
+#   GameAppUi.ParseStage, which moves only for the rewrite's modules and the "(N/M shaders)" count: through stage 1 (75 s of "unpacking 2.3 of 26.2 GB") and the reading of the shaders
+#   ("progress: N/M" lines) it never moved, and iOS expires a continued-processing task whose progress stalls. The expiration then asked the chain to PAUSE (0065): during a read nothing can
+#   stop, the request stayed raised (and remembered by the StopMachine during the .nsz extraction) and paused the build later by itself (South Park: "paused before the chain started",
+#   although the owner was back). NOW: the bar is BuildProgress.Fraction (stage 1's unpacking, stage 3's reading counter, then the translation), with BackgroundHeartbeat (one unit more every
+#   3 s without news, never past the stage's end, never backwards); an expiration pauses only while the shaders are TRANSLATED (ExpirationPolicy: the chain stops after the current one),
+#   elsewhere it is logged and the build goes on while iOS lets the process run; a pause iOS asked for that has not taken effect is WITHDRAWN when the person comes back
+#   (StopMachine.WithdrawPause, gameapp_request_stop(0)); only the person's own Pause is never withdrawn. The log says what iOS did: "task <id> submitted", "accepted by iOS", "started by
+#   iOS N s after its submission", "iOS expired task <id> N s after its submission (its bar at U of 10000, last moved S s before; <stage>)".
+# A / L. THE BUILD SCREEN (GameAppLibrary.cs GameBuildViewController): (1) Pause and Cancel were in the scroll, under the live log, 48 pt, while Notify me / Close were a fixed bottom row
+#   (56 pt): they ended half under it and were HIDDEN whenever they could not act (a stop being honoured): now one fixed bottom bar, two rows of the same 52 pt pills (#25252b with a hairline,
+#   the accent only for the primary), Pause / Cancel always there while it runs, off when they cannot act (BuildScreenButtons). (2) the cover square was the name's colour (blue): the cover,
+#   else #25252b with the initials. (3) "STEP 2 OF 5 · 0% · Profile": a .nup's stage 1 is the package's read, which BuildSteps took for "Prepare the profile" (stage k = step k): it is "Read
+#   the game" now (BuildProgress.StepLine) and the ring follows the unpacking and the reading. (L) a new run starts with no stage line (South Park's screen showed Zelda's "8938/42848 shaders").
+# D. THE QUEUE DURING A BUILD: the menu's "Add to the build queue" was dropped while a build ran and every Build button was off: now a game's Build is "Add to queue" while another builds
+#   (LibraryActions.Label / Enabled), the menu keeps its entry, AddToBuildQueue says when the game is the one building or already queued (QueueRule), and during a build it wants the queue
+#   so the game starts after the current build (QueueBuildEnded's next).
+# E / J / K. THE LAG (the logs: "launch-profile: GatherFacts 95-257", "RefreshScreen 290-437", "log rebuild 320-335", "storage/shadercache 1848-4771" ms): GatherFacts' slow parts are cached
+#   (TtlCache: the signature's entitlements once, the identity 30 s and invalidated by an import, the address space 10 s); the log page is redrawn at most once a second (400 ms kept the
+#   main thread busy during a build); while the GAME is on screen nothing periodic runs on the main thread (no ticker work, no log tailing into hidden views: read from where it was once the
+#   game ends, no screen refresh: done when it ends, no cloud listing) and the log says "game on screen: app timers and cloud work paused"; no folder walk (FolderSizes, on a worker)
+#   during a build or a game: measured again when it ends (the cached sizes stay shown). NOT DONE: the live log's table is still rebuilt (bounded, once a second at most), not appended.
+# C. THE CLOUD LISTING: it ran (a new SSH connection) at every return to the app, during a build too: now at the launch, on the refresh button, or when 15 minutes old, never while a build or a
+#   download runs (CloudRelist); ONE shared NAS session while the app is active (Nas.WithShared: the listing and the covers; closed when the app goes to the background).
+# F. DOWNLOADS: "1.2 of 4.8 GB · 38 MB/s · 1 min 35 s left" (the carousel's line, the Build tab's row) and "Downloading 37 % · 38 MB/s · 1:35" (a card, a cover's badge): DownloadMeter (an
+#   exponential moving average sampled at most twice a second, shown after 2 s, "stalled" after 5 s with no byte, reset by a new file or a reconnect; decimal units); one end line "download:
+#   <name>: 4.8 GB in 2 min 6 s (38 MB/s on average)"; drawn with the 1 s ticker of 0075.
+# G. FREE SPACE: FreeBytes was DriveInfo("/") (the system volume, purgeable space excluded: ~24.5 GB when Settings said >100 GB): now DiskFreeNow (NSURLVolumeAvailableCapacityForImportantUsage
+#   on Documents, else DriveInfo of Documents; kept 10 s) for every shown free size and the "Not enough space" checks (download, import, export); "storage: X free for important use (Y without
+#   purgeable space)" at the launch, a build's start and a download's start.
+# H. COVER BADGES: a dark pill (black 62 %) with a hairline, ink 13 pt semibold, the state's colour in a small dot, 6 / 10 pt padding, inside the corner; the bar a dark track (black 55 %) with the
+#   accent, 4 pt, over a bottom scrim (black 0 -> 45 %); carousel, grid and the iPad hero (one Look.Pill / Look.CoverBar).
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile (-t:Compile):
+#   0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness85: PAD81;P82;P83;P84;P85, GameAppField.cs added): 237 of 237 checks (34 new: the progress of
+#   stage 1 and 3, the heartbeat, the expiration rule, the REAL StopMachine's withdrawal of a remembered and of a native system pause, the relisting rule, the queue rule, the meter with the
+#   owner's exact format, the EMA and the stall, the free-space fallback, the caches, the screen's buttons, and the wiring of each); 16 of 16 mutations killed; the 0080-0084 trees still pass
+#   their harnesses (118, 131, 169, 178, 203).
+# NOT VERIFIED: nothing ran on a device: whether iOS keeps the task alive with the heartbeat (the expiration's own rule is Apple's), the lag after the caches (no profile on a phone), the
+#   NSURL important-usage figure, the shared SFTP session across a long background stay, the new screens' look. The engine's own frame pacing (the game's freezes) is another agent's.
+# NEW UI STRINGS: "Add to queue", " is being built now.", " is already in the queue.", " waits in the queue: it starts after the current build.", "estimating…", "stalled", " left",
+#   " on average)"; log lines "game on screen: app timers and cloud work paused", "storage: ", "free for important use", "without purgeable space", "background: task ", "accepted by iOS",
+#   "started by iOS", "after its submission", "the build cannot pause in this step", "back in the app: the pause iOS asked for", "cloud: not listed again now", "download: ".
+diff -ruN f/GameAppAttachUi.cs g/GameAppAttachUi.cs
+--- f/GameAppAttachUi.cs	2026-11-21 23:29:27
++++ g/GameAppAttachUi.cs	2026-11-21 23:34:46
+@@ -299,19 +299,20 @@
+                         if (source.Kind == CloudKind.Nas)
+                         {
+                             if (string.IsNullOrEmpty(password)) continue;
+-                            Nas.WithSession(nas, Nas.Password(nas.User, password), open =>   // ONE connection for the whole source (it was one per cover)
++                            foreach (var (f, how) in group)
+                             {
+-                                foreach (var (f, how) in group)
++                                if (running) break;
++                                (byte[], ulong, string, bool) r = (null, 0, null, true);
++                                // ONE connection for the whole source (it was one per cover); each cover takes it in turn (patch 0085: the app's shared session, so a listing never waits a whole pass)
++                                Nas.WithSession(nas, Nas.Password(nas.User, password), open =>
+                                 {
+-                                    if (running) break;
+-                                    (byte[], ulong, string, bool) r;
+                                     try { var (stream, size) = open(f.Remote); using (stream) r = ReadOne(how, stream, size); }
+                                     catch (Exception e) { r = (null, 0, (e.InnerException ?? e).Message, true); }
+-                                    Land(f, r);
+-                                    Post();
+-                                    if (got > 0 && got % 3 == 0) BeginInvokeOnMainThread(RefreshScreen);
+-                                }
+-                            });
++                                });
++                                Land(f, r);
++                                Post();
++                                if (got > 0 && got % 3 == 0) BeginInvokeOnMainThread(RefreshScreen);
++                            }
+                         }
+                         else
+                         {
+diff -ruN f/GameAppBackground.cs g/GameAppBackground.cs
+--- f/GameAppBackground.cs	2026-11-21 23:19:56
++++ g/GameAppBackground.cs	2026-11-21 23:38:32
+@@ -42,6 +42,8 @@
+     private static bool backgroundWarm;                         // the task in flight is a shader warm-up, not a build: its progress is the warm-up's "N of M"
+     private static string backgroundGame;                       // the game's name, for the warm-up's subtitle (patch 0076)
+     private static string backgroundTitle;                      // the title last given to the system (patch 0076: the automatic preparation's count is in it)
++    // patch 0085: when the request was submitted, when the bar last moved (what iOS saw), for the log of a start or an expiration
++    private static DateTime backgroundSubmittedUtc, backgroundAdvancedUtc;
+ 
+     /// Whether a continued-processing task is asked for or running (a build's or a warm-up's). GameAppWarm.cs asks again for the warm-up's when none is.
+     private static bool BackgroundInFlight { get { lock (backgroundLock) return backgroundId != null; } }
+@@ -74,9 +76,11 @@
+                 backgroundId = id;
+                 backgroundDone = 0;
+                 backgroundSubtitle = "Starting";
++                backgroundSubmittedUtc = backgroundAdvancedUtc = DateTime.UtcNow;
++                Write($"background: task {id} submitted (continued processing, {(warm ? "the shader preparation" : "the build")})");
+                 BGTaskScheduler.Shared.Submit(request, error =>
+                 {
+-                    if (error == null) return;
++                    if (error == null) { BeginInvokeOnMainThread(() => Write($"background: task {id} accepted by iOS")); return; }
+                     lock (backgroundLock) if (backgroundId == id && backgroundTask == null) backgroundId = null;
+                     BeginInvokeOnMainThread(() => Write(warm
+                         ? $"background: iOS refused the shader preparation's background task ({error.Code}: {error.LocalizedDescription}): it goes on while iBuilder is open, and the task is asked for again when you come back to iBuilder"
+@@ -97,9 +101,18 @@
+             backgroundTask = continued;
+             continued.Progress.TotalUnitCount = ProgressUnits;
+             continued.Progress.CompletedUnitCount = backgroundDone;
++            var startedAfter = (DateTime.UtcNow - backgroundSubmittedUtc).TotalSeconds;
++            var startedId = backgroundId;
++            BeginInvokeOnMainThread(() => Write($"background: task {startedId} started by iOS {startedAfter:0.0} s after its submission"));
+             continued.ExpirationHandler = () =>
+             {
+-                if (!backgroundWarm && stop.Stoppable)
++                // patch 0085 (the owner's log: the task expired ~90 s after the build started, at the start of stage 3, with its bar unmoved since stage 1): say exactly what iOS did
++                long units; double since, idle;
++                lock (backgroundLock) { units = backgroundDone; since = (DateTime.UtcNow - backgroundSubmittedUtc).TotalSeconds; idle = (DateTime.UtcNow - backgroundAdvancedUtc).TotalSeconds; }
++                var stageNow = lastStage;
++                BeginInvokeOnMainThread(() => Write($"background: iOS expired task {startedId} {since:0} s after its submission (its bar at {units} of {ProgressUnits}, last moved {idle:0} s before; {stageNow ?? "no stage yet"})"));
++                // a pause only where the chain can stop (the translation of the shaders, after the current one): elsewhere a pause request stayed raised and paused the build later, by itself
++                if (!backgroundWarm && ExpirationPolicy.Pauses(stop.Stoppable, stop.Phase == StopPhase.Extracting, stageNow))
+                 {
+                     PauseFromTheSystem(continued);   // GameAppStopUi.cs: runs off this queue, never blocks it or the main thread
+                     return;
+@@ -116,7 +129,7 @@
+                     return;
+                 }
+                 lock (backgroundLock) { if (backgroundTask == continued) backgroundTask = null; }
+-                BeginInvokeOnMainThread(() => Write("background: the system ended the background task; the build goes on while iOS lets this process live"));
++                BeginInvokeOnMainThread(() => Write("background: the build cannot pause in this step: no pause is asked; it goes on while iOS lets this process live"));
+             };
+         }
+         bool warmTask;
+@@ -129,7 +142,8 @@
+     private void BackgroundTick()
+     {
+         var stage = GameAppUi.ParseStage(lastStage);
+-        double fraction = stage.Fraction;
++        // patch 0085: the build's whole progress (stage 1's unpacking, stage 3's reading counter: they did not move the bar before, and iOS expires a task whose progress stalls)
++        double fraction = BuildProgress.Fraction(lastStage, lastReadingLine);
+         string step = stage.Valid ? $"{stage.Step}/{stage.Of}: {stage.Text}" : (lastStage ?? "Starting");
+         string title = null;
+         if (backgroundWarm && GameWarm.Kind == GameWarmLogic.WarmKind.Everything)
+@@ -150,8 +164,10 @@
+         {
+             var task = backgroundTask;
+             if (task == null) return;
+-            var done = Math.Max(backgroundDone, (long) (fraction * ProgressUnits));
+-            if (done != backgroundDone) { backgroundDone = done; task.Progress.CompletedUnitCount = done; }
++            // patch 0085: at least one unit more every few seconds while the build runs (never past the end of its stage), so the bar never stalls in iOS's eyes
++            var done = backgroundWarm ? Math.Max(backgroundDone, (long) (fraction * ProgressUnits))
++                                      : BackgroundHeartbeat.Next(backgroundDone, (long) (fraction * ProgressUnits), BackgroundHeartbeat.StageEnd(lastStage, ProgressUnits), (DateTime.UtcNow - backgroundAdvancedUtc).TotalSeconds);
++            if (done != backgroundDone) { backgroundDone = done; backgroundAdvancedUtc = DateTime.UtcNow; task.Progress.CompletedUnitCount = done; }
+             if (step.Length > 80) step = step.Substring(0, 80);
+             title ??= backgroundTitle ?? task.Title;
+             if (step != backgroundSubtitle || title != backgroundTitle)
+diff -ruN f/GameAppExport.cs g/GameAppExport.cs
+--- f/GameAppExport.cs	2026-11-21 23:19:56
++++ g/GameAppExport.cs	2026-11-21 23:37:04
+@@ -398,7 +398,7 @@
+         long total = entries.Sum(e => e.Size);
+         var outDir = Path.Combine(documents, "Exports");
+         Directory.CreateDirectory(outDir);
+-        long free = new DriveInfo(documents).AvailableFreeSpace;
++        long free = DiskFreeNow.Bytes();   // patch 0085: what iOS gives an important use (an export the person asked for)
+         long need = total + (256L << 20);
+         if (free > 0 && free < need)
+             throw new InvalidOperationException($"not enough space: the .ipa needs about {GameAppUi.SizeText(need)}, {GameAppUi.SizeText(free)} is free");
+diff -ruN f/GameAppField.cs g/GameAppField.cs
+--- f/GameAppField.cs	1970-01-01 01:00:00
++++ g/GameAppField.cs	2026-11-21 23:39:09
+@@ -0,0 +1,249 @@
++// gameapp/GameAppField.cs: the pure part of app/patches/0085, the owner's field report on the IPA of 2026-11-21 21:59 (its logs read, never copied): the build's progress as iOS sees
++// it (the background task was expired when its bar had not moved), what an expiration may do, when the cloud is listed again, adding to the queue during a build, a download's speed and
++// time left, the free space iOS really gives, and the short caches that keep the main thread light. No UIKit: the host harness compiles it as it is.
++
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Text.RegularExpressions;
++
++/// The build's progress from what the chain says: its stage line (gameapp.stage) and, in stage 3, its last "progress: N/M" log line (the shaders being read, before any "(N/M shaders)").
++/// GameAppUi.ParseStage moved the bar only for the rewrite's modules and the translation's shader count: stage 1 (75 s of "unpacking 2.3 of 26.2 GB" for Ocarina) and the start of stage 3
++/// stood still, and iOS expires a BGContinuedProcessingTask whose progress stalls.
++public static class BuildProgress
++{
++    private static readonly Regex Unpacking = new Regex(@"(?:unpacking|ExeFS)\s+([\d.]+)\s+of\s+([\d.]+)\s*GB");
++    private static readonly Regex Reading = new Regex(@"^\s*progress:\s*(\d+)/(\d+)\s*$");
++    private static readonly Regex Shaders = new Regex(@"\((\d+)/(\d+) shaders\)");
++
++    /// The part of stage 3 that is the reading of the game's shaders (the translation is the rest).
++    public const double ReadingShare = 0.15;
++
++    private static (double Start, double Width) Span(int step, int of)
++    {
++        double start = GameAppUi.ParseStage($"stage {step}/{of}: x").Fraction;
++        double end = step < of ? GameAppUi.ParseStage($"stage {step + 1}/{of}: x").Fraction : 1.0;
++        return (start, Math.Max(0, end - start));
++    }
++
++    /// 0..1 for the whole build. `readingLine`: the last "progress: N/M" line of the log (null when none since the stage began).
++    public static double Fraction(string stageLine, string readingLine)
++    {
++        var s = GameAppUi.ParseStage(stageLine);
++        if (!s.Valid) return 0;
++        var (start, width) = Span(s.Step, s.Of);
++        double within = 0;
++        var u = Unpacking.Match(s.Text);
++        if (u.Success && double.TryParse(u.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var a) && double.TryParse(u.Groups[2].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var b) && b > 0)
++            within = Math.Min(1, a / b);
++        else if (s.Of == 5 && s.Step == 3)
++        {
++            var sc = Shaders.Match(s.Text);
++            if (sc.Success && long.TryParse(sc.Groups[1].Value, out var d) && long.TryParse(sc.Groups[2].Value, out var t) && t > 0) within = ReadingShare + (1 - ReadingShare) * Math.Min(1, d / (double) t);
++            else if (readingLine != null && Reading.Match(readingLine) is { Success: true } r && long.TryParse(r.Groups[1].Value, out var rd) && long.TryParse(r.Groups[2].Value, out var rt) && rt > 0)
++                within = ReadingShare * Math.Min(1, rd / (double) rt);
++        }
++        else return s.Fraction;   // the rewrite's modules: ParseStage's own
++        return Math.Min(1, Math.Max(s.Fraction, start + width * within));
++    }
++
++    /// The stage line the build's STEPS are drawn from: a .nup's stage 1 ("reading the Switch 2 package …: unpacking 2.3 of 26.2 GB", 75 s for Ocarina) is the step "Read the game", not
++    /// "Prepare the profile" (GameAppUi.BuildSteps maps stage k to step k: right for an .nsp whose reading is the app's own extraction, step 0, but the build screen said "STEP 2 OF 5 ·
++    /// Profile" through the whole read of a .nup).
++    public static string StepLine(string stageLine)
++    {
++        var s = GameAppUi.ParseStage(stageLine);
++        return s.Valid && s.Of == 5 && s.Step == 1 && s.Text.StartsWith("reading the Switch 2 package", StringComparison.Ordinal) ? null : stageLine;
++    }
++
++    /// The "progress: N/M" lines of the log (the reading of the shaders), as they come.
++    public static bool IsReadingLine(string line) => line != null && Reading.IsMatch(line);
++}
++
++/// The units iOS is given for the task's bar: never backwards, and at least one more every few seconds while the build runs (a stage that reads a 26 GB package says nothing iOS counts),
++/// without passing the end of the stage it is in.
++public static class BackgroundHeartbeat
++{
++    public const int Every = 3;   // seconds
++
++    public static long Next(long last, long real, long stageEnd, double secondsSinceAdvance)
++    {
++        long next = Math.Max(last, real);
++        if (next == last && secondsSinceAdvance >= Every && last + 1 < stageEnd) next = last + 1;
++        return next;
++    }
++
++    /// The stage's end in units, for the cap.
++    public static long StageEnd(string stageLine, long units)
++    {
++        var s = GameAppUi.ParseStage(stageLine);
++        if (!s.Valid) return (long) (units * GameAppUi.ParseStage("stage 1/5: x").Fraction) + units / 50;
++        double end = s.Step < s.Of ? GameAppUi.ParseStage($"stage {s.Step + 1}/{s.Of}: x").Fraction : 1.0;
++        return (long) (end * units);
++    }
++}
++
++/// What iOS's expiration of the build's task does. Before: a PAUSE request whenever the build was stoppable; during the reading of a package or of the shaders the chain cannot stop there,
++/// the request stayed raised and paused the build later, in the background, by itself. Now: a pause only while the shaders are TRANSLATED (it stops after the current one); otherwise it is
++/// logged and the build goes on while iOS lets the process run.
++public static class ExpirationPolicy
++{
++    public static bool Pauses(bool stoppable, bool extracting, string stageLine)
++    {
++        if (!stoppable || extracting) return false;
++        var s = GameAppUi.ParseStage(stageLine);
++        return s.Valid && s.Of == 5 && s.Step == 3 && s.Text.Contains(" shaders)", StringComparison.Ordinal);
++    }
++}
++
++/// When the cloud sources are listed again (each NAS listing is an SSH connection): at the launch, on an explicit refresh, when the last listing is older than 15 minutes; never while a
++/// build or a download runs (it was at every return to the app).
++public static class CloudRelist
++{
++    public enum Why { Launch, Explicit, Foreground, SourceChanged }
++
++    public static readonly TimeSpan MaxAge = TimeSpan.FromMinutes(15);
++
++    public static bool Should(Why why, DateTime? lastListedUtc, DateTime nowUtc, bool building, bool downloading)
++    {
++        if (building || downloading) return false;
++        if (why == Why.Explicit || why == Why.SourceChanged || why == Why.Launch) return true;
++        return lastListedUtc == null || nowUtc - lastListedUtc.Value >= MaxAge;
++    }
++}
++
++/// The queue during a build: a game that is not built can always be added (its button says "Add to queue" while another game builds); the game being built and a game already queued say so.
++public static class QueueRule
++{
++    public enum Answer { Add, AlreadyQueued, IsBuilding, Nothing }
++
++    public static Answer Ask(string game, string building, IEnumerable<string> queued)
++    {
++        if (string.IsNullOrEmpty(game)) return Answer.Nothing;
++        if (building != null && string.Equals(game, building, StringComparison.OrdinalIgnoreCase)) return Answer.IsBuilding;
++        foreach (var q in queued ?? Array.Empty<string>()) if (string.Equals(q, game, StringComparison.OrdinalIgnoreCase)) return Answer.AlreadyQueued;
++        return Answer.Add;
++    }
++
++    public static string Words(Answer a, string display) => a switch
++    {
++        Answer.IsBuilding => display + " is being built now.",
++        Answer.AlreadyQueued => display + " is already in the queue.",
++        _ => display + " waits in the queue: it starts after the current build.",
++    };
++}
++
++/// A download's speed and time left: an exponential moving average of the rate, sampled at most twice a second; shown after 2 s of data ("estimating…" before), "stalled" after 5 s with no
++/// byte; Reset after a pause, a resume or a reconnect. Decimal units, as the rest of the app's sizes say "GB".
++public sealed class DownloadMeter
++{
++    public const double SampleEvery = 0.5, ShowAfter = 2.0, StallAfter = 5.0, Alpha = 0.25;
++
++    private DateTime start, lastSample, lastByte;
++    private long lastBytes;
++    private bool started;
++    public double Rate { get; private set; }   // bytes a second, smoothed
++    public long Bytes { get; private set; }
++    public long Total { get; private set; }
++
++    public void Reset() { started = false; Rate = 0; Bytes = 0; }
++
++    public void Update(long bytes, long total, DateTime nowUtc)
++    {
++        Total = total;
++        if (!started) { started = true; start = lastSample = lastByte = nowUtc; lastBytes = bytes; Bytes = bytes; return; }
++        if (bytes < lastBytes) { start = lastSample = lastByte = nowUtc; lastBytes = bytes; Bytes = bytes; Rate = 0; return; }   // a new file of the set, a restart
++        if (bytes > Bytes) lastByte = nowUtc;
++        Bytes = bytes;
++        double dt = (nowUtc - lastSample).TotalSeconds;
++        if (dt < SampleEvery) return;
++        double inst = (bytes - lastBytes) / dt;
++        Rate = Rate <= 0 ? inst : Alpha * inst + (1 - Alpha) * Rate;
++        lastSample = nowUtc;
++        lastBytes = bytes;
++    }
++
++    public bool Estimating(DateTime nowUtc) => !started || (nowUtc - start).TotalSeconds < ShowAfter || Rate <= 0;
++    public bool Stalled(DateTime nowUtc) => started && (nowUtc - lastByte).TotalSeconds > StallAfter;
++
++    public static string Size(double bytes) =>
++        bytes >= 1e9 ? (bytes / 1e9).ToString("0.0", CultureInfo.InvariantCulture) + " GB" : bytes >= 1e6 ? (bytes / 1e6).ToString("0", CultureInfo.InvariantCulture) + " MB" : (bytes / 1e3).ToString("0", CultureInfo.InvariantCulture) + " kB";
++
++    public static string Speed(double rate) =>
++        rate >= 1e9 ? (rate / 1e9).ToString("0.0", CultureInfo.InvariantCulture) + " GB/s" : rate >= 1e6 ? (rate / 1e6).ToString("0", CultureInfo.InvariantCulture) + " MB/s" : (rate / 1e3).ToString("0", CultureInfo.InvariantCulture) + " kB/s";
++
++    public static string Left(double seconds)
++    {
++        if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds < 0) return "";
++        var s = (long) Math.Round(seconds);
++        return s >= 3600 ? $"{s / 3600} h {s % 3600 / 60} min left" : s >= 60 ? $"{s / 60} min {s % 60} s left" : $"{s} s left";
++    }
++
++    public static string Clock(double seconds)
++    {
++        var s = (long) Math.Max(0, Math.Round(seconds));
++        return s >= 3600 ? $"{s / 3600}:{s % 3600 / 60:00}:{s % 60:00}" : $"{s / 60}:{s % 60:00}";
++    }
++
++    /// "1.2 of 4.8 GB · 38 MB/s · 1 min 35 s left" (or "· estimating…", "· stalled").
++    public string Long(DateTime nowUtc)
++    {
++        var head = Total > 0 ? $"{Size(Bytes).Replace(" GB", "").Replace(" MB", "")} of {Size(Total)}" : Size(Bytes);
++        if (Total > 0 && Size(Bytes).Split(' ')[1] != Size(Total).Split(' ')[1]) head = $"{Size(Bytes)} of {Size(Total)}";
++        if (Stalled(nowUtc)) return head + " · stalled";
++        if (Estimating(nowUtc)) return head + " · estimating…";
++        var left = Total > Bytes && Rate > 0 ? " · " + Left((Total - Bytes) / Rate) : "";
++        return head + " · " + Speed(Rate) + left;
++    }
++
++    /// "38 MB/s · 1:35" for a small card.
++    public string Compact(DateTime nowUtc)
++    {
++        if (Stalled(nowUtc)) return "stalled";
++        if (Estimating(nowUtc)) return "estimating…";
++        return Speed(Rate) + (Total > Bytes && Rate > 0 ? " · " + Clock((Total - Bytes) / Rate) : "");
++    }
++
++    /// The end of a download, for the log: "4.8 GB in 2 min 6 s (38 MB/s on average)".
++    public static string Summary(long bytes, TimeSpan took)
++    {
++        double s = Math.Max(0.001, took.TotalSeconds);
++        return $"{Size(bytes)} in {Left(s).Replace(" left", "")} ({Speed(bytes / s)} on average)";
++    }
++}
++
++/// The free space the screens show and the "Not enough space" checks use: what iOS gives an important use (a build, a download the person asked for: iOS purges caches for it, which is what
++/// Settings counts), else the volume's plain free space (DriveInfo of Documents' volume, not "/": the system volume's figure was ~24.5 GB when Settings said >100 GB).
++public static class DiskSpace
++{
++    public static long Choose(long important, long plain) => important > 0 ? important : Math.Max(0, plain);
++
++    public static string Line(long important, long plain) =>
++        $"storage: {GameAppUi.SizeText(Choose(important, plain))} free for important use ({GameAppUi.SizeText(Math.Max(0, plain))} without purgeable space)";
++}
++
++/// The build screen's Pause / Cancel row (patch 0085): while a build runs both are shown (off when they cannot act), paused only Cancel (Resume is the main button), else none.
++public static class BuildScreenButtons
++{
++    public static (bool Row, bool Pause, bool Cancel) Shown(bool running, bool canPause, bool canCancel) =>
++        running ? (true, true, true) : canCancel ? (true, false, true) : (false, false, false);
++}
++
++/// A value kept for a while (the facts the screen reads every second that cannot change that fast: the signing identity, the entitlements, the address space): computed again only after `ttl`.
++public sealed class TtlCache<T>
++{
++    private readonly TimeSpan ttl;
++    private T value;
++    private DateTime at = DateTime.MinValue;
++    private bool has;
++
++    public TtlCache(TimeSpan ttl) => this.ttl = ttl;
++
++    public T Get(Func<T> make, DateTime nowUtc)
++    {
++        if (!has || nowUtc - at >= ttl) { value = make(); at = nowUtc; has = true; }
++        return value;
++    }
++
++    public void Invalidate() => has = false;
++}
+diff -ruN f/GameAppFieldUi.cs g/GameAppFieldUi.cs
+--- f/GameAppFieldUi.cs	1970-01-01 01:00:00
++++ g/GameAppFieldUi.cs	2026-11-21 23:40:45
+@@ -0,0 +1,91 @@
++// gameapp/GameAppFieldUi.cs: app/patches/0085 (UIKit side): the free space iOS really gives, the download meters, the last reading line of stage 3, the shared NAS session's end.
++// The decisions are GameAppField.cs (pure, run by the host harness).
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using Foundation;
++using UIKit;
++
++/// The free space for an important use (NSURLVolumeAvailableCapacityForImportantUsageKey on Documents: what iOS frees purgeable space for, the figure Settings shows), else the plain free
++/// space of Documents' volume; kept 10 s (every screen and every "Not enough space" check reads it). Any thread.
++internal static class DiskFreeNow
++{
++    private static readonly object gate = new object();
++    private static readonly TtlCache<(long Important, long Plain)> cache = new TtlCache<(long, long)>(TimeSpan.FromSeconds(10));
++
++    public static (long Important, long Plain) Both()
++    {
++        lock (gate) return cache.Get(Read, DateTime.UtcNow);
++    }
++
++    public static long Bytes() { var b = Both(); return DiskSpace.Choose(b.Important, b.Plain); }
++
++    public static void Invalidate() { lock (gate) cache.Invalidate(); }
++
++    private static (long, long) Read()
++    {
++        long important = -1, plain = 0;
++        try
++        {
++            using var url = NSUrl.FromFilename(GameAppMain.Documents);
++            if (url.TryGetResource(NSUrl.VolumeAvailableCapacityForImportantUsageKey, out NSObject value) && value is NSNumber n) important = n.Int64Value;
++        }
++        catch (Exception) { important = -1; }
++        try { plain = new DriveInfo(GameAppMain.Documents).AvailableFreeSpace; } catch (Exception) { plain = 0; }
++        return (important, plain);
++    }
++}
++
++public sealed partial class GameAppViewController
++{
++    private static long DiskFree() => DiskFreeNow.Bytes();
++
++    /// "storage: 103.2 GB free for important use (24.5 GB without purgeable space)": at the launch, at a build's start, at a download's start.
++    private static string StorageLine() { var b = DiskFreeNow.Both(); return DiskSpace.Line(b.Important, b.Plain); }
++
++    private DateTime? lastCloudListUtc;   // the last cloud listing that ended (CloudRelist)
++    private string lastReadingLine;       // stage 3's last "progress: N/M" (BuildProgress)
++    private readonly Dictionary<string, DownloadMeter> downloadMeters = new Dictionary<string, DownloadMeter>(StringComparer.OrdinalIgnoreCase);
++    private NSObject nasBackgroundObserver;
++
++    /// The text of the log as it is appended (main thread): stage 3's reading counter is kept for the bar and for iOS's progress.
++    private void NoteLogText(string text)
++    {
++        if (text == null || text.IndexOf("progress: ", StringComparison.Ordinal) < 0) return;
++        foreach (var line in text.Split('\n'))
++            if (BuildProgress.IsReadingLine(line)) lastReadingLine = line.Trim();
++    }
++
++    /// The meter's words for a game being downloaded, "" when none.
++    private string MeterLong(string name) => name != null && downloadMeters.TryGetValue(name, out var m) ? m.Long(DateTime.UtcNow) : "";
++    private string MeterCompact(string name) => name != null && downloadMeters.TryGetValue(name, out var m) ? m.Compact(DateTime.UtcNow) : "";
++
++    /// The refresh button: the cloud is listed now, unless a build or a download runs (then it says so; it is listed after it, at the next return or refresh).
++    private void RefreshCloudAsked()
++    {
++        if (CloudRelist.Should(CloudRelist.Why.Explicit, lastCloudListUtc, DateTime.UtcNow, running, downloads.Count > 0)) RefreshCloud(null);
++        else Write("cloud: not listed again now: a build or a download is running (the listing of before stays; tap refresh once it is over)");
++    }
++
++    private volatile bool systemPause;   // the pause being honoured came from iOS's expiration, not from the person
++    private volatile bool gameOnScreen;  // the game view is up (a Play's boot): the app does nothing periodic on the main thread
++    private bool refreshOwed;            // a screen refresh asked while the game was on screen: done when it ends
++
++    /// The person is back in the app: a pause iOS asked for that has not taken effect yet is withdrawn (the South Park build paused itself after its extraction: the expiration's request had
++    /// stayed pending through the extraction and was applied at the chain's start although the owner was back).
++    private void WithdrawSystemPause()
++    {
++        if (!systemPause) return;
++        systemPause = false;
++        if (!stop.WithdrawPause(out bool native)) return;
++        if (native) { try { GameStopNative.gameapp_request_stop((int) StopKind.None); } catch (Exception) { } }
++        Write("background: back in the app: the pause iOS asked for (its task expired) is withdrawn; the build goes on");
++    }
++
++    /// The shared NAS session (GameAppNas.cs, patch 0085) ends when the app goes to the background; it is made again at the next listing or cover.
++    private void WatchNasSession()
++    {
++        nasBackgroundObserver ??= NSNotificationCenter.DefaultCenter.AddObserver(UIApplication.DidEnterBackgroundNotification, _ => System.Threading.Tasks.Task.Run(Nas.CloseShared));
++    }
++}
+diff -ruN f/GameAppLibrary.cs g/GameAppLibrary.cs
+--- f/GameAppLibrary.cs	2026-11-21 23:28:40
++++ g/GameAppLibrary.cs	2026-11-21 23:39:23
+@@ -238,7 +238,7 @@
+ 
+     private static long FreeBytes()
+     {
+-        try { return new DriveInfo("/").AvailableFreeSpace; } catch (Exception) { return 0; }
++        return DiskFree();   // patch 0085: what iOS gives an important use (it was "/": the system volume, ~24.5 GB when Settings said >100 GB)
+     }
+ 
+     private void RefreshGamesPage(UiFacts facts, IReadOnlyList<string> games)
+@@ -582,7 +582,7 @@
+         NSTimer.CreateScheduledTimer(0.8, _ =>
+         {
+             Write($"launch: cloud listing starts at {launchClock.ElapsedMilliseconds} ms");
+-            RefreshCloud(null);
++            if (CloudRelist.Should(CloudRelist.Why.Launch, lastCloudListUtc, DateTime.UtcNow, running, downloads.Count > 0)) RefreshCloud(null);   // patch 0085: not while a build runs
+             FetchCloudIcons();
+             QueueResumeIfOwed();
+         });
+@@ -810,7 +810,7 @@
+ 
+     private bool KeysAreFree => PresentedViewController == null && !GameExport.IsPlayer;
+ 
+-    [Export("keyRefresh")] private void KeyRefresh() { if (KeysAreFree) RefreshCloud(null); }
++    [Export("keyRefresh")] private void KeyRefresh() { if (KeysAreFree) RefreshCloudAsked(); }
+     [Export("keyImport")] private void KeyImport() { if (KeysAreFree && !running) Import(); }
+     [Export("keyImportFromFolder")] private void KeyImportFromFolder() { if (KeysAreFree && !running) ImportFromFolder(); }   // GameAppImportUi.cs
+     [Export("keyLibrary")] private void KeyLibrary() { if (KeysAreFree) { logsBack = null; ShowTab(0); } }
+@@ -1219,6 +1219,7 @@
+     private void Append(string text)
+     {
+         if (string.IsNullOrEmpty(text)) return;
++        NoteLogText(text);   // patch 0085: stage 3's reading counter, for the bar and iOS's progress
+         // The same lines, on disk (gameapp.ui.log), bounded: a device run is diagnosed from the files it left.
+         try
+         {
+@@ -1248,7 +1249,7 @@
+         {
+             logDirty = true;
+             // The page is drawn again at most every 400 ms, on a later turn of the run loop (it was a full rebuild of up to 6,000 lines at every append, once a second during a build).
+-            if (!pages[3].Hidden) (logRedraw ??= new Coalescer(work => BeginInvokeOnMainThread(work), () => { if (!pages[3].Hidden && logDirty) RebuildLog(keepPlace: true); }, TimeSpan.FromMilliseconds(400))).Request();
++            if (!pages[3].Hidden) (logRedraw ??= new Coalescer(work => BeginInvokeOnMainThread(work), () => { if (!pages[3].Hidden && logDirty) RebuildLog(keepPlace: true); }, TimeSpan.FromMilliseconds(1000))).Request();   // patch 0085: at most once a second (a rebuild took 320-335 ms on the phone during a build: 400 ms kept the main thread busy)
+         }
+         RefreshLogTiles();
+     }
+@@ -1384,12 +1385,13 @@
+         var entry = entries.FirstOrDefault(e => e.Name == game);
+         var now = running ? DateTime.Now : lastRunEnd == default ? DateTime.Now : lastRunEnd;
+         // patch 0080 (no autorun): a build shows its five steps, not "Launch" (a build ends on Ready; Play starts the game)
+-        var steps = NoAutorun.BuildRows(GameAppUi.BuildSteps(lastStage, stepStarts, now, finished: buildFinished && !failedRun && !EndedByUser));
++        // patch 0085: a .nup's stage 1 is "Read the game" (BuildProgress.StepLine); the ring follows stage 1's unpacking and stage 3's reading too (BuildProgress.Fraction)
++        var steps = NoAutorun.BuildRows(GameAppUi.BuildSteps(BuildProgress.StepLine(lastStage), stepStarts, now, finished: buildFinished && !failedRun && !EndedByUser));
+         int at = steps.FindIndex(r => r.State == GameAppUi.StepState.Now);
+         if (at < 0) at = steps.Count - 1;
+         var names = Dumps().Select(Path.GetFileName).ToList();
+         string meta = game == null ? "" : GameAppUi.ContentLine(game, names) ?? GameFileSizeText(game);
+-        var fraction = buildFinished && !failedRun && !EndedByUser ? 1.0 : GameAppUi.ParseStage(lastStage).Fraction;
++        var fraction = buildFinished && !failedRun && !EndedByUser ? 1.0 : BuildProgress.Fraction(lastStage, lastReadingLine);
+         var primary = game != null ? GameAppUi.GameAction(game, facts) : null;
+         var window = LiveLogWindow();
+         var rows = GameAppUi.Timeline(logLines.Skip(window.From).Take(window.To - window.From), false).Where(r => r.Kind != GameAppUi.LogKind.Stage).ToList();
+@@ -1840,6 +1842,7 @@
+             BeginInvokeOnMainThread(() =>
+             {
+                 refreshing = 0;
++                lastCloudListUtc = DateTime.UtcNow;   // patch 0085 (CloudRelist)
+                 foreach (var (id, files, error) in results)
+                 {
+                     if (files != null)
+@@ -1996,6 +1999,10 @@
+         var key = files[0].Name;
+         downloads[key] = 0;
+         downloadCancels.Clear(key);   // patch 0080: Cancel while it downloads (GameAppRedesignUi.cs CancelDownload)
++        downloadMeters[key] = new DownloadMeter();   // patch 0085: its speed and time left
++        var downloadStart = DateTime.UtcNow;
++        DiskFreeNow.Invalidate();
++        Write(StorageLine());
+         Directory.CreateDirectory(folder);
+         StartDownloadTicker();
+         var nas = LoadNas();
+@@ -2026,7 +2033,12 @@
+                         if (source.Kind != CloudKind.Nas && downloadCancels.IsRequested(key)) throw new OperationCanceledException("the download was cancelled");
+                         var all = need > 0 ? need : Math.Max(1, total);
+                         var fraction = Math.Min(0.999, (done0 + sent) / (double) all);
+-                        BeginInvokeOnMainThread(() => { if (downloads.ContainsKey(key)) downloads[key] = fraction; });
++                        long got = done0 + sent, all2 = need > 0 ? need : total;
++                        BeginInvokeOnMainThread(() =>
++                        {
++                            if (downloads.ContainsKey(key)) downloads[key] = fraction;
++                            if (downloadMeters.TryGetValue(key, out var meter)) meter.Update(got, all2, DateTime.UtcNow);   // the meter samples at most twice a second (DownloadMeter)
++                        });
+                     };
+                     string placedHow;
+                     if (source.Kind == CloudKind.Nas)
+@@ -2052,6 +2064,9 @@
+                 cancelled = DownloadEnd.Cancelled(cancelled, downloadCancels, key);
+                 if (cancelled) error = null;
+                 downloads.Remove(key);
++                downloadMeters.Remove(key);
++                if (error == null && !cancelled) Write($"download: {key}: {DownloadMeter.Summary(need > 0 ? need : before, DateTime.UtcNow - downloadStart)}");   // patch 0085: size, time, average speed
++                DiskFreeNow.Invalidate();
+                 UIApplication.SharedApplication.IdleTimerDisabled = false;
+                 UIApplication.SharedApplication.EndBackgroundTask(task);
+                 Write(cancelled ? $"download cancelled: {key}" + (landed.Count > 0 ? $" ({string.Join(", ", landed)} had landed and stay)" : " (nothing was kept)")
+@@ -2217,6 +2232,7 @@
+     public Action OnLog, OnPrimary, OnNotify, OnPause, OnCancel;
+     private readonly AmbientView ambient = new AmbientView();
+     private readonly UIImageView icon = new UIImageView { ContentMode = UIViewContentMode.ScaleAspectFill, ClipsToBounds = true };
++    private readonly UILabel iconInitials = new UILabel { TextAlignment = UITextAlignment.Center, TextColor = Theme.Text, Font = Theme.Font(15, UIFontWeight.Bold) };   // patch 0085
+     private readonly UILabel name = new UILabel(), meta = new UILabel();
+     private readonly UILabel stepOf = new UILabel(), percent = new UILabel(), stepName = new UILabel(), stepDetail = new UILabel();
+     private readonly CAShapeLayer ringBack = new CAShapeLayer(), ring = new CAShapeLayer();
+@@ -2247,6 +2263,9 @@
+         var close = Theme.Round("chevron.down", "Back to the library");
+         close.TouchUpInside += (_, __) => DismissViewController(true, null);
+         icon.Layer.CornerRadius = 10;
++        iconInitials.TranslatesAutoresizingMaskIntoConstraints = false;
++        icon.AddSubview(iconInitials);
++        NSLayoutConstraint.ActivateConstraints(new[] { iconInitials.CenterXAnchor.ConstraintEqualTo(icon.CenterXAnchor), iconInitials.CenterYAnchor.ConstraintEqualTo(icon.CenterYAnchor) });
+         icon.TranslatesAutoresizingMaskIntoConstraints = false;
+         icon.WidthAnchor.ConstraintEqualTo(38).Active = true;
+         icon.HeightAnchor.ConstraintEqualTo(38).Active = true;
+@@ -2318,10 +2337,10 @@
+         });
+         liveButton.TouchUpInside += (_, __) => OnLog?.Invoke();
+ 
+-        notify = Theme.Pill("Notify me", "bell", false, 56);
++        notify = Theme.Pill("Notify me", "bell", false, 52);
+         notify.AccessibilityIdentifier = "build-notify";
+         notify.TouchUpInside += (_, __) => OnNotify?.Invoke();
+-        primary = Theme.Pill("Play", "play.fill", true, 56);
++        primary = Theme.Pill("Play", "play.fill", true, 52);
+         primary.AccessibilityIdentifier = "build-primary";
+         primary.TouchUpInside += (_, __) => OnPrimary?.Invoke();
+         var buttons = new UIStackView(new UIView[] { notify, primary }) { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = 10 };
+@@ -2332,14 +2351,16 @@
+         // side in a wide one (ViewDidLayoutSubviews). The two stacks are one column with the same 18 pt gaps until they are separated.
+         var ringStack = Theme.Column(18, ringRow, chipsRow);
+         // Pause and Cancel of the build (GameAppStopUi.cs), under the live log
+-        pauseButton = Theme.Pill("Pause", "pause.fill", false, 48);
++        pauseButton = Theme.Pill("Pause", "pause.fill", false, 52);
+         pauseButton.AccessibilityIdentifier = "build-screen-pause";
+         pauseButton.TouchUpInside += (_, __) => OnPause?.Invoke();
+-        cancelButton = Theme.Pill("Cancel", "xmark", false, 48);
++        cancelButton = Theme.Pill("Cancel", "xmark", false, 52);
+         cancelButton.AccessibilityIdentifier = "build-screen-cancel";
+         cancelButton.TouchUpInside += (_, __) => OnCancel?.Invoke();
+         stopRow = new UIStackView(new UIView[] { pauseButton, cancelButton }) { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = 10, Hidden = true };
+-        var infoStack = Theme.Column(18, cards, liveButton, stopRow);
++        // patch 0085 (the owner: Pause and Cancel were half under the bottom row, in another style, and sometimes gone): the four actions are ONE fixed bar at the bottom, two rows of the
++        // same 52 pt pills (#25252b with a hairline; the accent for the primary only), never inside the scroll, so never under or over each other
++        var infoStack = Theme.Column(18, cards, liveButton);
+         body = new UIStackView(new UIView[] { ringStack, infoStack }) { Axis = UILayoutConstraintAxis.Vertical, Spacing = 18 };
+         var column = Theme.Column(18, top, body);
+         var scroll = new UIScrollView { AlwaysBounceVertical = true, ShowsVerticalScrollIndicator = false };
+@@ -2348,14 +2369,15 @@
+         buttons.TranslatesAutoresizingMaskIntoConstraints = false;
+         scroll.AddSubview(column);
+         View.AddSubview(scroll);
+-        View.AddSubview(buttons);
++        var bottomBar = new UIStackView(new UIView[] { stopRow, buttons }) { Axis = UILayoutConstraintAxis.Vertical, Spacing = 10, TranslatesAutoresizingMaskIntoConstraints = false };
++        View.AddSubview(bottomBar);
+         var g = View.SafeAreaLayoutGuide;
+         NSLayoutConstraint.ActivateConstraints(new[]
+         {
+             scroll.TopAnchor.ConstraintEqualTo(g.TopAnchor), scroll.LeadingAnchor.ConstraintEqualTo(g.LeadingAnchor),
+-            scroll.TrailingAnchor.ConstraintEqualTo(g.TrailingAnchor), scroll.BottomAnchor.ConstraintEqualTo(buttons.TopAnchor, -10),
+-            buttons.CenterXAnchor.ConstraintEqualTo(g.CenterXAnchor), buttons.BottomAnchor.ConstraintEqualTo(g.BottomAnchor, -8),
+-            buttons.WidthAnchor.ConstraintLessThanOrEqualTo(560), buttonsWidth,
++            scroll.TrailingAnchor.ConstraintEqualTo(g.TrailingAnchor), scroll.BottomAnchor.ConstraintEqualTo(bottomBar.TopAnchor, -10),
++            bottomBar.CenterXAnchor.ConstraintEqualTo(g.CenterXAnchor), bottomBar.BottomAnchor.ConstraintEqualTo(g.BottomAnchor, -8),
++            bottomBar.WidthAnchor.ConstraintLessThanOrEqualTo(560), buttonsWidth,
+         });
+         columnMax = Theme.PinColumn(scroll, column, 8, 12, 18, 560);
+         if (last != null) Apply(last);
+@@ -2429,7 +2451,8 @@
+     {
+         ambient.SetTint(m.Tint, true);
+         icon.Image = m.Icon;
+-        icon.BackgroundColor = m.Icon == null ? Theme.ColorFor(m.Name) : UIColor.Clear;
++        icon.BackgroundColor = m.Icon == null ? Look.Raised : UIColor.Clear;   // patch 0085: the cover, or the neutral #25252b with the initials (it was the name's colour: a blue square)
++        iconInitials.Text = m.Icon == null ? Theme.Initials(m.Name) : "";
+         name.Text = m.Name;
+         meta.Text = m.Meta;
+         var step = m.Steps[Math.Max(0, Math.Min(m.Current, m.Steps.Count - 1))];
+@@ -2475,10 +2498,13 @@
+         primary.Configuration = pc;
+         primary.Enabled = m.PrimaryEnabled;
+         // Pause (while it runs), Cancel (while it runs or is paused)
+-        pauseButton.Hidden = !m.CanPause;
+-        cancelButton.Hidden = !m.CanCancel;
++        // patch 0085: while a build runs Pause and Cancel are ALWAYS there (off, not gone, while they cannot act: a stop being honoured, the boot of a Play); paused: Cancel beside Resume
++        var stopShown = BuildScreenButtons.Shown(m.Running, m.CanPause, m.CanCancel);
++        stopRow.Hidden = !stopShown.Row;
++        pauseButton.Hidden = !stopShown.Pause;
++        cancelButton.Hidden = !stopShown.Cancel;
+         pauseButton.Enabled = m.CanPause;
+-        stopRow.Hidden = !m.CanPause && !m.CanCancel;
++        cancelButton.Enabled = m.CanCancel;
+         pc = primary.Configuration;
+         pc.Image = m.Running || m.Failed || m.Stopped != null && m.Stopped != "paused" ? null : UIImage.GetSystemImage("play.fill");
+         primary.Configuration = pc;
+diff -ruN f/GameAppMain.cs g/GameAppMain.cs
+--- f/GameAppMain.cs	2026-11-21 23:19:56
++++ g/GameAppMain.cs	2026-11-21 23:40:45
+@@ -167,7 +167,16 @@
+ 
+     /// Extended Virtual Addressing in this app's own signature (1/0), and the free address space now in GiB; -1 / -1
+     /// when the shim cannot be called.
+-    internal static (int Extended, double FreeGiB) AddressSpaceValue()
++    // patch 0085 (the owner's lag during a build): GatherFacts ran these at every refresh and every second on the build screen (~100 ms a call on the phone, "launch-profile: GatherFacts
++    // 95..116"): the entitlements of this app's own signature cannot change while it runs, the identity changes only by an import (IdentityStore invalidates it), the address space is read
++    // again after 10 s.
++    private static readonly TtlCache<(int, double)> addressCache = new TtlCache<(int, double)>(TimeSpan.FromSeconds(10));
++    private static readonly TtlCache<int> increasedCache = new TtlCache<int>(TimeSpan.FromDays(1)), getTaskAllowCache = new TtlCache<int>(TimeSpan.FromDays(1));
++    private static readonly TtlCache<(int, long)> identityCache = new TtlCache<(int, long)>(TimeSpan.FromSeconds(30));
++
++    internal static (int Extended, double FreeGiB) AddressSpaceValue() => addressCache.Get(AddressSpaceNow, DateTime.UtcNow);
++
++    private static (int Extended, double FreeGiB) AddressSpaceNow()
+     {
+         try
+         {
+@@ -178,7 +187,9 @@
+     }
+ 
+     /// The increased-memory-limit entitlement in this app's own signature: 1/0, -1 unreadable or no shim.
+-    internal static int IncreasedMemoryValue()
++    internal static int IncreasedMemoryValue() => increasedCache.Get(IncreasedMemoryNow, DateTime.UtcNow);
++
++    private static int IncreasedMemoryNow()
+     {
+         try { return gameapp_increased_memory(); }
+         catch (Exception) { return -1; }
+@@ -192,7 +203,7 @@
+         try
+         {
+             if (File.Exists(Path.Combine(Documents, "gameapp.load-blocked"))) return 0;
+-            int g = gameapp_get_task_allow();
++            int g = getTaskAllowCache.Get(() => gameapp_get_task_allow(), DateTime.UtcNow);   // patch 0085: the signature's entitlement, read once
+             return g == 1 ? 1 : g == 0 ? 0 : -1;
+         }
+         catch (Exception) { return -1; }
+@@ -206,7 +217,9 @@
+ 
+     /// The signing identity as the shim reports it: 1 = a .p12 is held (and its size), 0 = none, anything else =
+     /// unreadable. -1 when the shim could not be called at all.
+-    internal static (int Holding, long P12Bytes) IdentityState()
++    internal static (int Holding, long P12Bytes) IdentityState() => identityCache.Get(IdentityStateNow, DateTime.UtcNow);
++
++    private static (int Holding, long P12Bytes) IdentityStateNow()
+     {
+         try
+         {
+@@ -246,15 +259,17 @@
+     {
+         try { return gameapp_identity_store_bytes(p12, p12.LongLength, passphrase ?? string.Empty); }
+         catch (Exception error) { return -999 - error.HResult; }
++        finally { identityCache.Invalidate(); }   // patch 0085: the cached state is read again
+     }
+ 
+     internal static string FreeSpace()
+     {
+         try
+         {
+-            var drive = new DriveInfo("/");
++            // patch 0085: the free space iOS gives an important use (Settings' figure), on Documents' volume ("/" is the system volume)
++            var drive = new DriveInfo(Documents);
+             return string.Format("{0:F1} GB free of {1:F0} GB",
+-                drive.AvailableFreeSpace / (1024.0 * 1024 * 1024), drive.TotalSize / (1024.0 * 1024 * 1024));
++                DiskFreeNow.Bytes() / (1024.0 * 1024 * 1024), drive.TotalSize / (1024.0 * 1024 * 1024));
+         }
+         catch (Exception error) { return "unknown (" + error.GetType().Name + ")"; }
+     }
+@@ -824,6 +839,8 @@
+     {
+         if (!running || gameWindow == null || gameWindowShown || !GameAppUi.IsBootStage(lastStage)) return;
+         gameWindowShown = true;
++        gameOnScreen = true;   // patch 0085
++        Write("game on screen: app timers and cloud work paused");
+         Write(GameAppAudio.Configure());   // before the guest opens its audio output (see GameAppAudio.cs: the 1024-frame default crackles)
+         UIViewController top = this;
+         while (top.PresentedViewController != null) top = top.PresentedViewController;
+@@ -839,6 +856,8 @@
+     {
+         if (gameWindow == null) return;
+         if (gameWindowShown) gameWindow.DismissViewController(false, null);
++        gameOnScreen = false;   // patch 0085: the app's own work resumes
++        if (refreshOwed) { refreshOwed = false; RefreshScreen(); }
+         UIApplication.SharedApplication.IdleTimerDisabled = false;
+         gameWindow = null;
+         gameWindowShown = false;
+@@ -976,6 +995,7 @@
+         if (GameAppDiag.TakePrevious() is string previousRun) Write(previousRun);
+         Write($"memory ceiling at launch: available {GameAppMain.AvailableMiB()} MiB (os_proc_available_memory — the number jetsam enforces; it rises only if the increased-memory-limit entitlement is applied)");
+         Write($"free space: {GameAppMain.FreeSpace()} — Documents: {GameAppMain.Documents}");
++        Write(StorageLine());   // patch 0085: what iOS gives an important use (Settings' figure) and the plain free space
+         Write(GameAppMain.IdentityLine());
+         var argsPath = Path.Combine(GameAppMain.Documents, "gameapp.args");
+         bool hadArgs = File.Exists(argsPath);
+@@ -1559,7 +1579,7 @@
+         var docs = GameAppMain.Documents;
+         // nothing is measured while a delete runs (the folder is being emptied under the walk); each walk's time goes to the log as a launch-profile line when it is long
+         var made = new FolderSizes(FolderWalk.Bytes, work => BeginInvokeOnMainThread(work), () => running, () => DateTime.UtcNow, RefreshStorageViews,
+-                                   () => deletes.Busy, (key, ms, bytes) => BeginInvokeOnMainThread(() => NoteTime("storage/" + key, ms)));
++                                   () => deletes.Busy || running, (key, ms, bytes) => BeginInvokeOnMainThread(() => NoteTime("storage/" + key, ms)));
+         made.Track(FolderSizes.Framework, Path.Combine(docs, "DmGameProbe.framework"), false);
+         made.Track(FolderSizes.Extract, Path.Combine(docs, "extract"), true);
+         made.Track(FolderSizes.Exports, Path.Combine(docs, "Exports"), false);
+@@ -1857,8 +1877,11 @@
+     {
+         BeginInvokeOnMainThread(() =>
+         {
++            WithdrawSystemPause();   // patch 0085: only the person's own Pause pauses
+             RefreshScreen();
+-            RefreshCloud(null);
++            // patch 0085: the cloud was listed again (an SSH connection to the NAS) at every return to the app, during a build too: now only when the last listing is 15 minutes old, and
++            // never while a build or a download runs (CloudRelist); the refresh button lists at once
++            if (CloudRelist.Should(CloudRelist.Why.Foreground, lastCloudListUtc, DateTime.UtcNow, running, downloads.Count > 0)) RefreshCloud(null);
+             sizes.Request();
+         });
+     }
+@@ -1866,7 +1889,11 @@
+     /// Redraw the whole screen from the facts on disk: the banner, the carousel and list, the selected game, the Keys rows. Called at
+     /// launch (this one, synchronously), and through RefreshScreen when the app comes back to the foreground, when a run starts and ends, after an import or a
+     /// certificate, and when a game is selected.
+-    private void RefreshScreenNow() => Timed("RefreshScreen", RefreshScreenBody);
++    private void RefreshScreenNow()
++    {
++        if (gameOnScreen && running) { refreshOwed = true; return; }   // patch 0085: the game is on screen: drawn again when it ends
++        Timed("RefreshScreen", RefreshScreenBody);
++    }
+ 
+     private void RefreshScreenBody()
+     {
+@@ -2675,6 +2702,9 @@
+         if (runGame != null) selected = runGame;
+         launchingGame = bootOnly ? runGame ?? name : null;   // patch 0080: a Play is starting this game (the sheet's launch line, the library's "Starting…")
+         if (bootOnly) lastPlayGame = launchingGame;   // patch 0083
++        lastReadingLine = null;   // patch 0085: stage 3's reading counter of THIS run
++        lastStage = null;         // patch 0085: never the previous run's line (South Park's build screen showed Zelda's "8938/42848 shaders")
++        DiskFreeNow.Invalidate();
+         startedAt = DateTime.Now;
+         StopWarm("a run starts");   // GameAppWarm.cs: the phone is the build's or the game's now
+         PrepareGameWindow();
+@@ -2700,6 +2730,7 @@
+         Write($"\n=== {chosen} ({(bootOnly ? "one process: dlopen → nnMain, on the framework this app already built and signed" : "one process: " + (skipExtract ? "chain on existing files" : "extract") + " → rewrite → assemble → zsign → dlopen → nnMain")})");
+         Write($"output: {output}");
+         Write($"free space before: {GameAppMain.FreeSpace()}");
++        Write(StorageLine());   // patch 0085
+         Write($"memory before extraction: {GameAppMain.MemLine()}");
+ 
+         // The config the chain reads. The file is rebuilt every run, so a stale one can never be handed over.
+@@ -2922,6 +2953,7 @@
+         ticker = new Timer(_ => BeginInvokeOnMainThread(() =>
+         {
+             if (!running) return;
++            if (gameOnScreen) return;   // patch 0085: the game is on screen: nothing periodic on the main thread (the build screen, the run line, the sizes)
+             // A moving clock on the run card and the build screen cannot be mistaken for a frozen run
+             // (docs/PROFILE-DERIVED.md).
+             RefreshBuildScreen();
+@@ -2951,6 +2983,7 @@
+     /// go to files beside Documents, not to this process' standard output.
+     private void TailLogs()
+     {
++        if (gameOnScreen && running) return;   // patch 0085: the game is on screen: the logs are read again (from where they were) once it ends
+         chainOffset = Tail(Path.Combine(GameAppMain.Documents, "gameapp.chain.log"), chainOffset);
+         stagesOffset = Tail(Path.Combine(GameAppMain.Documents, "pipeline.stages.log"), stagesOffset);
+         // The chain overwrites Documents/gameapp.stage on every step: append the new one to the log and keep the
+diff -ruN f/GameAppNas.cs g/GameAppNas.cs
+--- f/GameAppNas.cs	2026-11-21 23:26:23
++++ g/GameAppNas.cs	2026-11-21 23:34:17
+@@ -325,16 +325,54 @@
+     /// the cap, the clashes and the subfolders that could not be listed.
+     public static List<CloudFile> List(NasConfig cfg, AuthenticationMethod auth, string folder, string sourceId, Action<string> log)
+     {
+-        using var client = Connect(cfg, auth, log, out _);
+         var dir = string.IsNullOrWhiteSpace(folder) ? "." : folder.TrimEnd('/');
+         if (dir.Length == 0) dir = "/";   // "/" trimmed is the root, not the login folder
+-        var result = NasScan.Scan(sourceId, dir, path => client.ListDirectory(path)
+-            .Select(f => new NasEntry(f.Name, f.FullName, f.IsDirectory, f.IsSymbolicLink, f.Length)).ToList());
+-        client.Disconnect();
++        // patch 0085: the SHARED session (one SSH connection while the app is active: the listing and the covers reuse it; it closes when the app goes to the background)
++        var result = WithShared(cfg, auth, log, client => NasScan.Scan(sourceId, dir, path => client.ListDirectory(path)
++            .Select(f => new NasEntry(f.Name, f.FullName, f.IsDirectory, f.IsSymbolicLink, f.Length)).ToList()));
+         foreach (var line in NasScan.Lines(result, dir)) log?.Invoke(line);
+         return result.Files;
+     }
+ 
++    // ---- patch 0085: one SSH session while the app is active ------------------------------------------------------------
++    private static readonly object sharedGate = new object();
++    private static SftpClient shared;
++    private static string sharedKey;
++
++    /// `work` on the shared connection (made, or made again when it dropped or the NAS changed), one caller at a time. A connection error drops it (the next call connects again).
++    public static T WithShared<T>(NasConfig cfg, AuthenticationMethod auth, Action<string> log, Func<SftpClient, T> work)
++    {
++        lock (sharedGate)
++        {
++            var key = cfg.Host + "|" + cfg.Port + "|" + cfg.User;
++            if (shared == null || !shared.IsConnected || sharedKey != key)
++            {
++                try { shared?.Dispose(); } catch (Exception) { }
++                shared = null;
++                shared = Connect(cfg, auth, log, out _);
++                sharedKey = key;
++            }
++            try { return work(shared); }
++            catch (Exception e) when (e is Renci.SshNet.Common.SshConnectionException || e is System.Net.Sockets.SocketException || e is ObjectDisposedException || !shared.IsConnected)
++            {
++                try { shared.Dispose(); } catch (Exception) { }
++                shared = null;
++                throw;
++            }
++        }
++    }
++
++    /// The app went to the background (or the NAS settings changed): the shared connection ends.
++    public static void CloseShared()
++    {
++        lock (sharedGate)
++        {
++            try { if (shared != null && shared.IsConnected) shared.Disconnect(); } catch (Exception) { }
++            try { shared?.Dispose(); } catch (Exception) { }
++            shared = null;
++        }
++    }
++
+     /// Downloads `remote` to `localPath` (as <localPath>.part, renamed at the end: a cut connection never leaves a file
+     /// that looks whole). `progress` gets the bytes so far.
+     public static void Download(NasConfig cfg, AuthenticationMethod auth, string remote, string localPath, Action<long, long> progress, Action<string> log, Func<bool> cancelled = null)
+@@ -360,12 +398,8 @@
+ 
+     /// Patch 0084: ONE connection for several remote reads (the covers of a listing: it was one SSH connection per cover). `work` gets an opener: a seekable stream over a remote path (only
+     /// the bytes read cross the network) and its size. The connection ends when `work` returns.
+-    public static void WithSession(NasConfig cfg, AuthenticationMethod auth, Action<Func<string, (Stream Stream, long Size)>> work)
+-    {
+-        using var client = Connect(cfg, auth, null, out _);
+-        try { work(remote => (client.OpenRead(remote), client.GetAttributes(remote).Size)); }
+-        finally { client.Disconnect(); }
+-    }
++    public static void WithSession(NasConfig cfg, AuthenticationMethod auth, Action<Func<string, (Stream Stream, long Size)>> work) =>
++        WithShared<int>(cfg, auth, null, client => { work(remote => (client.OpenRead(remote), client.GetAttributes(remote).Size)); return 0; });   // patch 0085: the shared session
+ 
+     /// Runs `read` on a seekable stream over `remote` (only the bytes it reads cross the network), then disconnects.
+     public static T WithReadStream<T>(NasConfig cfg, AuthenticationMethod auth, string remote, Func<Stream, T> read)
+diff -ruN f/GameAppPadUi.cs g/GameAppPadUi.cs
+--- f/GameAppPadUi.cs	2026-11-21 23:19:56
++++ g/GameAppPadUi.cs	2026-11-21 23:38:13
+@@ -218,7 +218,7 @@
+         var accent = Look.AccentOf(e.Icon, grey);
+         foreach (var b in LibraryActions.For(state, canRun))
+         {
+-            var button = Look.Capsule(b.Label, b.Symbol, b.Primary, accent, 52, b.Primary ? 16 : 15);
++            var button = Look.Capsule(LibraryActions.Label(b, facts.Running), b.Symbol, b.Primary, accent, 52, b.Primary ? 16 : 15);
+             button.AccessibilityIdentifier = "hero-" + b.Id;
+             button.Enabled = LibraryActions.Enabled(b.Act, facts.Running);
+             var act = b.Act;
+diff -ruN f/GameAppQueueUi.cs g/GameAppQueueUi.cs
+--- f/GameAppQueueUi.cs	2026-11-21 23:19:56
++++ g/GameAppQueueUi.cs	2026-11-21 23:37:59
+@@ -61,7 +61,19 @@
+     private void AddToBuildQueue(string game)
+     {
+         if (!GameFileHasContent(game)) return;   // GameAppSourceUi.cs: the file was removed after the build (patch 0068)
+-        if (!BuildQueue.Add(buildQueue, game)) { Write($"build queue: {GameAppUi.DisplayName(game)} is already in it"); return; }
++        // patch 0085 (the owner: adding to the queue during a build did nothing): the game being built and a game already queued say so; any other is added, and during a build the queue is
++        // wanted so that it starts after the current build (QueueBuildEnded: the next one)
++        var answer = QueueRule.Ask(game, running && launchingGame == null ? stop.Game ?? lastRunGame : null, buildQueue.Items.Where(i => i.State == BuildQueue.Queued).Select(i => i.Game));
++        if (answer != QueueRule.Answer.Add || !BuildQueue.Add(buildQueue, game))
++        {
++            var words = QueueRule.Words(answer == QueueRule.Answer.Add ? QueueRule.Answer.AlreadyQueued : answer, GameAppUi.DisplayName(game));
++            Write("build queue: " + words);
++            var said = UIAlertController.Create("Build queue", words, UIAlertControllerStyle.Alert);
++            said.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++            PresentWhenFree(said);
++            return;
++        }
++        if (running) { queueWanted = true; buildQueue.AutoStart = true; Write("build queue: " + QueueRule.Words(QueueRule.Answer.Add, GameAppUi.DisplayName(game))); }
+         SaveBuildQueue();
+         Write($"build queue: {GameAppUi.DisplayName(game)} added ({buildQueue.Queued} waiting). The Build tab starts it.");
+         var a = UIAlertController.Create("Added to the build queue",
+diff -ruN f/GameAppRedesign.cs g/GameAppRedesign.cs
+--- f/GameAppRedesign.cs	2026-11-21 23:28:31
++++ g/GameAppRedesign.cs	2026-11-21 23:37:59
+@@ -54,7 +54,10 @@
+     public static bool ShowsNote(LibState state, bool canRunHere) => state == LibState.Built && !canRunHere;
+ 
+     /// While a build or a boot has the phone (UiFacts.Running) every button is off, except the two that act on what is going on.
+-    public static bool Enabled(LibAct act, bool busy) => !busy || act == LibAct.Watch || act == LibAct.CancelDownload;
++    public static bool Enabled(LibAct act, bool busy) => !busy || act == LibAct.Watch || act == LibAct.CancelDownload || act == LibAct.Build;   // Build: "Add to queue" while busy (patch 0085)
++
++    /// Patch 0085: while another game builds, a game's Build is "Add to queue" (it waits, and starts after the current build).
++    public static string Label(LibButton b, bool busy) => busy && b.Act == LibAct.Build ? "Add to queue" : b.Label;
+ }
+ 
+ /// The words of a game's state: the cover's pill, the grid card's line, the carousel's meta line.
+diff -ruN f/GameAppRedesignUi.cs g/GameAppRedesignUi.cs
+--- f/GameAppRedesignUi.cs	2026-11-21 23:28:31
++++ g/GameAppRedesignUi.cs	2026-11-21 23:39:52
+@@ -119,23 +119,38 @@
+         return b;
+     }
+ 
+-    /// A pill on a cover: "Ready", "Not built", "In iCloud".
++    /// A state badge on a cover ("Building 2 %", "Ready", "Not built", "In iCloud"). Patch 0085 (the owner: unreadable on a busy cover): a solid dark pill (black 62 %) with a hairline, ink
++    /// text 13 pt semibold, the state's colour only in a small leading dot; 6 / 10 pt padding.
+     public static UIView Pill(string text, LibraryStatus.Tone tone, bool onCloud)
+     {
+-        var ink = onCloud ? Theme.Hex(0xDFE6FB) : ToneColor(tone);
+-        var label = Theme.Label(text, Theme.Font(11, UIFontWeight.Medium), ink);
+-        label.TranslatesAutoresizingMaskIntoConstraints = false;
+-        var pill = new UIView { BackgroundColor = onCloud ? UIColor.FromRGBA(14 / 255f, 14 / 255f, 18 / 255f, 0.72f) : ink.ColorWithAlpha(0.18f), UserInteractionEnabled = false };
+-        pill.Layer.CornerRadius = 11;
+-        pill.AddSubview(label);
++        var label = Theme.Label(text, Theme.Font(13, UIFontWeight.Semibold), Theme.Text);
++        label.LineBreakMode = UILineBreakMode.TailTruncation;
++        var dot = new UIView { BackgroundColor = onCloud ? CloudInk : ToneColor(tone), UserInteractionEnabled = false, TranslatesAutoresizingMaskIntoConstraints = false };
++        dot.Layer.CornerRadius = 3.5f;
++        var row = Theme.Row(6, dot, label);
++        row.TranslatesAutoresizingMaskIntoConstraints = false;
++        var pill = new UIView { BackgroundColor = UIColor.FromWhiteAlpha(0f, 0.62f), UserInteractionEnabled = false, IsAccessibilityElement = false };
++        pill.Layer.CornerRadius = 14;
++        pill.Layer.BorderWidth = 1;
++        pill.Layer.BorderColor = UIColor.FromWhiteAlpha(1f, 0.14f).CGColor;
++        pill.AddSubview(row);
+         NSLayoutConstraint.ActivateConstraints(new[]
+         {
+-            label.TopAnchor.ConstraintEqualTo(pill.TopAnchor, 4), label.BottomAnchor.ConstraintEqualTo(pill.BottomAnchor, -4),
+-            label.LeadingAnchor.ConstraintEqualTo(pill.LeadingAnchor, 9), label.TrailingAnchor.ConstraintEqualTo(pill.TrailingAnchor, -9),
++            dot.WidthAnchor.ConstraintEqualTo(7), dot.HeightAnchor.ConstraintEqualTo(7),
++            row.TopAnchor.ConstraintEqualTo(pill.TopAnchor, 6), row.BottomAnchor.ConstraintEqualTo(pill.BottomAnchor, -6),
++            row.LeadingAnchor.ConstraintEqualTo(pill.LeadingAnchor, 10), row.TrailingAnchor.ConstraintEqualTo(pill.TrailingAnchor, -10),
+         });
+         return pill;
+     }
+ 
++    /// A progress bar ON a cover (patch 0085): a dark track (black 55 %), the accent's fill, 4 pt, rounded; over the cover's bottom scrim (CoverScrim) so it reads on a light picture.
++    public static UIProgressView CoverBar(float value)
++    {
++        var bar = Bar(value, Theme.Accent, 4);
++        bar.TrackTintColor = UIColor.FromWhiteAlpha(0f, 0.55f);
++        return bar;
++    }
++
+     /// The cloud mark at a cover's top right: "In the cloud, not on this iPhone".
+     public static UIView CloudBadge(nfloat size)
+     {
+@@ -239,7 +254,8 @@
+     private readonly UIView greyGround = new UIView();
+     private readonly CAGradientLayer greyLayer = new CAGradientLayer();
+     private UIView pill, badge;
+-    private readonly UIProgressView bar = Look.Bar(0, Theme.Text, 6);
++    private readonly UIProgressView bar = Look.CoverBar(0);   // patch 0085: accent on a dark track
++    private readonly CAGradientLayer scrim = new CAGradientLayer();
+     public Action Activated;
+ 
+     public FlowCell()
+@@ -268,11 +284,14 @@
+         AddSubview(greyGround);
+         AddSubview(art);
+         AddSubview(empty);
++        scrim.Colors = new[] { UIColor.FromWhiteAlpha(0f, 0f).CGColor, UIColor.FromWhiteAlpha(0f, 0.45f).CGColor };   // patch 0085: the bottom scrim under the bar
++        scrim.Hidden = true;
++        Layer.AddSublayer(scrim);
+         bar.TranslatesAutoresizingMaskIntoConstraints = false;
+         AddSubview(bar);
+         NSLayoutConstraint.ActivateConstraints(new[]
+         {
+-            bar.LeadingAnchor.ConstraintEqualTo(LeadingAnchor, 18), bar.TrailingAnchor.ConstraintEqualTo(TrailingAnchor, -18), bar.BottomAnchor.ConstraintEqualTo(BottomAnchor, -18),
++            bar.LeadingAnchor.ConstraintEqualTo(LeadingAnchor, 18), bar.TrailingAnchor.ConstraintEqualTo(TrailingAnchor, -18), bar.BottomAnchor.ConstraintEqualTo(BottomAnchor, -16),
+         });
+     }
+ 
+@@ -290,6 +309,7 @@
+         AddSubview(pill);
+         pill.TopAnchor.ConstraintEqualTo(TopAnchor, 14).Active = true;
+         pill.LeadingAnchor.ConstraintEqualTo(LeadingAnchor, 14).Active = true;
++        pill.TrailingAnchor.ConstraintLessThanOrEqualTo(TrailingAnchor, item.Cloud ? -56 : -14).Active = true;   // inside the rounded corner, clear of the cloud mark
+         badge?.RemoveFromSuperview();
+         badge = null;
+         if (item.Cloud)
+@@ -299,7 +319,7 @@
+             badge.TopAnchor.ConstraintEqualTo(TopAnchor, 12).Active = true;
+             badge.TrailingAnchor.ConstraintEqualTo(TrailingAnchor, -12).Active = true;
+         }
+-        bar.Hidden = item.Fraction == null;
++        bar.Hidden = scrim.Hidden = item.Fraction == null;
+         bar.Progress = (float) (item.Fraction ?? 0);
+         AccessibilityLabel = item.Display + ", " + item.Status;
+     }
+@@ -309,6 +329,7 @@
+         base.LayoutSubviews();
+         art.Frame = empty.Frame = greyGround.Frame = Bounds;
+         greyLayer.Frame = Bounds;
++        scrim.Frame = new CGRect(0, Bounds.Height * 0.6f, Bounds.Width, Bounds.Height * 0.4f);
+         dash.Frame = Bounds;
+         dash.Path = UIBezierPath.FromRoundedRect(Bounds.Inset(0.5f, 0.5f), 38).CGPath;
+     }
+@@ -629,7 +650,9 @@
+     {
+         bool update = state == LibState.Built && GameAppUi.ContentChangedSinceBuild(e.Name, libNames ?? Dumps().Select(Path.GetFileName).ToList(), facts);
+         var paused = state == LibState.Paused ? PausedOf(e.Name, facts) : null;
+-        return LibraryStatus.Of(state, fraction, CloudWords(e.Cloud).Where, update, paused == null ? null : StopText.PausedChip(paused.StageLine));
++        var said = LibraryStatus.Of(state, fraction, CloudWords(e.Cloud).Where, update, paused == null ? null : StopText.PausedChip(paused.StageLine));
++        if (state == LibState.Downloading && MeterCompact(e.Name) is { Length: > 0 } speed) said = (said.Text + " · " + speed, said.Tone);   // patch 0085: "Downloading 37 % · 38 MB/s · 1:35"
++        return said;
+     }
+ 
+     /// A library button: the existing action of each (the Cloud page's download, the build, Play, the export...).
+@@ -642,6 +665,7 @@
+             case LibAct.CancelDownload: CancelDownload(e.Name); break;
+             case LibAct.Watch: ShowBuildScreen(); break;
+             case LibAct.Resume: ResumePaused(e.Name); break;
++            case LibAct.Build when running && launchingGame == null: AddToBuildQueue(e.Name); break;   // patch 0085: "Add to queue" while another game builds
+             case LibAct.Build: case LibAct.Play: selected = e.Name; PrimaryTapped(); break;
+             case LibAct.ExportIpa: selected = e.Name; ConfirmExport(e.Name); break;
+             case LibAct.Update: DoUpdate(e.Name); break;   // patch 0082: the Build tab's "Update" (an update or DLC added since the build)
+@@ -708,6 +732,7 @@
+         var title = Theme.Label("Library", Theme.Font(28, UIFontWeight.Bold), Theme.Text);
+         title.AccessibilityTraits = UIAccessibilityTrait.Header;
+         shelfSubtitle = Theme.Label("", Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
++        WatchNasSession();   // GameAppFieldUi.cs (patch 0085): the shared NAS session ends in the background
+         libToggle = Look.RoundIcon("square.grid.2x2", "Grid or carousel", 44);
+         libToggle.AccessibilityIdentifier = "view-toggle";
+         libToggle.TouchUpInside += (_, __) =>
+@@ -921,6 +946,7 @@
+         long size = e.Cloud != null && (state == LibState.CloudOnly || state == LibState.Downloading) ? e.Cloud.Size : 0;
+         var sizeText = size > 0 ? GameAppUi.SizeText(size) : ShelfMeta(e);
+         flowMeta.Text = LibraryStatus.Meta(state, e.Name, sizeText, CloudWords(e.Cloud).Long, canRun, GameAppUi.DeviceName);
++        if (state == LibState.Downloading && MeterLong(e.Name) is { Length: > 0 } meter) flowMeta.Text = CloudWords(e.Cloud).Long + " · " + meter;   // patch 0085: "1.2 of 4.8 GB · 38 MB/s · 1 min 35 s left"
+         int shown = rebuildFlow ? Math.Min(libShown.Count, 15) : 0;
+         int first = Math.Max(0, Math.Min(fi - shown / 2, libShown.Count - shown));
+         for (int i = first; i < first + shown; i++)
+@@ -944,7 +970,7 @@
+         var accent = Look.AccentOf(e.Icon, grey);
+         foreach (var b in rebuildFlow ? LibraryActions.For(state, canRun) : new LibButton[0])
+         {
+-            var button = Look.Capsule(state == LibState.Built && b.Act == LibAct.Play && running && launchingGame == e.Name ? "Starting…" : b.Label, b.Symbol, b.Primary, accent, 54, b.Primary ? 16 : 15);
++            var button = Look.Capsule(state == LibState.Built && b.Act == LibAct.Play && running && launchingGame == e.Name ? "Starting…" : LibraryActions.Label(b, facts.Running), b.Symbol, b.Primary, accent, 54, b.Primary ? 16 : 15);
+             button.AccessibilityIdentifier = b.Id;
+             button.Enabled = LibraryActions.Enabled(b.Act, facts.Running);
+             var act = b.Act;
+@@ -1023,7 +1049,7 @@
+         };   // patch 0081: on an iPad a card selects the hero's game
+ 
+         var parts = new List<UIView> { open };
+-        var cardBar = Look.Bar((float) (fraction ?? 0), Theme.Accent, 4);
++        var cardBar = Look.CoverBar((float) (fraction ?? 0));   // patch 0085: accent on a dark track
+         cardBar.Hidden = fraction == null || !(state == LibState.Downloading || state == LibState.Building);
+         parts.Add(cardBar);
+         gridLive[e.Name] = (line, cardBar);   // patch 0082 (review M3): updated in place between two rebuilds
+@@ -1038,7 +1064,7 @@
+             var b = acts[k];
+             var act = b.Act;
+             UIButton button;
+-            if (k == 0) button = Look.Capsule(b.Label, b.Symbol, b.Primary, accent, 36, 13);
++            if (k == 0) button = Look.Capsule(LibraryActions.Label(b, facts.Running), b.Symbol, b.Primary, accent, 36, 13);
+             else
+             {
+                 button = Look.RoundIcon(b.Act == LibAct.ExportIpa ? "arrow.up" : b.Symbol, b.Label, 36, Look.Raised);
+@@ -1098,7 +1124,7 @@
+                 case HoldItem.WarmToggle: list.Add(new HoldOverlay.Entry(warmQueue.Paused ? "Resume the shader preparation" : "Pause the shader preparation", warmQueue.Paused ? "play.fill" : "pause.fill", false, ToggleWarmPause, "hold-warm")); break;
+                 case HoldItem.WarmNow: list.Add(new HoldOverlay.Entry("Prepare the shaders now", "bolt.fill", false, () => PrepareNow(name), "hold-warm-now")); break;
+                 case HoldItem.CancelPaused: list.Add(new HoldOverlay.Entry("Cancel the paused build…", "xmark", false, () => AskCancel(name), "build-cancel")); break;
+-                case HoldItem.AddToQueue: if (!facts.Running) list.Add(new HoldOverlay.Entry("Add to the build queue", "list.number", false, () => AddToBuildQueue(name), "hold-queue")); break;
++                case HoldItem.AddToQueue: list.Add(new HoldOverlay.Entry("Add to the build queue", "list.number", false, () => AddToBuildQueue(name), "hold-queue")); break;
+                 case HoldItem.Upload:
+                     foreach (var t in targets) { var target = t; list.Add(new HoldOverlay.Entry("Upload to " + target.Name, "icloud.and.arrow.up", false, () => UploadTo(target, path, false), "hold-upload")); }
+                     break;
+diff -ruN f/GameAppShelf.cs g/GameAppShelf.cs
+--- f/GameAppShelf.cs	2026-11-21 23:28:31
++++ g/GameAppShelf.cs	2026-11-21 23:41:17
+@@ -179,7 +179,7 @@
+         title.AccessibilityTraits = UIAccessibilityTrait.Header;
+         buildSub = Theme.Label("", Theme.Font(12, UIFontWeight.Regular), Theme.Muted);
+         var refresh = Look.RoundIcon("arrow.triangle.2.circlepath", "Refresh the cloud", 34, UIColor.Clear, Theme.Muted);   // patch 0082: a small icon (the cloud re-listing)
+-        refresh.TouchUpInside += (_, __) => RefreshCloud(null);
++        refresh.TouchUpInside += (_, __) => RefreshCloudAsked();   // patch 0085: an explicit refresh (CloudRelist)
+         var plus = Look.RoundIcon("plus", "Add a game", 44, Theme.Accent, UIColor.Black);
+         plus.AccessibilityIdentifier = "import-file";
+         plus.Menu = AddMenu();   // GameAppImportUi.cs's two entries ("Add a game file", "Add from a folder without copying") and "From NAS or Cloud"
+@@ -293,7 +293,7 @@
+             foreach (var r in sections.SelectMany(s => s.Rows))
+                 if (buildLive.TryGetValue(r.Name, out var live))
+                 {
+-                    live.Note.Text = r.Note;
++                    live.Note.Text = RowNote(r);
+                     if (r.Fraction != null) live.Bar.SetProgress((float) r.Fraction.Value, false);
+                 }
+             buildSub.Text = BuildList.Header(games, buildQueue.Items.Count, GameAppUi.DeviceName);
+@@ -345,7 +345,7 @@
+         }
+         var name = Theme.Label(display, Theme.Font(15, UIFontWeight.Regular), Theme.Text, 1);
+         name.LineBreakMode = UILineBreakMode.TailTruncation;
+-        var note = Theme.Label(r.Note, Theme.Font(12, UIFontWeight.Regular), r.NoteAccent ? Theme.Accent : Theme.Muted);
++        var note = Theme.Label(RowNote(r), Theme.Font(12, UIFontWeight.Regular), r.NoteAccent ? Theme.Accent : Theme.Muted);
+         var texts = new List<UIView> { name, note };
+         var bar = Look.Bar((float) (r.Fraction ?? 0), Theme.Accent, 3);
+         bar.Hidden = r.Fraction == null;
+@@ -355,13 +355,13 @@
+         column.SetContentHuggingPriority(1, UILayoutConstraintAxis.Horizontal);
+         column.SetContentCompressionResistancePriority(1, UILayoutConstraintAxis.Horizontal);
+         var act = r.Act;
+-        var button = Look.Capsule(r.Button, null, r.Primary, null, 32, 13);
++        var button = Look.Capsule(facts.Running && act == LibAct.Build ? "Add to queue" : r.Button, null, r.Primary, null, 32, 13);   // patch 0085
+         button.AccessibilityIdentifier = "build-row-" + act.ToString().ToLowerInvariant();
+         button.AccessibilityLabel = r.Button + " " + display;
+         button.Enabled = LibraryActions.Enabled(act, facts.Running);
+         button.SetContentHuggingPriority(1000, UILayoutConstraintAxis.Horizontal);
+         button.SetContentCompressionResistancePriority(1000, UILayoutConstraintAxis.Horizontal);
+-        button.TouchUpInside += (_, __) => { if (act == LibAct.Build) { selected = r.Name; PrimaryTapped(); } else RunLibAct(act, e); };
++        button.TouchUpInside += (_, __) => { if (act == LibAct.Build && !(running && launchingGame == null)) { selected = r.Name; PrimaryTapped(); } else RunLibAct(act, e); };   // patch 0085: while building, RunLibAct queues it
+         var views = new List<UIView> { cover, column, button };
+         if (r.HasMore)
+         {
+@@ -382,6 +382,9 @@
+         return holder;
+     }
+ 
++    /// Patch 0085: a download's row says its speed and time left: "Downloading · 37 % · 1.2 of 4.8 GB · 38 MB/s · 1 min 35 s left".
++    private string RowNote(BuildRowView r) => r.Act == LibAct.CancelDownload && MeterLong(r.Name) is { Length: > 0 } m ? r.Note + " · " + m : r.Note;
++
+     /// Patch 0082: a game on this iPhone that is not built has no settings (they come with its build): its "…" is this small sheet.
+     private void ShowNotBuiltSheet(LibraryEntry e, UIView source)
+     {
+@@ -651,7 +654,7 @@
+         setLogs.Value.TextColor = logErrors > 0 ? Theme.Error : Theme.Muted;
+         settingsStorage.Set(CurrentStorageSegments());
+         long total = 0;
+-        try { total = new DriveInfo("/").TotalSize; } catch (Exception) { }
++        try { total = new DriveInfo(GameAppMain.Documents).TotalSize; } catch (Exception) { }   // patch 0085: Documents' volume
+         storageHeadline.Text = DeviceTiles.StorageHeadline(FreeBytes(), total);
+         // the sources (redrawn only when they change)
+         var rows = cloudSources.Select(s => (s.Kind == CloudKind.Nas ? "server.rack" : "icloud", s.Kind == CloudKind.Nas ? "NAS" : Cloud.ProviderName(s.Location),
+diff -ruN f/GameAppStop.cs g/GameAppStop.cs
+--- f/GameAppStop.cs	2026-11-21 23:19:56
++++ g/GameAppStop.cs	2026-11-21 23:40:45
+@@ -150,6 +150,21 @@
+         }
+     }
+ 
++    /// Patch 0085: a pause the SYSTEM asked for (its task expired) and that has not taken effect yet is withdrawn (the person came back to the app; only their own Pause pauses). True: the
++    /// chain holds the request now and must be told (gameapp_request_stop(0)); a remembered one is simply dropped. Nothing when no pause is being honoured.
++    public bool WithdrawPause(out bool native)
++    {
++        lock (gate)
++        {
++            native = false;
++            if (state != StopState.Pausing) return false;
++            state = StopState.Running;
++            native = chainOnStack;
++            pending = StopKind.None;
++            return true;
++        }
++    }
++
+     /// The Cancel button, after the confirmation, with the choice of what to keep. A cancel overrides a pause. From Paused nothing runs: NoChain (the cleanup only).
+     public StopStep Cancel(CancelChoice what)
+     {
+diff -ruN f/GameAppStopUi.cs g/GameAppStopUi.cs
+--- f/GameAppStopUi.cs	2026-11-21 23:19:56
++++ g/GameAppStopUi.cs	2026-11-21 23:40:45
+@@ -264,6 +264,7 @@
+ 
+     private void PausePressed()
+     {
++        systemPause = false;   // patch 0085: the person's own pause, never withdrawn
+         var step = stop.Pause();
+         if (step.Act == StopAct.Ignored) return;
+         if (step.Act == StopAct.Native) RaiseStop(step.Kind);
+@@ -460,6 +461,7 @@
+     /// bounded (about 5 s) and off the main thread, the paused record is written by Finish on the main thread (waited for the same way), then the task is completed. Never blocks the main thread.
+     private void PauseFromTheSystem(BGTask task)
+     {
++        systemPause = true;   // patch 0085: withdrawn if the person comes back before it takes effect (WithdrawSystemPause)
+         Task.Run(() =>
+         {
+             var step = stop.Pause();

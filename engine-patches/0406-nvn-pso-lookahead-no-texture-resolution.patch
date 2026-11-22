@@ -1,0 +1,130 @@
+# nvn/pso: keep texture resolution out of pipeline lookahead
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/5012821eff71f469ec98c307c4ab8d8af23be0c0
+# Author:    seedds, 2026-11-19 00:04:26 +0800
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# Why it matters here: see docs/UPSTREAM-AUDIT.md (section 5).
+#
+# Applies as is. Only the Metal 4 / look-ahead path (DM_PSO_MTL4) reaches it; this app runs the MTLDevice path, so it is a guard for when pso_mtl4 is turned on.
+#
+# Apply with: patch -p1 (tools/patched_engine.sh) or git apply -p1, to the tree out-nx2apple/engine + paches/engine/0103..0301 (the tree out-stage/out-engine/engine
+# is made of), in the order of the numbers of this folder. Checked on a COPY of the needed files only (git apply --check, then applied in series, then
+# paches/0002 0004 0005 0006 0007 0008 0009 0012 0013 still apply on top); NOT compiled, NOT run on a device.
+# Left out of the upstream diff: docs/, dm/games/ notes, and test files that conflict.
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -14255,6 +14255,7 @@
+     typeof(R.sc) sc0 = R.sc; int has_sc0 = R.has_sc;
+     int pso_dirty = g_pso_dirty, dss_dirty = g_dss_dirty;
+     uint32_t cf[8]; memcpy(cf, g_pass.cfmt, sizeof cf); uint32_t df = g_pass.dfmt, sf = g_pass.sfmt, samples = g_pass.samples, dfull = df, sfull = sf; int kicked0 = (int)g_pp_kicked, draws = 0;
++    int targets_known = 1;
+     op_cursor cur = {.p = g_exec_next};
+     // Collect likely attachment keys before alternatives, then admit only a small batch. Global dispatch and Metal do not promise compile order.
+     enum { QN = 160 }; static struct { pso_key k; void *vs, *fs; } qa[QN], qb[QN]; int na = 0, nb = 0;
+@@ -14262,15 +14263,23 @@
+         const uint8_t *q; op_hdr hq; const void *aq;
+         if (!op_next(&cur, &q, &hq, &aq)) break;
+         if (hq.op == OP_SET_RT) {
+-            const p_set_rt *r = aq; memset(cf, 0, sizeof cf); dfull = sfull = 0; samples = 1;
+-            for (int i = 0; i < r->n && i < 8; i++) { id<MTLTexture> t = r->color[i] && !rt_dup_slot(r, i) ? tex_mtl_replay(r->color[i]) : nil; if (t && nvn_fmt_bc(r->color[i]->d.format)) t = nil; if (t) { cf[i] = (uint32_t)rt_view_fmt_predict(r->color[i], t, &r->cview[i], r->has_cview[i]); samples = (uint32_t)t.sampleCount; } }   // BC targets are never attached (see attach)
+-            id<MTLTexture> dt = r->depth ? tex_mtl_replay(r->depth) : nil;
++            const p_set_rt *r = aq; memset(cf, 0, sizeof cf); dfull = sfull = 0; samples = 1; targets_known = 1;
++            // Only inspect textures already made. Resolving a future attachment can upload it and wait for the GPU, ending the encoder of the draw asking for a pipeline.
++            for (int i = 0; i < r->n && i < 8; i++) {
++                const tex_t *color = r->color[i];
++                if (!color || rt_dup_slot(r, i) || nvn_fmt_bc(color->d.format)) continue;   // BC targets are never attached directly (see attach)
++                id<MTLTexture> t = tex_made(color);
++                if (!t) { targets_known = 0; break; }
++                cf[i] = (uint32_t)rt_view_fmt_predict(color, t, &r->cview[i], r->has_cview[i]); samples = (uint32_t)t.sampleCount;
++            }
++            id<MTLTexture> dt = r->depth ? tex_made(r->depth) : nil;
++            if (r->depth && !dt) targets_known = 0;
+             if (dt) { MTLPixelFormat f = dt.pixelFormat; samples = (uint32_t)dt.sampleCount;
+                 dfull = f != MTLPixelFormatStencil8 ? (uint32_t)f : 0; sfull = (f == MTLPixelFormatStencil8 || f == MTLPixelFormatDepth32Float_Stencil8) ? (uint32_t)f : 0; }
+             df = dfull; sf = sfull; continue;
+         }
+         if (hq.op == OP_DRAW || hq.op == OP_DRAW_IDX) {
+-            if (S.rast_discard) continue;   // vertex work uses its own non-rasterizing pipeline, built on demand
++            if (!targets_known || S.rast_discard) continue;   // unresolved attachments and non-rasterizing pipelines are handled at draw time
+             draws++;
+             __unsafe_unretained NvProg *pr = S.prog ? prog_get(S.prog) : nil; if (!pr || !pr->sh[0]) continue;
+             __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
+--- a/dm/gfx/tests/t_pso_pending.m
++++ b/dm/gfx/tests/t_pso_pending.m
+@@ -48,6 +48,7 @@
+     pthread_cond_t _cv;
+     int _entered, _released, _block_through, _nil_call;
+     int _sync_calls, _async_calls;
++    int _texture_allocations;
+     pthread_t _submitter;
+     NSMutableArray *_results;
+     BOOL _submitter_call[1024];
+@@ -63,6 +64,7 @@
+ - (int)entered;
+ - (int)syncCalls;
+ - (int)asyncCalls;
++- (int)textureAllocations;
+ - (BOOL)callWasOnSubmitter:(int)call;
+ - (void)expectAbsentPendingKey:(const pso_key *)key onSubmitterCall:(int)call;
+ - (BOOL)submitterCallObservedKeyAbsent:(int)call;
+@@ -79,6 +81,12 @@
+     return self;
+ }
+ - (void)dealloc { pthread_cond_destroy(&_cv); pthread_mutex_destroy(&_mu); }
++- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor {
++    (void)descriptor;
++    _texture_allocations++;
++    return nil;
++}
++- (int)textureAllocations { return _texture_allocations; }
+ - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error {
+     (void)descriptor;
+     pthread_mutex_lock(&_mu);
+@@ -478,6 +486,37 @@
+         EXPECT_EQ("prediction preserves scissor validity", known, R.has_sc);
+     }
+     g_exec_next = NULL;
++}
++
++static void test_prediction_only_reads_existing_targets(void) {
++    reset_queue(); reset_pso_cache(); state_reset();
++    GateDevice *dev = [[GateDevice alloc] initBlockingThrough:0 nilCall:0]; g_dev = (id<MTLDevice>)(id)dev;
++    NvProg *program = [NvProg new]; program->sh[0] = test_vs; program->sh[1] = test_fs;
++    prog_t control = {.magic = MAGIC('P', 'R', 'O', 'G'), .nstage = 2, .serial = 0x7f010003};
++    serial_put(control.serial, program);
++    tex_t cold = {.magic = MAGIC('T', 'E', 'X', 0), .serial = 0x7f010004,
++                  .d = {.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8, .width = 16, .height = 16, .depth = 1, .levels = 1, .samples = 1}};
++    tex_t ready = cold; ready.serial++;
++    // For a target without a view, the descriptor supplies the format and sample count a texture would report.
++    tex_put(ready.serial, tex_desc(&ready, 0));
++    p_set_rt cold_pass = {.n = 1, .color = {&cold}}, ready_pass = {.n = 1, .color = {&ready}};
++    p_bind_program bind = {&control, 3};
++    p_draw draw = {.prim = NVN_DRAW_PRIMITIVE_TRIANGLES, .count = 3, .instances = 1};
++    uint8_t stream[2048] = {0}; size_t used = 0;
++    append_op(stream, &used, OP_BIND_PROGRAM, &bind, sizeof bind);
++    append_op(stream, &used, OP_SET_RT, &cold_pass, sizeof cold_pass);
++    append_op(stream, &used, OP_DRAW, &draw, sizeof draw);
++    append_op(stream, &used, OP_SET_RT, &ready_pass, sizeof ready_pass);
++    append_op(stream, &used, OP_DRAW, &draw, sizeof draw);
++    append_op(stream, &used, OP_END, NULL, 0);
++
++    g_exec_next = stream; pso_predict_rest(); g_exec_next = NULL;
++    EXPECT_TRUE("prediction reaches the later pass with a realized target", [dev waitForEntered:1 timeoutMs:5000]);
++    EXPECT_TRUE("target prediction drains its compiler work", drain_queue(5000));
++    EXPECT_EQ("prediction only compiles for known attachments", 1, [dev entered]);
++    EXPECT_EQ("prediction does not allocate future textures", 0, [dev textureAllocations]);
++    tex_put(ready.serial, nil); serial_del(control.serial);
++    reset_queue(); reset_pso_cache();
+ }
+ 
+ // The prediction runs once per submission, at its first new miss: a draw whose own build is already under way drew in an earlier frame and does not start it (issue #2438)
+@@ -504,6 +543,7 @@
+         test_completed_slot_kept_for_waiting_draw();
+         test_nil_prediction_falls_back_then_predicts();
+         test_prediction_restores_scissor();
++        test_prediction_only_reads_existing_targets();
+         test_prediction_at_first_new_miss();
+         test_inflight_counter_snapshot();
+         printf("== %d PSO pending checks, %d failed ==\n", g_checks, g_failed);

@@ -1,0 +1,48 @@
+# nvn/heaps: cap render-target recycle slack at 4 MiB
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/943a6111540e17333f7e060f40248ad68d62dce5  (PR #2566 census)
+# Author:    seedds, 2026-11-19 11:09:40 +0800
+# Co-authors:
+#   Co-authored-by: Stan Bono
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# Why it matters here: see docs/UPSTREAM-AUDIT.md (section 5).
+#
+# ADAPTED, not verbatim: upstream edits an inline 'size + size / 8'; this tree already moved that to rh_alloc_size() in nvn_rt_recycle.h (NX2Apple
+# patch 0055), so the 4 MiB cap (RH_SLACK) goes there, with two checks in t_rt_recycle_policy.c.
+#
+# Apply with: patch -p1 (tools/patched_engine.sh) or git apply -p1, to the tree out-nx2apple/engine + paches/engine/0103..0301 (the tree out-stage/out-engine/engine
+# is made of), in the order of the numbers of this folder. Checked on a COPY of the needed files only (git apply --check, then applied in series, then
+# paches/0002 0004 0005 0006 0007 0008 0009 0012 0013 still apply on top); NOT compiled, NOT run on a device.
+# Left out of the upstream diff: docs/, dm/games/ notes, and test files that conflict.
+
+--- a/dm/gfx/nvn/nvn_rt_recycle.h
++++ b/dm/gfx/nvn/nvn_rt_recycle.h
+@@ -4,7 +4,7 @@
+ 
+ #include <stdint.h>
+ 
+-enum { RH_CAP = 256u << 20 };
++enum { RH_CAP = 256u << 20, RH_SLACK = 4u << 20 };   // RH_SLACK: upstream 943a6111, the most a new heap is made larger than its target (a 296 MB shadow target sat in a 333 MB heap)
+ #define RH_IDLE_NS 3000000000ull
+ 
+ typedef struct {
+@@ -37,6 +37,7 @@
+ static inline uint64_t rh_alloc_size(uint64_t size, int exact_alloc) {
+     if (exact_alloc) return size;
+     uint64_t extra = size / 8;
++    if (extra > RH_SLACK) extra = RH_SLACK;   // upstream 943a6111: the small-target reuse allowance (an eighth) stays, a large target's headroom is capped
+     return size > UINT64_MAX - extra ? UINT64_MAX : size + extra;
+ }
+ 
+--- a/dm/gfx/tests/t_rt_recycle_policy.c
++++ b/dm/gfx/tests/t_rt_recycle_policy.c
+@@ -106,6 +106,8 @@
+     // Overflow-safe headroom and reuse sizing
+     {
+         CHECK(rh_alloc_size(800, 0) == 900, "macOS alloc adds +12.5 percent headroom");
++        CHECK(rh_alloc_size(64ull << 20, 0) == (64ull << 20) + RH_SLACK, "a large target's headroom is capped at RH_SLACK (4 MiB)");
++        CHECK(rh_alloc_size(296ull << 20, 0) == (296ull << 20) + RH_SLACK, "a 296 MB shadow target no longer sits in a 333 MB heap");
+         CHECK(rh_alloc_size(800, 1) == 800, "iOS alloc keeps exact size");
+         CHECK(rh_alloc_size(UINT64_MAX, 0) == UINT64_MAX, "alloc headroom clamps UINT64_MAX safely");
+         CHECK(rh_alloc_size(UINT64_MAX - 10, 0) == UINT64_MAX, "alloc headroom clamps near UINT64_MAX without wrap");

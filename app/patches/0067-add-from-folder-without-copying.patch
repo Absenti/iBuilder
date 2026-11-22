@@ -1,0 +1,1045 @@
+# 0067-add-from-folder-without-copying.patch -- "Add from a folder without copying" replaces 0066's file-picker entry; ONE place makes every folder picker (the modern initialiser, one delegate, picker log lines, the older initialiser as a fallback).
+# Applies after 0066 (the tree with 0010..0066 applied). UNTESTED ON DEVICE: compiled (dotnet build, ios-arm64, Release: rc 0, no error, 39 warnings: the 47 of the 0066 tree minus the 8 of the four obsolete-initialiser sites that now go through
+# one factory; none is new) and the pure classes run in a host harness (a net console program built from the real source text of GameAppImportFolder.cs, GameAppImport.cs and the 0064 / 0065 classes: 253 checks, the 0066 ones kept, 35 mutations
+# of the classes each caught); no iPhone run. Measured and assumed are told apart below.
+#
+# WHY (field results read from the owner's iPhone log, iOS 27.2.1): (1) the new entry of 0066, "Add from Files without copying", does not work: the owner selects games in Files and taps Open, the log says `import: the picker is open (in place)`, then
+#   `import: the picker was closed without a file`, never `picked`: the Open-mode FILE picker does not deliver its selection on 27.2.1 either (nor on 27.0.1). (2) The folder picker of the Cloud page ("Add a folder") used to work and now gives NO
+#   `cloud:` line at all: its callback never reaches the app (iOS 27.2.x regression of the Open-mode pickers, the iCloud provider, or the obsolete initialiser: nobody can tell yet). (3) Google Drive is greyed out in the picker (decided by iOS and the
+#   provider, not by this app). So: the unreliable entry goes, a folder-based flow comes, and every folder picker now says what happens, can be tried both ways, and offers the older one by itself when the modern one does not answer.
+#
+# TASK A -- ONE FACTORY FOR THE FOLDER PICKERS (GameAppPickers.cs, new)
+#   * PresentFolderPicker(purpose, picked, cancelled, older): the only place a folder picker is made. Purposes: "cloud folder" (the Cloud page, both buttons), "game files folder" (an exported app's game files), "update and DLC folder" ("Find them in a
+#       folder…", two menus), "import folder" (the + menu). Two variants, told apart in every log line: the MODERN API = new UIDocumentPickerViewController(new[] { UTTypes.Folder }, asCopy: false), AllowsMultipleSelection = false (the default of
+#       every purpose: FolderPickerOlderByDefault is false; it is the one switch to flip when the field log says the older one answers); the OLDER API = the initialiser that was used until now (new[] { "public.folder" }, UIDocumentPickerMode.Open), the
+#       obsolete-API warning silenced on those two lines. FolderPickerDelegate (GameAppLibrary.cs) is gone: ONE delegate (FolderPickerAnswer) implements documentPicker:didPickDocumentsAtURLs:, the single-URL documentPicker:didPickDocumentAtURL: (the first
+#       answer counts once) and documentPickerWasCancelled: (the old delegate had no cancel method).
+#   * Log lines (the next field log tells what happens): `picker: <purpose> folder picker is open (modern API|older API; no start location set | opened in <where>)` (the picker's directoryURL when one is set: none is), `picker: <purpose> picked <last path
+#       component> (<where it is>; <api>)` with the provider / domain from the path (PickedLocation, GameAppImportFolder.cs: iCloud Drive com~apple~CloudDocs, an iCloud container, File Provider Storage with its app group, CloudStorage, a network share
+#       (LiveFiles / SMB), an external volume, this app's own container, another app's folder; an unknown place: its first three components only, an account name never), `picker: <purpose> provider domain <identifier>` (NSFileProviderManager.
+#       GetIdentifierForUserVisibleFile, asked after the pick, only for the log), `picker: <purpose> cancelled (<api>)`, `picker: <purpose> answered with no folder (<api>)`, and when the controller is gone and not one callback came (a watchdog: two property
+#       reads twice a second, 10 minutes at most) `picker: <purpose> closed with no answer (<api>)`.
+#   * After a modern picker closed with no answer an alert offers "Try the older picker" ("The folder picker did not answer" / "iOS closed the picker without telling the app which folder was chosen. The older picker may work on this iPhone: try it?",
+#       "Not now"); it opens the same purpose with the older API and logs `picker: <purpose> trying the older picker`.
+#   * Cloud page (GameAppLibrary.cs, BuildCloudPage): a second row "Add a folder (older picker)" (id cloud-add-folder-older) under "Add a folder" (cloud-add-folder): the same flow with the older initialiser, so the owner can try both and the log says which
+#       one answered; and, under the existing line, the hint "Greyed out in the picker? That cloud cannot be added as a folder on this iPhone: add its games one by one with Add a game file (+ in the Build tab). The copy is removed after a successful build."
+#       (muted, 12 pt, nothing else replaced). FolderPicked logs every failure point: no folder, the security scope that could not be started, the bookmark that cannot be made (the system's text, its error domain and code, the provider
+#       from Cloud.ProviderName), the bookmark that could not be written, any exception; `cloud: added <name> (<path>; <provider>)`.
+#   * The mods sheet's own folder picker (GameAppModsUi.cs) and the file pickers (the old Import, certificate, saves, mods, covers) are not touched.
+#
+# THE FOLDER FLOW -- "Add from a folder without copying" (the + menu's second entry; identifier import-from-folder; the old "Add from Files without copying", its in-place delegate and its watchdog are removed, nothing else of 0066)
+#   * GameAppImportFolder.cs (new; no UIKit, run by the harness): FolderListing.OnDisk (the real lister: one readdir, the size from the directory entry, a stat, never a read of a file; links flagged), FolderScan.Scan (the folder's top level plus ONE
+#       level of its subfolders, 2,000 entries at most, lazily: it stops reading at the cap; never deeper; the names InPlaceImport.Accepts: .nsp .xci .nsz .nup and exactly prod.keys; hidden files and "._Game.nsp" never; links never; an iCloud
+#       placeholder .name.icloud under its real name with no size; a name found twice once, the top level's; a subfolder that cannot be opened or goes away is skipped, the picked folder's own error is the caller's; each row marked "In the library" when
+#       Documents has that name, any case), FolderChoice (the sheet's model: tick, Select all / Select none, rows in the library cannot be chosen, one file per name, "Add N"), FolderImportText (the words), PickedLocation (above).
+#   * GameAppImportFolderUi.cs (new): the selection sheet in the app's flat style: "Add from a folder", "<folder> · N game files", Cancel, "Select all" / "Select none", a table (only the rows on screen are built: hundreds of files cost nothing) with a circle to
+#       tick, the file name, "<size> · <folder>" or "In the library" (dim, disabled) or "In iCloud, not downloaded yet", the line under the list ("N chosen · at least X GB. Cloned, not copied, when they are on this iPhone's storage.", "Nothing chosen.",
+#       "Everything in this folder is in the library already."), the truncation note, and "Add N" (disabled at 0). It cannot be swiped away (ModalInPresentation): Cancel and Add N end it, and either way the owner is told once.
+#   * GameAppImportUi.cs (rewritten): ImportFromFolder -> PresentFolderPicker("import folder") -> FolderPickedForImport (main thread: the card, the worker) -> on a worker, under the folder's security scope (kept until the sheet is closed or the files are
+#       added, then stopped), the scan -> FolderRead (the sheet, or the alert "No game file found" / "Could not read the folder") -> "Add N" -> FolderChosen -> RunImportJobs (the 0066 worker, unchanged in what it does: a coordinated read per file, so an
+#       iCloud file is downloaded first; GameImport.Place: a clone, else the copy with progress, always through <name>.part and one rename; the progress card, the background task, the screen kept awake) with the same log lines `import: cloned ...` /
+#       `import: copied ...`. Names, update / DLC attachment and the title id are the file name's, exactly as for CopyIn: the file's own name in Documents, then RefreshGames + RefreshScreen. Log: `import: the folder picker is open`, `import: folder <name>:
+#       N game file(s) found` (+ `, M in the library already`), `import: folder <name>: only the first 2,000 entries were looked at`, `import: picked N file(s)`, `import: the folder picker was closed without a folder`, `import: nothing added from the folder`.
+#       Never on the main thread: the scan, the sizes, the clones and the copies; the sheet is filled when the scan returns.
+#   * GameAppLibrary.cs / GameAppShelf.cs: the key command is Command-Shift-I "Add from a folder without copying" (keyImportFromFolder); the three other folder-picker sites call the factory; the + menu's comment.
+#
+# NEW STRINGS: "Add from a folder without copying" (replaces "Add from Files without copying"), "Add from a folder", "Cancel", "Select all", "Select none", "Add <N>", "In the library", "In iCloud, not downloaded yet", "<folder> · <N> game file(s)", "<N> chosen · ",
+#   "at least ", "Cloned, not copied, when they are on this iPhone's storage.", "Nothing chosen.", "Everything in this folder is in the library already.", "Only the first 2,000 entries were looked at (the folder, and one level of folders in it).", "Reading",
+#   "No game file found", "<folder> holds no .nsp, .xci, .nsz or .nup game file and no prod.keys, at its top level or one folder down.", "Could not read the folder", "Still adding" (its text: "A folder is being read or files are being added from it. Wait for it to
+#   end (the Build tab shows how far it is)."), "The folder picker did not answer", "iOS closed the picker without telling the app which folder was chosen. The older picker may work on this iPhone: try it?", "Try the older picker", "Not now",
+#   "Add a folder (older picker)", "Greyed out in the picker? That cloud cannot be added as a folder on this iPhone: add its games one by one with Add a game file (+ in the Build tab). The copy is removed after a successful build.".
+#   ACCESSIBILITY IDS: import-file (the + button, a menu), import-progress, import-from-folder (the menu action; import-add is the other one), import-folder-sheet, import-folder-cancel, import-folder-select-all, import-folder-add, import-folder-list,
+#   import-folder-row-<index>, cloud-add-folder (existing), cloud-add-folder-older. REMOVED: the menu action import-in-place and the string "Add from Files without copying".
+#
+# MEASURED (host harness, .NET 11, Apple silicon Mac, APFS; 253 checks): the scan of a real folder (26 entries: the top level, two subfolders, a 26 GB sparse file among them, hidden / ._ / .DS_Store / links / deeper files / a placeholder) takes 1.5 ms and finds
+#   exactly the games, with the sizes of the directory entries (the 26 GB file's size read without reading it); a folder of 20,000 entries: 2,000 read, 998 game files, 10 ms, truncated; an endless listing is read to the cap and no further; a folder
+#   two levels down is never listed; a subfolder that vanishes or fails half way is skipped; hostile names (.., a slash, empty, too long) are never rows; the choice model (tick, Select all / none, rows in the library, one file per name); the whole flow on real
+#   files (scan -> Select all -> GameImport.Place with the real clonefile into a Documents folder: the four files that are there are cloned with one `import: cloned ...` line each, same SHA-256, under their own names; the update and the DLC attach by their title
+#   ids; the file that was in the library untouched; the iCloud placeholder fails alone; no .part; no space taken); PickedLocation over 13 realistic paths (an account name never logged).
+# NOT EXERCISED / ASSUMED (no device run): everything UIKit (the sheet, the table, the menu, the card, the alert, the timers); that the MODERN folder picker answers on iOS 27.2.1 (the whole point of the log lines and the older button); that the older
+#   one does; that NSFileProviderManager answers for a picked folder (it is only for the log); that a coordinated read of a file in a folder picked this way gives a path on the app's APFS volume (then it is cloned; else copied, and the line says why);
+#   Google Drive cannot be picked (greyed out: iOS and the provider decide).
+# RISKS: the player (an exported app) now picks its game files' folder with the modern API too (its only folder picker): the older one is offered by the alert if the modern one does not answer; the 0066 entry's Command-Shift-I now opens the folder flow.
+diff -ruN a/GameAppImport.cs b/GameAppImport.cs
+--- a/GameAppImport.cs
++++ b/GameAppImport.cs
+@@ -7,7 +7,7 @@
+ //   GameImport   Place(src, dest, clone, copy, log): the one decision, always through <dest>.part and one rename over any existing file:
+ //                  clone succeeds -> no copy;  clone fails -> the copy;  the copy fails -> the .part is removed and the previous dest is as it was;  dest exists -> replaced only by the final rename.
+ //                CopyBytes: the copy with progress (the loop CopyWithProgress had since patch 0040).
+-//   InPlaceImport  which picked names are added ("Add from Files without copying") and the sentence that says what happened.
++//   InPlaceImport  which names "Add from a folder without copying" takes (Accepts, SafeName: GameAppImportFolder.cs applies them to what it finds in a folder) and the sentence that says what happened.
+ // The delegates are injected so the harness can run every branch; the app passes FileClone.Try and GameImport.CopyBytes.
+ using System;
+ using System.Collections.Generic;
+@@ -181,7 +181,7 @@
+ /// One picked file's end: `Placed` when it is in the library, else `Error`.
+ public sealed record ImportOutcome(string Name, Placed Placed, string Error);
+ 
+-/// Which of the picked files "Add from Files without copying" takes, by index in the picked list.
++/// Which of a list of names are taken, by index (Accepts for each, a name twice once): the name rules in one call.
+ public sealed record InPlacePlan(IReadOnlyList<int> Accepted, IReadOnlyList<(int Index, string Why)> Skipped);
+ 
+ public static class InPlaceImport
+diff -ruN a/GameAppImportFolder.cs b/GameAppImportFolder.cs
+--- a/GameAppImportFolder.cs
++++ b/GameAppImportFolder.cs
+@@ -0,0 +1,234 @@
++// gameapp/GameAppImportFolder.cs -- "Add from a folder without copying": what is looked for in the folder, which files are "In the library" already, and what the person chose, with no UIKit (patch 0067; the host
++// harness compiles this file as it is).
++//
++// Why a folder: the FILE picker in Open mode does not deliver its selection on iOS 27.0.1 or 27.2.1 (the delegate gets "cancelled" when the person taps Open: measured on the owner's iPhone), while the FOLDER picker in
++// Open mode does (the Cloud page's "Add a folder"). So the person picks the folder that holds the games, the app looks inside it, shows what it found, and clones the chosen files (GameImport.Place, patch 0066).
++//
++//   FolderEntry / FolderListing   one entry of a folder as the file system lists it (name, folder or not, link or not, size from the directory entry: no file is opened or read), and the real lister.
++//   FolderScan                    the top level of the folder plus ONE level of subfolders, at most 2,000 entries read, never deeper: the files InPlaceImport accepts (.nsp .xci .nsz .nup, prod.keys), an iCloud
++//                                 placeholder (.name.icloud) under its real name, hidden files and links never, each name once (the top level wins), "In the library" when Documents has that name.
++//   FolderChoice                  the sheet's model: one row per file, multi-select, Select all / Select none, rows already in the library disabled, "Add N".
++//   FolderImportText              the words of the rows and the log.
++//   PickedLocation                where a picked folder is, in words for the picker log lines (iCloud Drive, a File Provider's storage, a network share, this app's own folder...).
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.IO.Enumeration;
++using System.Linq;
++
++/// One entry of a folder. `Size`: the directory entry's size (-1 for a folder or when it is not known).
++public sealed record FolderEntry(string Name, bool IsDirectory, bool IsLink, long Size);
++
++/// A game file (or prod.keys) found in the folder. `Name`: the name it will have in Documents (the real name of an iCloud placeholder). `Relative`: where it is under the picked folder ("Name" or "Sub/Name"; for a
++/// placeholder the real name's path: the coordinated read that reads it downloads it first). `Size`: -1 when it is only a placeholder (not downloaded: the size is not known without the cloud).
++public sealed record FolderFile(string Name, string Relative, string Folder, long Size, bool Placeholder, bool InLibrary);
++
++/// What the scan found. `Entries`: how many directory entries were read; `Folders`: how many subfolders were listed; `Truncated`: the cap was reached (the rest of the folder was not looked at);
++/// `Duplicates`: files whose name was already found (the first one stands: the top level before a subfolder).
++public sealed record FolderScanResult(IReadOnlyList<FolderFile> Files, int Entries, int Folders, bool Truncated, int Duplicates);
++
++public static class FolderListing
++{
++    /// The real lister: the entries of `root`/`relative` ("" = the folder itself) from one readdir, the size from the directory entry (a stat, never a read of the file), links flagged. Lazy: the scan stops reading
++    /// at its cap. An entry that cannot be read is skipped (IgnoreInaccessible); a folder that is not there throws when it is enumerated (the scan reports the top one, and skips a subfolder that went away). Worker threads only.
++    public static Func<string, IEnumerable<FolderEntry>> OnDisk(string root) => relative =>
++    {
++        var path = string.IsNullOrEmpty(relative) ? root : Path.Combine(root, relative);
++        var options = new EnumerationOptions { RecurseSubdirectories = false, IgnoreInaccessible = true, AttributesToSkip = 0, ReturnSpecialDirectories = false };
++        return new FileSystemEnumerable<FolderEntry>(path,
++            (ref FileSystemEntry e) => new FolderEntry(e.FileName.ToString(), e.IsDirectory, (e.Attributes & FileAttributes.ReparsePoint) != 0, e.IsDirectory ? -1 : e.Length), options);
++    };
++}
++
++public static class FolderScan
++{
++    /// About 2,000 entries: a folder of thousands is looked at in part, never walked to its end (the scan is on a worker, but a provider's folder can be slow to list).
++    public const int MaxEntries = 2000;
++
++    /// "X.nsp" for ".X.nsp.icloud" (an iCloud file not downloaded here), else null.
++    internal static string PlaceholderName(string name)
++    {
++        var real = Cloud.RealName(name);   // GameAppCloud.cs: ".X.nsp.icloud" -> "X.nsp", anything else as it is
++        return !string.IsNullOrEmpty(name) && real != name ? real : null;
++    }
++
++    /// A file this import takes, whatever else the folder holds: not hidden (".DS_Store", "._Game.nsp" next to a game on an exFAT card), not a link, and a name InPlaceImport.Accepts.
++    /// Returns the name it will have in Documents, or null.
++    internal static string Taken(FolderEntry e, out bool placeholder)
++    {
++        placeholder = false;
++        if (e.IsDirectory || e.IsLink || string.IsNullOrEmpty(e.Name)) return null;
++        var holder = PlaceholderName(e.Name);
++        if (holder != null) { placeholder = true; return InPlaceImport.Accepts(holder) ? holder : null; }
++        if (e.Name.StartsWith(".", StringComparison.Ordinal)) return null;
++        return InPlaceImport.Accepts(e.Name) ? e.Name : null;
++    }
++
++    /// `list(relative)`: the entries of the folder ("" = the picked folder, "Sub" = one of its subfolders). `libraryNames`: the file names Documents has (the games it lists, and prod.keys when it is there).
++    public static FolderScanResult Scan(Func<string, IEnumerable<FolderEntry>> list, IEnumerable<string> libraryNames, int maxEntries = MaxEntries)
++    {
++        var library = new HashSet<string>(libraryNames ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
++        var files = new List<FolderFile>();
++        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++        var subfolders = new List<string>();
++        int entries = 0, folders = 0, duplicates = 0;
++        bool truncated = false;
++
++        // returns false when the cap is reached
++        bool Read(string relative, bool top)
++        {
++            IEnumerable<FolderEntry> listed;
++            try { listed = list(relative) ?? Array.Empty<FolderEntry>(); }
++            catch (Exception) when (!top) { return true; }   // a subfolder that cannot be opened is skipped; the picked folder itself is the caller's error
++            using var cursor = listed.GetEnumerator();
++            while (true)
++            {
++                FolderEntry e;
++                try { if (!cursor.MoveNext()) break; e = cursor.Current; }
++                catch (Exception) when (!top) { return true; }   // ... or that goes away while it is read
++
++                if (entries >= maxEntries) { truncated = true; return false; }
++                entries++;
++                if (top && e.IsDirectory && !e.IsLink && !string.IsNullOrEmpty(e.Name) && !e.Name.StartsWith(".", StringComparison.Ordinal) && InPlaceImport.SafeName(e.Name)) { subfolders.Add(e.Name); continue; }
++                var name = Taken(e, out var placeholder);
++                if (name == null) continue;
++                if (!seen.Add(name)) { duplicates++; continue; }
++                files.Add(new FolderFile(name, relative.Length == 0 ? name : relative + "/" + name, relative, placeholder ? -1 : e.Size, placeholder, library.Contains(name)));
++            }
++            return true;
++        }
++
++        if (Read("", true))
++            foreach (var sub in subfolders.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToList())
++            {
++                folders++;
++                if (!Read(sub, false)) break;   // one level only: a subfolder's folders are never listed
++            }
++        return new FolderScanResult(files.OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase).ThenBy(f => f.Relative, StringComparer.Ordinal).ToList(), entries, folders, truncated, duplicates);
++    }
++}
++
++/// The sheet's model: what is selected. Rows already in the library cannot be chosen. Two rows of one name (the scan keeps one) could not both be chosen either: Documents has one file of a name.
++public sealed class FolderChoice
++{
++    private readonly IReadOnlyList<FolderFile> files;
++    private readonly bool[] chosen;
++
++    public FolderChoice(IReadOnlyList<FolderFile> files)
++    {
++        this.files = files ?? Array.Empty<FolderFile>();
++        chosen = new bool[this.files.Count];
++    }
++
++    public IReadOnlyList<FolderFile> Files => files;
++    public bool CanChoose(int row) => row >= 0 && row < files.Count && !files[row].InLibrary;
++    public bool IsChosen(int row) => row >= 0 && row < files.Count && chosen[row];
++    public int Choosable => Enumerable.Range(0, files.Count).Count(CanChoose);
++    public int InLibrary => files.Count(f => f.InLibrary);
++    public int Count => chosen.Count(c => c);
++    public bool AllChosen => Choosable > 0 && Count == Choosable;
++
++    /// Taps a row: a row in the library does nothing; choosing a name that another chosen row already has un-chooses that one.
++    public void Toggle(int row)
++    {
++        if (!CanChoose(row)) return;
++        if (chosen[row]) { chosen[row] = false; return; }
++        for (int i = 0; i < files.Count; i++)
++            if (chosen[i] && string.Equals(files[i].Name, files[row].Name, StringComparison.OrdinalIgnoreCase)) chosen[i] = false;
++        chosen[row] = true;
++    }
++
++    /// "Select all": every row that can be chosen (one per name). When all are chosen already, the same button says "Select none" and clears them.
++    public void SelectAllOrNone()
++    {
++        if (AllChosen) { Array.Clear(chosen, 0, chosen.Length); return; }
++        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++        for (int i = 0; i < files.Count; i++)
++        {
++            chosen[i] = CanChoose(i) && names.Add(files[i].Name);
++        }
++    }
++
++    public IReadOnlyList<FolderFile> Chosen => files.Where((f, i) => chosen[i]).ToList();
++
++    /// The bytes of the chosen files that are known (a placeholder's size is not).
++    public long KnownBytes => files.Where((f, i) => chosen[i] && f.Size >= 0).Sum(f => f.Size);
++    public bool SomeSizeUnknown => files.Where((f, i) => chosen[i]).Any(f => f.Size < 0);
++
++    public string AddTitle => "Add " + Count;
++    public string SelectTitle => AllChosen ? "Select none" : "Select all";
++}
++
++/// The words of the sheet and the log.
++public static class FolderImportText
++{
++    public const string Title = "Add from a folder";
++    public const string InLibrary = "In the library";
++    public const string Cancel = "Cancel";
++
++    /// The log line when the scan is done.
++    public static string Found(string folder, int count) => $"import: folder {folder}: {count} game file(s) found";
++
++    /// The second line of a row: the size and where it is, or why it cannot be chosen.
++    public static string Detail(FolderFile f) =>
++        f.InLibrary ? InLibrary
++        : f.Placeholder ? "In iCloud, not downloaded yet" + (f.Folder.Length > 0 ? " · " + f.Folder : "")
++        : GameAppUi.SizeText(f.Size) + (f.Folder.Length > 0 ? " · " + f.Folder : "");
++
++    /// Under the list: what is chosen.
++    public static string Summary(FolderChoice choice)
++    {
++        if (choice.Count == 0) return choice.Choosable == 0 ? "Everything in this folder is in the library already." : "Nothing chosen.";
++        return $"{choice.Count} chosen" + (choice.KnownBytes > 0 ? " · " + (choice.SomeSizeUnknown ? "at least " : "") + GameAppUi.SizeText(choice.KnownBytes) : "")
++               + ". Cloned, not copied, when they are on this " + GameAppUi.DeviceName + "'s storage.";
++    }
++
++    public static string Truncated(int max) => $"Only the first {max:N0} entries were looked at (the folder, and one level of folders in it).";
++
++    public static string Empty(string folder) => $"{folder} holds no .nsp, .xci, .nsz or .nup game file and no prod.keys, at its top level or one folder down.";
++}
++
++/// Where a folder the picker returned is, from its path, for the picker log (`picker: <purpose> picked <name> (<this>)`): the next field log then shows which providers answer. Nothing here reads the disk.
++public static class PickedLocation
++{
++    /// `home`: this app's container (HOME), to tell "this app's own folder" (may be null). Never the whole path of an unknown place: its first three components.
++    public static string Describe(string path, string home = null)
++    {
++        if (string.IsNullOrEmpty(path)) return "no path";
++        var p = path.Replace('\\', '/');
++        if (home != null && home.Length > 1)
++        {
++            var h = Normal(home);
++            if (Normal(p) == h || Normal(p).StartsWith(h + "/", StringComparison.Ordinal)) return "this app's own container";
++        }
++        var parts = p.Split('/', StringSplitOptions.RemoveEmptyEntries);
++        int cs = Array.IndexOf(parts, "CloudStorage");
++        if (cs >= 0 && cs + 1 < parts.Length)
++        {
++            var provider = parts[cs + 1];
++            var dash = provider.IndexOf('-');   // "GoogleDrive-<account>": the account is not logged
++            return "CloudStorage: " + (dash > 0 ? provider.Substring(0, dash) + "-…" : provider) + " (" + Cloud.ProviderName(p) + ")";
++        }
++        int md = Array.IndexOf(parts, "Mobile Documents");
++        if (md >= 0 && md + 1 < parts.Length)
++            return parts[md + 1] == "com~apple~CloudDocs" ? "iCloud Drive: com~apple~CloudDocs" : "iCloud container: " + parts[md + 1];
++        if (p.Contains("com~apple~CloudDocs")) return "iCloud Drive: com~apple~CloudDocs";
++        int fp = Array.IndexOf(parts, "File Provider Storage");
++        if (fp >= 0)
++        {
++            int ag = Array.IndexOf(parts, "AppGroup");
++            var group = ag >= 0 && ag + 1 < parts.Length ? parts[ag + 1] : "?";
++            return "File Provider Storage, app group " + (group.Length > 8 ? group.Substring(0, 8) + "…" : group) + " (" + Cloud.ProviderName(p) + ")";
++        }
++        int live = Array.IndexOf(parts, "LiveFiles");
++        if (live >= 0)
++            return live + 1 < parts.Length && parts[live + 1].IndexOf("smb", StringComparison.OrdinalIgnoreCase) >= 0 ? "a network share (LiveFiles, SMB)" : "a network or external volume (LiveFiles)";
++        if (p.StartsWith("/Volumes/", StringComparison.Ordinal)) return "an external volume";
++        int ag2 = Array.IndexOf(parts, "AppGroup");
++        if (ag2 >= 0) return "another app's shared storage (app group " + (ag2 + 1 < parts.Length ? parts[ag2 + 1].Substring(0, Math.Min(8, parts[ag2 + 1].Length)) + "…" : "?") + ")";
++        if (Array.IndexOf(parts, "Application") >= 0 && Array.IndexOf(parts, "Containers") >= 0) return "another app's folder (On My iPhone)";
++        return "location not recognised: /" + string.Join("/", parts.Take(3));
++    }
++
++    private static string Normal(string p) => (p.StartsWith("/private/", StringComparison.Ordinal) ? p.Substring("/private".Length) : p).TrimEnd('/');
++}
+diff -ruN a/GameAppImportFolderUi.cs b/GameAppImportFolderUi.cs
+--- a/GameAppImportFolderUi.cs
++++ b/GameAppImportFolderUi.cs
+@@ -0,0 +1,155 @@
++// gameapp/GameAppImportFolderUi.cs -- the sheet of "Add from a folder without copying" (patch 0067): one row per game file the scan found, its size under the name, a circle to tick, "Select all" / "Select none", rows already in the
++// library disabled with "In the library", and "Add N". What is found and what is chosen (FolderScan, FolderChoice, FolderImportText) is in GameAppImportFolder.cs (no UIKit, run by the host harness).
++//
++// A table, not a stack of views: a folder can hold hundreds of games and only the rows on screen are built. The scan was done on a worker before this sheet exists, so opening it costs nothing. The sheet cannot be swiped
++// away (ModalInPresentation): "Cancel" or "Add N" end it, and either way the owner is told exactly once (the picked folder's security scope is stopped there).
++using System;
++using System.Collections.Generic;
++using System.Linq;
++
++using Foundation;
++using UIKit;
++
++public sealed class GameFolderImportViewController : UIViewController
++{
++    private readonly string folderName;
++    private readonly FolderScanResult scan;
++    private readonly FolderChoice choice;
++    private readonly Action<IReadOnlyList<FolderFile>> add;
++    private readonly Action cancelled;
++    private readonly UITableView table = new UITableView(CoreGraphics.CGRect.Empty, UITableViewStyle.Plain);
++    private UIButton addButton, selectButton;
++    private UILabel summary;
++    private bool finished;
++
++    /// `add(chosen)`: "Add N" (the sheet closes first); `cancelled()`: Cancel, or the sheet went away some other way.
++    public GameFolderImportViewController(string folderName, FolderScanResult scan, Action<IReadOnlyList<FolderFile>> add, Action cancelled)
++    {
++        this.folderName = folderName; this.scan = scan; this.add = add; this.cancelled = cancelled;
++        choice = new FolderChoice(scan.Files);
++        ModalInPresentation = true;
++    }
++
++    public override void ViewDidLoad()
++    {
++        base.ViewDidLoad();
++        View.BackgroundColor = Theme.Ground;
++        View.TintColor = Theme.Accent;
++        View.AccessibilityIdentifier = "import-folder-sheet";
++
++        var title = Theme.Label(FolderImportText.Title, Theme.Rounded(22, UIFontWeight.Bold), Theme.Text);
++        title.AccessibilityTraits = UIAccessibilityTrait.Header;
++        var sub = Theme.Label($"{folderName} · {scan.Files.Count} game file{(scan.Files.Count == 1 ? "" : "s")}", Theme.Font(13, UIFontWeight.Regular), Theme.Muted, 2);
++        var cancel = UIButton.FromType(UIButtonType.System);
++        cancel.SetTitle(FolderImportText.Cancel, UIControlState.Normal);
++        cancel.AccessibilityIdentifier = "import-folder-cancel";
++        cancel.TouchUpInside += (_, __) => Close(add: false);
++        selectButton = UIButton.FromType(UIButtonType.System);
++        selectButton.AccessibilityIdentifier = "import-folder-select-all";
++        selectButton.TouchUpInside += (_, __) => { choice.SelectAllOrNone(); Changed(); };
++        var top = Theme.Row(8, Theme.Column(2, title, sub), new UIView(), cancel);
++        top.Alignment = UIStackViewAlignment.Top;
++        var selectRow = Theme.Row(8, new UIView(), selectButton);
++
++        table.TranslatesAutoresizingMaskIntoConstraints = false;
++        table.BackgroundColor = UIColor.Clear;
++        table.SeparatorColor = UIColor.FromWhiteAlpha(1f, 0.08f);
++        table.AccessibilityIdentifier = "import-folder-list";
++        table.Source = new Rows(this);
++
++        summary = Theme.Label("", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
++        addButton = Theme.Pill("Add 0", "plus", true, 50);
++        addButton.AccessibilityIdentifier = "import-folder-add";
++        addButton.TouchUpInside += (_, __) => Close(add: true);
++        var foot = new List<UIView> { summary };
++        if (scan.Truncated) foot.Add(Theme.Label(FolderImportText.Truncated(FolderScan.MaxEntries), Theme.Font(12, UIFontWeight.Medium), Theme.Warn, 0));
++        foot.Add(addButton);
++        var bottom = Theme.Column(8, foot.ToArray());
++
++        top.TranslatesAutoresizingMaskIntoConstraints = false;
++        selectRow.TranslatesAutoresizingMaskIntoConstraints = false;
++        bottom.TranslatesAutoresizingMaskIntoConstraints = false;
++        View.AddSubview(top);
++        View.AddSubview(selectRow);
++        View.AddSubview(table);
++        View.AddSubview(bottom);
++        var guide = View.SafeAreaLayoutGuide;
++        NSLayoutConstraint.ActivateConstraints(new[]
++        {
++            top.TopAnchor.ConstraintEqualTo(View.TopAnchor, 20), top.LeadingAnchor.ConstraintEqualTo(guide.LeadingAnchor, 20), top.TrailingAnchor.ConstraintEqualTo(guide.TrailingAnchor, -20),
++            selectRow.TopAnchor.ConstraintEqualTo(top.BottomAnchor, 8), selectRow.LeadingAnchor.ConstraintEqualTo(guide.LeadingAnchor, 20), selectRow.TrailingAnchor.ConstraintEqualTo(guide.TrailingAnchor, -20),
++            table.TopAnchor.ConstraintEqualTo(selectRow.BottomAnchor, 4), table.LeadingAnchor.ConstraintEqualTo(guide.LeadingAnchor), table.TrailingAnchor.ConstraintEqualTo(guide.TrailingAnchor),
++            table.BottomAnchor.ConstraintEqualTo(bottom.TopAnchor, -8),
++            bottom.LeadingAnchor.ConstraintEqualTo(guide.LeadingAnchor, 20), bottom.TrailingAnchor.ConstraintEqualTo(guide.TrailingAnchor, -20), bottom.BottomAnchor.ConstraintEqualTo(guide.BottomAnchor, -12),
++        });
++        Changed();
++    }
++
++    /// Whatever ended the sheet other than its two buttons (it cannot be swiped away, but a view that disappears is not trusted): the owner is told once.
++    public override void ViewDidDisappear(bool animated)
++    {
++        base.ViewDidDisappear(animated);
++        if (!finished && IsBeingDismissed) { finished = true; cancelled(); }
++    }
++
++    private void Close(bool add)
++    {
++        if (finished) return;
++        finished = true;
++        var chosen = choice.Chosen;
++        DismissViewController(true, null);
++        if (add && chosen.Count > 0) this.add(chosen); else cancelled();
++    }
++
++    /// The model changed: the rows, the two buttons and the line under the list are drawn again from it.
++    private void Changed()
++    {
++        table.ReloadData();
++        selectButton.SetTitle(choice.SelectTitle, UIControlState.Normal);
++        selectButton.Enabled = choice.Choosable > 0;
++        var c = addButton.Configuration;
++        c.AttributedTitle = new NSAttributedString(choice.AddTitle, new UIStringAttributes { Font = Theme.Font(16, UIFontWeight.Semibold) });
++        addButton.Configuration = c;
++        addButton.Enabled = choice.Count > 0;
++        summary.Text = FolderImportText.Summary(choice);
++    }
++
++    private sealed class Rows : UITableViewSource
++    {
++        private readonly GameFolderImportViewController owner;
++        public Rows(GameFolderImportViewController owner) => this.owner = owner;
++
++        public override nint RowsInSection(UITableView tableView, nint section) => owner.choice.Files.Count;
++
++        public override UITableViewCell GetCell(UITableView tableView, NSIndexPath indexPath)
++        {
++            int row = (int) indexPath.Row;
++            var file = owner.choice.Files[row];
++            bool on = owner.choice.IsChosen(row), can = owner.choice.CanChoose(row);
++            var cell = tableView.DequeueReusableCell("row") ?? new UITableViewCell(UITableViewCellStyle.Default, "row");
++            var content = UIListContentConfiguration.SubtitleCellConfiguration;
++            content.Text = file.Name;
++            content.SecondaryText = FolderImportText.Detail(file);
++            content.TextProperties.Color = can ? Theme.Text : Theme.Dim;
++            content.TextProperties.NumberOfLines = 2;
++            content.SecondaryTextProperties.Color = can ? Theme.Muted : Theme.Dim;
++            content.Image = UIImage.GetSystemImage(on ? "checkmark.circle.fill" : can ? "circle" : "minus.circle");
++            content.ImageProperties.TintColor = on ? Theme.Accent : Theme.Dim;
++            cell.ContentConfiguration = content;
++            cell.BackgroundColor = UIColor.Clear;
++            cell.SelectionStyle = can ? UITableViewCellSelectionStyle.Default : UITableViewCellSelectionStyle.None;
++            cell.IsAccessibilityElement = true;
++            cell.AccessibilityLabel = file.Name + ", " + FolderImportText.Detail(file) + (on ? ", chosen" : "");
++            cell.AccessibilityTraits = can ? UIAccessibilityTrait.Button : UIAccessibilityTrait.Button | UIAccessibilityTrait.NotEnabled;
++            cell.AccessibilityIdentifier = "import-folder-row-" + row;
++            return cell;
++        }
++
++        public override void RowSelected(UITableView tableView, NSIndexPath indexPath)
++        {
++            tableView.DeselectRow(indexPath, true);
++            owner.choice.Toggle((int) indexPath.Row);
++            owner.Changed();
++        }
++    }
++}
+diff -ruN a/GameAppImportUi.cs b/GameAppImportUi.cs
+--- a/GameAppImportUi.cs
++++ b/GameAppImportUi.cs
+@@ -1,13 +1,15 @@
+-// gameapp/GameAppImportUi.cs -- "Add from Files without copying": the + button's menu, the open-in-place picker, the import itself, the progress card on the Build tab (patch 0066). The decisions (clone or copy, the
+-// .part and the rename, which names are taken, the words of the log) are in GameAppImport.cs (no UIKit, run by the host harness).
++// gameapp/GameAppImportUi.cs -- "Add from a folder without copying": the + button's menu, the folder picker, the scan, the selection sheet's hand-over, the import itself and the progress card on the Build tab (patch 0066,
++// the entry rebuilt around a FOLDER in patch 0067). The decisions (clone or copy, the .part and the rename, which names are taken, what a scan finds, what is chosen, the words) are in GameAppImport.cs and
++// GameAppImportFolder.cs (no UIKit, run by the host harness); the sheet is GameAppImportFolderUi.cs.
+ //
+-//   * The + button of the Build tab (accessibility id `import-file`, also the Library's "Add a game" tile and Command-I) is a menu: "Add a game file" (the picker that has been the way in all along: UIDocumentPickerMode.Import,
+-//     iOS makes the copy in tmp/ and CopyIn moves it into Documents; it works on this phone and is NOT changed) and "Add from Files without copying" (this file). Command-Shift-I opens the second one.
+-//   * "Add from Files without copying": the picker in OPEN mode (UIDocumentPickerViewController(types, asCopy: false), several files): iOS hands over the files where they are, no copy. For each picked file, on a worker
+-//     thread, inside an NSFileCoordinator read (a file only in iCloud is downloaded first) and a security scope: an APFS clone into Documents, else (another volume, no clones) the copy with progress; always through
+-//     <name>.part and one rename. A progress card on the Build tab, a background task, the screen kept awake while it copies. The main thread does a few property reads and nothing else.
+-//   * A FILE picker in Open mode did not deliver its selection on iOS 27.0.1 in the exported player (the delegate never fired; the folder picker in Open mode did). The app logs `import: the picker is open (in place)` when
+-//     it opens and `import: picked N file(s)` when it answers, `import: the picker was closed without a file` when it is cancelled; a watchdog adds one line when the picker is gone and nothing was answered.
++//   * The + button of the Build tab (accessibility id `import-file`, also the Library's "Add a game" tile and Command-I) is a menu: "Add a game file" (the picker that has been the way in all along:
++//     UIDocumentPickerMode.Import, iOS makes the copy in tmp/ and CopyIn moves it into Documents; it works on this phone and is NOT changed) and "Add from a folder without copying" (this file; Command-Shift-I).
++//   * Why a folder: the FILE picker in Open mode does not deliver its selection on iOS 27.0.1 or 27.2.1 (patch 0066's entry: the owner selected games, tapped Open, and the delegate was told "cancelled"), while the FOLDER
++//     picker in Open mode did (the Cloud page's "Add a folder", until 27.2.1: see GameAppPickers.cs, the one place the folder pickers are made, with the log lines that tell what happens).
++//   * The flow: the folder is picked -> on a worker thread, under the folder's security scope, the folder is looked at (its top level and one level of folders in it, 2,000 entries at most: FolderScan) -> the sheet
++//     lists the game files found with their sizes, the ones already in the library disabled -> "Add N" -> each chosen file, on a worker, inside an NSFileCoordinator read (a file only in iCloud is downloaded first):
++//     an APFS clone into Documents, else (another volume, no clones) the copy with progress, always through <name>.part and one rename (GameImport.Place). A progress card on the Build tab, a background task, the screen
++//     kept awake while it copies. The security scope is held from the scan until the work is over, then stopped. The main thread does a few property reads and nothing else.
+ using System;
+ using System.Collections.Generic;
+ using System.IO;
+@@ -16,12 +18,12 @@
+ 
+ using Foundation;
+ using UIKit;
+-using UniformTypeIdentifiers;
+ 
+ public sealed partial class GameAppViewController
+ {
+-    private bool importBusy;
+-    private NSObject importPickerDelegate;   // alive while a picker is up
++    private bool importBusy;                 // a folder is being read, its sheet is open, or files are being added: one at a time
++    private NSUrl importFolder;              // the picked folder, its security scope held until the import is over
++    private bool importFolderScoped;
+     private UILabel importLine;
+     private UIProgressView importBar;
+     private UIView importCard;
+@@ -30,10 +32,10 @@
+     private UIMenu ImportMenu() => UIMenu.Create(new UIMenuElement[]
+     {
+         UIAction.Create("Add a game file", UIImage.GetSystemImage("doc.badge.plus"), "import-add", _ => Import()),
+-        UIAction.Create("Add from Files without copying", UIImage.GetSystemImage("folder.badge.plus"), "import-in-place", _ => ImportInPlace()),
++        UIAction.Create("Add from a folder without copying", UIImage.GetSystemImage("folder.badge.plus"), "import-from-folder", _ => ImportFromFolder()),
+     });
+ 
+-    /// The progress card of the Build tab's column: hidden until an in-place import is going.
++    /// The progress card of the Build tab's column: hidden until a folder is being read or files are being added.
+     private UIView MakeImportCard()
+     {
+         importLine = Theme.Label("", Theme.Font(13, UIFontWeight.Semibold), Theme.Text, 0);
+@@ -52,82 +54,111 @@
+         importCard.Hidden = false;
+     }
+ 
+-    // ---- the picker ----------------------------------------------------------------------------------------------------------
++    private void StillAdding()
++    {
++        Write("import: a folder or a file is still being added: wait for it to end");
++        var busy = UIAlertController.Create("Still adding", "A folder is being read or files are being added from it. Wait for it to end (the Build tab shows how far it is).", UIAlertControllerStyle.Alert);
++        busy.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(busy);
++    }
+ 
+-    private void ImportInPlace()
++    // ---- the folder picker ---------------------------------------------------------------------------------------------------
++
++    private void ImportFromFolder()
+     {
+         if (GameExport.IsPlayer) return;
+-        if (importBusy)
+-        {
+-            Write("import: a file is still being added: wait for it to end");
+-            var busy = UIAlertController.Create("Still adding", "A file is still being added from Files. Wait for it to end (the Build tab shows how far it is).", UIAlertControllerStyle.Alert);
+-            busy.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
+-            PresentWhenFree(busy);
+-            return;
+-        }
+-        var picker = new UIDocumentPickerViewController(new[] { UTTypes.Item }, false);   // asCopy: false = open the file where it is (the non-obsolete initialiser, as the cover picker's)
+-        picker.AllowsMultipleSelection = true;                                           // a game with its update and DLC in one go
+-        var answer = new InPlacePickerDelegate(this);
+-        importPickerDelegate = answer;
+-        picker.Delegate = answer;
+-        Write("import: the picker is open (in place)");
+-        PresentWhenFree(picker);
+-        WatchPicker(picker, answer);
++        if (importBusy) { StillAdding(); return; }
++        // GameAppPickers.cs: the one place a folder picker is made (logs `picker: import folder ...`, the modern initialiser by default, the offer of the older one when it does not answer)
++        PresentFolderPicker("import folder", FolderPickedForImport, () => Write("import: the folder picker was closed without a folder"));
++        Write("import: the folder picker is open");
+     }
+ 
+-    /// Only a line in the log: the picker is gone and the app was told nothing (the iOS 27.0.1 behaviour that made the old Open-mode file picker useless). Reads two properties twice a second, at most 10 minutes.
+-    private void WatchPicker(UIDocumentPickerViewController picker, InPlacePickerDelegate answer)
++    // ---- reading the folder (a worker) -----------------------------------------------------------------------------------------
++
++    /// The folder was picked. Main thread: it starts the worker and shows the card, nothing more.
++    private void FolderPickedForImport(NSUrl folder)
+     {
+-        int ticks = 0, gone = 0;
+-        bool shown = false;
+-        void Tick()
++        var root = folder?.Path;
++        if (string.IsNullOrEmpty(root)) { Write("import: the folder picker was closed without a folder"); return; }
++        if (importBusy) { StillAdding(); return; }
++        importBusy = true;
++        var name = folder.LastPathComponent;
++        ShowImportProgress(0, 1, name, 0, "Reading");
++        Task.Run(() =>
+         {
+-            if (answer.Answered || ++ticks > 1200) return;
+-            bool on = picker.IsViewLoaded && picker.View?.Window != null;
+-            if (on) { shown = true; gone = 0; }
+-            else if (shown && ++gone >= 6)
++            FolderScanResult scan = null;
++            string error = null;
++            bool scoped = folder.StartAccessingSecurityScopedResource();   // held until the sheet is closed or the files are added
++            try
+             {
+-                Write("import: the picker closed and the app got no answer from it (iOS may not deliver a pick made in Open mode: use \"Add a game file\")");
+-                return;
++                var library = Dumps().Select(Path.GetFileName).ToList();
++                if (File.Exists(Path.Combine(GameAppMain.Documents, "prod.keys"))) library.Add("prod.keys");
++                scan = FolderScan.Scan(FolderListing.OnDisk(root), library);
+             }
+-            NSTimer.CreateScheduledTimer(0.5, _ => Tick());
++            catch (Exception e) { error = e.Message; }
++            bool keep = scoped && error == null && scan.Files.Count > 0;
++            if (scoped && !keep) folder.StopAccessingSecurityScopedResource();
++            BeginInvokeOnMainThread(() => FolderRead(folder, name, scan, error, keep));
++        });
++    }
++
++    /// The scan is back (main thread): the sheet, or why there is none.
++    private void FolderRead(NSUrl folder, string name, FolderScanResult scan, string error, bool scopeHeld)
++    {
++        if (error != null || scan.Files.Count == 0)
++        {
++            importBusy = false;
++            if (importCard != null) importCard.Hidden = true;
++            if (error != null) Write($"import: folder {name} could not be read: {error}");
++            else Write(FolderImportText.Found(name, 0));
++            var none = UIAlertController.Create(error != null ? "Could not read the folder" : "No game file found", error ?? FolderImportText.Empty(name), UIAlertControllerStyle.Alert);
++            none.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
++            PresentWhenFree(none);
++            return;
+         }
+-        NSTimer.CreateScheduledTimer(0.5, _ => Tick());
++        importFolder = folder;
++        importFolderScoped = scopeHeld;
++        Write(FolderImportText.Found(name, scan.Files.Count) + (scan.Files.Any(f => f.InLibrary) ? $", {scan.Files.Count(f => f.InLibrary)} in the library already" : ""));
++        if (scan.Truncated) Write($"import: folder {name}: only the first {FolderScan.MaxEntries:N0} entries were looked at");
++        if (scan.Duplicates > 0) Write($"import: folder {name}: {scan.Duplicates} file(s) with a name already found were left out");
++        if (importCard != null) importCard.Hidden = true;
++        var sheet = new GameFolderImportViewController(name, scan, chosen => FolderChosen(folder, chosen), FolderSheetClosed);
++        Theme.StyleSheet(sheet);
++        PresentWhenFree(sheet);
+     }
+ 
+-    private sealed class InPlacePickerDelegate : NSObject, IUIDocumentPickerDelegate
++    /// "Cancel" on the sheet (or the sheet went away): nothing is added, the scope is stopped, the card is gone.
++    private void FolderSheetClosed()
+     {
+-        private readonly GameAppViewController owner;
+-        private volatile bool answered;
+-        public InPlacePickerDelegate(GameAppViewController owner) => this.owner = owner;
+-        public bool Answered => answered;
+-        public void DidPickDocument(UIDocumentPickerViewController controller, NSUrl url) { answered = true; owner.ImportPickedInPlace(new[] { url }); }
+-        public void DidPickDocumentAtUrls(UIDocumentPickerViewController controller, NSUrl[] urls) { answered = true; owner.ImportPickedInPlace(urls); }
+-        [Export("documentPickerWasCancelled:")]
+-        public void WasCancelled(UIDocumentPickerViewController controller) { answered = true; owner.Write("import: the picker was closed without a file"); }
++        Write("import: nothing added from the folder");
++        importBusy = false;
++        if (importCard != null) importCard.Hidden = true;
++        EndFolderImport();
+     }
+ 
++    private void EndFolderImport()
++    {
++        if (importFolder != null && importFolderScoped) importFolder.StopAccessingSecurityScopedResource();
++        importFolder = null;
++        importFolderScoped = false;
++    }
++
+     // ---- the import ----------------------------------------------------------------------------------------------------------
+ 
+-    /// What the picker handed over: each file where it is, under a security scope. Main thread: it only plans; the work is on a worker.
+-    private void ImportPickedInPlace(NSUrl[] urls)
++    /// "Add N" on the sheet. Main thread: it plans the jobs; the work is on a worker.
++    private void FolderChosen(NSUrl folder, IReadOnlyList<FolderFile> chosen)
+     {
+-        var picked = (urls ?? Array.Empty<NSUrl>()).Where(u => u != null && !string.IsNullOrEmpty(u.LastPathComponent)).ToList();
+-        if (picked.Count == 0) { Write("import: the picker returned no file"); return; }
+-        Write($"import: picked {picked.Count} file(s)");
+-        var names = picked.Select(u => Cloud.RealName(u.LastPathComponent)).ToList();   // an iCloud placeholder's real name
+-        var plan = InPlaceImport.Plan(names);
+-        foreach (var (index, why) in plan.Skipped) Write($"import: {names[index]} skipped: {why}");
+-        if (plan.Accepted.Count == 0)
+-        {
+-            var none = UIAlertController.Create("Nothing to add", string.Join("\n", plan.Skipped.Select(s => $"{names[s.Index]}: {s.Why}")), UIAlertControllerStyle.Alert);
+-            none.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
+-            PresentWhenFree(none);
+-            return;
+-        }
+-        if (importBusy) { Write("import: a file is still being added: this pick is ignored"); return; }
++        Write($"import: picked {chosen.Count} file(s)");
++        // each file's URL is a path under the picked folder, whose security scope is still held (as ScanFolderForContent / CopyContentIn read the files they found)
++        var jobs = chosen.Select(f => (Url: NSUrl.FromFilename(Path.Combine(folder.Path, f.Relative)), Name: f.Name)).ToList();
++        RunImportJobs(jobs, EndFolderImport);
++    }
++
++    /// Adds `jobs` to Documents (the file's own name, as CopyIn does; the title-id / update / DLC handling is the file name's, read by the refresh that follows: RefreshGames + RefreshScreen), one after the other on a
++    /// worker thread: a coordinated read (a file only in iCloud is downloaded first), then GameImport.Place. `afterwards` runs on the main thread when all are done.
++    private void RunImportJobs(List<(NSUrl Url, string Name)> jobs, Action afterwards)
++    {
+         importBusy = true;
+-        var jobs = plan.Accepted.Select(i => (Url: picked[i], Name: names[i])).ToList();
+         bool awake = !UIApplication.SharedApplication.IdleTimerDisabled;   // not undone when a build already keeps the screen awake
+         if (awake) UIApplication.SharedApplication.IdleTimerDisabled = true;
+         // The background task keeps the copy going when the app is left (a clone is over before that matters). When the system's time for it runs out the task is ended, not the app: the copy goes on when the app is back.
+@@ -147,7 +178,6 @@
+                 BeginInvokeOnMainThread(() => ShowImportProgress(index, jobs.Count, name, 0, "Adding"));
+                 Placed placed = null;
+                 string error = null;
+-                bool scoped = url.StartAccessingSecurityScopedResource();
+                 try
+                 {
+                     new NSFileCoordinator().CoordinateRead(url, (NSFileCoordinatorReadingOptions) 0, out NSError coordination, readable =>
+@@ -166,7 +196,6 @@
+                     if (placed == null && error == null) error = coordination?.LocalizedDescription ?? "the file could not be read";
+                 }
+                 catch (Exception e) { error ??= e.Message; }
+-                finally { if (scoped) url.StopAccessingSecurityScopedResource(); }
+                 if (error != null) log($"import: {name} could not be added: {error}");
+                 outcomes.Add(new ImportOutcome(name, placed, error));
+             }
+@@ -176,6 +205,7 @@
+                 if (importCard != null) importCard.Hidden = true;
+                 if (awake) UIApplication.SharedApplication.IdleTimerDisabled = false;
+                 EndTask();
++                afterwards?.Invoke();   // the folder's security scope is stopped: the work is done
+                 Write(InPlaceImport.Summary(outcomes));
+                 RefreshGames();
+                 RefreshScreen();
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs
++++ b/GameAppLibrary.cs
+@@ -675,7 +675,6 @@
+     /// A slim export not yet shown its game files (GameExport.PlayerRomfs).
+     private static bool PlayerNeedsGameFiles => GameExport.PlayerRomfsName != null && GameExport.PlayerRomfs == null;
+ 
+-    private FolderPickerDelegate gameFilesPicker;
+     private UIButton playerPick;
+     private UIProgressView playerProgress;
+ 
+@@ -687,11 +686,9 @@
+         // A FILE picker in Open mode does nothing on iOS 27.0.1: a tap on the game files (12 GB), on a 94-byte file, with the old or the content-type initialiser, never reaches the delegate (cable tests on the
+         // re-exported player, 2026-11-19; the folders of the same picker open, and a FOLDER picker has its blue "Open" button and works, like the one of the Cloud page). So the player picks the FOLDER that
+         // holds the game files (On My iPhone > iBuilder > Exports > <the game>), and finds the .romfs inside it, read in place through the folder's security scope.
+-        var picker = new UIDocumentPickerViewController(new[] { "public.folder" }, UIDocumentPickerMode.Open);
+         Write("game files: the folder picker is open (the .romfs is looked for inside the folder; the manifest decides)");
+-        gameFilesPicker = new FolderPickerDelegate(url =>
++        PresentFolderPicker("game files folder", url =>   // GameAppPickers.cs: the one place a folder picker is made
+         {
+-            if (url == null) { Write("game files: the picker closed without a file"); return; }
+             Write($"game files: picked {url.LastPathComponent}, checking it");
+             var why = GameExport.UsePickedRomfs(url);
+             Write(why == null ? $"game files: {url.LastPathComponent}, read in place from now on" : $"game files refused: {why}");
+@@ -703,9 +700,7 @@
+                 PresentWhenFree(a);
+             }
+             RefreshScreen();
+-        });
+-        picker.Delegate = gameFilesPicker;
+-        PresentWhenFree(picker);
++        }, () => Write("game files: the picker closed without a file"));
+     }
+ 
+     private string playerLastText, playerSavesText;
+@@ -791,7 +786,7 @@
+ 
+     // ---- the keyboard (an iPad with a hardware keyboard) -------------------------------------------------------------
+ 
+-    /// Command-R refreshes the cloud, Command-I imports, Command-Shift-I adds from Files without copying (patch 0066), Command-1 and Command-2 are the tabs, Command-comma is Settings, Return and
++    /// Command-R refreshes the cloud, Command-I imports, Command-Shift-I adds from a folder without copying (patch 0066, 0067), Command-1 and Command-2 are the tabs, Command-comma is Settings, Return and
+     /// Space press the selected game's main button. Held down, Command shows the first five in the system's list. They act on the
+     /// library's screen only: a sheet or an alert on top has its own keys.
+     private void AddKeyCommands()
+@@ -809,14 +804,14 @@
+         Add(",", UIKeyModifierFlags.Command, "keySettingsTab", null);   // the system's own shortcut for an app's settings
+         Add("\r", 0, "keyPrimary", "Play or build the selected game");
+         Add(" ", 0, "keyPrimary", null);
+-        Add("i", UIKeyModifierFlags.Command | UIKeyModifierFlags.Shift, "keyImportInPlace", "Add from Files without copying");
++        Add("i", UIKeyModifierFlags.Command | UIKeyModifierFlags.Shift, "keyImportFromFolder", "Add from a folder without copying");
+     }
+ 
+     private bool KeysAreFree => PresentedViewController == null && !GameExport.IsPlayer;
+ 
+     [Export("keyRefresh")] private void KeyRefresh() { if (KeysAreFree) RefreshCloud(null); }
+     [Export("keyImport")] private void KeyImport() { if (KeysAreFree && !running) Import(); }
+-    [Export("keyImportInPlace")] private void KeyImportInPlace() { if (KeysAreFree && !running) ImportInPlace(); }   // GameAppImportUi.cs
++    [Export("keyImportFromFolder")] private void KeyImportFromFolder() { if (KeysAreFree && !running) ImportFromFolder(); }   // GameAppImportUi.cs
+     [Export("keyLibrary")] private void KeyLibrary() { if (KeysAreFree) { logsBack = null; ShowTab(0); } }
+     [Export("keySettingsTab")] private void KeySettingsTab() { if (KeysAreFree) { logsBack = null; ShowTab(4); } }
+     [Export("keyPrimary")] private void KeyPrimary() { if (KeysAreFree && currentTab == 0 && action.Enabled) PrimaryTapped(); }
+@@ -1528,8 +1523,11 @@
+         cloudRows.Axis = UILayoutConstraintAxis.Vertical;
+         cloudRows.Spacing = 0;   // a flat list: the sources between hairlines, no cards (RefreshCloudPage)
+         var add = SettingsRow("Add a folder", AddFolderSource, true, false, -1, "cloud-add-folder");
++        var addOlder = SettingsRow("Add a folder (older picker)", AddFolderSourceOlder, true, false, -1, "cloud-add-folder-older");   // the previous initialiser (GameAppPickers.cs): the log says which one answers
+         var addHint = Theme.Label("iCloud Drive, Google Drive, OneDrive… (whatever the Files app shows).", Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
+-        var column = Theme.Column(14, header, note, SectionLabel("SOURCES"), cloudRows, SettingsCard(add.Button), addHint);
++        var greyHint = Theme.Label("Greyed out in the picker? That cloud cannot be added as a folder on this " + GameAppUi.DeviceName + ": add its games one by one with Add a game file (+ in the Build tab). The copy is removed after a successful build.",
++                                   Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0);
++        var column = Theme.Column(14, header, note, SectionLabel("SOURCES"), cloudRows, SettingsCard(add.Button, addOlder.Button), addHint, greyHint);
+         var scroll = new UIScrollView { AlwaysBounceVertical = true };
+         column.TranslatesAutoresizingMaskIntoConstraints = false;
+         scroll.AddSubview(column);
+@@ -1602,41 +1600,35 @@
+     /// Where a local file can be sent: the NAS (when set up) and every folder.
+     private List<CloudSource> UploadTargets() => GameExport.IsPlayer ? new List<CloudSource>() : cloudSources;
+ 
+-    private void AddFolderSource()
+-    {
+-        var picker = new UIDocumentPickerViewController(new[] { "public.folder" }, UIDocumentPickerMode.Open);
+-        picker.Delegate = new FolderPickerDelegate(FolderPicked);
+-        PresentWhenFree(picker);
+-    }
++    private void AddFolderSource() => PresentFolderPicker("cloud folder", FolderPicked);
+ 
++    /// The same, with the previous initialiser (Open mode, public.folder): a second way to try on a phone where the first does not answer; the log says which one answered.
++    private void AddFolderSourceOlder() => PresentFolderPicker("cloud folder", FolderPicked, older: true);
++
+     private void FolderPicked(NSUrl url)
+     {
+-        if (url == null) return;
++        if (url == null) { Write("cloud: no folder came back from the picker"); return; }
++        var location = url.Path;
++        var provider = Cloud.ProviderName(location);
+         bool scoped = url.StartAccessingSecurityScopedResource();
++        if (!scoped) Write($"cloud: {url.LastPathComponent} ({provider}): its security scope could not be started; trying to keep it all the same");
+         try
+         {
+             var data = url.CreateBookmarkData(NSUrlBookmarkCreationOptions.MinimalBookmark, null, null, out NSError error);
+-            if (data == null) { Write($"cloud: that folder cannot be kept ({error?.LocalizedDescription})"); return; }
++            if (data == null) { Write($"cloud: that folder cannot be kept ({error?.LocalizedDescription ?? "no reason given"}; {provider}; {error?.Domain} {error?.Code})"); return; }
+             var id = Cloud.NewId(CloudKind.Folder, cloudSources);
+-            data.Save(BookmarkPath(id), true);
+-            var source = new CloudSource(id, CloudKind.Folder, Cloud.SourceName(url.Path), url.Path);
++            if (!data.Save(BookmarkPath(id), true)) { Write($"cloud: the bookmark of {url.LastPathComponent} ({provider}) could not be written to {BookmarkPath(id)}"); return; }
++            var source = new CloudSource(id, CloudKind.Folder, Cloud.SourceName(location), location);
+             folderSources.Add(source);
+             SaveCloud();
+-            Write($"cloud: added {source.Name} ({url.Path})");
++            Write($"cloud: added {source.Name} ({location}; {provider})");
+             RefreshCloudPage();
+             RefreshCloud(id);
+         }
++        catch (Exception e) { Write($"cloud: adding {url.LastPathComponent} ({provider}) failed: {e.GetType().Name}: {e.Message}"); }
+         finally { if (scoped) url.StopAccessingSecurityScopedResource(); }
+     }
+ 
+-    private sealed class FolderPickerDelegate : NSObject, IUIDocumentPickerDelegate
+-    {
+-        private readonly Action<NSUrl> picked;
+-        public FolderPickerDelegate(Action<NSUrl> picked) => this.picked = picked;
+-        [Export("documentPicker:didPickDocumentsAtURLs:")]
+-        public void DidPickDocumentAtUrls(UIDocumentPickerViewController controller, NSUrl[] urls) => picked(urls?.FirstOrDefault());
+-    }
+-
+     // ---- a game's update and DLC: what it has, add files (several at once), or find them in a folder ------------
+ 
+     private UIButton contentAdd;
+@@ -1671,12 +1663,7 @@
+         var items = new List<UIMenuElement>
+         {
+             UIAction.Create("Add files… (pick several)", UIImage.GetSystemImage("doc.badge.plus"), null, _ => Import()),
+-            UIAction.Create("Find them in a folder…", UIImage.GetSystemImage("folder.badge.questionmark"), null, _ =>
+-            {
+-                var picker = new UIDocumentPickerViewController(new[] { "public.folder" }, UIDocumentPickerMode.Open);
+-                picker.Delegate = new FolderPickerDelegate(url => ScanFolderForContent(game, url));
+-                PresentWhenFree(picker);
+-            }),
++            UIAction.Create("Find them in a folder…", UIImage.GetSystemImage("folder.badge.questionmark"), null, _ => PresentFolderPicker("update and DLC folder", url => ScanFolderForContent(game, url))),
+         };
+         if (inCloud.Count > 0)
+             items.Add(UIAction.Create($"Download {inCloud.Count} from the cloud", UIImage.GetSystemImage("icloud.and.arrow.down"), null, _ =>
+diff -ruN a/GameAppPickers.cs b/GameAppPickers.cs
+--- a/GameAppPickers.cs
++++ b/GameAppPickers.cs
+@@ -0,0 +1,133 @@
++// gameapp/GameAppPickers.cs -- the ONE place a FOLDER picker is made (patch 0067): the Cloud page's "Add a folder", its "Add a folder (older picker)", the game files of an exported app, "Find them in a folder" (a game's update
++// and DLC) and "Add from a folder without copying". Why one place: on the owner's iPhone (iOS 27.2.1) the Cloud page's "Add a folder" stopped answering (no `cloud:` line at all in the log: the picker's callback never
++// reached the app), after it had worked on 27.0.1, and nobody can tell yet whether it is iOS, the iCloud provider or the initialiser. So every folder picker now
++//   * is built the MODERN way by default: new UIDocumentPickerViewController(new[] { UTTypes.Folder }, asCopy: false), AllowsMultipleSelection = false ("modern API"); the previous way, the obsolete initialiser with
++//     public.folder and UIDocumentPickerMode.Open, is the "older API" (the Cloud page has a button for it, and the offer below);
++//   * has ONE delegate that answers all three callbacks (documentPicker:didPickDocumentsAtURLs:, the single-URL documentPicker:didPickDocumentAtURL:, documentPickerWasCancelled:), each purpose told once;
++//   * writes the same log lines, so the next field log shows what happens: `picker: <purpose> folder picker is open (<api>; <start location>)`, `picker: <purpose> picked <name> (<where: provider / domain>; <api>)`,
++//     `picker: <purpose> provider domain <identifier>` (NSFileProviderManager, when it answers), `picker: <purpose> cancelled (<api>)`, and when the controller went away with no callback at all
++//     `picker: <purpose> closed with no answer (<api>)`, which also offers to try the older picker.
++// FolderPickerOlderByDefault is the one switch to flip when the field log says the older initialiser is the one that answers.
++using System;
++using System.Linq;
++using System.Threading;
++
++using FileProvider;
++using Foundation;
++using UIKit;
++using UniformTypeIdentifiers;
++
++public sealed partial class GameAppViewController
++{
++    /// false: every folder picker is built the modern way unless the caller asks for the older one.
++    internal static readonly bool FolderPickerOlderByDefault = false;
++
++    private NSObject folderPickerKeep;   // the delegate of the picker that is up (UIKit does not keep it)
++
++    /// Opens a folder picker for `purpose` (a few words: "cloud folder", "import folder"...). `picked(url)` on the main thread with the folder (its security scope is not started: the caller starts it); `cancelled()` when
++    /// the person cancelled or no folder came back. `older`: the previous initialiser (the Cloud page's second button; also the answer of the offer below).
++    private void PresentFolderPicker(string purpose, Action<NSUrl> picked, Action cancelled = null, bool? older = null)
++    {
++        bool useOlder = older ?? FolderPickerOlderByDefault;
++        UIDocumentPickerViewController picker;
++        if (useOlder)
++        {
++            // The initialiser that was here before patch 0067 (Open mode, public.folder): kept as the fallback, the warning silenced for these two lines.
++#pragma warning disable CA1422
++            picker = new UIDocumentPickerViewController(new[] { "public.folder" }, UIDocumentPickerMode.Open);
++#pragma warning restore CA1422
++        }
++        else picker = new UIDocumentPickerViewController(new[] { UTTypes.Folder }, false);   // asCopy: false = open the folder where it is (the non-obsolete initialiser, as the cover picker's)
++        picker.AllowsMultipleSelection = false;
++        var api = useOlder ? "older API" : "modern API";
++        var answer = new FolderPickerAnswer(purpose, api, line => Write(line), picked, cancelled);
++        folderPickerKeep = answer;
++        picker.Delegate = answer;
++        var start = picker.DirectoryUrl?.Path;
++        Write($"picker: {purpose} folder picker is open ({api}; " + (string.IsNullOrEmpty(start) ? "no start location set" : "opened in " + PickedLocation.Describe(start, Environment.GetEnvironmentVariable("HOME"))) + ")");
++        PresentWhenFree(picker);
++        WatchFolderPicker(picker, answer, purpose, api, useOlder, () => PresentFolderPicker(purpose, picked, cancelled, older: true));
++    }
++
++    /// One delegate for every folder picker: the plural and the single-URL callbacks are one answer (the first), a cancel is an answer too.
++    private sealed class FolderPickerAnswer : NSObject, IUIDocumentPickerDelegate
++    {
++        private readonly string purpose, api;
++        private readonly Action<string> log;
++        private readonly Action<NSUrl> picked;
++        private readonly Action cancelled;
++        private int answered;
++        public FolderPickerAnswer(string purpose, string api, Action<string> log, Action<NSUrl> picked, Action cancelled)
++        {
++            this.purpose = purpose; this.api = api; this.log = log; this.picked = picked; this.cancelled = cancelled;
++        }
++
++        public bool Answered => Volatile.Read(ref answered) != 0;
++
++        [Export("documentPicker:didPickDocumentsAtURLs:")]
++        public void DidPickDocumentAtUrls(UIDocumentPickerViewController controller, NSUrl[] urls) => Pick(urls?.FirstOrDefault());
++
++        [Export("documentPicker:didPickDocumentAtURL:")]
++        public void DidPickDocument(UIDocumentPickerViewController controller, NSUrl url) => Pick(url);
++
++        [Export("documentPickerWasCancelled:")]
++        public void WasCancelled(UIDocumentPickerViewController controller)
++        {
++            if (Interlocked.Exchange(ref answered, 1) != 0) return;
++            log($"picker: {purpose} cancelled ({api})");
++            cancelled?.Invoke();
++        }
++
++        private void Pick(NSUrl url)
++        {
++            if (Interlocked.Exchange(ref answered, 1) != 0) return;
++            if (url == null || string.IsNullOrEmpty(url.Path))
++            {
++                log($"picker: {purpose} answered with no folder ({api})");
++                cancelled?.Invoke();
++                return;
++            }
++            log($"picker: {purpose} picked {url.LastPathComponent} ({PickedLocation.Describe(url.Path, Environment.GetEnvironmentVariable("HOME"))}; {api})");
++            try
++            {
++                // the provider's own name for where it is (its domain), when the system tells: only for the log (the API is iOS / macOS only: the Mac Catalyst warning is silenced)
++#pragma warning disable CA1416
++                NSFileProviderManager.GetIdentifierForUserVisibleFile(url, (item, domain, error) =>
++                    NSOperationQueue.MainQueue.AddOperation(() => log($"picker: {purpose} provider domain " + (domain != null ? domain.ToString() : "none") + (error != null ? $" ({error.Domain} {error.Code})" : ""))));
++#pragma warning restore CA1416
++            }
++            catch (Exception) { }
++            picked(url);
++        }
++    }
++
++    /// The controller is gone and not one callback came: the line, and the offer of the older picker (only after the modern one). Two property reads twice a second, at most 10 minutes.
++    private void WatchFolderPicker(UIDocumentPickerViewController picker, FolderPickerAnswer answer, string purpose, string api, bool older, Action tryOlder)
++    {
++        int ticks = 0, gone = 0;
++        bool shown = false;
++        void Tick()
++        {
++            if (answer.Answered || ++ticks > 1200) return;
++            bool on = picker.IsViewLoaded && picker.View?.Window != null;
++            if (on) { shown = true; gone = 0; }
++            else if (shown && ++gone >= 6)
++            {
++                Write($"picker: {purpose} closed with no answer ({api})");
++                if (!older) OfferOlderPicker(purpose, tryOlder);
++                return;
++            }
++            NSTimer.CreateScheduledTimer(0.5, _ => Tick());
++        }
++        NSTimer.CreateScheduledTimer(0.5, _ => Tick());
++    }
++
++    private void OfferOlderPicker(string purpose, Action tryOlder)
++    {
++        var a = UIAlertController.Create("The folder picker did not answer",
++            "iOS closed the picker without telling the app which folder was chosen. The older picker may work on this " + GameAppUi.DeviceName + ": try it?", UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create("Try the older picker", UIAlertActionStyle.Default, _ => { Write($"picker: {purpose} trying the older picker"); tryOlder(); }));
++        a.AddAction(UIAlertAction.Create("Not now", UIAlertActionStyle.Cancel, null));
++        PresentWhenFree(a);
++    }
++}
+diff -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs
++++ b/GameAppShelf.cs
+@@ -499,7 +499,7 @@
+         refresh.TouchUpInside += (_, __) => RefreshCloud(null);
+         var plus = Theme.Round("plus", "Add a game file");
+         plus.AccessibilityIdentifier = "import-file";
+-        plus.Menu = ImportMenu();   // GameAppImportUi.cs: "Add a game file" (the picker that copies: unchanged) and "Add from Files without copying" (open in place, an APFS clone)
++        plus.Menu = ImportMenu();   // GameAppImportUi.cs: "Add a game file" (the picker that copies: unchanged) and "Add from a folder without copying" (the folder picker, a sheet of the games in it, an APFS clone)
+         plus.ShowsMenuAsPrimaryAction = true;
+         var header = Theme.Row(8, Theme.Column(4, title, buildSub), new UIView(), refresh, plus);
+         header.Alignment = UIStackViewAlignment.Top;
+@@ -531,7 +531,7 @@
+         phoneSection = Theme.Column(8, SectionLabel("ON THIS " + GameAppUi.DeviceName.ToUpperInvariant()), phoneCard);
+         cloudSection = Theme.Column(8, SectionLabel("IN THE CLOUD"), cloudCard, cloudNote);
+ 
+-        var column = Theme.Column(18, header, buildFilter, buildNowCard, MakeImportCard(), buildQueueSection, phoneSection, cloudSection);   // MakeImportCard: the progress of "Add from Files without copying"
++        var column = Theme.Column(18, header, buildFilter, buildNowCard, MakeImportCard(), buildQueueSection, phoneSection, cloudSection);   // MakeImportCard: the progress of "Add from a folder without copying"
+         var scroll = new UIScrollView { AlwaysBounceVertical = true, ShowsVerticalScrollIndicator = false };
+         column.TranslatesAutoresizingMaskIntoConstraints = false;
+         scroll.AddSubview(column);
+@@ -590,12 +590,7 @@
+         var items = new List<UIMenuElement>
+         {
+             UIAction.Create("Add files… (pick several)", UIImage.GetSystemImage("doc.badge.plus"), null, _ => Import()),
+-            UIAction.Create("Find them in a folder…", UIImage.GetSystemImage("folder.badge.questionmark"), null, _ =>
+-            {
+-                var picker = new UIDocumentPickerViewController(new[] { "public.folder" }, UIDocumentPickerMode.Open);
+-                picker.Delegate = new FolderPickerDelegate(url => ScanFolderForContent(game, url));
+-                PresentWhenFree(picker);
+-            }),
++            UIAction.Create("Find them in a folder…", UIImage.GetSystemImage("folder.badge.questionmark"), null, _ => PresentFolderPicker("update and DLC folder", url => ScanFolderForContent(game, url))),
+         };
+         if (inCloud.Count > 0)
+             items.Add(UIAction.Create($"Download {inCloud.Count} from the cloud", UIImage.GetSystemImage("icloud.and.arrow.down"), null, _ =>

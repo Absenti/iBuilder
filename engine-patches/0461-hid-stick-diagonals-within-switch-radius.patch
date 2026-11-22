@@ -1,0 +1,67 @@
+# host/hid: keep stick diagonals within the Switch radius (PR #3053)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/fdbb359db4e976e9eb488f2e93a3c40d601ff284  (PR #3053)
+# Author:    seedds, 2026-11-20 23:30 +0800
+# Co-authors:
+#   Co-authored-by: Susano Kevin Amala Mahil Maran
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES FOR THE PHONE
+#   A Switch stick never leaves the circle of radius DM_STICK_MAX; GameController axis pairs (a DualSense or Xbox pad on the iPhone) reach +-1 on each axis, so a diagonal reads up to ~1.15 of
+#   full tilt (upstream: Persona 3 Portable moved erratically). stick_circle() projects a vector beyond DM_STICK_MAX onto the circle, keeping direction and interior values, in fill() and
+#   fill_joy() (hle_hid.c). Default: on, no switch. Not tested upstream on iOS hardware.
+# Applies as is. RISK: low. NOT run on a device. Shader chain id untouched.
+#
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0415 (0407 touches the same file) and the candidates numbered below this one.
+
+diff --git a/dm/host/hle_hid.c b/dm/host/hle_hid.c
+index 1b8aa822..2a367725 100644
+--- a/dm/host/hle_hid.c
++++ b/dm/host/hle_hid.c
+@@ -560,6 +560,15 @@ static void rec_start(void) {
+     LOG("DM_REC: recording player 1's input to %s as DM_KEYS steps in presented frames", e);
+ }
+ 
++// Each stick held inside the circle of radius DM_STICK_MAX, as Horizon's hid reports it: a Switch stick's calibrated value never leaves that
++// circle, while a Mac or iPhone controller's axes each reach ±1 on their own, so a diagonal read up to about 1.15 of full tilt (a DualSense
++// through GameController). A game that takes the magnitude as at most full tilt got more than it could; the direction is kept
++static void stick_circle(int32_t a[4]) {
++    for (int i = 0; i < 4; i += 2) {
++        double m = hypot((double)a[i], (double)a[i + 1]);
++        if (m > DM_STICK_MAX) { a[i] = (int32_t)lrint(a[i] * DM_STICK_MAX / m); a[i + 1] = (int32_t)lrint(a[i + 1] * DM_STICK_MAX / m); }
++    }
++}
+ // Stick direction pseudo-buttons (NpadButton 16..23) from the sticks' values
+ static uint64_t stick_dirs(const int32_t a[4]) {
+     uint64_t b = 0;
+@@ -580,6 +589,7 @@ static void fill_joy(NpadState *s, npad_ref r) {
+         b |= atomic_load(&g_joy_btn[r.pad][side]) | atomic_exchange(&g_joy_latch[r.pad][side], 0);
+         uint64_t v = atomic_load(&g_joy_axes[r.pad][side]); a[2 * side] = ax(v, 0); a[2 * side + 1] = ax(v, 1);
+     }
++    stick_circle(a);
+     s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];
+     s->buttons = (b & 0x0f00ffffull) | stick_dirs(a);
+     s->attributes = ATTR_CONNECTED | (left ? ATTR_LEFT_CONN : 0) | (right ? ATTR_RIGHT_CONN : 0);
+@@ -609,6 +619,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
+         uint64_t c = atomic_load(&g_sc_axes); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(c, i));
+     }
+     if (atomic_load(&g_hold)) { b = 0; memset(a, 0, sizeof a); }   // an applet is in front: the game reads nothing (the latches were taken all the same)
++    stick_circle(a);
+     s->lx = a[0]; s->ly = a[1]; s->rx = a[2]; s->ry = a[3];
+     b &= 0xffffull;
+     if (s->lx < -STICK_THRESH) b |= 1u << 16;
+diff --git a/dm/host/tests/t_hid.c b/dm/host/tests/t_hid.c
+index 0137ff57..6bbc4171 100644
+--- a/dm/host/tests/t_hid.c
++++ b/dm/host/tests/t_hid.c
+@@ -534,6 +534,10 @@ static void t_script(void) {
+     CHECK(buttons_of(1, STYLE_FULLKEY) == 0, "player 2 does not receive or consume scripted presses");
+     NpadState s; fill(&s, NPAD_HANDHELD, STYLE_HANDHELD);
+     CHECK(s.buttons == DM_BTN_A && s.lx == 100 && s.ly == -200 && s.rx == 300 && s.ry == -400, "scripted buttons and all four axes reach player 1 in handheld mode");
++    script_set(0, DM_STICK_MAX, DM_STICK_MAX, -DM_STICK_MAX, 20000);   // a Mac controller's diagonal: each axis at full tilt on its own
++    fill(&s, NPAD_HANDHELD, STYLE_HANDHELD);
++    CHECK(hypot(s.lx, s.ly) <= DM_STICK_MAX + 1 && hypot(s.rx, s.ry) <= DM_STICK_MAX + 1, "a diagonal past full tilt is held inside the stick's circle");
++    CHECK(s.lx == s.ly && s.lx > 23000 && s.rx < 0 && s.ry > 0 && abs(s.rx * 20000 + s.ry * DM_STICK_MAX) < DM_STICK_MAX, "the held diagonal keeps its direction and reaches the circle");
+     script_set(0, 0, 0, 0, 0); buttons_of(NPAD_HANDHELD, STYLE_HANDHELD);
+     g_mode = 1; dm_pad_players(1);
+     g_nsteps = 0; g_steps = NULL;

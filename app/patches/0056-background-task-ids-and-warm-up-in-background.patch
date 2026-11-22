@@ -1,0 +1,132 @@
+# The background task (a build, and now the shader warm-up) was refused under every bundle id but the one named in Info.plist: the system matches "<runtime bundle id>.build.<n>" against the exact
+# permitted ids (device test 2026-11-19: dev.nxpocket.gameapp.usb.build.1 refused against dev.nxpocket.gameapp.* and accepted once dev.nxpocket.gameapp.usb.build.* was listed).
+#  * Info.plist.fragment lists the SideStore id of this project's team; the export lists the player's own id and the installer's suffix variant; scripts/usb-install.sh adds the cable install's.
+#  * "Prepare the shaders" now runs under that task (progress on the lock screen) and keeps going when the app is left (GameAppWarm.cs, GameAppBackground.cs).
+# Applies after 0055.
+diff -ruN a/GameAppBackground.cs b/GameAppBackground.cs
+--- a/GameAppBackground.cs
++++ b/GameAppBackground.cs
+@@ -35,11 +35,12 @@
+     private static long backgroundDone;                         // the last unit count reported
+     private static string backgroundSubtitle;
+     private static int backgroundCounter;
++    private static bool backgroundWarm;                         // the task in flight is a shader warm-up, not a build: its progress is the warm-up's "N of M"
+ 
+     private static string BackgroundPrefix => (NSBundle.MainBundle.BundleIdentifier ?? "dev.nxpocket.gameapp") + ".build.";
+ 
+     /// Ask the system to keep this build running in the background. Called from BeginRun for a build (not a boot).
+-    private void BackgroundBegin(string game)
++    private void BackgroundBegin(string game, bool warm = false)
+     {
+         if (!UIKit.UIDevice.CurrentDevice.CheckSystemVersion(26, 0)) return;
+         try
+@@ -53,7 +54,8 @@
+                 // identifier kills the app, hence the counter.
+                 if (!BGTaskScheduler.Shared.Register(id, null, BackgroundStarted))
+                 { Write("background: the system refused the task registration (is the identifier in Info.plist?)"); return; }
+-                var title = "Building " + GameAppUi.DisplayName(game);
++                backgroundWarm = warm;
++                var title = warm ? "Preparing the shaders of " + GameAppUi.DisplayName(game) : "Building " + GameAppUi.DisplayName(game);
+                 var request = new BGContinuedProcessingTaskRequest(id, title, "Starting")
+                 {
+                     Strategy = BGContinuedProcessingTaskRequestSubmissionStrategy.Fail,
+@@ -95,13 +97,22 @@
+     private void BackgroundTick()
+     {
+         var stage = GameAppUi.ParseStage(lastStage);
++        double fraction = stage.Fraction;
++        string step = stage.Valid ? $"{stage.Step}/{stage.Of}: {stage.Text}" : (lastStage ?? "Starting");
++        if (backgroundWarm)
++        {
++            // the warm-up's own status ("Preparing the shaders… 1200 of 29650")
++            var status = GameWarm.Status ?? "";
++            var m = System.Text.RegularExpressions.Regex.Match(status, @"(\d+) of (\d+)");
++            if (m.Success && long.TryParse(m.Groups[2].Value, out var total) && total > 0) fraction = long.Parse(m.Groups[1].Value) / (double) total;
++            step = status.Length > 0 ? status : "Starting";
++        }
+         lock (backgroundLock)
+         {
+             var task = backgroundTask;
+             if (task == null) return;
+-            var done = Math.Max(backgroundDone, (long) (stage.Fraction * ProgressUnits));
++            var done = Math.Max(backgroundDone, (long) (fraction * ProgressUnits));
+             if (done != backgroundDone) { backgroundDone = done; task.Progress.CompletedUnitCount = done; }
+-            var step = stage.Valid ? $"{stage.Step}/{stage.Of}: {stage.Text}" : (lastStage ?? "Starting");
+             if (step.Length > 80) step = step.Substring(0, 80);
+             if (step != backgroundSubtitle)
+             {
+@@ -120,6 +131,7 @@
+             var id = backgroundId;
+             backgroundTask = null;
+             backgroundId = null;
++            backgroundWarm = false;
+             if (task != null)
+             {
+                 if (success) task.Progress.CompletedUnitCount = ProgressUnits;
+diff -ruN a/GameAppExport.cs b/GameAppExport.cs
+--- a/GameAppExport.cs
++++ b/GameAppExport.cs
+@@ -318,6 +318,16 @@
+         var dict = NSMutableDictionary.FromFile(original) ?? new NSMutableDictionary();
+         var baseId = OriginalBundleId(dict);
+         dict["CFBundleIdentifier"] = new NSString(GameAppUi.ExportBundleId(baseId, titleId));
++        // The background task (the shader warm-up keeps going when the app is left) is "<runtime bundle id>.build.<n>" and Info.plist must permit THAT id: the player's own, and the one an installer
++        // gives it (a team suffix: dev.nxpocket.gameapp.<TEAM> -> the suffix is kept after the player's id). The wildcard of the base app does not match (device test, 2026-11-19).
++        {
++            var exportId = GameAppUi.ExportBundleId(baseId, titleId);
++            var runtimeId = NSBundle.MainBundle.BundleIdentifier ?? baseId;
++            var suffix = runtimeId.StartsWith(baseId, StringComparison.Ordinal) ? runtimeId.Substring(baseId.Length) : "";
++            var permitted = new List<string> { exportId + ".build.*" };
++            if (suffix.Length > 0) permitted.Add(exportId + suffix + ".build.*");
++            dict["BGTaskSchedulerPermittedIdentifiers"] = NSArray.FromStrings(permitted.ToArray());
++        }
+         // the installer's own keys (ALTBundleIdentifier, ALTAppGroups, ALTPairingFile ...) are its to write again at the next install
+         foreach (var key in dict.Keys.Select(k => k.ToString()).Where(k => k.StartsWith("ALT", StringComparison.Ordinal)).ToList())
+             dict.Remove(new NSString(key));
+diff -ruN a/GameAppWarm.cs b/GameAppWarm.cs
+--- a/GameAppWarm.cs
++++ b/GameAppWarm.cs
+@@ -496,9 +496,11 @@
+ public sealed partial class GameAppViewController
+ {
+     /// The player asked ("Prepare the shaders…" in the game's settings): prepare the game's shaders in the background. Nothing else calls this: not a launch, not the end of a build.
+-    private void StartWarm(string game) => StartWarmTitle(string.IsNullOrEmpty(game) ? null : GameAppUi.BaseTitleIdOf(GameExport.IsPlayer ? GameExport.PlayerDump : game));
++    private void StartWarm(string game) => StartWarmTitle(string.IsNullOrEmpty(game) ? null : GameAppUi.BaseTitleIdOf(GameExport.IsPlayer ? GameExport.PlayerDump : game), GameExport.IsPlayer ? GameExport.PlayerDump : game);
+ 
+-    private void StartWarmTitle(string tid)
++    private NSTimer warmTicker;
++
++    private void StartWarmTitle(string tid, string game = null)
+     {
+         if (tid == null) return;
+         GameWarm.Sink = line => BeginInvokeOnMainThread(() => Write(line));
+@@ -506,6 +508,16 @@
+         GameWarm.Changed -= WarmChanged;
+         GameWarm.Changed += WarmChanged;
+         GameWarm.Start(tid, root);
++        // The warm-up keeps going when the player leaves the app: a continued-processing task (iOS 26) with its own progress on the lock screen, fed once a second by its status
++        BackgroundBegin(game ?? tid, warm: true);
++        warmTicker?.Invalidate();
++        warmTicker = NSTimer.CreateRepeatingScheduledTimer(1.0, _ =>
++        {
++            if (GameWarm.Active) { BackgroundTick(); return; }
++            warmTicker?.Invalidate();
++            warmTicker = null;
++            BackgroundEnd(true);
++        });
+     }
+ 
+     /// A run (a build or a boot) starts: the warm-up gives the phone back.
+diff -ruN a/Info.plist.fragment b/Info.plist.fragment
+--- a/Info.plist.fragment
++++ b/Info.plist.fragment
+@@ -19,6 +19,9 @@
+ 		<string>dev.nxpocket.gameapp.build.*</string>
+ 		<!-- the id a sideloading service or a cable install gives the app (dev.nxpocket.gameapp.<TEAM> / .usb): the task id is that id plus ".build.<n>" (GameAppBackground.cs BackgroundPrefix) -->
+ 		<string>dev.nxpocket.gameapp.*</string>
++		<!-- An installer gives the app a bundle id with the team suffix, and the system matches the task id (<runtime bundle id>.build.<n>) against THIS list only by the exact id (device test, 2026-11-19:
++		     the base id's wildcard was refused, the exact one accepted). scripts/build-app.sh fills in the team suffix from IBUILDER_TEAM_SUFFIX and leaves the entry out when it is not set; a cable install adds its own. -->
++		<string>dev.nxpocket.gameapp.@TEAM_SUFFIX@.build.*</string>
+ 	</array>
+ 	<!-- ProMotion: a display link may run above 60 Hz (the engine's 120 fps path; load/front_pad.m front_screen_max_fps) -->
+ 	<key>CADisableMinimumFrameDurationOnPhone</key>

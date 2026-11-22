@@ -1,0 +1,48 @@
+[package]
+name = "ibuilder-shaderbuild"
+description = "Stage 3's build driver in Rust (dmsh_build.py module level + job_for + batches/translate + shader_device.build/live_*): keys, translation cache, job files for the translator, batching and threads, streamed DMROMFS1 library + c1/cb tables, live translation, tool backends"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# `ProcessTools`: the engine's dmsh_xlate and spirv-cross run as child processes (Mac). The core library has no process API (iOS).
+host-tools = ["dep:memmap2"]
+# join ibuilder_shader::finish (package F2's per-shader finish()) as the `Finisher`; off until that module exists in ibuilder-shader
+f2-finish = []
+
+[dependencies]
+ibuilder-shader = { path = "../ibuilder-shader" }
+# only `ibuilder_pipeline::stop`: the process-wide pause / cancel request that the build's workers read between shaders (the pipeline does not depend on this crate)
+ibuilder-pipeline = { path = "../ibuilder-pipeline" }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+# the CLI maps a library image to replay it (a Mac tool; the library itself reads and writes files with positioned I/O, no map)
+memmap2 = { workspace = true, optional = true }
+# SIMD substring search for the record markers in the split packages (already in the lock through serde_json)
+memchr = "2"
+# preserve_order: the translator's job json keeps the Python dict's insertion order (and so does the reflection); raw_value: the tool memo passes the translator the missed jobs' own JSON texts
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+
+[build-dependencies]
+sha2 = { workspace = true }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+# tests/stop_chain.rs runs the whole chain's stage 3 over this crate's build with the pipeline's stand-in stage workers
+ibuilder-pipeline = { path = "../ibuilder-pipeline", features = ["mock"] }
+# tests/ids_agree_with_shadersplit.rs: `live::ids` is a copy of part of this crate's ctl.rs (kept, not refactored); the test is what stops the two from drifting apart
+ibuilder-shadersplit = { path = "../ibuilder-shadersplit" }
+# the full-library comparison maps the two 1.7 GB images (test code only)
+memmap2 = { workspace = true }
+
+[[bin]]
+name = "shaderbuild"
+path = "src/bin/shaderbuild.rs"
+required-features = ["host-tools"]
+
+[[bin]]
+name = "libdiff"
+path = "src/bin/libdiff.rs"
+required-features = ["host-tools"]

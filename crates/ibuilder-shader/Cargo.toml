@@ -1,0 +1,37 @@
+[package]
+name = "ibuilder-shader"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Rust port of the engine's per-shader MSL finishing step (dmsh_build.py finish(): the post-rewrites of dmsh_rewrite / dmsh_fetch / dmsh_entry / dmsh_side / dmsh_wide)"
+
+[dependencies]
+rayon = { workspace = true }
+# memchr: the SIMD substring search the scanners use instead of regular expressions (already in the lock through serde_json; pure Rust, builds for iOS)
+memchr = "2"
+memmap2 = { workspace = true }
+serde_json = "1"
+# F2 (src/finish/): `regex` (pure Rust, no look-around: the Python's look-behinds and back-references are scanners), `sha2` (the reflection's chain_compiler digest)
+regex = "1"
+sha2 = { workspace = true }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+
+[[bin]]
+name = "shader_post"
+path = "src/bin/shader_post.rs"
+
+[[bin]]
+name = "shader_tables"
+path = "src/bin/shader_tables.rs"
+
+[[bin]]
+name = "step_diff"
+path = "src/bin/step_diff.rs"
+
+# Mac only (drives the dmsh_xlate / spirv-cross binaries as child processes): the verification harness of `finish` (docs/shaders/SHADER-FINISH-RUST.md). Cargo found it
+# by auto-discovery before; it is declared like the other three
+[[bin]]
+name = "shader_finish"
+path = "src/bin/shader_finish.rs"

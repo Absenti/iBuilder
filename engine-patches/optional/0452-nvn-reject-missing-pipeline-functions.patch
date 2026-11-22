@@ -1,0 +1,112 @@
+# nvn/pipeline: reject missing required render functions (Metal aborted instead of returning an error)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/d08243122795175f541fef95aa879194dc33a8d3
+# Author:    seedds, 2026-11-20 23:29:41 +0800
+# Co-authors:
+#   Co-authored-by: Manuel Pérez Mayol
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); the attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES FOR THE PHONE
+#   The render pipelines of this phone go through dva_rps / dva_mps (engine-patches/0414, which take the place of dev_rps / dev_mps for every caller) and, without 0414, through dev_rps / dev_mps.
+#   A required function that is nil (a shader library that failed to compile leaves one in the descriptor) made Metal ABORT the process before it returned an error. Now dva_rps returns an
+#   NSError ("missing vertex function", code 3) BEFORE the archive lookup (the lookup is a Metal call too), and dva_mps does the same for a missing mesh or mesh-fragment function.
+#   Depth-only classic rendering may still omit its fragment function, a native mesh pipeline its object function. Upstream tested it with the Ocarina of Time profile. Default: on.
+#
+# ADAPTED, not verbatim: upstream edits the bodies of dev_rps / dev_mps; on this tree 0414 routes every caller to dva_rps / dva_mps (its #defines), so the checks go there; missing_pipeline_function()
+#   is defined after dev_mps. dev_rps / dev_mps themselves are left as they are (paches/0009 rewrites them; checked: paches/0007 0008 0009 still apply). Upstream's three test hunks are kept
+#   (t_pso_warm calls dev_rps / dev_mps, which are the dva_* ones through 0414's #defines).
+# RISK: low. NOT run on a device. Shader chain id untouched.
+#
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0415 and the candidates numbered below this one, in the order of the numbers of this folder.
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -151,6 +151,13 @@
+ static id<MTLRenderPipelineState> dev_mps(MTLMeshRenderPipelineDescriptor *d, NSError **out) {
+     plain_compile_begin(); NSError *e = nil; id ps = [g_dev newRenderPipelineStateWithMeshDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&e]; return compile_done(ps, e, out);
+ }
++// The Metal device calls can abort on a missing required function before they return a pipeline error. Return that error at the host boundary instead (nxnative d0824312): a missing
++// vertex function, or a missing native mesh or mesh fragment function. Depth-only classic rendering may still omit its fragment function, a native mesh pipeline its object function.
++static id<MTLRenderPipelineState> missing_pipeline_function(NSString *stage, NSError **out) {
++    if (out) *out = [NSError errorWithDomain:@"nxnative.NVN.Pipeline" code:3
++        userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"missing %@ function", stage]}];
++    return nil;
++}
+ static id<MTLFunction> dev_fn(id<MTLLibrary> lib, NSString *name, MTLFunctionConstantValues *cv, NSError **out) {
+     plain_compile_begin(); NSError *e = nil; id f = [lib newFunctionWithName:name constantValues:cv error:&e]; return compile_done(f, e, out);
+ }
+@@ -400,11 +407,15 @@
+     return compile_done(ps, e, out);
+ }
+ static id<MTLRenderPipelineState> dva_rps(MTLRenderPipelineDescriptor *d, NSError **out) {
++    if (!d.vertexFunction) return missing_pipeline_function(@"vertex", out);   // before the archive lookup too: Metal aborts on it (nxnative d0824312)
+     plain_compile_begin(); NSError *e = nil; id ps = dva_on() ? dva_lookup(0, d) : nil;
+     if (!ps) { ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e]; if (ps && g_dva_state == 1) dva_offer(0, d); }
+     return compile_done(ps, e, out);
+ }
+ static id<MTLRenderPipelineState> dva_mps(MTLMeshRenderPipelineDescriptor *d, NSError **out) {
++    // A mesh pipeline requires a fragment function even for depth-only rendering (mtk_nop_fragment).
++    if (!d.meshFunction) return missing_pipeline_function(@"mesh", out);
++    if (!d.fragmentFunction) return missing_pipeline_function(@"mesh fragment", out);
+     plain_compile_begin(); NSError *e = nil; id ps = nil; int arch = 0;
+     if (@available(iOS 18.0, macOS 15.0, *)) arch = dva_on();
+     if (arch) ps = dva_lookup(2, d);
+--- a/dm/gfx/tests/t_pso_admission.m
++++ b/dm/gfx/tests/t_pso_admission.m
+@@ -95,6 +95,9 @@
+     g_shmap = [NSMutableDictionary dictionary]; g_warm_started = 1;   // no shaders or prewarm tasks in this fixture
+     EXPECT("fallback skips prebuild", -1, pso_prebuild(1, 1, QOS_CLASS_USER_INITIATED));
+     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
++    id<MTLLibrary> lib = [MTLCreateSystemDefaultDevice() newLibraryWithSource:@"#include <metal_stdlib>\nvertex metal::float4 v() { return 0; }" options:nil error:nil];
++    d.vertexFunction = [lib newFunctionWithName:@"v"];
++    EXPECT("fixture vertex function", 1, d.vertexFunction != nil);
+     EXPECT("render through the device", 1, pso_build(d, 1, NULL) == dev->pipeline);
+     EXPECT("compute through the device", 1, cps_new(nil, NULL) == dev->pipeline);
+     EXPECT("render device call", 1, dev->renders); EXPECT("compute device call", 1, dev->computes);
+--- a/dm/gfx/tests/t_pso_archive.m
++++ b/dm/gfx/tests/t_pso_archive.m
+@@ -629,13 +629,23 @@
+     EXPECT("notify background: handed-over period not published", 1, archive_files(@(cdir)).count);
+     // Geometry and embedded pipelines share these MTLDevice boundaries; no reporter is required to notify the archive.
+     CompileFailureDevice *device = [CompileFailureDevice new]; device->device = g_dev;
++    id<MTLLibrary> mesh_lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
++        "struct V { float4 p [[position]]; };\n"
++        "[[mesh]] void ms(mesh<V, void, 3, 1, topology::triangle> out) { out.set_primitive_count(0); }\n"
++        options:nil error:&err];
++    id<MTLFunction> mesh_fn = [mesh_lib newFunctionWithName:@"ms"];
++    EXPECT("notify device: fixture mesh function", 1, mesh_fn != nil);
+     for (int kind = 0; kind < 4; kind++) {
+         d.vertexDescriptor.layouts[16].stride = 4832 + kind * 16;
+         EXPECT("notify device: a captured base", 1, pso_build(d, 0, &err) != nil && atomic_load(&g_ep->n) == 1);
+         ep = g_ep; g_dev = (id<MTLDevice>)device; id result;
+         if (kind == 0) result = cps_new([g_lib2 newFunctionWithName:@"vs"], NULL);   // unregistered: directly through the MTLDevice
+         else if (kind == 1) result = pso_build_dev(d, 0, NULL);
+-        else if (kind == 2) result = dev_mps([MTLMeshRenderPipelineDescriptor new], NULL);
++        else if (kind == 2) {
++            MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
++            m.meshFunction = mesh_fn; m.fragmentFunction = [g_lib newFunctionWithName:@"fs"];
++            result = dev_mps(m, NULL);
++        }
+         else result = dev_lib(@"fragment void fixture() {}", NULL);
+         g_dev = device->device;
+         EXPECT("notify device: compile refused", 1, result == nil);
+--- a/dm/gfx/tests/t_pso_warm.m
++++ b/dm/gfx/tests/t_pso_warm.m
+@@ -314,6 +314,17 @@
+     pso_key depth = {.dfmt = MTLPixelFormatDepth32Float, .samples = 1};
+     NSError *error = nil;
+     EXPECT("depth-only native mesh pipeline uses the empty fragment", 1, mtk_build(&depth, nil, live, nil, &error, NULL) != nil);
++    MTLRenderPipelineDescriptor *no_vertex = [MTLRenderPipelineDescriptor new];
++    error = nil;
++    EXPECT("missing vertex function returns an error", 1, dev_rps(no_vertex, &error) == nil && error.code == 3);
++    MTLMeshRenderPipelineDescriptor *no_fragment = [MTLMeshRenderPipelineDescriptor new];
++    no_fragment.meshFunction = live->fn;
++    error = nil;
++    EXPECT("missing mesh fragment function returns an error", 1, dev_mps(no_fragment, &error) == nil && error.code == 3);
++    MTLMeshRenderPipelineDescriptor *no_mesh = [MTLMeshRenderPipelineDescriptor new];
++    no_mesh.fragmentFunction = fragment->fn;
++    error = nil;
++    EXPECT("missing mesh function returns an error", 1, dev_mps(no_mesh, &error) == nil && error.code == 3);
+     g_mtk.ms = nil;
+     g_warm_t0 = bp_now(); warm_finish();
+ }

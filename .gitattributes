@@ -1,0 +1,65 @@
+# =============================================================================
+# .gitattributes of iBuilder
+#
+# 1. Text files are LF in the repository AND in every working tree (`eol=lf`, also on Windows): the app snapshot
+#    (app/SNAPSHOT.tsv), the pinned inputs (app/inputs.tsv) and the byte-compare oracle all hash file contents, so a
+#    checkout must never rewrite a line ending.
+# 2. Anything that is compared byte for byte (patches, test fixtures, captured evidence) is NOT text for git (`-text`):
+#    no line-ending or whitespace normalisation, ever. Eleven shader fixtures under crates/ibuilder-shader/tests/fixtures
+#    contain CR bytes on purpose; `text=auto` alone would silently rewrite them and break their byte-exact tests.
+# 3. GitHub's language statistics should show the Rust code, not the vendored snapshot, the patches or the fixtures.
+# A later line overrides an earlier one for the same attribute: keep the specific rules below the general ones.
+# =============================================================================
+
+# ---- default ---------------------------------------------------------------
+* text=auto eol=lf
+
+# ---- sources and data formats (explicit, for tools that ignore `text=auto`) --
+*.rs        text eol=lf diff=rust
+*.toml      text eol=lf
+*.md        text eol=lf diff=markdown
+*.sh        text eol=lf
+*.py        text eol=lf diff=python
+*.cs        text eol=lf diff=csharp
+*.c         text eol=lf diff=cpp
+*.h         text eol=lf diff=cpp
+*.cpp       text eol=lf diff=cpp
+*.m         text eol=lf diff=objc
+*.S         text eol=lf
+*.tmpl      text eol=lf
+*.csproj    text eol=lf
+*.plist     text eol=lf
+*.entitlements text eol=lf
+*.fragment  text eol=lf
+*.tsv       text eol=lf
+*.json      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# ---- patches: applied byte-exact by scripts/check-patches-apply.sh and scripts/build-app.sh ------------------------
+# `-text`: no line-ending conversion. `-whitespace`: no whitespace complaint (a context line of a patch may end in a
+# space; that is part of the patch).
+*.patch     -text -whitespace
+*.diff      -text -whitespace
+*.applied   -text -whitespace
+
+# ---- binary files -----------------------------------------------------------
+*.gz        binary
+*.zip       binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.ico       binary
+*.dylib     binary
+*.a         binary
+*.ipa       binary
+
+# ---- fixtures: byte-exact, never normalised ----------------------------------------------------------
+/crates/*/tests/data/**      -text -whitespace linguist-generated
+/crates/*/tests/fixtures/**  -text -whitespace linguist-generated
+
+# ---- language statistics: show the Rust workspace --------------------------------------------------------------------
+# The C# snapshot of the app and the patches against it / against the engine are inputs of the build, not the project's Rust code.
+/app/gameapp/**     linguist-vendored
+/app/patches/**     linguist-vendored
+/engine-patches/**  linguist-vendored

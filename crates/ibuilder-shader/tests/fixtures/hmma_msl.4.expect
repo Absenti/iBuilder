@@ -1,0 +1,98 @@
+OK
+{}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+};
+
+
+int dmsh_hmma16816_f16(thread const uint& p_lane, thread const uint& p_blk, thread const uint& p_a0, thread const uint& p_a1, thread const uint& p_a2, thread const uint& p_a3, thread const uint& p_b0, thread const uint& p_b1, thread const uint& p_acc0, thread const uint& p_acc1, thread const uint& p_fl, thread const uint& p_aaddr, thread const uint& p_ao0, thread const uint& p_ao1, thread const uint& p_ao2, thread const uint& p_ao3, thread const uint& p_astr, thread uint& p_d1, threadgroup spvUnsafeArray<uint, 256>& p_scr, thread simdgroup_half8x8 (&acc)[16], thread simdgroup_half8x8 (&am)[4], thread simdgroup_half8x8 (&bm)[2], const int bmode)
+{
+    threadgroup uint* s = &p_scr[uint(p_blk)];
+    threadgroup half* h = (threadgroup half*)s;
+    const int f = int(p_fl), k = (f >> 8) * 2;
+    const bool areuse = f & 1, cslot = f & 2, dslot = f & 4, czero = f & 8, adirect = false;
+    const bool btake = bmode >= 0 && (bmode & 1), bfill = bmode >= 0 && !(bmode & 1); const int bk = (bmode >> 1) * 2;
+    uint g = uint(p_lane) >> 2, t = uint(p_lane) & 3;
+    if (!areuse && !adirect) { s[g * 8 + t] = uint(p_a0); s[(g + 8) * 8 + t] = uint(p_a1); s[g * 8 + 4 + t] = uint(p_a2); s[(g + 8) * 8 + 4 + t] = uint(p_a3); }
+    if (!btake) { s[128 + g * 8 + t] = uint(p_b0); s[128 + g * 8 + 4 + t] = uint(p_b1); }
+    if (!cslot && !czero) { s[192 + g * 4 + t] = uint(p_acc0); s[192 + (g + 8) * 4 + t] = uint(p_acc1); }
+    if (!btake || (!areuse && !adirect) || (!cslot && !czero)) simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (!areuse && adirect) {
+        threadgroup half* x = (threadgroup half*)nullptr + (int(simd_broadcast(uint(p_aaddr), ushort(0))) >> 1);
+        const ulong st = ulong(uint(p_astr) >> 1); const bool tr = f & 32;
+        simdgroup_load(am[0], x + (int(p_ao0) >> 1), st, ulong2(0, 0), tr); simdgroup_load(am[1], x + (int(p_ao2) >> 1), st, ulong2(0, 0), tr);
+        simdgroup_load(am[2], x + (int(p_ao1) >> 1), st, ulong2(0, 0), tr); simdgroup_load(am[3], x + (int(p_ao3) >> 1), st, ulong2(0, 0), tr);
+    } else if (!areuse) {
+        simdgroup_load(am[0], h, 16, ulong2(0, 0)); simdgroup_load(am[1], h, 16, ulong2(8, 0)); simdgroup_load(am[2], h, 16, ulong2(0, 8)); simdgroup_load(am[3], h, 16, ulong2(8, 8));
+    }
+    // C and D in the call's own matrices: a slot is read only for a chain's C (cslot) and written only for its D (dslot). A call outside every chain has slot 0 in its
+    // flags (no slot bits); working in acc[0..1] it overwrote the accumulator a chain held there between its two calls (Ocarina of Time's agl_ndsr_vr networks: 2,515 such
+    // calls in 30 shaders, dotted rows across fog and light, GitHub issue #1537). The flags are constants at each inlined call, so the copies cost nothing
+    // Ampere adds each 8 products to the accumulator and rounds once to f16, k 0-7 then k 8-15 (N_FMA 8 in Khattak and Mikaitis's A100 model, which matches recorded
+    // A100 output in 5,000 of 5,000 cases), where simdgroup_half8x8 rounds after every product (2,420 of them). So each block runs in f32 (each product of two halves
+    // exact, the sum in order) and its result is rounded to f16 (RNE): an f16 C, the first block's result and D are the only roundings
+    // simdgroup_multiply_accumulate takes a float result from half operands and a half C. A lane's thread_elements() are the same two places in a half and a
+    // float matrix, so the rounding is two conversions a lane. Rounding through a multiply-accumulate with zero A and B into a half result gives the same bits but
+    // made the network twice as slow (NDSR's fa3033d05c0a41d6: 0.59 ms against 0.32 on an M5 Max). dm/gfx/msl/ndve_engine.metal's hmma() rounds the same way
+    simdgroup_half8x8 b0, b1, c0, c1;
+    simdgroup_float8x8 f0, f1;
+    if (btake) { b0 = bm[bk]; b1 = bm[bk + 1]; }
+    else { simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true); if (bfill) { bm[bk] = b0; bm[bk + 1] = b1; } }
+    if (czero) { c0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h); c1 = c0; }
+    else if (cslot) { c0 = acc[k]; c1 = acc[k + 1]; }
+    else { simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8)); }
+    simdgroup_multiply_accumulate(f0, am[0], b0, c0); simdgroup_multiply_accumulate(f1, am[2], b0, c1);
+    for (int i = 0; i < 2; i++) { c0.thread_elements()[i] = half(f0.thread_elements()[i]); c1.thread_elements()[i] = half(f1.thread_elements()[i]); }   // the first block's rounding
+    simdgroup_multiply_accumulate(f0, am[1], b1, c0); simdgroup_multiply_accumulate(f1, am[3], b1, c1);
+    for (int i = 0; i < 2; i++) { c0.thread_elements()[i] = half(f0.thread_elements()[i]); c1.thread_elements()[i] = half(f1.thread_elements()[i]); }
+    if (dslot) { acc[k] = c0; acc[k + 1] = c1; simdgroup_barrier(mem_flags::mem_threadgroup); p_d1 = 0; return 0; }
+    simdgroup_store(c0, h + 384, 8, ulong2(0, 0)); simdgroup_store(c1, h + 384, 8, ulong2(0, 8));
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    uint d0 = s[192 + g * 4 + t], d1 = s[192 + (g + 8) * 4 + t];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    p_d1 = as_type<uint>(d1);
+    return as_type<int>(d0);
+}
+
+struct spvDescriptorSetBuffer0
+{
+    int x [[id(0)]];
+};
+
+kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]])
+{
+    simdgroup_half8x8 dm_acc[16], dm_am[4], dm_bm[2];
+    threadgroup spvUnsafeArray<uint, 4096> _scr0;
+    uint _lane = uint(gl_LocalInvocationID.x);
+    uint _100 = _k;
+    uint _101 = _100++;
+    uint _104;
+    uint _115 = dmsh_hmma16816_f16(_l2, _blk, _105, _106, _107, _108, _102, _103, _109, _110, 94, _aaddr, _111, _112, _113, _114, _astr, _104, _scr0, dm_acc, dm_am, dm_bm, -1);
+}

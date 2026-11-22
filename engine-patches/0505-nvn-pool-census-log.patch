@@ -1,0 +1,118 @@
+# nvn/memory: a census of the memory pools in the residency set every 600 frames ("[pools]" log lines), diagnostic only
+#
+# Source:    https://github.com/cheemu21/kid-with-sword-remake  branch L, commit 1449bc502ff5dfe19a39aa61b9485458449ea7ce ("L7.2.1", 2026-11-18)
+# Author:    patpat (the commit's name)
+# Licence:   MIT, Copyright (c) 2026 seedds and contributors (nxnative LICENSE; the fork is MIT too); the attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m: pool_census(), called from mtl_mem_stat every 600 frames)
+#   One log line per 600 frames: how many pool buffers, how many in the residency set and their MB, how many of those only texture uploads reached (they hold what the GPU samples
+#   from host textures, not from the pool, so they could leave the set), how many the game gave an address of, the large pools, and the 8 largest held with their ages.
+#   Nothing else changes. Takes the pool mutex (g_mu) for the walk (a few hundred entries).
+# Why: the graphics ledger is 2.4-3.9 GB of Ocarina of Time's footprint on an iPhone 18 Pro (fork) and 5.2 GB GPU allocated in ours; this says which pools are wired and why, to decide what can leave
+#   the set. Default: on (a line per 600 frames, about 30 s at 20 fps).
+# Shader chain: not touched. Checked: patch -p1 --forward --dry-run, no fuzz, in the series; nvn_mtl.m passes clang -fsyntax-only -fobjc-arc with the host's include paths. NOT run.
+
+# REVISION 2 (2026-11-21, review L5): pool_census formatted floating-point values ("%.0f" of MB and ages as doubles) in a hook that runs on the guest thread's small stack, which the file's own
+#   comment above (mtl_mem_stat) asks to avoid: sizes are now whole MB (bytes + 512 KB) >> 20, ages whole seconds; the line reads as before. Test: t_pool_census (12 checks: the line over three pool
+#   entries, and a source guard that pool_census holds no double, no "%.0f", no "1e9"; `make -C dm/gfx/tests GAME=<profile> check_t_pool_census`).
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -6171,7 +6171,37 @@
+ // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
+ // Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
+ static _Atomic uint64_t g_gptr_bindings, g_gptr_reads, g_gptr_added, g_gptr_bytes;   // gmem_discover: bindings with sources, readable words, newly addressed logical pool/run ranges and bytes
++// The pools in the residency set and why (L7.2.1, diagnostic, every 600 frames): a pool's zero-copy buffer in the set wires every page of it, and on an iPhone that is charged to the app's
++// footprint (the graphics ledger: 2.4-3.9 GB of Ocarina of Time's 3.4-5.2 GB on an iPhone 18 Pro). n_tex_reads / n_other: the first lookups of each pool by texture uploads and by
++// everything else (draw bindings, copies, the raw memory table); a pool only texture uploads reached holds what the GPU samples from host textures, not from the pool
++#define MB_ROUND(b) ((unsigned long long)(((uint64_t)(b) + (1u << 19)) >> 20))   // bytes to whole MB, rounded
++static void pool_census(unsigned long long frame) {
++    enum { TOP = 8 };
++    uint64_t nb = 0, rb = 0, rb_tex = 0, rb_addr = 0, big_b = 0; int n = 0, nr = 0, nr_tex = 0, nr_addr = 0;
++    struct { uint64_t size; uint32_t t, o; int reach, addr; uint64_t age_s; } top[TOP] = {{0}}; int ntop = 0;   // whole numbers only: the frame hook runs on a small guest stack (review L5)
++    pthread_mutex_lock(&g_mu);
++    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++    for (int i = 0; i < g_npool; i++) { const pool_ent *e = &g_pools[i]; uint64_t z = e->hi - e->lo; n++; nb += z;
++        if (!e->res) continue;
++        int addr = addr_meets(e->lo, e->hi); nr++; rb += z;
++        if (!e->n_other) { nr_tex++; rb_tex += z; }
++        if (addr) { nr_addr++; rb_addr += z; }
++        int k = ntop < TOP ? ntop++ : TOP - 1;
++        if (k == TOP - 1 && ntop == TOP && top[k].size >= z) continue;
++        top[k].size = z; top[k].t = e->n_tex_reads; top[k].o = e->n_other; top[k].reach = e->reach; top[k].addr = addr; top[k].age_s = now > e->born ? (now - e->born) / 1000000000ull : 0;
++        for (int j = k; j > 0 && top[j].size > top[j - 1].size; j--) { __typeof__(top[0]) x = top[j]; top[j] = top[j - 1]; top[j - 1] = x; } }
++    for (int i = 0; i < g_nbig; i++) big_b += g_big[i].hi - g_big[i].lo;
++    int nbig = g_nbig;
++    pthread_mutex_unlock(&g_mu);
++    char t[1024]; size_t o = 0;
++    for (int i = 0; i < ntop && o < sizeof t - 96; i++)
++        o += (size_t)snprintf(t + o, sizeof t - o, "%s%llu MB (uploads %u / other %u%s%s, %llu s old)", i ? "; " : "", MB_ROUND(top[i].size), top[i].t, top[i].o,
++                              top[i].addr ? ", address given out" : "", top[i].reach == REACH_WHOLE ? ", whole large pool" : top[i].reach == REACH_SHORT ? ", chunk" : "", (unsigned long long)top[i].age_s);
++    MLOG("[pools] frame %llu: %d pool buffers %llu MB, %d in the residency set %llu MB (only texture uploads reached %d of them, %llu MB; with an address the game gave out %d, %llu MB); large pools %d, %llu MB; largest held: %s",
++         frame, n, MB_ROUND(nb), nr, MB_ROUND(rb), nr_tex, MB_ROUND(rb_tex), nr_addr, MB_ROUND(rb_addr), nbig, MB_ROUND(big_b), ntop ? t : "none");
++}
+ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
++    if (!(frame % 600)) pool_census(frame);
+     static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
+     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
+     if (lines >= 400 || (lines && dr < 64 && dg < 64 && frame - last_frame < 3000)) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -572,6 +572,9 @@
+ # DM_NVN_TEX_MIP_SKIP (engine-patches/0501 revision 2): the [RED] limits line, and no reduction for a texture with a compressed / uncompressed alias pair
+ t_mip_skip_limits: t_mip_skip_limits.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_mip_skip_limits.m $(MTL_T_SRC) $(FW)
++# engine-patches/0505 revision 2 (review L5): the pool census line is made of whole numbers
++t_pool_census: t_pool_census.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_census.m $(MTL_T_SRC) $(FW)
+ t_pso_skey: t_pso_skey.m ../nvn/nvn_pso_skey.h ../nvn/nvn_obj.h
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_skey.m -framework Foundation
+ t_view_swizzle: t_view_swizzle.m $(MTL_T_DEP)
+--- /dev/null
++++ b/dm/gfx/tests/t_pool_census.m
+@@ -0,0 +1,45 @@
++// engine-patches/0505 revision 2 (the review's L5): the pool census line the frame hook writes every 600 frames is made of whole numbers (the hook runs on a small guest stack, where
++// floating-point formatting is what the file's own comment says to avoid). No GPU work: pool_census over three entries of the pool table, its [pools] line read back from the log
++#include "../nvn/nvn_mtl.m"
++#include <fcntl.h>
++#include <unistd.h>
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define EXPECT(name, want, got) do { long long w_ = (long long)(want), g_ = (long long)(got); checks++; if (w_ != g_) { printf("FAIL %s: expected %lld, got %lld (line %d)\n", name, w_, g_, __LINE__); failed++; } } while (0)
++#define EXPECT_HAS(name, log, needle) do { checks++; if (![(log) containsString:@needle]) { failed++; printf("FAIL %s: the log has no \"%s\"\n--- log\n%s\n---\n", name, needle, [(log) UTF8String]); } } while (0)
++#define EXPECT_NOHAS(name, log, needle) do { checks++; if ([(log) containsString:@needle]) { failed++; printf("FAIL %s: pool_census has \"%s\"\n", name, needle); } } while (0)
++int main(void) { @autoreleasepool {
++    char tmpl[1024]; snprintf(tmpl, sizeof tmpl, "%s/t_pool_census.XXXXXX", NSTemporaryDirectory().fileSystemRepresentation); if (!mkdtemp(tmpl)) return 1;
++    NSString *logp = [@(tmpl) stringByAppendingPathComponent:@"engine.log"]; int fd = open(logp.fileSystemRepresentation, O_RDWR | O_CREAT | O_TRUNC, 0600); if (fd < 0 || dup2(fd, 2) < 0) return 1;
++    mtl_init();
++    // 64 MB (resident, texture uploads only, 7 s old), 3.5 MB (resident, used by draws), 1.5 MB (not in the residency set)
++    g_pools = calloc(3, sizeof *g_pools); g_cap = 3; g_npool = 3;
++    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++    g_pools[0] = (pool_ent){.lo = 0x100000000ull, .hi = 0x100000000ull + (64u << 20), .res = 1, .born = now - 7000000000ull, .reach = REACH_END, .n_tex_reads = 5, .n_other = 0};
++    g_pools[1] = (pool_ent){.lo = 0x200000000ull, .hi = 0x200000000ull + (3u << 20) + (1u << 19), .res = 1, .born = now - 2000000000ull, .reach = REACH_END, .n_tex_reads = 1, .n_other = 9};
++    g_pools[2] = (pool_ent){.lo = 0x300000000ull, .hi = 0x300000000ull + (1u << 20) + (1u << 19), .res = 0, .born = now, .reach = REACH_END};
++    pool_census(600);
++    NSString *log = [NSString stringWithContentsOfFile:logp encoding:NSUTF8StringEncoding error:nil] ?: @"";
++    NSRange r = [log rangeOfString:@"[pools] frame 600:"]; EXPECT("the [pools] line is written", 1, r.location != NSNotFound);
++    NSString *line = r.location == NSNotFound ? @"" : [log substringFromIndex:r.location]; NSRange e = [line rangeOfString:@"\n"]; if (e.location != NSNotFound) line = [line substringToIndex:e.location];
++    EXPECT_HAS("3 pool buffers, 69 MB (64 + 3.5 + 1.5 = 69)", line, "3 pool buffers 69 MB");
++    EXPECT_HAS("2 in the residency set, 68 MB (67.5 rounds up)", line, "2 in the residency set 68 MB");
++    EXPECT_HAS("only texture uploads reached 1, 64 MB", line, "only texture uploads reached 1 of them, 64 MB");
++    EXPECT_HAS("the largest, in whole MB and seconds", line, "64 MB (uploads 5 / other 0, 7 s old)");
++    EXPECT_HAS("the second", line, "4 MB (uploads 1 / other 9, 2 s old)");   // 3.5 MB rounds to 4
++    int digits_dot = 0; for (NSUInteger i = 0; i + 1 < line.length; i++) if (isdigit([line characterAtIndex:i]) && [line characterAtIndex:i + 1] == '.' && i + 2 < line.length && isdigit([line characterAtIndex:i + 2])) digits_dot++;
++    EXPECT("no decimal number in the line", 0, digits_dot);
++    // the source guard: the output of "%.0f" and of whole numbers reads the same, so the property that matters (no floating point on the hook's stack) is checked on the function's text
++    NSString *src = [NSString stringWithContentsOfFile:@"../nvn/nvn_mtl.m" encoding:NSUTF8StringEncoding error:nil] ?: @"";
++    NSRange a0 = [src rangeOfString:@"static void pool_census("], b0 = [src rangeOfString:@"void mtl_mem_stat(unsigned long long frame"];
++    EXPECT("found pool_census in the source", 1, a0.location != NSNotFound && b0.location > a0.location);
++    NSString *body = a0.location != NSNotFound && b0.location > a0.location ? [src substringWithRange:NSMakeRange(a0.location, b0.location - a0.location)] : @"";
++    EXPECT_NOHAS("no double in pool_census", body, "double"); EXPECT_NOHAS("no %.Nf in pool_census", body, "%.0f"); EXPECT_NOHAS("no floating division", body, "1e9"); EXPECT_NOHAS("no floating MB", body, "1048576.0");
++    [NSFileManager.defaultManager removeItemAtPath:@(tmpl) error:nil];
++    printf("t_pool_census: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }

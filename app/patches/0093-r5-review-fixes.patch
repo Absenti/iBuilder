@@ -1,0 +1,471 @@
+# 0093-r5-review-fixes.patch -- the third-party review r5 (2026-11-22) on patches 0078-0091: each point checked against the code, fixed here. Applies after 0092.
+# UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# P3 (0090 RemoteReadStream) CONFIRMED: a remote read that gave nothing (or ended early) left a SHORT block in the cache as if it were whole, so a Read could still end before the end of the
+#    file. A block is now cached only whole (the last one as long as the listed size says); an empty reply is tried again from where it stopped, MaxEmptyReads (3) times in a row, then the
+#    read fails with a clear IOException ("the remote file gave nothing at byte N of its listed M (3 tries): it is shorter than listed, or the connection stalled"); a file shorter than
+#    listed is that error now (it was "what there is"). GameAppWarm.cs's pack header (GameWarmLogic.ReadImageIndex) was ONE Read of 32 bytes: ReadAtLeast now. Every other Read of a stream
+#    where a full count is assumed loops already (checked: GameAppWarm.cs 83/268/838, GameAppUi.cs, GameAppDiag.cs, GameAppBootOverlay.cs, the NupRemote callback, the copies).
+# P7 (0085 free space) CONFIRMED in part: kept the important-use figure for decisions AND display (Apple's figure for work the person asked for: the main agent's decision); but a failed
+#    `new DriveInfo(Documents)` became a silent 0. Now: DriveInfo, else statfs on Documents (struct statfs of Darwin arm64: f_bsize at 0, f_bavail at 24), else UNKNOWN (-1): an unknown
+#    figure refuses nothing (DiskSpace.Refuses: the download's and the export's checks), is shown as "unknown", and the log says "free space unknown: …".
+# P8 (0087 GameWarm.Start) CONFIRMED: the next run's thread joins the stopped one's for at most 5 s (WarmRun.JoinTimeoutMs), then abandons it with a log line (it stops at its next library:
+#    its run number is not current) and goes on. The join is on the run's own thread, never the main one.
+# P9 (0088 PartialDiscard.Plan) CONFIRMED: a paused REBUILD of a game whose finished build is still in Documents (the framework stamp names it, for this app build) lost its stamp and
+#    framework at a discard. Now only the rebuild's shader work folder goes (extract/, the framework, its stamp, the marker and profile.tsv are that build's and stay), and the question says
+#    "Removes what the paused rebuild made so far…; Its finished build stays: it still plays."; "Not built" is said only of a game that is not built.
+# P18 (0083 playStopped) CONFIRMED: the "Play was stopped before the game started" line was cleared only by the next Play: now by ANY run's start (a build too) and by its game's delete.
+# P19 (weak points): 0080's comment on LibraryActions.Enabled said "the two" buttons stay on while busy; the code (since 0085) keeps three: the comment is fixed (the code is right).
+#    0086 QueuePlan.For(Paused) = Add: kept (a paused game may be queued), and made coherent: the queue now RESUMES a paused game from where it stopped (StartQueued: ResumePlan, the files
+#    kept in extract/, as Resume; from the start with the cache only when a run already came back in this process), its queue row says "Resume", its menu entry "Queue the resume"; Resume
+#    and "Discard the partial build" stay its own entries. 0078 "Rebuild, or send the log" was a build's words: a PLAY refused for no shader library now says "The game was not started: its
+#    shader library is missing and could not be made again (it would draw nothing). Play again; if it fails again, rebuild the game, or send the log." (log line, notification).
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch 0010-0093 applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile
+#   (-t:Compile): 0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness93: … P91;P93): 342 of 342 checks (20 new: a 0-byte reply then data, short and empty
+#   replies mid-file over 300 random reads, the end of file exactly, a file shorter than listed, bounded retries, the pack header, unknown free space, statfs's layout MEASURED on this Mac
+#   (statfs = DriveInfo to the byte), the join timeout, the rebuild's discard, the words, playStopped, the queue's resume, the Play's words, the comment); 14 of 14 mutations killed.
+# NOT VERIFIED: nothing ran on a device: statfs on iOS (same arm64 struct as the Mac's, by the SDK header), a real stalled SFTP reply, a real queued resume.
+# NEW UI STRINGS: "unknown", "Queue the resume", "Resume", ChainResult.NoShaderLibraryPlayText, PartialDiscard.KeepsBuilt, "Removes what the paused rebuild made so far"; log lines
+#   "free space unknown: ", "the remote file gave nothing at byte ", "did not end within ", "build queue: … was paused: it goes on from where it stopped".
+diff -ruN m/GameAppExport.cs n/GameAppExport.cs
+--- m/GameAppExport.cs	2026-11-22 02:00:47
++++ n/GameAppExport.cs	2026-11-22 02:03:50
+@@ -400,7 +400,8 @@
+         Directory.CreateDirectory(outDir);
+         long free = DiskFreeNow.Bytes();   // patch 0085: what iOS gives an important use (an export the person asked for)
+         long need = total + (256L << 20);
+-        if (free > 0 && free < need)
++        if (free < 0) log(DiskSpace.UnknownLine);   // patch 0093 (review r5 P7)
++        if (DiskSpace.Refuses(free, need))
+             throw new InvalidOperationException($"not enough space: the .ipa needs about {GameAppUi.SizeText(need)}, {GameAppUi.SizeText(free)} is free");
+         log($"export: {entries.Count} files, {GameAppUi.SizeText(total)} -> Exports/{appName}.ipa");
+ 
+diff -ruN m/GameAppField.cs n/GameAppField.cs
+--- m/GameAppField.cs	2026-11-22 02:00:47
++++ n/GameAppField.cs	2026-11-22 02:04:39
+@@ -219,10 +219,25 @@
+ /// Settings counts), else the volume's plain free space (DriveInfo of Documents' volume, not "/": the system volume's figure was ~24.5 GB when Settings said >100 GB).
+ public static class DiskSpace
+ {
+-    public static long Choose(long important, long plain) => important > 0 ? important : Math.Max(0, plain);
++    /// Patch 0093 (review r5 P7): the important-use figure (what iOS frees purgeable space for: Apple's figure for work the person asked for) decides and is shown; else the plain free space of
++    /// Documents' volume; -1 when neither could be read (UNKNOWN: it was a silent 0). An unknown figure refuses nothing (Refuses) and the log says "free space unknown".
++    public static long Choose(long important, long plain) => important > 0 ? important : plain >= 0 ? plain : -1;
+ 
++    /// Whether `need` bytes are refused for lack of space: only on a KNOWN figure.
++    public static bool Refuses(long free, long need) => free >= 0 && need > free;
++
++    /// "103.2 GB", or "unknown".
++    public static string Text(long bytes) => bytes < 0 ? "unknown" : GameAppUi.SizeText(bytes);
++
++    public const string UnknownLine = "free space unknown: the volume's free space could not be read (important use, DriveInfo, statfs): nothing is refused for it";
++
+     public static string Line(long important, long plain) =>
+-        $"storage: {GameAppUi.SizeText(Choose(important, plain))} free for important use ({GameAppUi.SizeText(Math.Max(0, plain))} without purgeable space)";
++        Choose(important, plain) < 0 ? "storage: " + UnknownLine
++        : $"storage: {GameAppUi.SizeText(Choose(important, plain))} free for important use ({Text(plain)} without purgeable space)";
++
++    /// statfs's buffer on Darwin (arm64, 64-bit inodes: struct statfs): f_bsize (uint32) at 0, f_bavail (uint64) at 24; the struct is 2,168 bytes.
++    public static long FromStatfs(byte[] buf) =>
++        buf == null || buf.Length < 32 ? -1 : (long) Math.Min((ulong) long.MaxValue, (ulong) BitConverter.ToUInt32(buf, 0) * BitConverter.ToUInt64(buf, 24));
+ }
+ 
+ /// The build screen's Pause / Cancel row (patch 0085): while a build runs both are shown (off when they cannot act), paused only Cancel (Resume is the main button), else none.
+@@ -303,6 +318,9 @@
+ /// ends the run at once now; the next run's thread waits for the old one to be gone (GameWarm.Start).
+ public sealed class WarmRun
+ {
++    /// Patch 0093 (review r5 P8): how long a new run's thread waits for the stopped run's thread before it abandons it.
++    public const int JoinTimeoutMs = 5000;
++
+     private readonly object gate = new object();
+     private int generation;
+     private volatile bool active;
+@@ -399,9 +417,16 @@
+         return s.Of == 5 && s.Step >= 1 && s.Step < 3 ? 0 : -1;   // stage 1 (reading) or 2 (the rewrite): no shader yet
+     }
+ 
+-    /// The question's text: "Removes the extracted game (13.0 GB), the rewrite and the 1,234 shaders translated so far; the game file itself stays." then what stays.
+-    public static string Note(long extractBytes, long shaders, bool extractIsThis)
++    /// Patch 0093 (review r5 P9): a paused REBUILD of a game whose finished build is still here (its stamp names it, for this app build): that build stays, it still plays.
++    public const string KeepsBuilt = "Every finished shader stays in the shader cache; the game's settings, saves, cover and mods are not touched. Its finished build stays: it still plays.";
++
++    /// The question's text: "Removes the extracted game (13.0 GB), the rewrite and the 1,234 shaders translated so far; the game file itself stays." then what stays. `builtHere`: a
++    /// finished build of this game is in Documents (patch 0093): only the rebuild's own work goes, never that build ("Not built" is said only when it is true).
++    public static string Note(long extractBytes, long shaders, bool extractIsThis, bool builtHere = false)
+     {
++        if (builtHere)
++            return "Removes what the paused rebuild made so far" + (shaders > 0 ? " (" + shaders.ToString("N0", CultureInfo.InvariantCulture) + (shaders == 1 ? " shader" : " shaders") + " translated)" : "")
++                   + "; the game file itself stays.\n" + KeepsBuilt;
+         var parts = new List<string>();
+         if (extractIsThis) parts.Add(extractBytes >= 0 ? "the extracted game (" + GameAppUi.SizeText(extractBytes) + ")" : "the extracted game");
+         parts.Add("the rewrite");
+@@ -411,9 +436,12 @@
+         return "Removes " + list + (extractIsThis ? "" : " (the extracted game is another build's now: it stays)") + "; the game file itself stays.\n" + Keeps;
+     }
+ 
+-    /// What goes: a cancel that frees the space (CancelPlan, the chain having run), and the extraction marker and profile.tsv when extract/ is this game's.
+-    public static CancelPlan Plan(string tid, bool frameworkIsPartial, bool extractIsThis)
++    /// What goes: a cancel that frees the space (CancelPlan, the chain having run), and the extraction marker and profile.tsv when extract/ is this game's. `builtHere` (patch 0093, review
++    /// r5 P9): a finished build of this game is in Documents (a paused REBUILD): only the rebuild's shader work folder goes; extract/, the framework, its stamp, the marker and profile.tsv
++    /// are that build's and stay (the stamp was always removed before, which orphaned a working framework).
++    public static CancelPlan Plan(string tid, bool frameworkIsPartial, bool extractIsThis, bool builtHere = false)
+     {
++        if (builtHere) return CancelPlan.For(CancelChoice.KeepExtracted, tid, false, chainRan: true, extractIsThis: false);
+         var p = CancelPlan.For(CancelChoice.FreeSpace, tid, frameworkIsPartial, chainRan: true, extractIsThis);
+         var files = p.Files.ToList();
+         if (extractIsThis) files.AddRange(new[] { "gameapp.extracted", "profile.tsv" });
+@@ -454,7 +482,7 @@
+     private readonly Dictionary<long, LinkedListNode<(long Index, byte[] Data)>> byIndex = new Dictionary<long, LinkedListNode<(long, byte[])>>();
+     private long position;
+ 
+-    public const int DefaultBlock = 256 * 1024, DefaultBlocks = 16;
++    public const int DefaultBlock = 256 * 1024, DefaultBlocks = 16, MaxEmptyReads = 3;
+ 
+     /// The remote stream's Read calls (each one a round trip or less) and the bytes they gave.
+     public int Requests { get; private set; }
+@@ -509,17 +537,25 @@
+         if (byIndex.TryGetValue(index, out var node)) { lru.Remove(node); lru.AddFirst(node); return node.Value.Data; }
+         long start = index * block;
+         var data = new byte[(int) Math.Min(block, length - start)];
++        // patch 0093 (review r5 P3): a block is cached only WHOLE (the last one is as long as the listed size says): a remote read that gives nothing is tried again (from where it
++        // stopped, MaxEmptyReads times in a row), then the read fails with a clear IOException; a short block was cached as authoritative before, so a Read could still end early
++        int got = 0, empty = 0;
+         inner.Position = start;
+-        int got = 0;
+         while (got < data.Length)
+         {
+             int n = inner.Read(data, got, data.Length - got);
+             Requests++;
+-            if (n <= 0) break;
++            if (n <= 0)
++            {
++                if (++empty >= MaxEmptyReads)
++                    throw new IOException($"the remote file gave nothing at byte {(start + got).ToString(CultureInfo.InvariantCulture)} of its listed {length.ToString(CultureInfo.InvariantCulture)} ({MaxEmptyReads} tries): it is shorter than listed, or the connection stalled");
++                inner.Position = start + got;   // again from where it stopped
++                continue;
++            }
++            empty = 0;
+             got += n;
+             Fetched += n;
+         }
+-        if (got < data.Length) Array.Resize(ref data, got);   // shorter than listed: what there is (a later Read ends there)
+         var added = lru.AddFirst((index, data));
+         byIndex[index] = added;
+         while (lru.Count > maxBlocks) { var last = lru.Last; lru.RemoveLast(); byIndex.Remove(last.Value.Index); }
+diff -ruN m/GameAppFieldUi.cs n/GameAppFieldUi.cs
+--- m/GameAppFieldUi.cs	2026-11-22 02:00:47
++++ n/GameAppFieldUi.cs	2026-11-22 02:03:50
+@@ -34,8 +34,19 @@
+             if (url.TryGetResource(NSUrl.VolumeAvailableCapacityForImportantUsageKey, out NSObject value) && value is NSNumber n) important = n.Int64Value;
+         }
+         catch (Exception) { important = -1; }
+-        try { plain = new DriveInfo(GameAppMain.Documents).AvailableFreeSpace; } catch (Exception) { plain = 0; }
++        // patch 0093 (review r5 P7): DriveInfo on a path can throw: then statfs on Documents; -1 (unknown) when that fails too, never a silent 0
++        try { plain = new DriveInfo(GameAppMain.Documents).AvailableFreeSpace; }
++        catch (Exception) { plain = Statfs(GameAppMain.Documents); }
+         return (important, plain);
++    }
++
++    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "statfs", SetLastError = true)]
++    private static extern int statfs_native(string path, byte[] buf);
++
++    private static long Statfs(string path)
++    {
++        try { var buf = new byte[4096]; return statfs_native(path, buf) == 0 ? DiskSpace.FromStatfs(buf) : -1; }
++        catch (Exception) { return -1; }
+     }
+ }
+ 
+diff -ruN m/GameAppLibrary.cs n/GameAppLibrary.cs
+--- m/GameAppLibrary.cs	2026-11-22 02:00:47
++++ n/GameAppLibrary.cs	2026-11-22 02:05:18
+@@ -1441,7 +1441,7 @@
+         var content = new UserNotifications.UNMutableNotificationContent
+         {
+             Title = selected != null ? GameAppUi.DisplayName(selected) : "iBuilder",
+-            Body = failedRun ? ChainResult.FailureText(lastChainRc) ?? "The build stopped: open iBuilder to see why." : "Built: ready to play.",
++            Body = failedRun ? ChainResult.FailureText(lastChainRc, runBootOnly) ?? "The build stopped: open iBuilder to see why." : "Built: ready to play.",   // patch 0093: a Play's own words
+             Sound = UserNotifications.UNNotificationSound.Default,
+         };
+         var request = UserNotifications.UNNotificationRequest.FromIdentifier("build-ended", content, null);
+@@ -1990,7 +1990,8 @@
+         var sources = cloudSources;
+         // A NAS file is always copied: its space is needed up front. A file of a Files folder is cloned when the volume allows (no space at all): the room for a COPY is checked file by file, only when the clone was refused (GameImport.Place).
+         long copyNeed = files.Where(f => sources.FirstOrDefault(s => s.Id == f.SourceId)?.Kind != CloudKind.Folder).Sum(f => f.Size);
+-        if (copyNeed > 0 && FreeBytes() > 0 && copyNeed + (1L << 30) > FreeBytes())
++        if (copyNeed > 0 && FreeBytes() < 0) Write(DiskSpace.UnknownLine);   // patch 0093 (review r5 P7): an unknown figure refuses nothing, and says so
++        if (copyNeed > 0 && DiskSpace.Refuses(FreeBytes(), copyNeed + (1L << 30)))
+         {
+             var a = UIAlertController.Create("Not enough space", $"{GameAppUi.SizeText(copyNeed)} to download, {GameAppUi.SizeText(FreeBytes())} free. Free some space first.", UIAlertControllerStyle.Alert);
+             a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Cancel, null));
+diff -ruN m/GameAppMain.cs n/GameAppMain.cs
+--- m/GameAppMain.cs	2026-11-22 02:00:47
++++ n/GameAppMain.cs	2026-11-22 02:05:18
+@@ -268,6 +268,7 @@
+         {
+             // patch 0085: the free space iOS gives an important use (Settings' figure), on Documents' volume ("/" is the system volume)
+             var drive = new DriveInfo(Documents);
++            if (DiskFreeNow.Bytes() < 0) return "unknown (" + DiskSpace.UnknownLine + ")";   // patch 0093
+             return string.Format("{0:F1} GB free of {1:F0} GB",
+                 DiskFreeNow.Bytes() / (1024.0 * 1024 * 1024), drive.TotalSize / (1024.0 * 1024 * 1024));
+         }
+@@ -2373,6 +2374,7 @@
+             foreach (var note in notes) Write(note);
+             Write($"deleted {GameAppUi.DisplayName(game)}: {removed} item(s), {GameAppUi.SizeText(freed)} freed" + (failed > 0 ? $", {failed} could not be removed" : ""));
+             if (selected == game) selected = null;
++            if (playStopped is { } ps && ps.Game == game) playStopped = null;   // patch 0093 (review r5 P18): a deleted game says nothing of its last Play
+             if (pausedBuilds.Any(r => r.Game == game)) { pausedBuilds = PausedStore.Remove(pausedBuilds, game); SavePaused(); stop.Forget(); }   // a deleted game has no paused build
+             SlotsChanged();   // patch 0073: its parked build (games/<id>/slot) went with it
+             sizes.Invalidate();
+@@ -2903,7 +2905,7 @@
+                 lastChainRc = chainError != null ? -1 : rc;
+                 // patch 0078: a code that says why (4: no shader library, 5: no framework) is said, as an error line, before the screen is drawn: never "Ready" or "Built" for a game that
+                 // would draw nothing or that is not there
+-                if (failedRun && ChainResult.LogLine(lastChainRc) is string why) Write(why);
++                if (failedRun && ChainResult.LogLine(lastChainRc, runBootOnly) is string why) Write(why);   // patch 0093: a Play's own words
+                 // patch 0073: a .nup the chain was given (nup=) is extracted when the chain derived its profile in this run (that stage runs only once the package is read): its marker, then "Optimize storage".
+                 // Any outcome, except a cancel that frees the space (it deletes the extraction).
+                 var profilePath = Path.Combine(GameAppMain.Documents, "profile.tsv");
+diff -ruN m/GameAppPadUi.cs n/GameAppPadUi.cs
+--- m/GameAppPadUi.cs	2026-11-22 02:00:47
++++ n/GameAppPadUi.cs	2026-11-22 02:04:03
+@@ -130,7 +130,7 @@
+             sideSources.AddArrangedSubview(row);
+         }
+         sideStorage.Set(CurrentStorageSegments());
+-        sideFree.Text = GameAppUi.SizeText(FreeBytes()) + " free";
++        sideFree.Text = DiskSpace.Text(FreeBytes()) + " free";   // patch 0093: "unknown" rather than 0
+     }
+ 
+     // ---- the mode: decided after every layout (ApplyAdaptiveLayout) ----------------------------------------------------
+diff -ruN m/GameAppQueueUi.cs n/GameAppQueueUi.cs
+--- m/GameAppQueueUi.cs	2026-11-22 02:00:47
++++ n/GameAppQueueUi.cs	2026-11-22 02:05:05
+@@ -120,7 +120,7 @@
+             string sub = item.State == BuildQueue.Running ? "Building now"
+                        : item.State == BuildQueue.Paused ? (string.IsNullOrEmpty(item.Note) ? "Paused" : item.Note) + " · Resume it in the Build tab"
+                        : item.State == BuildQueue.Failed ? "Stopped: " + (string.IsNullOrEmpty(item.Note) ? "see the log" : item.Note)
+-                       : (first ? "Next" : "Waiting") + " · " + QueuePlan.RowWord(facts != null && GameAppUi.GameStatusOf(game, facts) == GameAppUi.GameStatus.Ready);   // patch 0086: Build or Rebuild
++                       : (first ? "Next" : "Waiting") + " · " + QueuePlan.RowWord(facts != null && GameAppUi.GameStatusOf(game, facts) == GameAppUi.GameStatus.Ready, pausedBuilds.Any(r => r.Game == game));   // patch 0086: Build or Rebuild
+             if (item.State == BuildQueue.Queued) first = false;
+             var row = new GameRowView(CoverOf(game, facts), GameAppUi.DisplayName(game), sub, false, false, null,
+                                       item.State == BuildQueue.Running ? null : "xmark", false, null);
+@@ -181,6 +181,26 @@
+         QueueStartNext();
+     }
+ 
++    /// Patch 0093 (review r5: 0086 queued a PAUSED game as "Add" and the queue built it again from the start): a paused game goes on from where it stopped, as Resume does (ResumePlan: the
++    /// chain on the files kept in Documents/extract); a run already came back in this process (the runtime starts once per process), or the plan is a new start: SetUpAndPlay, with the shaders
++    /// already finished from the cache, said in the log.
++    private void StartQueued(string game)
++    {
++        var record = pausedBuilds.FirstOrDefault(r => r.Game == game);
++        if (record != null)
++        {
++            var plan = ResumePlan.Decide(GameAppUi.IsNup(game), record);
++            if (plan.Kind == ResumeKind.Continue && !pythonRanThisProcess)
++            {
++                Write($"build queue: {GameAppUi.DisplayName(game)} was paused: it goes on from where it stopped (the files kept in Documents/extract)");
++                StartContinuedBuild(game, plan.Stage, "paused");
++                return;
++            }
++            Write($"build queue: {GameAppUi.DisplayName(game)} was paused: it starts again" + (plan.Kind == ResumeKind.Continue ? " (a run already came back in this process)" : "") + "; the shaders already finished come from the cache");
++        }
++        SetUpAndPlay(game);
++    }
++
+     private void QueueStartNext()
+     {
+         var item = BuildQueue.Next(buildQueue);
+@@ -214,7 +234,7 @@
+         selected = item.Game;
+         Write($"build queue: building {GameAppUi.DisplayName(item.Game)} ({buildQueue.Queued} more waiting)");
+         heatBypass = true;
+-        try { SetUpAndPlay(item.Game); } finally { heatBypass = false; }
++        try { StartQueued(item.Game); } finally { heatBypass = false; }
+         if (!running)
+         {
+             // Refused before it began (no keys, a withdrawn file): the reason is in the log; the queue goes on.
+diff -ruN m/GameAppRedesign.cs n/GameAppRedesign.cs
+--- m/GameAppRedesign.cs	2026-11-22 02:00:47
++++ n/GameAppRedesign.cs	2026-11-22 02:04:55
+@@ -53,7 +53,8 @@
+     /// The get-task-allow line shows under the carousel's buttons for a built game only.
+     public static bool ShowsNote(LibState state, bool canRunHere) => state == LibState.Built && !canRunHere;
+ 
+-    /// While a build or a boot has the phone (UiFacts.Running) every button is off, except the two that act on what is going on.
++    /// While a build or a boot has the phone (UiFacts.Running) every button is off, except Watch and Cancel the download (they act on what is going on) and, since patch 0085, Build,
++    /// which is then "Add to queue" (patch 0093, review r5: the comment said "the two" since 0085 added the third).
+     public static bool Enabled(LibAct act, bool busy) => !busy || act == LibAct.Watch || act == LibAct.CancelDownload || act == LibAct.Build;   // Build: "Add to queue" while busy (patch 0085)
+ 
+     /// Patch 0085: while another game builds, a game's Build is "Add to queue" (it waits, and starts after the current build).
+@@ -440,7 +441,7 @@
+ 
+     /// "56 GB free of 235 GB".
+     public static string StorageHeadline(long free, long total) =>
+-        total > 0 ? $"{GameAppUi.SizeText(free)} free of {GameAppUi.SizeText(total)}" : $"{GameAppUi.SizeText(free)} free";
++        total > 0 ? $"{DiskSpace.Text(free)} free of {GameAppUi.SizeText(total)}" : $"{DiskSpace.Text(free)} free";   // patch 0093: an unknown figure says so
+ }
+ 
+ /// The Build tab's card: the stages with their times, the shader count, the note.
+@@ -533,7 +534,10 @@
+         $"{game} is built. When the queue reaches it, its build is replaced by a new one (with the update, DLC or mods added since). The shaders already translated come from the cache.";
+ 
+     /// The queue row's words: "Build" for a game that is not built, "Rebuild" for one that is.
+-    public static string RowWord(bool built) => built ? "Rebuild" : "Build";
++    public static string RowWord(bool built, bool paused = false) => paused ? "Resume" : built ? "Rebuild" : "Build";   // patch 0093: a paused build in the queue goes on, it is not built again
++
++    /// Patch 0093 (review r5): the menu's queue entry of a PAUSED game (Resume and Discard are its own entries): the queue resumes it from where it stopped (ResumePlan), not from the start.
++    public const string QueueResumeLabel = "Queue the resume";
+ }
+ 
+ /// Patch 0082 (the owner): a game's settings (its sheet or iPad inspector: frame rate, upscaler, memory saver, mods, saves, logs, export) exist ONLY for a BUILT game. A game on this iPhone that
+diff -ruN m/GameAppRedesignUi.cs n/GameAppRedesignUi.cs
+--- m/GameAppRedesignUi.cs	2026-11-22 02:00:47
++++ n/GameAppRedesignUi.cs	2026-11-22 02:05:05
+@@ -614,7 +614,7 @@
+     private string launchingGame;   // the game a Play is starting (a boot-only run): the sheet's launch line
+     private string lastPlayGame;    // patch 0083: the game of the last boot-only run (launchingGame is cleared by Finish before StopEnding)
+     private bool runBootOnly;
+-    private (string Game, string Line)? playStopped;   // patch 0083: "Play was stopped before the game started" for that game, until the next Play
++    private (string Game, string Line)? playStopped;   // patch 0083: "Play was stopped before the game started" for that game; patch 0093: until the next run (a Play or a build) or its delete
+ 
+     /// Patch 0083: a stop ended a boot-only run before the boot (the chain's 131 / 130): no paused-build record, no cleanup; the game stays Ready, Play is offered again, one honest line.
+     private void PlayInterrupted(bool paused)
+@@ -846,7 +846,7 @@
+         if (selected == null || !entries.Any(e => e.Name == selected)) selected = libShown.FirstOrDefault()?.Name;
+ 
+         long localBytes = DumpBytes();
+-        shelfSubtitle.Text = LibraryStatus.Summary(libShown.Count, localBytes > 0 ? GameAppUi.SizeText(localBytes) : null, GameAppUi.SizeText(FreeBytes()));
++        shelfSubtitle.Text = LibraryStatus.Summary(libShown.Count, localBytes > 0 ? GameAppUi.SizeText(localBytes) : null, DiskSpace.Text(FreeBytes()));   // patch 0093: "unknown" rather than 0
+         bool grid = shelfView == "grid";
+         var toggleConfig = libToggle.Configuration;
+         toggleConfig.Image = UIImage.GetSystemImage(grid ? "rectangle.stack" : "square.grid.2x2");
+@@ -1152,7 +1152,7 @@
+                     list.Add(new HoldOverlay.Entry(PartialDiscard.Title, "trash", true, ok ? () => AskDiscardPartial(name) : () => ShowDiscardRefused(d.Why), "hold-discard", ok ? null : d.Why));
+                     break;
+                 }
+-                case HoldItem.AddToQueue: list.Add(new HoldOverlay.Entry("Add to the build queue", "list.number", false, () => AddToBuildQueue(name), "hold-queue")); break;
++                case HoldItem.AddToQueue: list.Add(new HoldOverlay.Entry(state == LibState.Paused ? QueuePlan.QueueResumeLabel : "Add to the build queue", "list.number", false, () => AddToBuildQueue(name), "hold-queue")); break;   // patch 0093
+                 case HoldItem.Upload:
+                     foreach (var t in targets) { var target = t; list.Add(new HoldOverlay.Entry("Upload to " + target.Name, "icloud.and.arrow.up", false, () => UploadTo(target, path, false), "hold-upload")); }
+                     break;
+diff -ruN m/GameAppShelf.cs n/GameAppShelf.cs
+--- m/GameAppShelf.cs	2026-11-22 02:00:47
++++ n/GameAppShelf.cs	2026-11-22 02:04:03
+@@ -1033,7 +1033,7 @@
+         Line("Game", size);
+         var buildValue = ready ? Line("Build", BuildText()) : null;
+         var shadersValue = tid != null ? Line("Shaders", Known(sizes.Get(FolderSizes.GameShaders))) : null;
+-        Line("Free on this " + GameAppUi.DeviceName, GameAppUi.SizeText(FreeBytes()));
++        Line("Free on this " + GameAppUi.DeviceName, DiskSpace.Text(FreeBytes()));   // patch 0093
+         FillStorage = () =>
+         {
+             if (buildValue != null) buildValue.Text = BuildText();
+diff -ruN m/GameAppStop.cs n/GameAppStop.cs
+--- m/GameAppStop.cs	2026-11-22 02:00:47
++++ n/GameAppStop.cs	2026-11-22 02:05:18
+@@ -74,9 +74,12 @@
+     public const string NoFrameworkLine = "Not assembled or signed";
+     public const string NoFrameworkNote = "the game could not be assembled or signed: see the log";
+ 
+-    /// The reason a failed run of code `rc` has words for, or null (the generic "stopped" texts stay).
+-    public static string FailureText(int rc) => rc == NoShaderLibrary ? NoShaderLibraryText : rc == NoFramework ? NoFrameworkText : null;
++    /// Patch 0093 (review r5): a PLAY (a boot-only run) that found no shader library and could not make it: nothing was built or broken, the boot was refused; "Rebuild" was the build's word.
++    public const string NoShaderLibraryPlayText = "The game was not started: its shader library is missing and could not be made again (it would draw nothing). Play again; if it fails again, rebuild the game, or send the log.";
+ 
++    /// The reason a failed run of code `rc` has words for, or null (the generic "stopped" texts stay). `play`: the run was a Play (boot-only), not a build.
++    public static string FailureText(int rc, bool play = false) => rc == NoShaderLibrary ? (play ? NoShaderLibraryPlayText : NoShaderLibraryText) : rc == NoFramework ? NoFrameworkText : null;
++
+     /// The run line's start for a failed run of code `rc`, or null ("Stopped at <step>").
+     public static string RunLine(int rc) => rc == NoShaderLibrary ? NoShaderLibraryLine : rc == NoFramework ? NoFrameworkLine : null;
+ 
+@@ -84,7 +87,7 @@
+     public static string QueueNote(int rc) => rc == NoShaderLibrary ? NoShaderLibraryNote : rc == NoFramework ? NoFrameworkNote : null;
+ 
+     /// The line the log gets for a failed run of code `rc` (an error line: "[RED]" makes it the build screen's last error, where "See what stopped it" scrolls), or null.
+-    public static string LogLine(int rc) => FailureText(rc) is string t ? "[RED] " + t : null;
++    public static string LogLine(int rc, bool play = false) => FailureText(rc, play) is string t ? "[RED] " + t : null;
+ }
+ 
+ /// The state of the build the user can stop. Thread-safe: the buttons are on the main thread, the chain's start and return are on the run's worker thread. Methods return what the caller must DO; they never
+diff -ruN m/GameAppStopUi.cs n/GameAppStopUi.cs
+--- m/GameAppStopUi.cs	2026-11-22 02:00:47
++++ n/GameAppStopUi.cs	2026-11-22 02:04:55
+@@ -105,7 +105,7 @@
+     {
+         runOutcome = StopOutcome.Finished;
+         runBootOnly = bootOnly;   // patch 0083: a stop of a boot-only run is an interrupted Play (PlayStop)
+-        if (bootOnly) playStopped = null;
++        playStopped = null;   // patch 0093 (review r5 P18): ANY run's start ends the "Play was stopped" line (it came back after every build: only a Play cleared it)
+         pauseRecorded = false;
+         resumedFrom = bootOnly ? null : pausedBuilds.FirstOrDefault(r => r.Game == name);
+         stop.Begin(name, stoppable: !bootOnly, extracting);
+@@ -177,7 +177,7 @@
+             var inSlot = SlotStore.Read(GameAppMain.Documents);
+             if (inSlot.Tid != null && !inSlot.BelongsTo(game, tid)) extractIsThis = false;
+         }
+-        var plan = discard ? PartialDiscard.Plan(tid, FrameworkIsPartial(game), extractIsThis) : CancelPlan.For(choice, tid, FrameworkIsPartial(game), chainRan, extractIsThis);
++        var plan = discard ? PartialDiscard.Plan(tid, FrameworkIsPartial(game), extractIsThis, DiscardBuiltHere(game)) : CancelPlan.For(choice, tid, FrameworkIsPartial(game), chainRan, extractIsThis);
+         pausedBuilds = PausedStore.Remove(pausedBuilds, game);
+         SavePaused();
+         QueueCancelled(game);
+@@ -362,6 +362,13 @@
+         PresentWhenFree(a);
+     }
+ 
++    /// Patch 0093 (review r5 P9): a finished build of this game is in Documents (the framework stamp names it, made by this app build): the paused run is a REBUILD, that build stays.
++    private bool DiscardBuiltHere(string game)
++    {
++        try { var f = GatherFacts(); return f.Framework == FrameworkState.Fresh && f.FrameworkGame == game; }
++        catch (Exception) { return true; }   // not known: keep what may be a working build
++    }
++
+     /// Whether extract/ holds THIS game's extraction (ApplyCancel decides the same way): the paused record says it was extracted, and the slot in Documents is not another game's.
+     private bool DiscardExtractIsThis(string game, PausedBuild record)
+     {
+@@ -379,7 +386,8 @@
+         var record = pausedBuilds.FirstOrDefault(r => r.Game == game);
+         if (offer.Offer != PartialDiscard.Offer.Offered || record == null || discardSizing) return;
+         bool extractIsThis = DiscardExtractIsThis(game, record);
+-        var plan = PartialDiscard.Plan(GameAppUi.BaseTitleIdOf(game), FrameworkIsPartial(game), extractIsThis);
++        bool builtHere = DiscardBuiltHere(game);   // patch 0093 (review r5 P9): a paused REBUILD keeps the finished build
++        var plan = PartialDiscard.Plan(GameAppUi.BaseTitleIdOf(game), FrameworkIsPartial(game), extractIsThis, builtHere);
+         long shaders = PartialDiscard.ShadersDone(record.StageLine);
+         var docs = GameAppMain.Documents;
+         discardSizing = true;
+@@ -399,7 +407,7 @@
+             {
+                 discardSizing = false;
+                 var name = GameAppUi.DisplayName(game);
+-                var a = UIAlertController.Create($"Discard the partial build of {name}?", PartialDiscard.Note(extract, shaders, extractIsThis), UIAlertControllerStyle.Alert);
++                var a = UIAlertController.Create($"Discard the partial build of {name}?", PartialDiscard.Note(extract, shaders, extractIsThis, builtHere), UIAlertControllerStyle.Alert);
+                 a.AddAction(UIAlertAction.Create(total > 0 ? $"Discard ({GameAppUi.SizeText(total)})" : "Discard", UIAlertActionStyle.Destructive, _ => DiscardPartial(game, total)));
+                 a.AddAction(UIAlertAction.Create("Keep it", UIAlertActionStyle.Cancel, null));
+                 PresentWhenFree(a);
+diff -ruN m/GameAppWarm.cs n/GameAppWarm.cs
+--- m/GameAppWarm.cs	2026-11-22 02:00:47
++++ n/GameAppWarm.cs	2026-11-22 02:04:18
+@@ -72,7 +72,7 @@
+         {
+             using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+             var head = new byte[32];
+-            if (f.Read(head, 0, 32) != 32 || Encoding.ASCII.GetString(head, 0, 8) != "DMROMFS1") return null;
++            if (f.ReadAtLeast(head, 32, throwOnEndOfStream: false) != 32 || Encoding.ASCII.GetString(head, 0, 8) != "DMROMFS1") return null;   // patch 0093 (review r5 P3): a full 32 bytes, not one Read
+             long ioff = BitConverter.ToInt64(head, 8), isz = BitConverter.ToInt64(head, 16), n = BitConverter.ToInt64(head, 24);
+             long length = f.Length;
+             if (ioff < 32 || isz < 0 || n < 1 || n > 4_000_000 || ioff > length || isz > length - ioff || n * 24 > isz) return null;
+@@ -619,7 +619,10 @@
+             {
+                 // patch 0087: a stopped run is over at once on the screen, but its workers may still finish the library they are on: this run starts once that thread is gone (one run's
+                 // workers at a time, warmed.tsv written by one run), and not at all when it was itself stopped or replaced meanwhile
+-                if (previous != null && previous.IsAlive) previous.Join();
++                // patch 0093 (review r5 P8): waited for at most WarmRun.JoinTimeoutMs; a thread that is still not gone (a worker stuck in a compile) is abandoned, said in the log: it stops at its
++                // next library (its run number is not current), and this run goes on. On the run's own thread, never the main one.
++                if (previous != null && previous.IsAlive && !previous.Join(WarmRun.JoinTimeoutMs))
++                    Log($"shader warm-up: the stopped run's thread did not end within {WarmRun.JoinTimeoutMs / 1000} s: it is abandoned (it stops at its next library); this run goes on");
+                 if (Current(mine))
+                 {
+                     lock (gate) { progressDone = 0; progressTotal = 0; }
