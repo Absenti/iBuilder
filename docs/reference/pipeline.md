@@ -114,7 +114,7 @@ Function groups:
 | run | `ibuilder_run_chain(h, config_path_or_NULL)`, `ibuilder_chain_status`, `ibuilder_cancel`, `ibuilder_request_stop(kind)`, `ibuilder_stop_requested` |
 | memory / platform | `ibuilder_mem_info`, `ibuilder_mem_line`, `ibuilder_available_bytes`, `ibuilder_address_space_info`, `ibuilder_self_identifier`, `ibuilder_early_init` |
 | game host | `ibuilder_set_game_layer`, `ibuilder_host_symbol`, `ibuilder_quit_game`, `ibuilder_live_handler` |
-| launch state | `ibuilder_classify_boot_request`, `ibuilder_classify_framework`, `ibuilder_classify_previous_run`, `ibuilder_parse_stage`, `ibuilder_is_boot_stage`, `ibuilder_decide_launch` (JSON), `ibuilder_begin_run`, `ibuilder_finish_run`, `ibuilder_logs_mark`, `ibuilder_log_trim` |
+| launch state | `ibuilder_classify_boot_request`, `ibuilder_classify_framework`, `ibuilder_classify_framework_id`, `ibuilder_classify_previous_run`, `ibuilder_parse_stage`, `ibuilder_is_boot_stage`, `ibuilder_decide_launch` (JSON), `ibuilder_begin_run`, `ibuilder_finish_run`, `ibuilder_logs_mark`, `ibuilder_log_trim` |
 | container | `ibuilder_nup_icon`, `ibuilder_nup_icon_read` (title icon of a `.nup`, error `IBUILDER_E_NUP`) |
 
 Error codes: `IBUILDER_E_BAD_ARG` -1, `E_BUSY` -2, `E_NUP` -3, `E_IO` -4, `E_PANIC` -99.

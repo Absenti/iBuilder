@@ -173,6 +173,9 @@ int ibuilder_classify_boot_request(int exists, const char *content);            
 #define IBUILDER_FRAMEWORK_FRESH 1
 #define IBUILDER_FRAMEWORK_STALE 2
 int ibuilder_classify_framework(int on_disk, const char *stamp_content, const char *current_build);
+/* The same with this app's framework id (GameAppBuild.FrameworkId; NULL or "" for none): FRESH when the stamp's framework_id= equals it, or, for a stamp written before framework ids
+ * (no framework_id= line), when its app_build= equals current_build. ibuilder_classify_framework (above) compares the build ids only, as it always did. */
+int ibuilder_classify_framework_id(int on_disk, const char *stamp_content, const char *current_build, const char *current_framework_id);
 #define IBUILDER_PREV_DESIGNED_END 0
 #define IBUILDER_PREV_PLAYER_END   1
 #define IBUILDER_PREV_DESIGNED_END_NO_CLEAN_EXIT 2

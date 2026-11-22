@@ -13,7 +13,7 @@
 //! | `gameapp.stage` | the chain | the one-line current step |
 //! | `gameapp.killed` | `report_interrupted_run` | iOS ended a BUILD (memory): the library offers Resume |
 //! | `gameapp.continue` / `.run` | the chain / the app | the chain ended on purpose before stage 3 (result 75); the next launch continues it |
-//! | `gameapp.framework` | the chain, after signing | which build of the app built the framework on disk, for which game |
+//! | `gameapp.framework` | the chain, after signing | which build of the app (and which framework id) built the framework on disk, for which game |
 
 use crate::layout::Docs;
 use crate::stage::stage_number;
@@ -52,16 +52,20 @@ pub fn classify_boot_request(exists: bool, content: Option<&str>) -> BootRequest
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameworkStamp {
     pub app_build: String,
+    /// `framework_id=`: the build script's FRAMEWORK ID of the app that built it (a hash of only what shapes a built framework and its boot: the host, the stage crates, the
+    /// tables, the shader chain; scripts/lib-hash.sh `framework_id_listing`). `None` for a stamp written before it existed.
+    pub framework_id: Option<String>,
     pub game: String,
     pub content: Option<String>,
     /// `signature=adhoc-export`: stage 4b signed the framework ad hoc (no identity on this install): built for export only, never booted here
     pub export_only: bool,
 }
 
-/// `ParseFrameworkStamp`: `key=value` lines (app_build, game, content). `None` when there is no stamp or it names no build.
+/// `ParseFrameworkStamp`: `key=value` lines (app_build, framework_id, game, content). `None` when there is no stamp or it names no build.
 pub fn parse_framework_stamp(content: Option<&str>) -> Option<FrameworkStamp> {
     let content = content?;
     let (mut build, mut game, mut built, mut export_only) = (None, None, None, false);
+    let mut framework_id = None;
     for raw in content.split('\n') {
         let line = raw.trim();
         let Some(eq) = line.find('=').filter(|&i| i > 0) else {
@@ -70,6 +74,7 @@ pub fn parse_framework_stamp(content: Option<&str>) -> Option<FrameworkStamp> {
         let (key, value) = (line[..eq].trim(), line[eq + 1..].trim().to_string());
         match key {
             "app_build" => build = Some(value),
+            "framework_id" => framework_id = Some(value).filter(|v| !v.is_empty()),
             "game" => game = Some(value),
             "content" => built = Some(value),
             "signature" => export_only = value == crate::assemble::EXPORT_ONLY_SIGNATURE,
@@ -79,6 +84,7 @@ pub fn parse_framework_stamp(content: Option<&str>) -> Option<FrameworkStamp> {
     match build {
         Some(b) if !b.is_empty() => Some(FrameworkStamp {
             app_build: b,
+            framework_id,
             game: game.unwrap_or_default(),
             content: built,
             export_only,
@@ -94,18 +100,53 @@ pub enum FrameworkState {
     Stale,
 }
 
+/// Whether a framework stamped `stamp_build` / `stamp_framework_id` is THIS app's to boot without a rebuild. The rule (the app's `GameAppUi.FrameworkMatches` is the same):
+/// - the stamp names a framework id and so does this app: they must be equal; the app's own build id does not matter (an app update that changed nothing a built framework
+///   depends on -- only the C# app, the shader crates, the docs -- keeps every built game playable: "Play", no rebuild);
+/// - else (a stamp from before framework ids, or a caller that has none): the app build ids must be equal, as before. An empty id on this side never matches.
+///
+/// A different framework id is always a rebuild: the host or a stage crate changed, and booting the old framework would run the old host and rewrite.
+pub fn framework_matches(
+    stamp_build: &str,
+    stamp_framework_id: &str,
+    current_build: &str,
+    current_framework_id: &str,
+) -> bool {
+    if !current_framework_id.is_empty() && !stamp_framework_id.is_empty() {
+        return stamp_framework_id == current_framework_id;
+    }
+    !current_build.is_empty() && stamp_build == current_build
+}
+
 /// `ClassifyFramework`: `on_disk`: the framework and the extraction it boots from are both there. A framework with no usable stamp is STALE, not fresh: it predates
-/// builds being tracked, and the safe reading of "I cannot tell who built this" is "not this build".
+/// builds being tracked, and the safe reading of "I cannot tell who built this" is "not this build". The comparison is the build id only (see `classify_framework_id`).
 pub fn classify_framework(
     on_disk: bool,
     stamp_content: Option<&str>,
     current_build: &str,
 ) -> FrameworkState {
+    classify_framework_id(on_disk, stamp_content, current_build, "")
+}
+
+/// `ClassifyFramework` with this app's framework id: FRESH when `framework_matches` says the framework on disk is this app's (its framework id, or for an older stamp its build id).
+pub fn classify_framework_id(
+    on_disk: bool,
+    stamp_content: Option<&str>,
+    current_build: &str,
+    current_framework_id: &str,
+) -> FrameworkState {
     if !on_disk {
         return FrameworkState::None;
     }
     match parse_framework_stamp(stamp_content) {
-        Some(s) if !current_build.is_empty() && s.app_build == current_build => {
+        Some(s)
+            if framework_matches(
+                &s.app_build,
+                s.framework_id.as_deref().unwrap_or(""),
+                current_build,
+                current_framework_id,
+            ) =>
+        {
             FrameworkState::Fresh
         }
         _ => FrameworkState::Stale,
@@ -537,6 +578,8 @@ pub fn report_interrupted_run(docs: &Docs) -> Option<InterruptedReport> {
 pub struct LaunchFacts<'a> {
     /// this build of the app (`GameAppBuild.Id`)
     pub current_build: &'a str,
+    /// this app's framework id (`GameAppBuild.FrameworkId`), "" for none: the build id alone decides (`framework_matches`)
+    pub current_framework_id: &'a str,
     /// `GameAppUi.CannotRunHere`: a distribution certificate (no get-task-allow) cannot run code from Documents
     pub cannot_run_here: bool,
     /// the framework this build would boot: `Documents/DmGameProbe.framework/DmGameProbe`, or an exported game's
@@ -625,7 +668,12 @@ pub fn decide_launch(docs: &Docs, facts: &LaunchFacts<'_>) -> LaunchPlan {
             } else {
                 None
             };
-            let fw = classify_framework(on_disk, stamp.as_deref(), facts.current_build);
+            let fw = classify_framework_id(
+                on_disk,
+                stamp.as_deref(),
+                facts.current_build,
+                facts.current_framework_id,
+            );
             if facts.cannot_run_here {
                 // A distribution certificate: the boot would be refused at the dlopen ("file system sandbox blocked mmap()"), and starting it at every launch was the "iBuilder starts again" loop (2026-11-18).
                 let _ = fs::remove_file(docs.boot_only());
@@ -821,6 +869,96 @@ mod tests {
     }
 
     #[test]
+    fn the_framework_id_decides_when_both_sides_have_one() {
+        use FrameworkState::{Fresh, Stale};
+        // the stamp the chain writes now: app_build AND framework_id
+        let stamp = "app_build=20261120-100000-rustaaaa\nframework_id=f00d\ngame=G.nsp\nbuilt=t\ncontent=\n";
+        let p = parse_framework_stamp(Some(stamp)).unwrap();
+        assert_eq!(p.framework_id.as_deref(), Some("f00d"));
+        assert_eq!(
+            parse_framework_stamp(Some("app_build=B\nframework_id=\n"))
+                .unwrap()
+                .framework_id,
+            None,
+            "an empty framework_id is none"
+        );
+        assert_eq!(
+            classify_framework_id(true, Some(stamp), "20261122-090000-rustbbbb", "f00d"),
+            Fresh,
+            "an app update with the same framework id: the built game boots, no rebuild"
+        );
+        assert_eq!(
+            classify_framework_id(true, Some(stamp), "20261120-100000-rustaaaa", "beef"),
+            Stale,
+            "another framework id is a rebuild, even with the same build id (the host or a stage crate changed)"
+        );
+        assert_eq!(
+            classify_framework_id(true, Some(stamp), "20261122-090000-rustbbbb", ""),
+            Stale,
+            "a caller with no framework id compares the build ids, as before"
+        );
+        assert_eq!(
+            classify_framework_id(true, Some(stamp), "20261120-100000-rustaaaa", ""),
+            Fresh
+        );
+        assert_eq!(
+            classify_framework_id(false, Some(stamp), "x", "f00d"),
+            FrameworkState::None
+        );
+        assert_eq!(classify_framework_id(true, None, "x", "f00d"), Stale);
+        assert_eq!(
+            classify_framework_id(true, Some("framework_id=f00d\n"), "x", "f00d"),
+            Stale,
+            "a stamp that names no build is no stamp"
+        );
+        // an older stamp (no framework_id): the build id decides, so the first update to an app with framework ids rebuilds once
+        let old = "app_build=B1\ngame=G.nsp\n";
+        assert_eq!(classify_framework_id(true, Some(old), "B1", "f00d"), Fresh);
+        assert_eq!(classify_framework_id(true, Some(old), "B2", "f00d"), Stale);
+        assert_eq!(
+            classify_framework_id(true, Some(stamp), "x", "F00D"),
+            Stale,
+            "the comparison is ordinal"
+        );
+        assert_eq!(
+            classify_framework(true, Some(stamp), "20261122-090000-rustbbbb"),
+            Stale,
+            "classify_framework (no framework id) keeps its old answer"
+        );
+        assert!(framework_matches("B", "f", "C", "f"));
+        assert!(!framework_matches("B", "f", "B", "g"));
+        assert!(framework_matches("B", "", "B", "g"));
+        assert!(!framework_matches("", "", "", ""));
+    }
+
+    #[test]
+    fn a_boot_request_survives_an_app_update_with_the_same_framework_id() {
+        let d = TempDir::new("launch-fwid");
+        let docs = Docs::new(d.path());
+        let (fw, flat) = (
+            docs.join("DmGameProbe.framework/DmGameProbe"),
+            docs.join("extract/flat"),
+        );
+        write(&fw, "x");
+        std::fs::create_dir_all(&flat).unwrap();
+        write(
+            docs.framework_stamp(),
+            "app_build=B1\nframework_id=F1\ngame=G\n",
+        );
+        let armed = "boot the framework that is already built and signed\n";
+        write(docs.boot_only(), armed);
+        let mut f = facts(&fw, &flat, "B2");
+        f.current_framework_id = "F1";
+        assert_eq!(decide_launch(&docs, &f).action, LaunchAction::BootOnly);
+        f.current_framework_id = "F2";
+        assert_eq!(decide_launch(&docs, &f).action, LaunchAction::Nothing);
+        assert!(
+            !docs.boot_only().exists(),
+            "another framework id: the request is withdrawn"
+        );
+    }
+
+    #[test]
     fn previous_run_classification() {
         use PreviousRun::*;
         let booting = "stage 5/5: booting the guest (dlopen + dm_host_probe_boot -> nnMain; quit from the gear menu)";
@@ -983,6 +1121,7 @@ mod tests {
     fn facts<'a>(fw: &'a Path, flat: &'a Path, build: &'a str) -> LaunchFacts<'a> {
         LaunchFacts {
             current_build: build,
+            current_framework_id: "",
             cannot_run_here: false,
             framework: fw,
             flat,

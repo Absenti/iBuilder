@@ -8,7 +8,7 @@
 #     the signature is ad hoc / unsigned (no identity, no provisioning profile) and carries the RAM entitlement.
 # The checks of the original that read gameapp_pipeline.py / mods.py / shader_device.py / pack_nup.py in the bundle are replaced by checks of the Rust chain's own log strings in the executable.
 #
-# usage: app/verify_ipa.sh <file.ipa> [expected-bundle-id]      env: GAMEAPP_RAM_ENTITLEMENT=0 GAMEAPP_EVA_ENTITLEMENT=1 SHADER_CHAIN=<id>
+# usage: app/verify_ipa.sh <file.ipa> [expected-bundle-id]      env: GAMEAPP_RAM_ENTITLEMENT=0 GAMEAPP_EVA_ENTITLEMENT=1 SHADER_CHAIN=<id> FRAMEWORK_ID=<16 hex>
 set -uo pipefail
 # shellcheck source=../scripts/lib-spawn.sh
 . "$(cd "$(dirname "$0")" && pwd)/../scripts/lib-spawn.sh" || exit 1
@@ -210,6 +210,10 @@ if [ -f "$APP/host-prebuilt.dylib" ]; then
     python3 -I -c 'import sys; sys.exit(0 if sys.argv[2].encode("utf-16-le") in open(sys.argv[1], "rb").read() else 1)' "$APP/GameApp.dll" "$SHADER_CHAIN" \
       && pass "and the app's own constant (GameAppBuild.ShaderChain, GameApp.dll) says the same" || fail "GameApp.dll does not carry the shader chain $SHADER_CHAIN"
   fi
+  if [ -n "${FRAMEWORK_ID:-}" ]; then
+    python3 -I -c 'import sys; sys.exit(0 if sys.argv[2].encode("utf-16-le") in open(sys.argv[1], "rb").read() else 1)' "$APP/GameApp.dll" "$FRAMEWORK_ID" \
+      && pass "the app carries its framework id $FRAMEWORK_ID (GameAppBuild.FrameworkId, GameApp.dll: a game built by an app with this id boots without a rebuild)" || fail "GameApp.dll does not carry the framework id $FRAMEWORK_ID"
+  fi
 fi
 for f in dm/games/settings.tsv; do [ -f "$APP/$f" ] && pass "the bundle carries $f (read by the Rust chain for the launcher catalogue)" || fail "the bundle has no $f"; done
 NT=$(find "$APP/dm/games" -name game.tsv | wc -l | tr -d ' ')
@@ -234,6 +238,7 @@ want = [('the boot-only launch path', 'gameapp.boot-only present'),
         ('a framework another build made is never booted', 'was not built by this version of the app'),
         ('the checklist says when the framework is stale', 'built by an older version of the app'),
         ('the config hands the pipeline the build id', 'app_build='),
+        ('the config hands the pipeline the framework id, stamped with the framework (0099)', 'framework_id='),
         ('a launch does not restart a boot that never came back', 'a boot from it was started and never came back'),
         ('a boot that ran to its time limit is one line, not an interruption', 'ended at its boot time limit'),
         ('and a time limit whose exit never finished is still reported', 'not `graceful exit done`'),

@@ -951,6 +951,40 @@ pub unsafe extern "C" fn ibuilder_classify_framework(
     })
 }
 
+/// `ibuilder_classify_framework` with this app's framework id (`GameAppBuild.FrameworkId`, NULL or "" for none): FRESH when the stamp's `framework_id` is the same, or, for a stamp
+/// from before framework ids, when its `app_build` is (`state::framework_matches`). The older entry point keeps its answer (build ids only).
+///
+/// # Safety
+/// Strings are NULL or NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ibuilder_classify_framework_id(
+    on_disk: c_int,
+    stamp_content: *const c_char,
+    current_build: *const c_char,
+    current_framework_id: *const c_char,
+) -> c_int {
+    guard(E_PANIC, || {
+        // SAFETY: NUL-terminated by contract.
+        let (s, b, f) = unsafe {
+            (
+                cstr(stamp_content),
+                cstr(current_build),
+                cstr(current_framework_id),
+            )
+        };
+        match state::classify_framework_id(
+            on_disk != 0,
+            s.as_deref(),
+            b.as_deref().unwrap_or(""),
+            f.as_deref().unwrap_or(""),
+        ) {
+            FrameworkState::None => 0,
+            FrameworkState::Fresh => 1,
+            FrameworkState::Stale => 2,
+        }
+    })
+}
+
 /// # Safety
 /// Strings are NULL or NUL-terminated.
 #[unsafe(no_mangle)]
@@ -1074,6 +1108,8 @@ pub unsafe extern "C" fn ibuilder_decide_launch(
             &docs,
             &LaunchFacts {
                 current_build: &b,
+                // this entry point predates framework ids: the build id alone decides, as it always did (ibuilder_classify_framework_id has the framework id rule)
+                current_framework_id: "",
                 cannot_run_here: cannot_run_here != 0,
                 framework: &fw,
                 flat: &flat,

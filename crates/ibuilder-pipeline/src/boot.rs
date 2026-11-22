@@ -23,6 +23,7 @@ use crate::settings::{
 use crate::shaderpack::{set_shader_map, set_shader_pack};
 use crate::shaders::{LiveShaders, build_shaders};
 use crate::stage::write_stage;
+use crate::state::framework_matches;
 use crate::util::{is_dir, is_file};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -139,16 +140,25 @@ pub fn boot_only(ctx: &mut Ctx) -> i32 {
         );
         return 3;
     }
-    // Only a framework THIS build of the app made is booted without a rebuild. A config with no app_build (a harness that predates it) skips the check; the app always writes one.
+    // Only a framework THIS app may boot is booted without a rebuild: its stamp's framework id is this app's (`framework_id`), or, for a stamp from before framework ids, its
+    // build id is (`state::framework_matches`). A config with neither (a harness that predates them) skips the check; the app always writes both.
     let want = ctx.cfg.get_or("app_build", "").to_string();
-    if !want.is_empty() {
-        let have = read_framework_stamp(ctx)
-            .get_or("app_build", "")
-            .to_string();
-        if have != want {
+    let want_fw = ctx.cfg.get_or("framework_id", "").to_string();
+    if !want.is_empty() || !want_fw.is_empty() {
+        let stamp = read_framework_stamp(ctx);
+        let have = stamp.get_or("app_build", "").to_string();
+        let have_fw = stamp.get_or("framework_id", "").to_string();
+        if !framework_matches(&have, &have_fw, &want, &want_fw) {
+            let id = |b: &str, f: &str| match (b.is_empty(), f.is_empty()) {
+                (true, true) => "an unstamped build".to_string(),
+                (false, true) => b.to_string(),
+                (true, false) => format!("framework id {f}"),
+                (false, false) => format!("{b} (framework id {f})"),
+            };
             ctx.log(&format!(
-                "boot-only: the framework on disk was built by '{}', this app is '{want}' -- it would run an older host and rewrite, so it is not booted; run a build",
-                if have.is_empty() { "an unstamped build" } else { &have }
+                "boot-only: the framework on disk was built by '{}', this app is '{}' -- it would run an older host and rewrite, so it is not booted; run a build",
+                id(&have, &have_fw),
+                id(&want, &want_fw)
             ));
             boot_only_consume(
                 ctx,

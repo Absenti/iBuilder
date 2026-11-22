@@ -328,6 +328,13 @@ int main(int argc, char **argv)
           ibuilder_classify_boot_request(0, NULL) == IBUILDER_BOOT_REQUEST_NONE, "ibuilder_classify_boot_request");
     CHECK(ibuilder_classify_framework(1, "app_build=B1\ngame=G\n", "B1") == IBUILDER_FRAMEWORK_FRESH && ibuilder_classify_framework(1, "app_build=B1\n", "B2") == IBUILDER_FRAMEWORK_STALE &&
           ibuilder_classify_framework(0, NULL, "B1") == IBUILDER_FRAMEWORK_NONE, "ibuilder_classify_framework");
+    CHECK(ibuilder_classify_framework_id(1, "app_build=B1\nframework_id=F1\ngame=G\n", "B2", "F1") == IBUILDER_FRAMEWORK_FRESH &&
+          ibuilder_classify_framework_id(1, "app_build=B1\nframework_id=F1\n", "B1", "F2") == IBUILDER_FRAMEWORK_STALE &&
+          ibuilder_classify_framework_id(1, "app_build=B1\ngame=G\n", "B1", "F1") == IBUILDER_FRAMEWORK_FRESH &&
+          ibuilder_classify_framework_id(1, "app_build=B1\ngame=G\n", "B2", "F1") == IBUILDER_FRAMEWORK_STALE &&
+          ibuilder_classify_framework_id(1, "app_build=B1\nframework_id=F1\n", "B1", NULL) == IBUILDER_FRAMEWORK_FRESH &&
+          ibuilder_classify_framework_id(0, NULL, "B1", "F1") == IBUILDER_FRAMEWORK_NONE &&
+          ibuilder_classify_framework(1, "app_build=B1\nframework_id=F1\n", "B2") == IBUILDER_FRAMEWORK_STALE, "ibuilder_classify_framework_id: the framework id decides, an older stamp falls back to the build id");
     CHECK(ibuilder_classify_previous_run("stage 5/5: booting the guest (x)", "[gameapp] the player ended the game: sending SIGTERM to self", "[dm] graceful exit done") == IBUILDER_PREV_PLAYER_END &&
           ibuilder_classify_previous_run("stage 2/5: rewriting", "[gameapp] dlopen OK", NULL) == IBUILDER_PREV_KILLED_OR_UNKNOWN, "ibuilder_classify_previous_run");
     ibuilder_stage st;

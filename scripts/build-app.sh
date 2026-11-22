@@ -33,6 +33,14 @@
 # Where it writes: only $APP_WORK (default <repo>/target/app-work), $CARGO_TARGET_DIR (default <repo>/target) and dist/. Environment:
 #   APP_WORK=<dir>   APP_OUT=<dir> (default <repo>/dist)   CARGO_TARGET_DIR=<dir>   SKIP_RUST=1 (reuse the archive from a previous run)   APP_NAME_SUFFIX=<text>
 #   GAMEAPP_EVA_ENTITLEMENT=1 adds extended-virtual-addressing (off: a free Apple ID cannot carry it)   GAMEAPP_RAM_ENTITLEMENT=0 builds without the RAM entitlement
+# The FRAMEWORK ID (step 1, GameAppBuild.FrameworkId; scripts/framework-id.sh prints it without building): what a built game's stamp is compared with after an app update. The build id
+# (GameAppBuild.Id, <yyyymmdd-hhmmss>-rust<hash>) is new at every build, so comparing it made every game "Needs setup" after every update. The framework id hashes ONLY what shapes a built
+# framework and its boot, computed from the files, deterministically (scripts/lib-hash.sh framework_id_listing; the listing goes to <work>/framework-inputs.txt and the MANIFEST):
+#   FRAMEWORK_EPOCH (raised by hand), the host dylib's sha256, the shader chain, the cargo features, the stage crates ibuilder-nso ibuilder-a64 ibuilder-rewrite ibuilder-macho
+#   ibuilder-sign ibuilder-profile ibuilder-mods ibuilder-nup, ibuilder-pipeline minus the files that never touch a framework (stage 3's shaders, logs, gates, the launch state
+#   machine), ibuilder-cli's adapters.rs + Cargo.toml, Cargo.lock, app/game-tables, the engine's dm/games/settings.tsv and dm/games/*/game.tsv, the host sources the profile reads
+#   (dm/host, dm/gfx, dm/gfx/nvn, dm/gfx/vk), the extractor (nx_extract/Program.cs + app/patches/nx_extract_merged_update.py).
+#   NOT the C# app or its patches, NOT the time, NOT the shader crates (the shader library is versioned by its chain and split version). The same id: "Play", no rebuild; another: rebuild.
 # The bundle id is dev.ibuilder.app, fixed: the sideloading service spends one of a small weekly quota of App IDs per distinct id (docs/DECISIONS.md trap 26 of the iOSBuilder repo).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -150,6 +158,12 @@ if grep -qE '^nup *=' "$ROOT/crates/ibuilder-cli/Cargo.toml" 2>/dev/null; then
   else FFI_FEATURES="real-stages,ibuilder-cli/nup"; NUP_STATE="in this build (ibuilder-cli/nup enabled by this script)"; fi
 fi
 echo "  Switch 2 package reader (.nup): $NUP_STATE" >&2
+# the framework id (header above; scripts/lib-hash.sh): stamped with every framework this app builds, and what an updated app compares a built game's stamp with
+FRAMEWORK_INPUTS="$WD/framework-inputs.txt"
+framework_id_listing "$ROOT" "$ENGINE" "$HOST_DYLIB" "$SHADER_CHAIN" "$FFI_FEATURES" > "$FRAMEWORK_INPUTS"
+FRAMEWORK_ID="$(framework_id_of < "$FRAMEWORK_INPUTS")"
+grep -q $'\t-$' "$FRAMEWORK_INPUTS" && die "an input of the framework id is missing ($(grep $'\t-$' "$FRAMEWORK_INPUTS" | cut -f1 | tr '\n' ' ')): see $FRAMEWORK_INPUTS"
+echo "  framework id $FRAMEWORK_ID (a built game whose stamp has it boots without a rebuild; inputs in $FRAMEWORK_INPUTS)" >&2
 say "1. libibuilder_ffi.a for $RUST_TARGET  (build id $BUILD_ID, features $FFI_FEATURES)"
 FFI_OUT="$WD/ffi"
 FFI_STATE="built by scripts/build-ios-ffi.sh"
@@ -252,8 +266,8 @@ for f in Utilities/BitUtils.cs Utilities/BitfieldExtensions.cs Pools/ObjectPool.
 done
 cp "$XT/Program.cs" "$XT/dmsh_xlate.csproj" "$XL/"          # UNCHANGED: --source-sha hashes these two files
 cp "$ROOT/app/gameapp/xlate/GameAppXlate.cs" "$ROOT/app/gameapp/xlate/XlateCommonShim.cs" "$XL/"
-printf 'internal static class GameAppBuild { public const string Id = "%s"; public const string ShaderChain = "%s"; }\n' "$BUILD_ID" "$SHADER_CHAIN" > "$P/GameAppBuild.cs"
-echo "  build id (the framework's stamp): $BUILD_ID; shader chain $SHADER_CHAIN" >&2
+printf 'internal static class GameAppBuild { public const string Id = "%s"; public const string ShaderChain = "%s"; public const string FrameworkId = "%s"; }\n' "$BUILD_ID" "$SHADER_CHAIN" "$FRAMEWORK_ID" > "$P/GameAppBuild.cs"
+echo "  build id $BUILD_ID; framework id (what a built game's stamp is compared with) $FRAMEWORK_ID; shader chain $SHADER_CHAIN" >&2
 plutil -lint "$P/Info.plist.fragment" >/dev/null 2>&1 || die "Info.plist.fragment is not a valid plist"
 plutil -lint "$P/GameApp.entitlements" >/dev/null 2>&1 || die "GameApp.entitlements is not a valid plist"
 # plutil is lenient where the SDK's parser is not: a `--` INSIDE an XML comment is legal to plutil and fatal to the SDK. xmllint is strict.
@@ -484,10 +498,10 @@ V_EVA="${GAMEAPP_EVA_ENTITLEMENT:-0}"; V_RAM="${GAMEAPP_RAM_ENTITLEMENT:-1}"
   echo "# replays the check this build ran on $(basename "$IPA"), with the same verifier (app/verify_ipa.sh + scripts/lib-spawn.sh, copied here at build time) and the same environment"
   echo 'HERE=$(cd "$(dirname "$0")" && pwd)'
   echo 'IPA="${1:-$HERE/../'"$(basename "$IPA")"'}"'
-  printf 'GAMEAPP_EVA_ENTITLEMENT=%q GAMEAPP_RAM_ENTITLEMENT=%q SHADER_CHAIN=%q APP_BUILD_NUMBER=%q APP_VERSION=%q exec "$HERE/app/verify_ipa.sh" "$IPA" %q\n' \
-    "$V_EVA" "$V_RAM" "$SHADER_CHAIN" "${APP_BUILD_NUMBER:-}" "${APP_VERSION:-}" "$APP_ID"
+  printf 'GAMEAPP_EVA_ENTITLEMENT=%q GAMEAPP_RAM_ENTITLEMENT=%q SHADER_CHAIN=%q FRAMEWORK_ID=%q APP_BUILD_NUMBER=%q APP_VERSION=%q exec "$HERE/app/verify_ipa.sh" "$IPA" %q\n' \
+    "$V_EVA" "$V_RAM" "$SHADER_CHAIN" "$FRAMEWORK_ID" "${APP_BUILD_NUMBER:-}" "${APP_VERSION:-}" "$APP_ID"
 } > "$VERIFY_DIR/replay.sh" && chmod +x "$VERIFY_DIR/replay.sh" || die "cannot write $VERIFY_DIR/replay.sh"
-GAMEAPP_EVA_ENTITLEMENT="$V_EVA" GAMEAPP_RAM_ENTITLEMENT="$V_RAM" SHADER_CHAIN="$SHADER_CHAIN" \
+GAMEAPP_EVA_ENTITLEMENT="$V_EVA" GAMEAPP_RAM_ENTITLEMENT="$V_RAM" SHADER_CHAIN="$SHADER_CHAIN" FRAMEWORK_ID="$FRAMEWORK_ID" \
   APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-}" APP_VERSION="${APP_VERSION:-}" \
   "$VERIFY_DIR/app/verify_ipa.sh" "$IPA" "$APP_ID" 2>&1 | tee "$WD/verify_ipa.log" >&2
 VRC="${PIPESTATUS[0]}"
@@ -512,6 +526,7 @@ say "10. $APP_OUT/MANIFEST.txt"
   echo "signature        $(codesign -dv "$APP/$APPNAME" 2>&1 | grep -E 'Signature|flags' | tr '\n' ' ')"
   echo "entitlements     $(codesign -d --entitlements :- "$APP/$APPNAME" 2>/dev/null | grep -o 'com.apple.developer.kernel[a-z-]*' | tr '\n' ' ')"
   echo "shader chain     $SHADER_CHAIN (the patched engine's header = the host's)"
+  echo "framework id     $FRAMEWORK_ID (GameAppBuild.FrameworkId: a game built by an app with this id boots without a rebuild; its inputs below)"
   echo "version          CFBundleShortVersionString ${APP_VERSION:-from the csproj}, CFBundleVersion ${APP_BUILD_NUMBER:-1}"
   echo "$FONTS_STATE"
   echo "scrubbed files   $(grep -c . "$WD/scrubbed.txt" || true) (home directory blanked in the bundle; verify_ipa.sh greps the whole bundle for it)"
@@ -534,6 +549,9 @@ say "10. $APP_OUT/MANIFEST.txt"
   echo "tree id                  rust$RUST_ID"
   echo "libibuilder_ffi.a        $(stat -f %z "$RUSTLIB") bytes  sha256 $RUSTLIB_SHA"
   echo "ffi library              $FFI_STATE"
+  echo
+  echo "== the framework id's inputs (scripts/lib-hash.sh framework_id_listing): framework id $FRAMEWORK_ID =="
+  while IFS=$'\t' read -r n h; do printf '%-24s %s\n' "$n" "$h"; done < "$FRAMEWORK_INPUTS"
   echo
   echo "== the C# snapshot (app/SNAPSHOT.tsv sha256 $(shasum -a 256 < "$ROOT/app/SNAPSHOT.tsv" | cut -c1-16)); C# patches applied: ${#PATCHES[@]} =="
   echo "app/gameapp_shim_rust.c  $(shasum -a 256 < "$ROOT/app/gameapp_shim_rust.c" | cut -d' ' -f1)"
