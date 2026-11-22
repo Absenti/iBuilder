@@ -159,6 +159,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             spirv_cross_c.h
+            spirv.h
           sparse-checkout-cone-mode: false
       - name: app/c/test/run.sh (NSZ converter and SPIRV-Cross driver, host build)
         run: |
