@@ -226,6 +226,13 @@ impl ShaderResume {
     }
 }
 
+/// A `<pack>.none` marker ("this game holds no shader this split reads") is only believed when the split that wrote it is this app's:
+/// a newer split may read the game (Beach Buggy Racing 2's Vector Unit .apf archive: 0 shaders, then 496 with SPLIT_REV 3).
+/// A marker without a `split` line was written before the version was recorded and is stale for the same reason.
+fn none_marker_current(text: &str, split_ver: &str) -> bool {
+    text.lines().any(|l| l == format!("split {split_ver}"))
+}
+
 fn split_version(ctx: &Ctx) -> String {
     ctx.adapters
         .shaders
@@ -256,7 +263,9 @@ pub fn shaders_will_build(ctx: &Ctx) -> bool {
     let none_marker = with_ext(&pack, ".none");
     if is_file(&none_marker) {
         let t = read_text(&none_marker).unwrap_or_default();
-        if dlc_sig == "-" || t.contains(&format!("dlc {dlc_sig}\n")) {
+        if none_marker_current(&t, &split_version(ctx))
+            && (dlc_sig == "-" || t.contains(&format!("dlc {dlc_sig}\n")))
+        {
             return false;
         }
     }
@@ -392,6 +401,14 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
     let none_marker = with_ext(&pack, ".none");
     let dlc = aoc_images(ctx, &tid);
     let dlc_sig = dlc_signature(&dlc);
+    let split_ver = split_version(ctx);
+    if is_file(&none_marker) {
+        let t = read_text(&none_marker).unwrap_or_default();
+        if !none_marker_current(&t, &split_ver) {
+            ctx.log(&format!("stage 3 shaders: {tid} held no shader for another version of the shader split; this app's is {split_ver} -- split again"));
+            let _ = fs::remove_file(&none_marker);
+        }
+    }
     if is_file(&none_marker) {
         let t = read_text(&none_marker).unwrap_or_default();
         if !t.contains(&format!("dlc {dlc_sig}\n")) && dlc_sig != "-" {
@@ -407,7 +424,6 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         ));
         return Ok(None);
     }
-    let split_ver = split_version(ctx);
     if let Some(stale) = stale_split(&pack, &split_ver) {
         ctx.log(&format!(
             "stage 3 shaders: Documents/shaders/{tid} was split by another version of the shader split ({stale}, this app {split_ver}): it may miss shaders this version finds -- built again"
@@ -685,7 +701,10 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
     if n == 0 {
         ctx.log("stage 3 shaders: the game ships no shader this split reads (it may compile them at run time: a Mac capture is needed for such a game) -- nothing built");
         rmtree(&work);
-        let marker = format!("the split found 0 shaders in RomFS.img and main\ndlc {dlc_sig}\n");
+        let marker = format!(
+            "the split found 0 shaders in RomFS.img and main\ndlc {dlc_sig}\nsplit {}\n",
+            split_version(ctx)
+        );
         if let Err(e) = write_atomic(&none_marker, marker.as_bytes()) {
             ctx.log(&format!(
                 "stage 3 shaders: could not write {}: {e} (the next run splits again)",
