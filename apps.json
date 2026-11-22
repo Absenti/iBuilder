@@ -19,6 +19,16 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.1.2",
+          "buildVersion": "3",
+          "date": "2026-11-22T14:45:59Z",
+          "localizedDescription": "> [!WARNING]\n> No game, firmware or key is included or downloaded. Use iBuilder only with games you own and the `prod.keys` dumped from your own console. Not affiliated with Nintendo or Apple.\n\n**New**\n- **Export without a `.p12`**: with no signing certificate in iBuilder, a build is signed ad hoc for export only; export the IPA and install it with your signing tool (SideStore, AltStore, Sideloadly, Xcode or a certificate provider re-signs it). The `.p12` is now needed only to play inside iBuilder; importing one later offers \"Sign again to play\".\n- **GPUs without BC textures** (A14–A16 devices, e.g. iPhone 12–15 non-Pro): detected automatically; BC textures are decoded on the CPU. Untested on such devices: expect slow loading and high memory use; reports welcome.\n\n**Install**: SideStore source `https://raw.githubusercontent.com/Absenti/iBuilder/main/apps.json`, or the `.ipa` below. Bundle id `dev.ibuilder.app`, iOS 26+. Assets: the `.ipa`, its `.sha256`, and `.ipa.verify.tar.gz` (the verifier that checked it: 240 checks passed).",
+          "downloadURL": "https://github.com/Absenti/iBuilder/releases/download/v0.1.2/GameApp-rust-20261122-144325-rust7d81008a.ipa",
+          "size": 40854278,
+          "sha256": "812162fa910190a3dfd52c90d27fbfd5c72e2b4a7a34abb5fc554bc49bbcc9f3",
+          "minOSVersion": "26.0"
+        },
+        {
           "version": "0.1.1",
           "buildVersion": "2",
           "date": "2026-11-22T11:29:50Z",
