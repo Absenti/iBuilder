@@ -11,8 +11,8 @@
 #   IPHONEOS_DEPLOYMENT_TARGET=14.0                 the app's minimum iOS (set it: the C code of capstone and Rust's objects carry it; a mismatch is a linker warning per object)
 #
 # Needs rustup's toolchain (the Homebrew rustc has no aarch64-apple-ios standard library): the keg is put on PATH for this script only.
-# Verified (see docs/chain/PIPELINE-RUST.md, "iOS portability"): both targets build; the exported symbols match include/ibuilder.h; a C client links the simulator archive and runs the chain in a
-# booted simulator. The archive linked into the real .NET app: docs/APP-RUST.md (scripts/build-app.sh).
+# Verified (see docs/reference/pipeline.md, "iOS portability"): both targets build; the exported symbols match include/ibuilder.h; a C client links the simulator archive and runs the chain in a
+# booted simulator. The archive linked into the real .NET app: docs/ARCHITECTURE.md (scripts/build-app.sh).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"

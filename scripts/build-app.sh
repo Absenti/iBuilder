@@ -4,7 +4,7 @@
 #   scripts/build-app.sh device        -> dist/GameApp-rust-<buildid>.ipa (+ .sha256, dist/MANIFEST.txt): the unsigned / ad hoc device .ipa SideStore re-signs
 #   scripts/build-app.sh simulator     -> $APP_WORK/simulator/app/GameApp.app, ad hoc signed, NOT installed (app/sim/*.sh install and drive it)
 #
-# What it builds (docs/APP-RUST.md has the design and what is verified):
+# What it builds (docs/ARCHITECTURE.md has the design):
 #   1. libibuilder_ffi.a for the target: `cargo build --release -p ibuilder-ffi --features real-stages` (scripts/build-ios-ffi.sh). The features give the chain driver with the REAL stage
 #      workers: profile, rewrite, assemble, sign, mods and stage 3 (ibuilder-shadersplit, ibuilder-shaderbuild, ibuilder-shader's finisher); the translator and SPIRV-Cross are callbacks.
 #   2. libgameappshim-rust-<kind>.a: app/gameapp_shim_rust.c (the drop-in for gameapp_shim.c), zsign (+ OpenSSL, zlib, minizip) and its adapter, SPIRV-Cross's C wrapper, the NSZ converter

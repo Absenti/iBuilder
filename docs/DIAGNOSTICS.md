@@ -1,6 +1,6 @@
 # Hidden diagnostics (`Documents/.diag`)
 
-Added 2026-11-19 (`app/patches/0050-hidden-diagnostics.patch`, `0052-...`, `crates/ibuilder-pipeline/src/diag.rs`). A folder whose name starts with a dot is not shown by the Files app; nothing here is sent anywhere.
+The app keeps a diagnostics folder (`app/patches/0050-hidden-diagnostics.patch` and `0052-...` on the C# side, `crates/ibuilder-pipeline/src/diag.rs` on the Rust side). A folder whose name starts with a dot is not shown by the Files app; nothing here is sent anywhere.
 
 ## Fetch it from a Mac (phone on the cable, trusted, developer mode)
 
@@ -26,8 +26,12 @@ The newest six sessions are kept, 48 MB at most; an events file stops taking ord
 
 ## The host's switches turned on for a game (`diag::host_env`)
 
-Only where nothing set them already (a harness, `Documents/env.txt`); `diag_host=0` in `gameapp.config` leaves all of them off: `DM_BOOTPROF=1` (boot timing: mapping, relocation, Metal library, pipelines, uploads, first present), `DM_MEMSTAT=<.diag/memstat-...>`, `DM_PSO_WAITLOG=1` (draws that waited more than 20 ms for a pipeline), `DM_SLOWFRAME=1` (timing of dropped frames), `DM_HITCH_DUMP=2000:20` (no frame for 2 s: every guest thread, once per stall), `DM_FD_LOG=120`, `DM_NVN_CMDSTAT=1`. The guest log (`gameapp.guest.log`) carries their lines.
+Only where nothing set them already (a test harness, `Documents/env.txt`); `diag_host=0` in `gameapp.config` leaves all of them off: `DM_BOOTPROF=1` (boot timing: mapping, relocation, Metal library, pipelines, uploads, first present), `DM_MEMSTAT=<.diag/memstat-...>`, `DM_PSO_WAITLOG=1` (draws that waited more than 20 ms for a pipeline), `DM_SLOWFRAME=1` (timing of dropped frames), `DM_HITCH_DUMP=2000:20` (no frame for 2 s: every guest thread, once per stall), `DM_FD_LOG=120`, `DM_NVN_CMDSTAT=1`. The guest log (`gameapp.guest.log`) carries their lines.
 
 ## Putting a build on a phone that is on the cable
 
-`scripts/usb-install.sh <GameApp.app>` signs a COPY with Xcode's automatic provisioning (bundle id `dev.ibuilder.app.usb`, the team's development certificate, the entitlements already in the executable), installs it with `devicectl` and launches it. It never reads a provisioning profile or a private key. The deliverable `.ipa` stays ad hoc signed for SideStore / FlareStore.
+`scripts/usb-install.sh <GameApp.app>` signs a COPY with Xcode's automatic provisioning (bundle id `dev.ibuilder.app.usb`, your team's development certificate, the entitlements already in the executable), installs it with `devicectl` and launches it. It never reads a provisioning profile or a private key. The deliverable `.ipa` stays ad hoc signed for SideStore / FlareStore.
+
+## Before you share a log
+
+The files contain device names, file names and paths. Read them and remove personal information before posting them in an issue (see [../SECURITY.md](../SECURITY.md)).

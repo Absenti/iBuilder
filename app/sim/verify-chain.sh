@@ -2,7 +2,7 @@
 # app/sim/verify-chain.sh <app Documents folder> <reference run folder> -- did the chain that ran INSIDE the app write the same outputs as the Mac CLI run (scripts/e2e-grizzy.sh)?
 #
 # <reference run folder> is a `ibuilder --out` folder of the CLI on the same Grizzy inputs whose outputs were compared with the Python oracle by the earlier packages
-# (docs/chain/E2E-RUST.md: 21 of 21 rewrite files identical to out-py/pyrewrite/out, the library identical to the Python's but for three stamped files). The oracle folders themselves
+# (docs/reference/pipeline.md: 21 of 21 rewrite files identical to out-py/pyrewrite/out, the library identical to the Python's but for three stamped files). The oracle folders themselves
 # (out-py, out/ref-img-grizzy) were deleted from the iOSBuilder checkout on 2026-11-19 ~12:09, so the comparison here is in-app output against that earlier verified CLI output.
 #   (2) the 21 rewrite files, cmp one by one;  (3) the shader library image, libdiff (file by file inside the DMROMFS1 image);  (4) the signed framework: codesign on the Mach-O alone,
 #   its platform and identifier;  (5) the markers and the stage lines of the run.

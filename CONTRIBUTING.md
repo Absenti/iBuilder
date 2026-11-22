@@ -1,8 +1,15 @@
 # Contributing to iBuilder
 
-Thanks for helping. This is a small project; these rules keep it correct and safe to publish. Start with
-[docs/CONVENTIONS.md](docs/CONVENTIONS.md) (the rules every contributor follows) and [docs/README.md](docs/README.md)
-(the index of every document).
+Thanks for helping. This is a small project; these rules keep it correct and safe to publish. The documents are
+indexed in [docs/README.md](docs/README.md); [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the place to start.
+
+## What the project is
+
+iBuilder is a Rust rewrite of the toolchain of iOSBuilder (Python, C# and C), which builds a Switch game as a native iOS
+game on the iPhone from the user's own dump. The engine host (nxnative) and the Ryujinx / LibHac libraries are third
+party and stay as they are. Goals, in this order: (1) **byte-identical output** to the Python toolchain, (2) lower wall
+time, (3) lower peak memory (the iPhone's jetsam ceiling is about 3.3 GiB), (4) no embedded runtimes (no CPython, no
+CoreCLR) on the phone.
 
 ## Build and test
 
@@ -43,7 +50,7 @@ macOS's: it is for your own phone and must never be shared (see [NOTICE.md](NOTI
 * **Tests**: a fix comes with a test that fails without it; a reader of untrusted input (a container, a module, a
   profile) comes with a test that feeds it truncated and extreme data and expects an `Err`, never a panic.
 * **The byte-compare oracle**: for every valid input, the output of a stage stays **byte-identical** to the reference
-  toolchain's (goal 1 of [docs/CONVENTIONS.md](docs/CONVENTIONS.md)). If a change must alter an output, say so
+  toolchain's (goal 1 above). If a change must alter an output, say so
   explicitly, justify it, and update the pinned hashes in the same PR.
 * **iOS constraints**: the library crates ship on an iPhone: no `fork`, `exec` or `std::process::Command`, no
   macOS-only API, prefer `#![forbid(unsafe_code)]` and justify any `unsafe`.
@@ -55,6 +62,37 @@ macOS's: it is for your own phone and must never be shared (see [NOTICE.md](NOTI
 * **Docs**: update the document of the crate or topic you changed (see [docs/README.md](docs/README.md)).
 * **CI must be green.** Merging needs one approving review, including the code owner's
   ([.github/CODEOWNERS](.github/CODEOWNERS)).
+
+## Rules for the code
+
+* **The original iOSBuilder checkout is a read-only input** (`$IOSBUILDER`, see [docs/BUILDING.md](docs/BUILDING.md)): tests
+  compare against its reference outputs and the app build takes prebuilt pieces from it. Nothing here writes there. Run
+  its Python with `PYTHONDONTWRITEBYTECODE=1`, from copies in a scratch folder.
+* **Scratch folders** (generated oracle outputs, Python reference environments, cargo target directories) live outside the
+  repository; `target/` is ignored.
+* **Fixtures that are absent skip, loudly.** A test that needs a file the repository does not contain calls
+  `ibuilder_testkit::skip(reason)` and returns (`ibuilder_testkit::have(path)` is the usual check). Never a bare
+  `eprintln!("SKIP")` or a silent `return`: libtest counts those as passed. `skip` prints, appends to
+  `$CARGO_TARGET_DIR/skipped-tests.log`, and panics when `IBUILDER_STRICT_FIXTURES=1`.
+* **A test count is `scripts/test-report.sh`'s count**, not cargo's: "N passed, K of them skipped for missing fixtures".
+  Quote both, and the machine.
+* **Untrusted input.** Whatever is read from a file (a container, an image, a module, a config) is the file's word: sizes,
+  counts and offsets are checked (`checked_*`, `u128`, or against the file's own length) before they slice, index, loop or
+  allocate, and damaged input is an `Err`, never a panic (a release build is `panic = "abort"`). Every reader of such input
+  has a test that feeds it truncations and extreme values (`crates/ibuilder-rewrite/tests/damaged_module.rs` is the model).
+* **iOS constraints.** Core library crates do not use `fork`, `exec`, `std::process::Command` or macOS-only APIs; threads
+  (`rayon`) are fine. Prefer `#![forbid(unsafe_code)]` and justify any `unsafe`. Keep crates buildable for
+  `aarch64-apple-ios`. Mac-only binaries live in `src/bin/`.
+* **Layout.** A Cargo workspace, `members = ["crates/*"]`, names `ibuilder-<thing>`, library first (`src/lib.rs`), an
+  optional CLI in `src/bin/`, edition 2024. Dependencies are kept few (`rayon`, `memmap2`, `sha2`, `lz4_flex`, `capstone`,
+  `anyhow` / `thiserror`, `libc`, `clap`, `serde` / `serde_json`, `hex`); justify any other in the crate's doc.
+* **Toolchains.** The default `cargo` builds for the host. For iOS targets, prefix the command with the rustup toolchain's
+  `bin` (for Homebrew: `PATH=/opt/homebrew/opt/rustup/bin:$PATH cargo build --release --target aarch64-apple-ios-sim -p <crate>`);
+  without it cargo may pick another rustc and fail with E0463.
+* **Measuring.** Wall time and memory with `/usr/bin/time -l`, release builds. A shared machine makes numbers
+  indicative: say how loaded it was.
+* **Reporting a change.** State what is done, the exact verification commands and results, what is not verified (the
+  skipped tests among them), and the numbers (wall time, peak RSS, versus Python).
 
 ## Bugs, ideas, security
 

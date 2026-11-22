@@ -1,6 +1,6 @@
 #!/bin/bash
 # scripts/e2e-grizzy.sh -- the WHOLE chain on Grizzy and the Lemmings through the Mac CLI (profile -> rewrite -> shaders -> assemble -> ad hoc sign), and its checks.
-# docs/chain/E2E-RUST.md has the results of the runs and what each check proves.
+# docs/reference/pipeline.md describes the end-to-end check.
 #
 #   scripts/e2e-grizzy.sh run    NAME [ibuilder options...]     run the CLI into $E2E_ROOT/NAME under /usr/bin/time -l (logs: NAME.{stdout,time,report.tsv,uptime.*}); exit status = the CLI's
 #   scripts/e2e-grizzy.sh kill   NAME SECONDS [options...]      the same, but SIGTERM after SECONDS (an interrupted stage 3), then what it left behind
@@ -67,7 +67,7 @@ verify)
   if [ -n "${PYLIB:-}" ] && [ -f "$PYLIB" ] && [ -x "$LIBDIFF" ]; then
     echo "(3) libdiff, our library vs the Python's:"
     "$LIBDIFF" "$lib" "$PYLIB" --ignore-first-line c1_full.tsv --ignore-first-line cb_extent.tsv
-    echo "    exit $? (3 files differ by design when the profile differs: c1_full.tsv, cb_extent.tsv, inputs.tsv: see docs/chain/E2E-RUST.md section 3, check (3))"
+    echo "    exit $? (3 files differ by design when the profile differs: c1_full.tsv, cb_extent.tsv, inputs.tsv: see docs/reference/pipeline.md)"
   else echo "(3) skipped: set PYLIB to the Python's b-$CHAIN.img and build libdiff"; fi
   # (4) the Mach-O alone: copied out of the bundle folder (inside X.framework/ codesign also wants _CodeSignature/CodeResources, which ibuilder-sign does not write)
   tmp="$(mktemp -d)"; cp "$out/DmGameProbe.framework/DmGameProbe" "$tmp/DmGameProbe"
