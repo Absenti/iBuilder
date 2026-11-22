@@ -35,6 +35,8 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <TargetConditionals.h>
 
 #include "ibuilder.h"
@@ -389,6 +391,65 @@ static int sign_cb(void *user, const char *framework_dir, const char *exe, char 
     return rc;
 }
 
+/* Stage 4b's fallback (ibuilder_options.sign_adhoc): the chain calls it when sign_cb found no identity on this install (rc 10 no embedded.mobileprovision, 12 no certificate,
+ * 13 the item holds no .p12). The same zsign ad hoc mode as the simulator's branch above: the framework is then built for EXPORT ONLY (the stamp says signature=adhoc-export), because
+ * iOS does not map an ad hoc framework from Documents on a device; an installer re-signs every executable of an exported IPA, so "Export as its own app" works without a .p12. */
+static int sign_adhoc_cb(void *user, const char *framework_dir, const char *exe, char *mode, int mode_cap, char *identifier, int identifier_cap,
+                         char *err, int err_cap)
+{
+    (void) user;
+    char ident[256] = {0};
+    ibuilder_self_identifier(ident, (int) sizeof ident);
+    if (ident[0] == 0) snprintf(ident, sizeof ident, "dev.ibuilder.app");
+    fill(identifier, identifier_cap, ident);
+    fill(mode, mode_cap, "adhoc(zsign, no certificate: export only)");
+    char e[1024] = {0};
+    int rc = nxpocket_sign_adhoc(framework_dir, exe, ident, e, (int) sizeof e);
+    fill(err, err_cap, e);
+    logln("[gameapp] no signing identity here: %s/%s signed ad hoc for export only -> %d%s%s", framework_dir ? framework_dir : "?", exe ? exe : "?", rc, e[0] ? ": " : "", e);
+    return rc;
+}
+
+/* "Sign again to play": a framework a build signed ad hoc because no .p12 was here (export only) is signed again with the identity the player has imported since, the way stage 4b
+ * signs (device_identity_sign: embedded.mobileprovision + the Keychain .p12, in memory). No rebuild: the Mach-O, its Info.plist and its rewritten modules stay as they are. rc as
+ * device_identity_sign: 0 signed, 10 no profile, 11 unreadable, 12 no certificate, 13 no .p12, 14 the passphrase does not fit, 20 zsign refused. The app rewrites the stamp on 0. */
+int gameapp_sign_framework_again(const char *framework_dir, const char *exe)
+{
+    if (framework_dir == NULL || exe == NULL || framework_dir[0] == 0 || exe[0] == 0) return 11;
+    char ident[256] = {0};
+    ibuilder_self_identifier(ident, (int) sizeof ident);
+    if (ident[0] == 0) snprintf(ident, sizeof ident, "dev.ibuilder.app");
+    int rc = device_identity_sign(framework_dir, exe, ident);
+    logln("[gameapp] sign again with this app's identity (an export-only build): %s/%s -> %d", framework_dir, exe, rc);
+    return rc;
+}
+
+/* ---- the GPU: BC texture formats ---------------------------------------------------------------------------------------------------------------
+ * MTLDevice.supportsBCTextureCompression of the system default device (A17 Pro and later iPhones, M1 and later iPads, every Apple silicon Mac and its simulator: yes). Without it the host
+ * stops at mtl_init ("has no BC texture formats") unless the profile's tex_bc_cpu is on: then nvn_bcdec.c decodes them on the CPU. 1 yes, 0 no, -1 unknown (no Metal, no device, a
+ * system without the property). Asked once, through the Objective-C runtime (this file is plain C; Metal is loaded by the app anyway). The chain gets it as IBUILDER_FLAG_GPU_NO_BC. */
+static _Atomic int g_gpu_bc = -2;
+
+int gameapp_gpu_bc_textures(void)
+{
+    int have = atomic_load(&g_gpu_bc);
+    if (have != -2) return have;
+    int v = -1;
+    void *metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY | RTLD_GLOBAL);
+    typedef id (*create_fn)(void);
+    create_fn create = metal != NULL ? (create_fn) dlsym(metal, "MTLCreateSystemDefaultDevice") : NULL;
+    id dev = create != NULL ? create() : NULL;
+    if (dev != NULL) {
+        SEL bc = sel_registerName("supportsBCTextureCompression");
+        if (class_respondsToSelector(object_getClass(dev), bc))
+            v = ((BOOL (*)(id, SEL)) objc_msgSend)(dev, bc) ? 1 : 0;
+        ((void (*)(id, SEL)) objc_msgSend)(dev, sel_registerName("release"));   /* MTLCreateSystemDefaultDevice returns +1 */
+    }
+    atomic_store(&g_gpu_bc, v);
+    logln("[gameapp] GPU BC textures: %s", v == 1 ? "yes" : v == 0 ? "NO: every game decodes them on the CPU (slower, more memory)" : "unknown (treated as yes)");
+    return v;
+}
+
 /* ---- the game view and the host (stage 5 is in Rust; these are the app's entries into the loaded host) ---------------------------------------- */
 
 /* The game view's CAMetalLayer, from the managed side. Retained here (the view lives on the main thread; the host keeps this pointer from a
@@ -631,6 +692,8 @@ int gameapp_run_chain(void)
     o.spirv_cross = gameapp_spirv_cross;
     o.live_notify = live_notify_cb;
     o.flags = IBUILDER_FLAG_BOOT_IN_PROCESS;   /* PIPELINE_BOOT=1: stage 5 runs in this process */
+    o.sign_adhoc = sign_adhoc_cb;              /* no .p12 here: the framework is signed ad hoc, for export only */
+    if (gameapp_gpu_bc_textures() == 0) o.flags |= IBUILDER_FLAG_GPU_NO_BC;   /* a GPU without BC textures: every boot decodes them on the CPU */
 
     preset_profile_env(docs, cfg);
     int err = 0;

@@ -48,6 +48,8 @@ pub const E_PANIC: c_int = -99;
 
 pub const FLAG_BOOT_IN_PROCESS: u32 = 0x1;
 pub const FLAG_MOCK_STAGES: u32 = 0x2;
+/// The device's GPU has no BC texture formats (the app asked Metal: `supportsBCTextureCompression` is false): every boot decodes them on the CPU (`DM_PROF_TEX_BC_CPU=1`).
+pub const FLAG_GPU_NO_BC: u32 = 0x4;
 
 // ---- the C types -------------------------------------------------------------------------------------------------------------------------------------
 
@@ -101,6 +103,8 @@ pub struct IbuilderOptions {
     pub live_notify: LiveNotifyFn,
     pub live_notify_user: *mut c_void,
     pub flags: u32,
+    /// Stage 4b's fallback when `sign` found no identity (rc 10, 12, 13): sign the framework ad hoc, for export only. Called with `sign_user`. NULL: no fallback (the build fails).
+    pub sign_adhoc: SignFn,
 }
 
 #[repr(C)]
@@ -154,6 +158,7 @@ pub struct Ibuilder {
     progress_user: UserPtr,
     sign: SignFn,
     sign_user: UserPtr,
+    sign_adhoc: SignFn,
     xlate: ToolCFn,
     spirv_cross: ToolCFn,
     live_notify: LiveNotifyFn,
@@ -272,29 +277,33 @@ impl Log for CallbackLog {
     }
 }
 
+type SignCFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    *const c_char,
+    *mut c_char,
+    c_int,
+    *mut c_char,
+    c_int,
+    *mut c_char,
+    c_int,
+) -> c_int;
+
 struct CallbackSigner {
-    f: unsafe extern "C" fn(
-        *mut c_void,
-        *const c_char,
-        *const c_char,
-        *mut c_char,
-        c_int,
-        *mut c_char,
-        c_int,
-        *mut c_char,
-        c_int,
-    ) -> c_int,
+    f: SignCFn,
+    /// `sign_adhoc` of the options: stage 4b's fallback with no identity (export only); `None` when the caller gave none
+    adhoc: Option<SignCFn>,
     user: UserPtr,
 }
 
-impl Signer for CallbackSigner {
-    fn sign(&self, framework_dir: &Path, exe: &str, _v: &View<'_>) -> SignOutcome {
+impl CallbackSigner {
+    fn call(&self, f: SignCFn, framework_dir: &Path, exe: &str) -> SignOutcome {
         let (fd, ex) = (c_string(&framework_dir.to_string_lossy()), c_string(exe));
         let (mut mode, mut ident, mut err) =
             ([0 as c_char; 256], [0 as c_char; 256], [0 as c_char; 1024]);
         // SAFETY: the caller's sign callback with valid NUL-terminated inputs and writable output buffers of the stated sizes.
         let rc = unsafe {
-            (self.f)(
+            f(
                 self.user.0,
                 fd.as_ptr(),
                 ex.as_ptr(),
@@ -324,6 +333,15 @@ impl Signer for CallbackSigner {
             identifier: s(&ident),
             err: s(&err),
         }
+    }
+}
+
+impl Signer for CallbackSigner {
+    fn sign(&self, framework_dir: &Path, exe: &str, _v: &View<'_>) -> SignOutcome {
+        self.call(self.f, framework_dir, exe)
+    }
+    fn sign_adhoc(&self, framework_dir: &Path, exe: &str, _v: &View<'_>) -> Option<SignOutcome> {
+        self.adhoc.map(|f| self.call(f, framework_dir, exe))
     }
     fn identifier(&self) -> String {
         sys::entitlements::self_identifier()
@@ -463,6 +481,7 @@ pub unsafe extern "C" fn ibuilder_create(
             progress_user: UserPtr(o.progress_user),
             sign: o.sign,
             sign_user: UserPtr(o.sign_user),
+            sign_adhoc: o.sign_adhoc,
             xlate: o.xlate,
             spirv_cross: o.spirv_cross,
             live_notify: o.live_notify,
@@ -579,6 +598,7 @@ impl Ibuilder {
         if let Some(f) = self.sign {
             a.signer = Arc::new(CallbackSigner {
                 f,
+                adhoc: self.sign_adhoc,
                 user: self.sign_user,
             });
         }
@@ -636,6 +656,7 @@ pub unsafe extern "C" fn ibuilder_run_chain(h: *mut Ibuilder, config_path: *cons
             .chain_log(chain_log)
             .mem(mem)
             .boot_enabled(h.flags & FLAG_BOOT_IN_PROCESS != 0)
+            .gpu_without_bc(h.flags & FLAG_GPU_NO_BC != 0)
             .build();
         ctx.cancel = h.cancel.clone();
         ctx.adapters = h.adapters(ctx.live.clone());
@@ -1351,6 +1372,7 @@ mod tests {
             live_notify: None,
             live_notify_user: std::ptr::null_mut(),
             flags: 0,
+            sign_adhoc: None,
         }
     }
 
@@ -1426,6 +1448,7 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let s = CallbackSigner {
             f: sign_cb,
+            adhoc: None,
             user: UserPtr(&calls as *const AtomicUsize as *mut c_void),
         };
         let d = TempDir::new("ffi-sign");
@@ -1441,6 +1464,58 @@ mod tests {
         );
         assert!(r.err.contains("/x/DmGameProbe.framework/DmGameProbe"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    unsafe extern "C" fn adhoc_cb(
+        user: *mut c_void,
+        _fw: *const c_char,
+        _exe: *const c_char,
+        mode: *mut c_char,
+        mc: c_int,
+        id: *mut c_char,
+        ic: c_int,
+        _err: *mut c_char,
+        _ec: c_int,
+    ) -> c_int {
+        let calls = unsafe { &*(user as *const std::sync::atomic::AtomicUsize) };
+        calls.fetch_add(100, Ordering::SeqCst);
+        unsafe {
+            fill(mode, mc, "adhoc(zsign, no certificate: export only)");
+            fill(id, ic, "dev.ibuilder.app");
+        }
+        0
+    }
+
+    #[test]
+    fn the_ad_hoc_callback_is_the_signers_fallback_and_none_without_it() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = AtomicUsize::new(0);
+        let user = UserPtr(&calls as *const AtomicUsize as *mut c_void);
+        let d = TempDir::new("ffi-sign-adhoc");
+        let ctx = Ctx::builder(d.path()).build();
+        let fw = Path::new("/x/DmGameProbe.framework");
+        let without = CallbackSigner {
+            f: sign_cb,
+            adhoc: None,
+            user,
+        };
+        assert!(without.sign_adhoc(fw, "DmGameProbe", &ctx.view()).is_none());
+        let with = CallbackSigner {
+            f: sign_cb,
+            adhoc: Some(adhoc_cb),
+            user,
+        };
+        let r = with.sign_adhoc(fw, "DmGameProbe", &ctx.view()).unwrap();
+        assert_eq!(
+            (r.rc, r.mode.as_str()),
+            (0, "adhoc(zsign, no certificate: export only)")
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            100,
+            "only the ad hoc callback ran"
+        );
+        assert_eq!(with.sign(fw, "DmGameProbe", &ctx.view()).rc, 12);
     }
 
     /// a callback that fills every byte of its buffers and no NUL (a text as long as the capacity): `CStr::from_ptr` would run on past the array
@@ -1467,6 +1542,7 @@ mod tests {
     fn a_sign_callback_that_leaves_no_nul_is_read_within_its_buffers() {
         let s = CallbackSigner {
             f: full_cb,
+            adhoc: None,
             user: UserPtr(std::ptr::null_mut()),
         };
         let d = TempDir::new("ffi-sign-full");

@@ -44,6 +44,12 @@ pub struct Ctx {
     pub boot_enabled: bool,
     /// the stage status map (`status` in `_chain`)
     pub status: BTreeMap<String, String>,
+    /// stage 4b found no signing identity on this install and signed the framework ad hoc instead (`assemble::adhoc_fallback`): the build is for export only (stamped
+    /// `signature=adhoc-export`), never booted here
+    pub export_only: bool,
+    /// the device's GPU has no BC texture formats (`MTLDevice.supportsBCTextureCompression` is false, measured by the app: `IBUILDER_FLAG_GPU_NO_BC`): every boot asks the host to decode
+    /// them on the CPU (`DM_PROF_TEX_BC_CPU=1`, `boot::set_bc_cpu`). False also when it is not known: nothing changes then
+    pub gpu_without_bc: bool,
 }
 
 /// What an adapter sees of the context (a shared view, so the context stays free to be borrowed mutably around the call).
@@ -122,6 +128,7 @@ pub struct CtxBuilder {
     clock: Option<Arc<dyn Clock>>,
     adapters: Option<Adapters>,
     boot_enabled: bool,
+    gpu_without_bc: bool,
 }
 
 impl CtxBuilder {
@@ -137,6 +144,7 @@ impl CtxBuilder {
             clock: None,
             adapters: None,
             boot_enabled: false,
+            gpu_without_bc: false,
         }
     }
     pub fn bundle(mut self, b: impl Into<PathBuf>) -> Self {
@@ -173,6 +181,11 @@ impl CtxBuilder {
     }
     pub fn boot_enabled(mut self, on: bool) -> Self {
         self.boot_enabled = on;
+        self
+    }
+    /// The device's GPU has no BC texture formats (see [`Ctx::gpu_without_bc`]).
+    pub fn gpu_without_bc(mut self, on: bool) -> Self {
+        self.gpu_without_bc = on;
         self
     }
 
@@ -215,6 +228,8 @@ impl CtxBuilder {
             live,
             boot_enabled: self.boot_enabled,
             status: BTreeMap::new(),
+            export_only: false,
+            gpu_without_bc: self.gpu_without_bc,
         }
     }
 }

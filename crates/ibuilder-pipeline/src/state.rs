@@ -54,12 +54,14 @@ pub struct FrameworkStamp {
     pub app_build: String,
     pub game: String,
     pub content: Option<String>,
+    /// `signature=adhoc-export`: stage 4b signed the framework ad hoc (no identity on this install): built for export only, never booted here
+    pub export_only: bool,
 }
 
 /// `ParseFrameworkStamp`: `key=value` lines (app_build, game, content). `None` when there is no stamp or it names no build.
 pub fn parse_framework_stamp(content: Option<&str>) -> Option<FrameworkStamp> {
     let content = content?;
-    let (mut build, mut game, mut built) = (None, None, None);
+    let (mut build, mut game, mut built, mut export_only) = (None, None, None, false);
     for raw in content.split('\n') {
         let line = raw.trim();
         let Some(eq) = line.find('=').filter(|&i| i > 0) else {
@@ -70,6 +72,7 @@ pub fn parse_framework_stamp(content: Option<&str>) -> Option<FrameworkStamp> {
             "app_build" => build = Some(value),
             "game" => game = Some(value),
             "content" => built = Some(value),
+            "signature" => export_only = value == crate::assemble::EXPORT_ONLY_SIGNATURE,
             _ => {}
         }
     }
@@ -78,6 +81,7 @@ pub fn parse_framework_stamp(content: Option<&str>) -> Option<FrameworkStamp> {
             app_build: b,
             game: game.unwrap_or_default(),
             content: built,
+            export_only,
         }),
         _ => None,
     }
@@ -630,6 +634,10 @@ pub fn decide_launch(docs: &Docs, facts: &LaunchFacts<'_>) -> LaunchPlan {
                 // The request points at a framework THIS version of the app did not build (an older build's, or none): booting it would run an older host and rewrite.
                 let _ = fs::remove_file(docs.boot_only());
                 notes.push("gameapp.boot-only present, but the framework on disk was not built by this version of the app — withdrawn, nothing is booted; tap Set up and play on a game to rebuild".into());
+            } else if parse_framework_stamp(stamp.as_deref()).is_some_and(|s| s.export_only) {
+                // Signed ad hoc for export only (no .p12 at the build): iOS would refuse to map it from Documents, so it is not booted at launch either.
+                let _ = fs::remove_file(docs.boot_only());
+                notes.push("gameapp.boot-only withdrawn: the framework on disk was signed ad hoc for export only (no .p12 at the build) — Export it as its own app, or import your .p12 and sign it again to play here".into());
             } else if classify_boot_request(true, Some(&req)) == BootRequestState::Attempted {
                 notes.push("gameapp.boot-only present, but a boot from it was started and never came back — not starting again; tap Play to boot the framework once more (nothing is rebuilt)".into());
             } else {
@@ -1165,6 +1173,47 @@ mod tests {
         assert!(
             !docs.boot_only().exists(),
             "a distribution certificate withdraws it (the 'starts again' loop)"
+        );
+        // a framework signed ad hoc for export only (no .p12 at the build): never booted at launch, the request is withdrawn
+        write(
+            docs.framework_stamp(),
+            "app_build=B1\ngame=G\nbuilt=t\ncontent=\nsignature=adhoc-export\n",
+        );
+        write(
+            docs.boot_only(),
+            "boot the framework that is already built and signed\n",
+        );
+        let plan = decide_launch(&docs, &facts(&fw, &flat, "B1"));
+        assert_eq!(plan.action, LaunchAction::Nothing);
+        assert!(!docs.boot_only().exists());
+        assert!(
+            plan.notes.iter().any(|n| n.contains("export only")),
+            "{:?}",
+            plan.notes
+        );
+    }
+
+    #[test]
+    fn an_export_only_stamp_is_read_as_such() {
+        let p = parse_framework_stamp(Some(
+            "app_build=B\ngame=G.nsp\nbuilt=t\ncontent=\nsignature=adhoc-export\n",
+        ))
+        .unwrap();
+        assert!(p.export_only);
+        assert_eq!(
+            classify_framework(true, Some("app_build=B\nsignature=adhoc-export\n"), "B"),
+            FrameworkState::Fresh,
+            "an export-only build is still this build's (Export IPA needs it)"
+        );
+        assert!(
+            !parse_framework_stamp(Some("app_build=B\ngame=G\n"))
+                .unwrap()
+                .export_only
+        );
+        assert!(
+            !parse_framework_stamp(Some("app_build=B\nsignature=device\n"))
+                .unwrap()
+                .export_only
         );
     }
 

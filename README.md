@@ -50,16 +50,22 @@ The IPA is also on the [Releases](https://github.com/Absenti/iBuilder/releases) 
 
 ## What you need
 
-* An iPhone or iPad (tested on iOS 27; minimum iOS 26).
+* An iPhone or iPad (tested on iOS 27; minimum iOS 26). A GPU without BC textures (an iPhone before the A17 Pro, an iPad before the M1) works too:
+  iBuilder decodes the textures on the CPU, which is slower and uses more memory (Settings › This iPhone says so).
 * Your game: `.nsp`, `.xci`, `.nsz` (Switch) or `.nup` (Switch 2).
 * `prod.keys` from your own console (not needed for a `.nup`).
-* Your signing certificate (`.p12` and its password), imported once, so the app can sign what it builds.
+* Optional: your signing certificate (`.p12` and its password), needed only to **play inside iBuilder**. Without it a build is signed ad hoc
+  for export: export the IPA and install it as its own app. Imported later, the game's settings offer **Sign again to play** (no rebuild).
+
+An exported IPA is not installable as is: iOS installs only signed apps, so install it with a signing tool (SideStore / AltStore, Sideloadly or Xcode with an Apple ID,
+a paid developer account, or a distribution-certificate provider), which re-signs it. Exporting without a `.p12` only removes the need to import a certificate into iBuilder.
 
 ## Which certificate did you install iBuilder with?
 
 | | **Development** certificate (e.g. a free Apple ID through SideStore) | **Distribution** certificate (e.g. FlareStore) |
 |---|---|---|
-| Play inside iBuilder | **Yes**: iOS lets the app load the code it generates. | **No**: iOS refuses to load that code from the app's storage. |
+| Play inside iBuilder | **Yes**, with your `.p12` imported: iOS lets the app load the code it generates. | **No**: iOS refuses to load that code from the app's storage. |
+| The `.p12` | Needed to play inside iBuilder (a build without it is for export only). | Not needed: the installer re-signs the exported IPA. |
 | Export an IPA | Optional. | **Required**: build the game, export the full IPA, install it as its own app. |
 | First start | Runs in iBuilder with its shader cache. | The exported app starts with an empty shader cache (below). |
 
@@ -71,7 +77,7 @@ It can take a few minutes for a large game; it does not repeat on later launches
 
 ## Using it
 
-1. Open iBuilder, import `prod.keys` and your certificate (the Library shows what is still missing).
+1. Open iBuilder, import `prod.keys` (the Library shows what is still missing) and, to play inside iBuilder, your certificate.
 2. Add a game (Build tab **+**, or share it to iBuilder from the Files app) and start the build. It can be paused, resumed or cancelled.
 3. Play, or export the IPA, depending on your certificate (table above).
 

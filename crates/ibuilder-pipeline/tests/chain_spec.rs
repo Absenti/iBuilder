@@ -959,3 +959,168 @@ fn a_build_that_fails_at_stage_4_and_at_stage_3_returns_no_framework() {
     sorted.dedup();
     assert_eq!(sorted.len(), codes.len(), "{codes:?}");
 }
+
+// ---- export without a .p12: stage 4b signs ad hoc when this install has no identity ------------------------------------------------------------------
+
+#[test]
+fn the_ad_hoc_fallback_is_for_no_identity_only() {
+    use ibuilder_pipeline::assemble::adhoc_fallback;
+    for rc in [10, 12, 13] {
+        assert!(adhoc_fallback(rc), "rc {rc}: no identity on this install");
+    }
+    for rc in [0, 11, 14, 20, 1, -1] {
+        assert!(!adhoc_fallback(rc), "rc {rc}: not a missing identity");
+    }
+}
+
+#[test]
+fn no_identity_signs_ad_hoc_stamps_export_only_and_boots_nothing() {
+    for rc in [10, 12, 13] {
+        let mut c = chain_fixture("boot_after_build=1\nboot_seconds=45\n");
+        let signer = Arc::new(MockAdhocSigner {
+            rc,
+            ..Default::default()
+        });
+        c.fx.ctx.adapters.signer = signer.clone();
+        let rep = run_chain(&mut c.fx.ctx);
+        assert_eq!(rep.rc, RC_OK, "rc {rc}: {:?}", c.fx.log.lines());
+        assert!(rep.all_ok(), "{:?}", rep.status);
+        assert_eq!(signer.adhoc_calls.load(Ordering::SeqCst), 1);
+        let stamp = fs::read_to_string(c.fx.p("gameapp.framework")).unwrap();
+        assert!(stamp.ends_with("\nsignature=adhoc-export\n"), "{stamp}");
+        assert!(
+            ibuilder_pipeline::state::parse_framework_stamp(Some(&stamp))
+                .unwrap()
+                .export_only
+        );
+        let fw = fs::read(c.fx.p("DmGameProbe.framework/DmGameProbe")).unwrap();
+        assert!(fw.ends_with(b"MOCK-ADHOC-SIGNATURE\n"));
+        assert!(c.fx.log.contains("stage 4b no signing identity here"));
+        assert!(c.fx.log.contains("stage 4b sign ad hoc rc=0"));
+        assert!(
+            c.fx.log
+                .contains("stage 5 NOT STARTED: the framework is signed ad hoc for export only"),
+            "{:?}",
+            c.fx.log.lines()
+        );
+        assert_eq!(c.boot.requests.lock().unwrap().len(), 0, "never dlopen'd");
+        assert!(!c.fx.p("gameapp.running").exists());
+    }
+}
+
+#[test]
+fn a_broken_certificate_still_fails_and_an_identity_signs_as_before() {
+    for rc in [11, 14, 20] {
+        let mut c = chain_fixture("");
+        let signer = Arc::new(MockAdhocSigner {
+            rc,
+            ..Default::default()
+        });
+        c.fx.ctx.adapters.signer = signer.clone();
+        let rep = run_chain(&mut c.fx.ctx);
+        assert_eq!(rep.rc, RC_NO_FRAMEWORK, "rc {rc}");
+        assert_eq!(signer.adhoc_calls.load(Ordering::SeqCst), 0);
+        assert!(!c.fx.p("gameapp.framework").exists());
+    }
+    // the ad hoc signature itself refused: the build fails, and says both
+    let mut c = chain_fixture("");
+    c.fx.ctx.adapters.signer = Arc::new(MockAdhocSigner {
+        rc: 12,
+        adhoc_rc: 20,
+        ..Default::default()
+    });
+    let rep = run_chain(&mut c.fx.ctx);
+    assert_eq!(rep.rc, RC_NO_FRAMEWORK);
+    assert!(
+        c.fx.log
+            .contains("the ad hoc signature (export only) failed too")
+    );
+    assert!(!c.fx.p("gameapp.framework").exists());
+    // with an identity: the ad hoc mode is never called and the stamp has its four lines, as before
+    let mut c = chain_fixture("");
+    let signer = Arc::new(MockAdhocSigner::default());
+    c.fx.ctx.adapters.signer = signer.clone();
+    let rep = run_chain(&mut c.fx.ctx);
+    assert_eq!(rep.rc, RC_OK);
+    assert_eq!(signer.adhoc_calls.load(Ordering::SeqCst), 0);
+    let stamp = fs::read_to_string(c.fx.p("gameapp.framework")).unwrap();
+    assert_eq!(stamp.lines().count(), 4, "{stamp}");
+    assert!(!stamp.contains("signature="));
+    assert!(!c.fx.log.contains("sign ad hoc"));
+    assert_eq!(
+        ibuilder_pipeline::markers::framework_stamp_text("B1", "G.nsp", "T", "c", false),
+        "app_build=B1\ngame=G.nsp\nbuilt=T\ncontent=c\n",
+        "the stamp of a signed framework is byte for byte what it was"
+    );
+    assert_eq!(
+        ibuilder_pipeline::markers::framework_stamp_text("B1", "G.nsp", "T", "c", true),
+        "app_build=B1\ngame=G.nsp\nbuilt=T\ncontent=c\nsignature=adhoc-export\n"
+    );
+}
+
+#[test]
+fn a_boot_only_launch_refuses_an_export_only_framework() {
+    let mut c = chain_fixture("");
+    c.fx.ctx.adapters.signer = Arc::new(MockAdhocSigner {
+        rc: 12,
+        ..Default::default()
+    });
+    assert_eq!(run_chain(&mut c.fx.ctx).rc, RC_OK);
+    write(c.fx.p("gameapp.boot-only"), "boot the framework\n");
+    let mut ctx = ibuilder_pipeline::Ctx::builder(c.fx.docs())
+        .env(c.fx.env.clone())
+        .log(c.fx.log.clone())
+        .mem(c.fx.mem.clone())
+        .adapters(c.fx.ctx.adapters.clone())
+        .boot_enabled(true)
+        .build();
+    let p = c.fx.p("gameapp.config");
+    load_config(&mut ctx, Some(&p));
+    let rep = run_chain(&mut ctx);
+    assert_eq!(rep.rc, RC_NOTHING_TO_BOOT, "{:?}", c.fx.log.lines());
+    assert_eq!(c.boot.requests.lock().unwrap().len(), 0);
+    assert!(
+        !c.fx.p("gameapp.boot-only").exists(),
+        "the request is consumed: it can never be honoured"
+    );
+    assert!(c.fx.log.contains("signed ad hoc for export only"));
+}
+
+// ---- GPUs without BC textures: every boot decodes them on the CPU --------------------------------------------------------------------------------------
+
+#[test]
+fn a_gpu_without_bc_boots_with_tex_bc_cpu_and_a_gpu_with_them_is_unchanged() {
+    use ibuilder_pipeline::boot::{BC_CPU_ENV, BC_CPU_LINE};
+    let mut with = chain_fixture("boot_after_build=1\nboot_seconds=45\n");
+    assert!(run_chain(&mut with.fx.ctx).all_ok());
+    assert_eq!(with.boot.requests.lock().unwrap().len(), 1);
+    assert_eq!(with.fx.env.get(BC_CPU_ENV), None, "a BC GPU: no switch");
+    assert!(!with.fx.log.contains(BC_CPU_LINE));
+    let mut without = chain_fixture("boot_after_build=1\nboot_seconds=45\n");
+    without.fx.ctx.gpu_without_bc = true;
+    assert!(run_chain(&mut without.fx.ctx).all_ok());
+    assert_eq!(without.boot.requests.lock().unwrap().len(), 1);
+    assert_eq!(without.fx.env.get(BC_CPU_ENV).as_deref(), Some("1"));
+    assert_eq!(
+        without
+            .fx
+            .log
+            .lines()
+            .iter()
+            .filter(|l| l.as_str() == BC_CPU_LINE)
+            .count(),
+        1,
+        "one line"
+    );
+    assert_eq!(
+        fs::read(with.fx.p("profile.tsv")).unwrap(),
+        fs::read(without.fx.p("profile.tsv")).unwrap(),
+        "the profile is the same: the switch is the boot's environment only"
+    );
+    // a 0 from env.txt (or anything else) cannot stop it: the host would stop at the first BC texture
+    let mut forced = chain_fixture("boot_after_build=1\nboot_seconds=45\n");
+    forced.fx.env.set(BC_CPU_ENV, "0");
+    forced.fx.ctx.gpu_without_bc = true;
+    assert!(run_chain(&mut forced.fx.ctx).all_ok());
+    assert_eq!(forced.fx.env.get(BC_CPU_ENV).as_deref(), Some("1"));
+}

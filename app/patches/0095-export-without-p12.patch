@@ -1,0 +1,476 @@
+# 0095-export-without-p12.patch -- a build no longer needs the .p12: with no signing identity on this install the chain signs the framework AD HOC, for export only. Applies after 0094.
+# UNTESTED ON DEVICE AND IN THE SIMULATOR: compiled, and its pure part ran in the host harness (below).
+#
+# Why: with a distribution certificate a built game cannot be played inside iBuilder anyway (iOS refuses to map code from the app's Documents); the player builds, then "Export as its own
+# app" (IPA), and the installer (SideStore / AltStore / a provider) RE-SIGNS the whole IPA, frameworks included. So the .p12 is needed only to Play inside iBuilder.
+# The chain (ibuilder-pipeline stage 4b, assemble::adhoc_fallback): when the signer finds no identity (rc 10 no embedded.mobileprovision, 12 no certificate, 13 no .p12) it signs the
+# framework ad hoc (ibuilder_options.sign_adhoc: the shim's zsign ad hoc mode, the simulator's) and stamps it "signature=adhoc-export"; no boot starts from such a framework (after the
+# build, boot-only, or at launch). rc 11, 14 and 20 (a .p12 that is there and cannot be used) still fail. With a .p12 nothing changes (the same signing call, the stamp's four lines).
+# The app:
+#   * the certificate row is information, not a prerequisite ("needed only to Play inside iBuilder"): no banner, the Settings tile says "Not imported" (no red);
+#   * a build signed for export only (UiFacts.ExportOnlyGames: the stamp in Documents and the parked ones) is Export IPA only, never Play (no dlopen is tried), with the line "Built for
+#     export: import your .p12 to play inside iBuilder, or export the IPA." under its buttons and in its sheet; the build screen says "Ready to export", the notification "Built for export";
+#   * a .p12 imported later: the game's sheet offers "Sign again to play" (gameapp_sign_framework_again: the framework signed with the identity as stage 4b does, no rebuild; the stamp then
+#     loses its signature= line and the game plays). Not offered with a distribution certificate (it could not play here anyway).
+#   * the export (GameAppExport.cs) needed no change: it drops the framework's _CodeSignature and Info.plist, writes its own Info.plist, and the Mach-O keeps its ad hoc signature, which an
+#     installer replaces like any other; nothing in the export reads the identity.
+#
+# VERIFIED (M1 Pro): check-patches-apply.sh: 0010-0096 apply in order, no fuzz, no offset. Compile (-t:Compile, ios-arm64): 0 errors / 40 warnings, the same codes as 0094. Host harness
+#   (target/agent-work/feat-p12-bc/h96): 56 of 56 checks (0095 and 0096); harness94 still 358 of 358 on the patched tree; 8 of 8 mutations killed.
+# NOT VERIFIED: nothing ran on a device: a real build with no .p12, an exported IPA installed by SideStore / a provider, a real "Sign again" with zsign.
+# NEW UI STRINGS: "Built for export: import your .p12 to play inside iBuilder, or export the IPA.", "Sign again to play", "needed only to Play inside iBuilder", "Ready to export",
+#   "Built for export: export the IPA", "Not imported"; log lines "sign again: ", "the built framework is signed for export only".
+diff -ruN a/GameAppLibrary.cs b/GameAppLibrary.cs
+--- a/GameAppLibrary.cs	2026-11-22 15:04:33
++++ b/GameAppLibrary.cs	2026-11-22 15:19:24
+@@ -1414,7 +1414,8 @@
+                     : stop.State == StopState.Paused ? StopText.PausedLine(lastStage) : stop.State == StopState.Cancelled ? StopText.Cancelled() : stop.State == StopState.Cancelling ? StopText.Cancelling() : null,
+             !running ? (stop.State == StopState.Paused ? "paused" : stop.State == StopState.Cancelled || stop.State == StopState.Cancelling ? "cancelled" : null) : null,
+             running && stop.Stoppable && stop.State == StopState.Running,
+-            (running && stop.Stoppable && stop.State == StopState.Running) || stop.State == StopState.Paused));
++            (running && stop.Stoppable && stop.State == StopState.Running) || stop.State == StopState.Paused,
++            ExportOnly: game != null && GameAppUi.IsExportOnlyBuild(game, facts)));   // patch 0095: "Ready to export"
+     }
+ 
+     // ---- "Notify me": a notification when the build ends (the app may be in the background meanwhile) ------------
+@@ -1441,7 +1442,7 @@
+         var content = new UserNotifications.UNMutableNotificationContent
+         {
+             Title = selected != null ? GameAppUi.DisplayName(selected) : "iBuilder",
+-            Body = failedRun ? ChainResult.FailureText(lastChainRc, runBootOnly) ?? "The build stopped: open iBuilder to see why." : "Built: ready to play.",   // patch 0093: a Play's own words
++            Body = failedRun ? ChainResult.FailureText(lastChainRc, runBootOnly) ?? "The build stopped: open iBuilder to see why." : LastBuildExportOnly() ? LibraryActions.BuiltForExport : "Built: ready to play.",   // patch 0093: a Play's own words; 0095: a build with no .p12
+             Sound = UserNotifications.UNNotificationSound.Default,
+         };
+         var request = UserNotifications.UNNotificationRequest.FromIdentifier("build-ended", content, null);
+@@ -2234,7 +2235,7 @@
+     public sealed record Model(string Name, UIImage Icon, string Meta, List<GameAppUi.BuildStep> Steps, int Current, double Fraction,
+                                bool Running, bool Failed, string TimeLeft, string Clock, bool RamUnlocked, bool Extended, string MemoryLine,
+                                List<(string Text, GameAppUi.LogKind Kind)> Live, bool Notify, string PrimaryTitle, bool PrimaryEnabled, UIColor Tint,
+-                               string StopLine = null, string Stopped = null, bool CanPause = false, bool CanCancel = false);
++                               string StopLine = null, string Stopped = null, bool CanPause = false, bool CanCancel = false, bool ExportOnly = false);
+ 
+     public Action OnLog, OnPrimary, OnNotify, OnPause, OnCancel;
+     private readonly AmbientView ambient = new AmbientView();
+@@ -2466,7 +2467,7 @@
+         stepOf.Text = m.Running ? $"STEP {m.Current + 1} OF {m.Steps.Count}" : m.Stopped != null ? m.Stopped.ToUpperInvariant() : m.Failed ? "STOPPED" : "BUILT";
+         percent.Text = $"{Math.Round(m.Fraction * 100):0}%";
+         stepName.Text = m.Running ? step.Name switch { "Translate the shaders" => "Shaders", "Rewrite the code for iPhone" => "Rewrite", "Prepare the profile" => "Profile", "Read the game" => "Reading", "Sign the game" => "Signing", _ => step.Name }
+-                                  : m.Stopped != null ? step.Name : m.Failed ? step.Name : "Ready to play";
++                                  : m.Stopped != null ? step.Name : m.Failed ? step.Name : m.ExportOnly ? "Ready to export" : "Ready to play";
+         stepDetail.Text = m.StopLine != null ? m.StopLine : m.Running ? step.Detail : "";
+         stepDetail.Hidden = string.IsNullOrEmpty(stepDetail.Text);
+         ring.StrokeEnd = (nfloat) Math.Max(0.01, Math.Min(1, m.Fraction));
+diff -ruN a/GameAppMain.cs b/GameAppMain.cs
+--- a/GameAppMain.cs	2026-11-22 15:04:33
++++ b/GameAppMain.cs	2026-11-22 15:20:08
+@@ -247,7 +247,7 @@
+                     : $"signing identity: in this app's Keychain ({p12Len} byte .p12) — the chain can sign the framework";
+             if (holding == 0)
+                 return "signing identity: MISSING — tap \"Certificate (.p12)\" and pick your .p12 (the certificate of the installer "
+-                     + "that installed this app: SideStore's, or FlareStore's). Without it the chain rewrites everything and then fails at stage 4b: prod.keys is NOT it";
++                     + "that installed this app: SideStore's, or FlareStore's). Without it a build is signed ad hoc for export only (Export as its own app works; Play inside iBuilder needs the .p12): prod.keys is NOT it";
+             return "signing identity: unreadable (gameapp_identity_status -> " + holding + ")";
+         }
+         catch (Exception error) { return "signing identity: unavailable (" + error.GetType().Name + ")"; }
+@@ -1055,8 +1055,16 @@
+             string request = null;
+             try { request = File.ReadAllText(BootOnlyPath); }
+             catch (Exception error) { Write($"gameapp.boot-only is unreadable: {error.GetType().Name}: {error.Message} — not starting; tap Play to boot the framework"); }
+-            if (request != null && GameAppUi.CannotRunHere(GatherFacts()))
++            var launchFacts = request != null ? GatherFacts() : null;
++            if (launchFacts != null && !GameAppUi.CannotRunHere(launchFacts) && GameAppUi.IsExportOnlyBuild(launchFacts.FrameworkGame, launchFacts))
+             {
++                // patch 0095: a build signed with no .p12 is for export only (the Rust launch withdraws the request too): never booted from Documents
++                try { File.Delete(BootOnlyPath); } catch (Exception) { }
++                Write("gameapp.boot-only withdrawn: the built framework is signed for export only (no .p12 at the build) — Export it as its own app, or import your .p12 and sign it again to play here");
++                RefreshScreen();
++            }
++            else if (launchFacts != null && GameAppUi.CannotRunHere(launchFacts))
++            {
+                 // A distribution certificate: the boot would be refused at the dlopen ("file system sandbox blocked
+                 // mmap()"), and starting it at every launch was the "iBuilder starts again" loop (2026-11-18).
+                 try { File.Delete(BootOnlyPath); } catch (Exception) { }
+@@ -1273,6 +1281,7 @@
+             FrameworkGame: GameAppUi.ParseFrameworkStamp(stamp)?.Game,
+             FrameworkContent: GameAppUi.ParseFrameworkStamp(stamp)?.Content,
+             Parked: GameExport.IsPlayer ? null : ParkedReadyGames(),   // GameAppSlotUi.cs (patch 0073): the games whose build is parked and ready
++            ExportOnlyGames: GameExport.IsPlayer ? null : ExportOnlyGames(stamp),   // GameAppSlotUi.cs (patch 0095): the builds signed for export only
+             ShaderPacks: InstalledShaderPacks(),
+             PendingShaderPacks: Directory.Exists(GameAppMain.Documents)
+                 ? Directory.EnumerateFiles(GameAppMain.Documents, "*.shaders.tar")
+@@ -2659,6 +2668,7 @@
+     private void BeginRun(string name, string[] arguments, bool skipExtract, bool bootOnly = false)
+     {
+         if (running) return;
++        if (signingAgain != null) { Write($"wait: the framework of {GameAppUi.DisplayName(signingAgain)} is being signed again"); return; }   // patch 0095
+         if (deletes.Busy) { Write("a delete is still going: try again in a moment"); return; }   // its worker thread is removing the build and the shaders
+         // A Switch 2 game (.nup): no extractor run here (it reads NSP/XCI only); the chain reads the package itself
+         // (gameapp_pipeline.extract_nup, from the config's nup= line), with no keys.
+@@ -2688,9 +2698,9 @@
+         // so the warning does not apply to it: telling the user the chain "will fail at stage 4b" seconds before
+         // it boots a framework that is already signed is one more sentence that describes the wrong path.
+         if (!bootOnly) builtThisProcess = true;
+-        if (!bootOnly && GameAppMain.IdentityLine().Contains("MISSING"))
+-            Write("WARNING: no signing certificate in this app's Keychain — the chain will rewrite and assemble, "
+-                + "then fail at stage 4b. Open the Keys tab and tap \"Certificate (.p12)\" first if you want the boot.");
++        if (!bootOnly && GameAppMain.IdentityLine().Contains("MISSING"))   // patch 0095: no longer a failure at stage 4b
++            Write("note: no signing certificate in this app's Keychain — the framework is signed ad hoc, for export only (Export as its own app: the installer re-signs it). "
++                + "To play inside iBuilder, import your .p12 (\"Certificate (.p12)\"), then \"" + SignAgainTitle + "\" in the game's settings.");
+         // Patch 0073: an extraction about to run (the C# step, or the chain reading a .nup) replaces extract/: its marker goes first, and is written again when the new extraction is complete
+         // (AfterExtraction: then "Optimize storage" replaces the files it read by stubs, when the toggle is on).
+         bool nupRead = slotGame != null && GameAppUi.IsNup(slotGame) && GameAppMain.NupHasContent(Path.Combine(GameAppMain.Documents, slotGame));
+@@ -2907,6 +2917,7 @@
+                 // patch 0078: a code that says why (4: no shader library, 5: no framework) is said, as an error line, before the screen is drawn: never "Ready" or "Built" for a game that
+                 // would draw nothing or that is not there
+                 if (failedRun && ChainResult.LogLine(lastChainRc, runBootOnly) is string why) Write(why);   // patch 0093: a Play's own words
++                if (!failedRun && !bootOnly && outcome == StopOutcome.Finished && LastBuildExportOnly()) Write("build: " + LibraryActions.BuiltForExport);   // patch 0095
+                 // patch 0073: a .nup the chain was given (nup=) is extracted when the chain derived its profile in this run (that stage runs only once the package is read): its marker, then "Optimize storage".
+                 // Any outcome, except a cancel that frees the space (it deletes the extraction).
+                 var profilePath = Path.Combine(GameAppMain.Documents, "profile.tsv");
+diff -ruN a/GameAppPadUi.cs b/GameAppPadUi.cs
+--- a/GameAppPadUi.cs	2026-11-22 15:04:33
++++ b/GameAppPadUi.cs	2026-11-22 15:19:24
+@@ -206,7 +206,7 @@
+         var state = LibStateOf(e, facts, out var fraction);
+         var status = StatusOf(e, state, fraction, facts);
+         bool grey = state == LibState.CloudOnly || state == LibState.Downloading;
+-        bool canRun = CanRunHere(facts);
++        bool canRun = CanRunHere(facts, e.Name);   // patch 0095
+         heroCover.Set(new FlowItem(e.Name, GameAppUi.DisplayName(e.Name), e.Icon, grey, grey, status.Text, status.Tone, state == LibState.Downloading || state == LibState.Building ? fraction : null));
+         heroPill?.RemoveFromSuperview();
+         heroPill = Look.Pill(status.Text, status.Tone, grey);
+@@ -244,6 +244,7 @@
+             heroButtons.AddArrangedSubview(b);
+         }
+         heroNote.Hidden = !LibraryActions.ShowsNote(state, canRun);
++        heroNote.Text = LibraryActions.NoteText(GameAppUi.CannotRunHere(facts), GameAppUi.IsExportOnlyBuild(e.Name, facts));   // patch 0095
+         ambient.SetHue(e.Icon != null ? Look.HueOf(e.Icon) : -1, true);
+     }
+ 
+diff -ruN a/GameAppRedesign.cs b/GameAppRedesign.cs
+--- a/GameAppRedesign.cs	2026-11-22 15:04:33
++++ b/GameAppRedesign.cs	2026-11-22 15:19:24
+@@ -24,6 +24,15 @@
+     /// The line under the carousel's buttons when the installed certificate has no get-task-allow (a distribution one): the game is exported, never played here.
+     public const string NoGetTaskAllowNote = "This certificate has no get-task-allow: a game cannot run inside iBuilder. Export it and install it as its own app.";
+ 
++    /// Patch 0095: the line under a game built with no .p12 (signed ad hoc, for export only).
++    public const string ExportOnlyNote = "Built for export: import your .p12 to play inside iBuilder, or export the IPA.";
++
++    /// Patch 0095: the line under the buttons of a built game that is exported, not played: the certificate's (no get-task-allow: a .p12 would not help) wins over the build's.
++    public static string NoteText(bool noGetTaskAllow, bool exportOnlyBuild) => !noGetTaskAllow && exportOnlyBuild ? ExportOnlyNote : NoGetTaskAllowNote;
++
++    /// Patch 0095: what a build that ended signed for export only says (the notification, the log).
++    public const string BuiltForExport = "Built for export: export the IPA (Export as its own app), or import your .p12 to play inside iBuilder.";
++
+     /// The state from the facts the screen has: only in a cloud source (and being downloaded or not), being built, paused, built (a framework this app build made, GameAppUi.GameStatusOf Ready), or not.
+     public static LibState StateOf(bool cloudOnly, bool downloading, bool building, bool paused, bool ready)
+     {
+diff -ruN a/GameAppRedesignUi.cs b/GameAppRedesignUi.cs
+--- a/GameAppRedesignUi.cs	2026-11-22 15:04:34
++++ b/GameAppRedesignUi.cs	2026-11-22 15:19:24
+@@ -641,6 +641,8 @@
+     }
+ 
+     private static bool CanRunHere(UiFacts facts) => !GameAppUi.CannotRunHere(facts);
++    /// Patch 0095: this game can be played here: the install can (CanRunHere) and its build is not signed for export only.
++    private static bool CanRunHere(UiFacts facts, string game) => !GameAppUi.CannotRunHere(facts, game);
+ 
+     private (string Where, string Long) CloudWords(CloudFile f)
+     {
+@@ -861,7 +863,7 @@
+ 
+         // patch 0082 (review M3): the grid is built again only when its key changes (names, states, labels, what is on); else its bars and words are updated in place
+         var gridKeyNow = RedrawKey.Of(new[] { grid ? "g" : "c", GridColumns.ToString(), padWide ? "p" : "", WarmShownTitle() ?? "", warmQueue.Paused ? "wp" : "" }
+-            .Concat(libShown.Select(e => { var s = LibStateOf(e, facts, out _); return RedrawKey.Card(e.Name, s, s == LibState.Built && GameAppUi.ContentChangedSinceBuild(e.Name, libNames, facts), facts.Running, CanRunHere(facts), e.Icon != null, false) + ExtrasLine(e, s); })));   // + patch 0091
++            .Concat(libShown.Select(e => { var s = LibStateOf(e, facts, out _); return RedrawKey.Card(e.Name, s, s == LibState.Built && GameAppUi.ContentChangedSinceBuild(e.Name, libNames, facts), facts.Running, CanRunHere(facts, e.Name), e.Icon != null, false) + ExtrasLine(e, s); })));   // + patch 0091
+         bool rebuildGrid = gridKeyNow != gridKey;
+         if (rebuildGrid)
+         {
+@@ -936,7 +938,7 @@
+         }
+         var e = libShown[fi];
+         var state = LibStateOf(e, facts, out _);
+-        bool canRun = CanRunHere(facts);
++        bool canRun = CanRunHere(facts, e.Name);   // patch 0095: per game (a build signed for export only)
+         // patch 0082 (review M3): the dots and the buttons are built again only when the focus, the state or what the buttons say changes; the words are always refreshed
+         var flowKeyNow = RedrawKey.Of(new[] { fi.ToString(), libShown.Count.ToString(), RedrawKey.Card(e.Name, state, false, facts.Running, canRun, e.Icon != null, false), running && launchingGame == e.Name ? "s" : "" });
+         bool rebuildFlow = flowKeyNow != flowKey;
+@@ -982,7 +984,7 @@
+             flowButtons.AddArrangedSubview(button);
+         }
+         flowNote.Hidden = !LibraryActions.ShowsNote(state, canRun);
+-        flowNote.Text = LibraryActions.NoGetTaskAllowNote;
++        flowNote.Text = LibraryActions.NoteText(GameAppUi.CannotRunHere(facts), GameAppUi.IsExportOnlyBuild(e.Name, facts));   // patch 0095
+         if (!running && playStopped is { } ps && ps.Game == e.Name) { flowNote.Text = ps.Line; flowNote.Hidden = false; }   // patch 0083: an interrupted Play, said once under its buttons
+         // the ground's glow: the dominant hue of the cover in focus (a fixed amber when it has none)
+         ambient.SetHue(e.Icon != null ? Look.HueOf(e.Icon) : -1, true);
+@@ -1065,7 +1067,7 @@
+         gridLive[e.Name] = (line, cardBar);   // patch 0082 (review M3): updated in place between two rebuilds
+         if (WarmStrip(e.Name, false, state == LibState.Built) is UIView warm) parts.Add(warm);   // GameAppWarm.cs (0070, 0076): the shaders being prepared, with its bar
+         // the actions on ONE row (the owner's third correction): the primary a pill filling the width, a second action (Export IPA beside Play) a 36 pt round icon-only button at its right
+-        bool canRun = CanRunHere(facts);
++        bool canRun = CanRunHere(facts, e.Name);   // patch 0095
+         var accent = Look.AccentOf(e.Icon, grey);
+         var acts = LibraryActions.For(state, canRun);
+         var row = new UIStackView { Axis = UILayoutConstraintAxis.Horizontal, Spacing = 6, Alignment = UIStackViewAlignment.Center };
+@@ -1113,7 +1115,7 @@
+     private List<HoldOverlay.Entry> HoldEntries(LibraryEntry e, UiFacts facts)
+     {
+         var state = LibStateOf(e, facts, out _);
+-        bool canRun = CanRunHere(facts);
++        bool canRun = CanRunHere(facts, e.Name);   // patch 0095
+         var name = e.Name;
+         var path = Path.Combine(GameAppMain.Documents, name);
+         bool local = e.Cloud == null || File.Exists(path);
+@@ -1313,7 +1315,7 @@
+             bool expired = left == "Expired", soon = left == "Less than a day left" || left == "1 day left";
+             Set(tileCert, left == "—" ? "In the Keychain" : left, expired ? Theme.Error : soon ? Theme.Warn : Theme.Text, note);
+         }
+-        else Set(tileCert, "Missing", Theme.Error, "Tap to import your .p12 · " + note);
++        else Set(tileCert, "Not imported", Theme.Muted, "Needed only to Play inside iBuilder: builds export without it · Tap to import your .p12 · " + note);   // patch 0095: not a prerequisite
+         if (launchCeilingMiB == -2) launchCeilingMiB = facts.AvailableMiB;   // the ceiling at launch (the first refresh), the figure the launch log gives
+         var memory = DeviceTiles.Memory(facts.IncreasedMemory, launchCeilingMiB);
+         Set(tileMemory, memory.Value, memory.Good ? Theme.Ok : null, "What iOS lets a game use");
+diff -ruN a/GameAppShelf.cs b/GameAppShelf.cs
+--- a/GameAppShelf.cs	2026-11-22 15:04:34
++++ b/GameAppShelf.cs	2026-11-22 15:19:24
+@@ -767,7 +767,7 @@
+         var state = LibStateOf(e, facts, out _);
+         // patch 0082 (the owner): only a BUILT game has settings (this sheet / the iPad inspector); a game on this iPhone not built gets its small sheet, a cloud game nothing
+         if (!GameSettingsRule.HasSettings(state)) { if (local && state == LibState.NotBuilt) ShowNotBuiltSheet(e, null); return; }
+-        bool canRun = CanRunHere(facts);
++        bool canRun = CanRunHere(facts, game);   // patch 0095: a build signed for export only is exported, not played
+         bool ready = state == LibState.Built;
+         bool grey = state == LibState.CloudOnly || state == LibState.Downloading;
+         var tid = GameAppUi.BaseTitleIdOf(game);
+@@ -847,6 +847,13 @@
+         }
+         var actionRow = Theme.Row(10, top.ToArray());
+         actionRow.Alignment = UIStackViewAlignment.Fill;
++        // patch 0095: a build signed with no .p12 is for export only: said under the buttons (Play is not offered: iOS would refuse to load it from Documents)
++        UILabel exportOnlyNote = null;
++        if (ready && GameAppUi.IsExportOnlyBuild(game, facts))
++        {
++            exportOnlyNote = Theme.Label(LibraryActions.NoteText(GameAppUi.CannotRunHere(facts), true), Theme.Font(13, UIFontWeight.Regular), Theme.Muted, 0);
++            exportOnlyNote.AccessibilityIdentifier = "sheet-export-only";
++        }
+ 
+         // ---- the launch line (Play): the save's copy, then the chain's boot stages, until the game is on the screen
+         var launchText = Theme.Label("", Theme.Font(13, UIFontWeight.Regular), Theme.Text, 0);
+@@ -967,6 +974,8 @@
+         if (tid != null && !GameExport.IsPlayer) { var m = SettingsRow("Mods", () => Then(() => ShowMods(game, ready)), true, false, -1, "sheet-mods"); rows.Add(m.Button); }
+         if (tid != null) rows.Add(SettingsRow("Saves", () => Then(() => ShowSaves(game)), true, false, -1, "sheet-saves").Button);
+         if (ready && !GameExport.IsPlayer) { var x = SettingsRow("Export as its own app", () => Then(() => ConfirmExport(game)), true, false, -1, "sheet-export"); x.Value.Text = "IPA"; rows.Add(x.Button); }
++        // patch 0095: the .p12 was imported after this game was built for export only: its framework is signed again with it (no rebuild), then Play is offered
++        if (GameAppUi.OffersSignAgain(game, facts)) { var sa = SettingsRow(SignAgainTitle, () => Then(() => SignAgainToPlay(game)), true, false, -1, "sheet-sign-again"); sa.Value.Text = "No rebuild"; rows.Add(sa.Button); }
+         rows.Add(SettingsRow("Logs", () => Then(() => ShareGameLogs(game, View)), true, false, -1, "sheet-logs").Button);
+         var mainRows = Look.Group(rows.ToArray());
+ 
+@@ -1047,6 +1056,7 @@
+         };
+ 
+         var body = new List<UIView> { actionRow, launchCard, stats, optionsCard, mainRows };
++        if (exportOnlyNote != null) body.Insert(1, exportOnlyNote);   // patch 0095
+         if (shadersBlock != null) body.Add(shadersBlock);
+         if (more.Count > 0) { body.Add(Look.Section("More")); body.Add(Look.Group(more.ToArray())); }
+         body.Add(Look.Section("Storage")); body.Add(Look.Group(storage.ToArray()));
+diff -ruN a/GameAppSlotUi.cs b/GameAppSlotUi.cs
+--- a/GameAppSlotUi.cs	2026-11-22 15:04:33
++++ b/GameAppSlotUi.cs	2026-11-22 15:19:51
+@@ -233,3 +233,78 @@
+         return made;
+     }
+ }
++
++// ---- patch 0095: a build with no .p12 is signed for export only; "Sign again to play" once the .p12 is imported ------------------------------------------------
++public sealed partial class GameAppViewController
++{
++    /// gameapp_sign_framework_again (app/gameapp_shim_rust.c): the framework in `frameworkDir` signed again with this app's identity (embedded.mobileprovision + the Keychain .p12), as stage 4b signs.
++    [System.Runtime.InteropServices.DllImport("__Internal")] private static extern int gameapp_sign_framework_again(string frameworkDir, string exe);
++
++    internal const string SignAgainTitle = "Sign again to play";
++    private string signingAgain;   // the game whose framework is being signed again (a worker thread), or null
++
++    /// The built games whose framework is signed for export only: the one in Documents (its stamp `stamp`) and the parked ones whose build this version of the app made.
++    private IReadOnlyCollection<string> ExportOnlyGames(string stamp)
++    {
++        var set = new HashSet<string>(StringComparer.Ordinal);
++        var active = GameAppUi.ParseFrameworkStamp(stamp);
++        if (active != null && active.ExportOnly && !string.IsNullOrEmpty(active.Game)) set.Add(active.Game);
++        foreach (var p in ParkedSlots())
++            if (p.Stamp != null && p.Stamp.ExportOnly && !string.IsNullOrEmpty(p.Stamp.Game)) set.Add(p.Stamp.Game);
++        return set;
++    }
++
++    /// The build that just ended is signed for export only (Documents/gameapp.framework says so).
++    private bool LastBuildExportOnly()
++    {
++        try
++        {
++            var path = Path.Combine(GameAppMain.Documents, "gameapp.framework");
++            return File.Exists(path) && GameAppUi.ParseFrameworkStamp(File.ReadAllText(path))?.ExportOnly == true;
++        }
++        catch (Exception) { return false; }
++    }
++
++    /// "Sign again to play": the game's framework (in Documents, or parked in games/<id>/slot) is signed with the imported .p12 on a worker, then its stamp loses `signature=adhoc-export`
++    /// and the game plays. Nothing is rebuilt. Refused while a build, a boot or another signature runs.
++    private void SignAgainToPlay(string game)
++    {
++        var facts = GatherFacts();
++        if (running || signingAgain != null) { Write("sign again: wait until the build or the signature that is running ends"); return; }
++        if (!GameAppUi.OffersSignAgain(game, facts)) { Write($"sign again: {GameAppUi.DisplayName(game)} is not a build signed for export only with a .p12 to sign it (nothing done)"); return; }
++        string root = facts.Framework == FrameworkState.Fresh && facts.FrameworkGame == game ? GameAppMain.Documents : ParkedSlotOf(game)?.Root;
++        if (root == null) { Write($"sign again: the build of {GameAppUi.DisplayName(game)} was not found"); return; }
++        var frameworkDir = Path.Combine(root, GameSlot.Framework);
++        var stampPath = Path.Combine(root, GameSlot.Stamp);
++        signingAgain = game;
++        Write($"sign again: {GameAppUi.DisplayName(game)}: its framework is signed with your .p12 (no rebuild) — {frameworkDir}");
++        RefreshScreen();
++        Bg.Run(() =>
++        {
++            int rc;
++            try { rc = gameapp_sign_framework_again(frameworkDir, "DmGameProbe"); }
++            catch (Exception) { rc = -1; }   // EntryPointNotFoundException: a shim without it
++            if (rc == 0)
++            {
++                var part = stampPath + ".part";
++                File.WriteAllText(part, GameAppUi.StampSignedAgain(File.ReadAllText(stampPath)));
++                File.Move(part, stampPath, true);
++            }
++            return rc;
++        }, (rc, error) =>
++        {
++            signingAgain = null;
++            if (error != null) Write($"sign again: [RED] the stamp could not be written: {error.Message} — the build stays for export only");
++            else if (rc == 0) Write($"sign again: {GameAppUi.DisplayName(game)} is signed with your certificate: Play");
++            else Write($"sign again: [RED] not signed: {GameAppUi.SignAgainFailure(rc)} — the build stays for export only");
++            SlotsChanged();
++            RefreshScreen();
++            if (error == null && rc != 0)
++            {
++                var a = UIAlertController.Create(SignAgainTitle, "Not signed: " + GameAppUi.SignAgainFailure(rc) + ". The game can still be exported.", UIAlertControllerStyle.Alert);
++                a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Default, null));
++                PresentWhenFree(a);
++            }
++        }, work => BeginInvokeOnMainThread(work));
++    }
++}
+diff -ruN a/GameAppUi.cs b/GameAppUi.cs
+--- a/GameAppUi.cs	2026-11-22 15:04:33
++++ b/GameAppUi.cs	2026-11-22 15:19:24
+@@ -26,8 +26,9 @@
+ /// another build of the app made it, or it predates the stamp: booting it would run an older host and rewrite.
+ public enum FrameworkState { None, Fresh, Stale }
+ 
+-/// What gameapp_pipeline.py writes to Documents/gameapp.framework right after it signs a framework.
+-public sealed record FrameworkStamp(string AppBuild, string Game, string Content = "");
++/// What gameapp_pipeline.py writes to Documents/gameapp.framework right after it signs a framework. `ExportOnly` (patch 0095): its `signature=adhoc-export` line: the chain found no
++/// .p12 here and signed the framework ad hoc, so the build is exported (the installer re-signs it), never played inside iBuilder until it is signed again with a .p12.
++public sealed record FrameworkStamp(string AppBuild, string Game, string Content = "", bool ExportOnly = false);
+ 
+ /// What the main button does when tapped.
+ public enum ActionKind { Busy, Import, Boot, Run, Export }
+@@ -49,7 +50,8 @@
+                              IReadOnlyList<string> ShaderPacks = null, IReadOnlyList<string> PendingShaderPacks = null,
+                              int ExtendedAddressing = -1, double AddressSpaceFreeGiB = -1, int IncreasedMemory = -1,
+                              bool PlayerMode = false, int LoadsFromDocuments = -1, string FrameworkContent = null,
+-                             IReadOnlyDictionary<string, string> Parked = null);   // patch 0073: the games whose build is parked in Documents/games/<id>/slot and ready (game file -> the stamp's content=)
++                             IReadOnlyDictionary<string, string> Parked = null,   // patch 0073: the games whose build is parked in Documents/games/<id>/slot and ready (game file -> the stamp's content=)
++                             IReadOnlyCollection<string> ExportOnlyGames = null);   // patch 0095: the built games (in Documents or parked) whose framework is signed ad hoc, for export only
+ 
+ public static class GameAppUi
+ {
+@@ -95,6 +97,7 @@
+     {
+         if (content == null) return null;
+         string build = null, game = null, built = null;   // no content= line: a stamp from before builds recorded it
++        bool exportOnly = false;   // patch 0095: signature=adhoc-export
+         foreach (var raw in content.Split('\n'))
+         {
+             var line = raw.Trim();
+@@ -105,8 +108,9 @@
+             if (key == "app_build") build = value;
+             else if (key == "game") game = value;
+             else if (key == "content") built = value;
++            else if (key == "signature") exportOnly = value == ExportOnlySignature;
+         }
+-        return string.IsNullOrEmpty(build) ? null : new FrameworkStamp(build, game ?? "", built);
++        return string.IsNullOrEmpty(build) ? null : new FrameworkStamp(build, game ?? "", built, exportOnly);
+     }
+ 
+     /// `onDisk`: the framework and the extraction it boots from are both there. `stampContent`: what
+@@ -145,8 +149,8 @@
+ 
+         if (f.IdentityState == 1)
+             rows.Add(new ChecklistRow("Signing certificate", Inv($"stored in the Keychain ({f.P12Bytes} bytes)"), CheckLevel.Ok));
+-        else if (f.IdentityState == 0)
+-            rows.Add(new ChecklistRow("Signing certificate", "none — a device needs it to sign the framework (Certificate)", CheckLevel.Warn));
++        else if (f.IdentityState == 0)   // patch 0095: not a prerequisite any more: a build without it is signed for export (the installer re-signs the IPA)
++            rows.Add(new ChecklistRow("Signing certificate", CertificateOptionalDetail, CheckLevel.Info));
+         else
+             rows.Add(new ChecklistRow("Signing certificate", "unreadable", CheckLevel.Warn));
+ 
+@@ -403,7 +407,7 @@
+         // ran to its time limit consumes its request, and the framework it booted is still good. A request alone is
+         // not enough (it may point at a framework an older app built, or at none), and a stale framework is never
+         // offered: it would run an older host and rewrite.
+-        if (f.Framework == FrameworkState.Fresh && CannotRunHere(f))
++        if (f.Framework == FrameworkState.Fresh && CannotRunHere(f, f.FrameworkGame))   // patch 0095: or a build signed for export only
+             return new PrimaryAction(ActionKind.Export, "Export as .ipa", true);
+         if (f.Framework == FrameworkState.Fresh)
+             return f.BootRequest == BootRequestState.Armed
+@@ -496,7 +500,7 @@
+     {
+         if (f.Running) return new PrimaryAction(ActionKind.Busy, "Running…", false);
+         if (GameStatusOf(fileName, f) == GameStatus.Ready)
+-            return CannotRunHere(f) ? new PrimaryAction(ActionKind.Export, "Export as .ipa to play", true)
++            return CannotRunHere(f, fileName) ? new PrimaryAction(ActionKind.Export, "Export as .ipa to play", true)   // patch 0095: or this game's build is signed for export only
+                                     : new PrimaryAction(ActionKind.Boot, "Play", true);
+         // An exported game's app builds nothing: its game is in its bundle, or it is not playable at all.
+         if (f.PlayerMode) return new PrimaryAction(ActionKind.Busy, "Not playable — export it again", false);
+@@ -829,6 +833,43 @@
+     /// an app's own bundle, i.e. exported as an .ipa. An exported game's own app is never in that case (its game is in
+     /// its bundle). `LoadsFromDocuments`: 1 yes, 0 no (the signature says so, or a dlopen was refused), -1 unknown.
+     public static bool CannotRunHere(UiFacts f) => !f.PlayerMode && f.LoadsFromDocuments == 0;
++
++    // ---- patch 0095: a build with no .p12 is signed for export only ------------------------------------------------------------------------------
++
++    /// The stamp's `signature=` value of a framework the chain signed ad hoc because no .p12 was here (ibuilder-pipeline assemble::EXPORT_ONLY_SIGNATURE).
++    public const string ExportOnlySignature = "adhoc-export";
++
++    /// The certificate row when none is imported: needed only to play a built game inside iBuilder, never to build or export.
++    public const string CertificateOptionalDetail = "none — needed only to Play inside iBuilder: without it a build is signed for Export IPA (the installer re-signs it); import your .p12 to play here";
++
++    /// `game`'s built framework (in Documents or parked) is signed ad hoc, for export only. An exported game's own app is never in that case (the installer signed its bundle).
++    public static bool IsExportOnlyBuild(string game, UiFacts f) =>
++        !f.PlayerMode && !string.IsNullOrEmpty(game) && f.ExportOnlyGames != null && f.ExportOnlyGames.Contains(game) && GameStatusOf(game, f) == GameStatus.Ready;
++
++    /// A built game is exported, never played here: the install cannot run code from Documents (CannotRunHere), or THIS game's build is signed for export only.
++    public static bool CannotRunHere(UiFacts f, string game) => CannotRunHere(f) || IsExportOnlyBuild(game, f);
++
++    /// "Sign again to play": an export-only build, a .p12 imported since, an install that can run code from Documents (not a distribution certificate), nothing running. The framework is
++    /// signed again with the identity (gameapp_sign_framework_again), no rebuild.
++    public static bool OffersSignAgain(string game, UiFacts f) =>
++        IsExportOnlyBuild(game, f) && f.IdentityState == 1 && f.LoadsFromDocuments != 0 && !f.Running;
++
++    /// The stamp once the framework is signed with the identity: every line but `signature=`, unchanged and in order.
++    public static string StampSignedAgain(string stamp) =>
++        string.Join("\n", (stamp ?? "").Split('\n').Where(l => !l.TrimStart().StartsWith("signature=", StringComparison.Ordinal))).TrimEnd('\n') + "\n";
++
++    /// Why "Sign again" did not sign: gameapp_sign_framework_again's rc (the chain's stage 4b codes), or null for 0.
++    public static string SignAgainFailure(int rc) => rc switch
++    {
++        0 => null,
++        10 => "this install has no provisioning profile (embedded.mobileprovision): it cannot sign with a certificate",
++        11 => "the provisioning profile or the certificate could not be read",
++        12 => "no certificate in this app's Keychain: import your .p12 first",
++        13 => "the Keychain item holds no .p12: import your .p12 again",
++        14 => "the .p12's password is longer than 511 bytes: import the certificate again with a shorter one",
++        -1 => "this build of the app cannot sign again",
++        _ => Inv($"the signer refused the framework (rc {rc}): see the log"),
++    };
+ 
+     public static ChecklistRow RunsHereRow(int loadsFromDocuments)
+     {

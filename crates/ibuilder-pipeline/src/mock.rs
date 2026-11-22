@@ -144,6 +144,42 @@ impl Signer for MockSigner {
     }
 }
 
+/// A signer that finds no identity (`rc`, e.g. 12) and has an ad hoc mode (`adhoc_rc`): stage 4b's export-only fallback. `adhoc_calls` counts the ad hoc signatures.
+#[derive(Default)]
+pub struct MockAdhocSigner {
+    pub rc: i32,
+    pub adhoc_rc: i32,
+    pub adhoc_calls: std::sync::atomic::AtomicUsize,
+}
+impl Signer for MockAdhocSigner {
+    fn sign(&self, framework_dir: &Path, exe: &str, v: &View<'_>) -> SignOutcome {
+        MockSigner { rc: self.rc }.sign(framework_dir, exe, v)
+    }
+    fn sign_adhoc(&self, framework_dir: &Path, exe: &str, _v: &View<'_>) -> Option<SignOutcome> {
+        self.adhoc_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.adhoc_rc == 0 {
+            use std::io::Write;
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .append(true)
+                .open(framework_dir.join(exe))
+            {
+                let _ = f.write_all(b"MOCK-ADHOC-SIGNATURE\n");
+            }
+        }
+        Some(SignOutcome {
+            rc: self.adhoc_rc,
+            mode: "mock-adhoc(export only)".into(),
+            identifier: self.identifier(),
+            err: if self.adhoc_rc == 0 {
+                String::new()
+            } else {
+                "mock ad hoc refusal".into()
+            },
+        })
+    }
+}
+
 /// A shader backend whose "translation" is one tiny file per shader.
 #[derive(Default)]
 pub struct MockShaders {

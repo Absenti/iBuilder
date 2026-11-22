@@ -1,0 +1,158 @@
+# 0096-gpu-without-bc-textures.patch -- older iPhones and iPads (a GPU without BC textures: before the A17 Pro, the M1) play: the chain decodes the textures on the CPU, and the app says so.
+# Applies after 0095.
+# UNTESTED ON DEVICE AND IN THE SIMULATOR (a simulator's GPU has BC textures): compiled, and its pure part ran in the host harness (below).
+#
+# The shim asks Metal once (gameapp_gpu_bc_textures: MTLCreateSystemDefaultDevice().supportsBCTextureCompression, 1 / 0 / -1) and hands the chain IBUILDER_FLAG_GPU_NO_BC; every boot then
+# sets DM_PROF_TEX_BC_CPU=1, which the host reads on top of its profile (hle_profile.c read_env) so nvn_mtl.m decodes BC1-7 on the CPU (nvn_bcdec.c) instead of stopping at mtl_init
+# ("has no BC texture formats"). The chain logs "GPU without BC textures: textures decoded on the CPU (slower, more memory)". On a GPU with BC textures nothing changes.
+# The app, on such a device only:
+#   * Settings › This iPhone (the Keys page): "Textures  decoded on the CPU — this GPU has no BC support (slower, more memory)";
+#   * a game's sheet: an info row "Textures · Decoded on the CPU" with one line of explanation;
+#   * the first build: one notice, "This GPU has no BC textures … performance may be low …" (Documents/gameapp.settings.tsv keeps cpu_textures_notice 1).
+#
+# VERIFIED: see 0095 (the same compile and harness runs cover both).
+# NOT VERIFIED: nothing ran on a device without BC textures (an A16 or older iPhone): the real speed and memory of the CPU decode, the Metal query on such a GPU.
+# NEW UI STRINGS: "Textures: decoded on the CPU — this GPU has no BC support", "This GPU has no BC textures", "Decoded on the CPU"; settings key "cpu_textures_notice".
+diff -ruN b/GameAppMain.cs c/GameAppMain.cs
+--- b/GameAppMain.cs	2026-11-22 15:20:08
++++ c/GameAppMain.cs	2026-11-22 15:21:18
+@@ -45,6 +45,8 @@
+     [DllImport("__Internal")] private static extern int gameapp_extended_va();
+     [DllImport("__Internal")] private static extern int gameapp_increased_memory();
+     [DllImport("__Internal")] private static extern int gameapp_get_task_allow();
++    // patch 0096: MTLDevice.supportsBCTextureCompression (app/gameapp_shim_rust.c): 1 yes, 0 no (every game decodes its textures on the CPU), -1 unknown
++    [DllImport("__Internal")] private static extern int gameapp_gpu_bc_textures();
+     [DllImport("__Internal")] private static extern void gameapp_address_space(out long freeTotal, out long largest);
+     // The signing identity, read and written by the shim itself: one implementation of the Keychain item, so the
+     // status the UI prints is the same one device_identity_sign() will read.
+@@ -186,6 +188,13 @@
+         catch (Exception) { return (-1, -1); }
+     }
+ 
++    /// Patch 0096: the GPU reads BC textures: 1 yes, 0 no (the chain decodes them on the CPU for every game), -1 unknown or no shim. Asked once (the shim caches it).
++    internal static int GpuBcTexturesValue()
++    {
++        try { return gameapp_gpu_bc_textures(); }
++        catch (Exception) { return -1; }
++    }
++
+     /// The increased-memory-limit entitlement in this app's own signature: 1/0, -1 unreadable or no shim.
+     internal static int IncreasedMemoryValue() => increasedCache.Get(IncreasedMemoryNow, DateTime.UtcNow);
+ 
+@@ -1282,6 +1291,7 @@
+             FrameworkContent: GameAppUi.ParseFrameworkStamp(stamp)?.Content,
+             Parked: GameExport.IsPlayer ? null : ParkedReadyGames(),   // GameAppSlotUi.cs (patch 0073): the games whose build is parked and ready
+             ExportOnlyGames: GameExport.IsPlayer ? null : ExportOnlyGames(stamp),   // GameAppSlotUi.cs (patch 0095): the builds signed for export only
++            GpuBcTextures: GameAppMain.GpuBcTexturesValue(),   // patch 0096
+             ShaderPacks: InstalledShaderPacks(),
+             PendingShaderPacks: Directory.Exists(GameAppMain.Documents)
+                 ? Directory.EnumerateFiles(GameAppMain.Documents, "*.shaders.tar")
+@@ -2002,7 +2012,7 @@
+         foreach (var row in keysRows.ArrangedSubviews.ToArray()) { keysRows.RemoveArrangedSubview(row); row.RemoveFromSuperview(); }
+         foreach (var row in GameAppUi.Checklist(facts))
+             if (row.Label == "prod.keys" || row.Label == "Signing certificate" || row.Label == "Memory ceiling" || row.Label == "Address space"
+-                || row.Label == "RAM unlocked" || row.Label == "Extended addressing" || row.Label == "Play inside iBuilder")
++                || row.Label == "RAM unlocked" || row.Label == "Extended addressing" || row.Label == "Play inside iBuilder" || row.Label == GameAppUi.TexturesLabel)   // patch 0096
+                 keysRows.AddArrangedSubview(ChecklistLabel(row));
+     }
+ 
+@@ -2669,6 +2679,7 @@
+     {
+         if (running) return;
+         if (signingAgain != null) { Write($"wait: the framework of {GameAppUi.DisplayName(signingAgain)} is being signed again"); return; }   // patch 0095
++        if (!bootOnly) CpuTexturesNoticeOnce();   // patch 0096: a GPU without BC textures: said once, at the first build
+         if (deletes.Busy) { Write("a delete is still going: try again in a moment"); return; }   // its worker thread is removing the build and the shaders
+         // A Switch 2 game (.nup): no extractor run here (it reads NSP/XCI only); the chain reads the package itself
+         // (gameapp_pipeline.extract_nup, from the config's nup= line), with no keys.
+diff -ruN b/GameAppShelf.cs c/GameAppShelf.cs
+--- b/GameAppShelf.cs	2026-11-22 15:19:24
++++ c/GameAppShelf.cs	2026-11-22 15:21:18
+@@ -965,6 +965,12 @@
+                 }));
+             }
+         }
++        if (GameAppUi.ShowsCpuTextures(facts.GpuBcTextures))   // patch 0096: a GPU without BC textures: an info row, not a setting
++        {
++            var tex = SettingsRow(GameAppUi.TexturesLabel, null, false, false, -1, "sheet-textures-cpu");
++            tex.Value.Text = GameAppUi.CpuTexturesValue;
++            optionRows.Add(Theme.Column(2, tex.Button, Theme.Label(GameAppUi.CpuTexturesNote, Theme.Font(12, UIFontWeight.Regular), Theme.Muted, 0)));
++        }
+         var all = SettingsRow("All settings for this game", () => nav.PushViewController(SettingsPage(), true), true, false, -1, "sheet-game-settings");
+         var optionsColumn = Theme.Column(12, new UIView[] { Look.Section("Settings for this game") }.Concat(optionRows).Concat(new UIView[] { all.Button }).ToArray());
+         var optionsCard = Look.Card(optionsColumn, 14, 16);
+diff -ruN b/GameAppSlotUi.cs c/GameAppSlotUi.cs
+--- b/GameAppSlotUi.cs	2026-11-22 15:19:51
++++ c/GameAppSlotUi.cs	2026-11-22 15:21:18
+@@ -308,3 +308,20 @@
+         }, work => BeginInvokeOnMainThread(work));
+     }
+ }
++
++// ---- patch 0096: a GPU without BC textures, said once at the first build ------------------------------------------------------------------------------------------
++public sealed partial class GameAppViewController
++{
++    /// At the first build on a GPU without BC textures: one notice that performance may be low (the build goes on behind it). Shown once: Documents/gameapp.settings.tsv keeps cpu_textures_notice 1.
++    private void CpuTexturesNoticeOnce()
++    {
++        int bc = GameAppMain.GpuBcTexturesValue();
++        if (!GameAppUi.CpuTexturesNoticeDue(bc, ReadAppSettings())) return;
++        try { File.WriteAllText(AppSettingsPath, GameAppUi.WithAppSetting(ReadAppSettings(), GameAppUi.CpuTexturesNoticeKey, "1")); }
++        catch (Exception error) { Write($"could not save the settings: {error.Message}"); }
++        Write("device: " + GameAppUi.CpuTexturesLine + " (every game; slower, more memory)");
++        var a = UIAlertController.Create(GameAppUi.CpuTexturesNoticeTitle, GameAppUi.CpuTexturesNoticeText, UIAlertControllerStyle.Alert);
++        a.AddAction(UIAlertAction.Create("OK", UIAlertActionStyle.Default, null));
++        PresentWhenFree(a);
++    }
++}
+diff -ruN b/GameAppUi.cs c/GameAppUi.cs
+--- b/GameAppUi.cs	2026-11-22 15:19:24
++++ c/GameAppUi.cs	2026-11-22 15:21:18
+@@ -51,7 +51,8 @@
+                              int ExtendedAddressing = -1, double AddressSpaceFreeGiB = -1, int IncreasedMemory = -1,
+                              bool PlayerMode = false, int LoadsFromDocuments = -1, string FrameworkContent = null,
+                              IReadOnlyDictionary<string, string> Parked = null,   // patch 0073: the games whose build is parked in Documents/games/<id>/slot and ready (game file -> the stamp's content=)
+-                             IReadOnlyCollection<string> ExportOnlyGames = null);   // patch 0095: the built games (in Documents or parked) whose framework is signed ad hoc, for export only
++                             IReadOnlyCollection<string> ExportOnlyGames = null,   // patch 0095: the built games (in Documents or parked) whose framework is signed ad hoc, for export only
++                             int GpuBcTextures = -1);   // patch 0096: the GPU reads BC textures: 1 yes, 0 no (decoded on the CPU), -1 unknown
+ 
+ public static class GameAppUi
+ {
+@@ -158,6 +159,7 @@
+         rows.Add(RamUnlockRow(f.IncreasedMemory, f.AvailableMiB));
+         if (!f.PlayerMode) rows.Add(RunsHereRow(f.LoadsFromDocuments));
+         rows.Add(ExtendedAddressingRow(f.ExtendedAddressing, f.AddressSpaceFreeGiB));
++        if (TexturesRow(f.GpuBcTextures) is ChecklistRow textures) rows.Add(textures);   // patch 0096: only on a GPU without BC textures
+ 
+         if (f.AvailableMiB < 0)
+             rows.Add(new ChecklistRow("Memory ceiling", "no per-process limit here (a simulator)", CheckLevel.Info));
+@@ -833,6 +835,30 @@
+     /// an app's own bundle, i.e. exported as an .ipa. An exported game's own app is never in that case (its game is in
+     /// its bundle). `LoadsFromDocuments`: 1 yes, 0 no (the signature says so, or a dlopen was refused), -1 unknown.
+     public static bool CannotRunHere(UiFacts f) => !f.PlayerMode && f.LoadsFromDocuments == 0;
++
++    // ---- patch 0096: GPUs without BC textures (older iPhones and iPads) -------------------------------------------------------------------------------
++
++    public const string TexturesLabel = "Textures";
++    /// The line of Settings › This iPhone (the Keys page) on such a device.
++    public const string CpuTexturesLine = "Textures: decoded on the CPU — this GPU has no BC support";
++    public const string CpuTexturesDetail = "decoded on the CPU — this GPU has no BC support (slower, more memory)";
++    /// The game sheet's info row.
++    public const string CpuTexturesValue = "Decoded on the CPU";
++    public const string CpuTexturesNote = "This GPU has no BC texture support: the game's textures are decoded on the CPU. Slower, and it uses more memory.";
++    /// The one-time notice at the first build on such a device (Documents/gameapp.settings.tsv remembers it was shown).
++    public const string CpuTexturesNoticeKey = "cpu_textures_notice";
++    public const string CpuTexturesNoticeTitle = "This GPU has no BC textures";
++    public const string CpuTexturesNoticeText = "Games use BC-compressed textures, which this GPU cannot read: iBuilder decodes them on the CPU for every game. "
++        + "It works, but performance may be low and the games use more memory.";
++
++    /// Settings' row: only on a GPU without BC textures (null on one with them, or when it is not known: nothing changes there).
++    public static ChecklistRow TexturesRow(int gpuBc) => gpuBc == 0 ? new ChecklistRow(TexturesLabel, CpuTexturesDetail, CheckLevel.Warn) : null;
++
++    /// The game sheet shows its textures row (a GPU without BC textures).
++    public static bool ShowsCpuTextures(int gpuBc) => gpuBc == 0;
++
++    /// The notice is due: a GPU without BC textures, and the settings do not say it was shown.
++    public static bool CpuTexturesNoticeDue(int gpuBc, string appSettings) => gpuBc == 0 && AppSetting(appSettings, CpuTexturesNoticeKey, "0") != "1";
+ 
+     // ---- patch 0095: a build with no .p12 is signed for export only ------------------------------------------------------------------------------
+ 

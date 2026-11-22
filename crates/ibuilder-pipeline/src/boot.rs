@@ -8,7 +8,8 @@
 use crate::adapters::BootRequest;
 use crate::ctx::Ctx;
 use crate::markers::{
-    boot_only_consume, boot_only_mark_attempted, note_boot_result, read_framework_stamp,
+    boot_only_consume, boot_only_mark_attempted, framework_is_export_only, note_boot_result,
+    read_framework_stamp,
 };
 use crate::memory::{mem_line, release_memory};
 use crate::mods::apply_mods;
@@ -43,6 +44,28 @@ pub fn prepare_boot(ctx: &Ctx) {
     set_game_env(ctx);
     set_alias_size(ctx);
     check_address_space(ctx);
+    set_bc_cpu(ctx); // last: a GPU without BC textures needs it whatever env.txt or a setting said
+}
+
+/// The one line a boot on a GPU without BC textures logs.
+pub const BC_CPU_LINE: &str =
+    "GPU without BC textures: textures decoded on the CPU (slower, more memory)";
+/// The host's profile override (`hle_profile.c read_env`: `DM_PROF_<KEY>` on top of `DM_PROFILE`'s file, read at the first `dm_profile()`, after the dlopen): with `tex_bc_cpu` on,
+/// `nvn_mtl.m mtl_init_once` sets `g_bc_cpu = !supportsBCTextureCompression && tex_bc_cpu` and decodes BC1-7 on the CPU (`nvn_bcdec.c`) instead of `MDIE("... has no BC texture formats")`.
+pub const BC_CPU_ENV: &str = "DM_PROF_TEX_BC_CPU";
+
+/// A GPU without BC textures (`Ctx::gpu_without_bc`, measured by the app through Metal): every game boots with `DM_PROF_TEX_BC_CPU=1`. A GPU with them (or one not measured) gets
+/// nothing here: its environment and profile are exactly what they were. Returns whether it set the switch.
+pub fn set_bc_cpu(ctx: &Ctx) -> bool {
+    if !ctx.gpu_without_bc {
+        return false;
+    }
+    if let Some(v) = ctx.env.get(BC_CPU_ENV).filter(|v| v.trim() != "1") {
+        ctx.log(&format!("game env: {BC_CPU_ENV} was '{v}': set to 1, this GPU cannot read BC textures (the host would stop at the first one)"));
+    }
+    ctx.env.set(BC_CPU_ENV, "1");
+    ctx.log(BC_CPU_LINE);
+    true
 }
 
 /// What a boot returned: `(stage, guest)`, `(3, -1)` for no boot host.
@@ -133,6 +156,15 @@ pub fn boot_only(ctx: &mut Ctx) -> i32 {
             );
             return 3;
         }
+    }
+    // Signed ad hoc for export only (no .p12 at the build): iOS refuses to map such a framework from Documents on a device, so it is never dlopen'd here. Export it, or sign it again.
+    if framework_is_export_only(ctx) {
+        ctx.log("boot-only: [RED] the framework was signed ad hoc for export only (no .p12 when it was built): it is not booted here -- Export it as its own app (the installer re-signs it), or import your .p12 and sign it again to play inside iBuilder");
+        boot_only_consume(
+            ctx,
+            "the framework is signed for export only, so it cannot be booted here",
+        );
+        return 3;
     }
     ctx.log(&format!(
         "stage 5 boot-only: a process that ran no stage of the chain boots {framework}"

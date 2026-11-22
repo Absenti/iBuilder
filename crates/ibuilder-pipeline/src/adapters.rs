@@ -267,6 +267,12 @@ pub struct SignOutcome {
 pub trait Signer: Send + Sync {
     /// Sign `<framework_dir>/<exe>` in process (adhoc, or with the device identity when the app carries a provisioning profile).
     fn sign(&self, framework_dir: &Path, exe: &str, v: &View<'_>) -> SignOutcome;
+    /// Sign `<framework_dir>/<exe>` AD HOC, with no identity: what stage 4b falls back to when [`Signer::sign`] found no identity on this install (rc 10, 12, 13:
+    /// `assemble::adhoc_fallback`). Such a framework cannot be played inside the app on a device, but an installer re-signs it in an exported IPA (`Export as its own app`).
+    /// `None`: this signer has no ad hoc mode, and the build fails as it did before the fallback existed.
+    fn sign_adhoc(&self, _framework_dir: &Path, _exe: &str, _v: &View<'_>) -> Option<SignOutcome> {
+        None
+    }
     /// This app's own CodeDirectory identifier (the framework is signed *as this app*, docs/SIGN-IN-APP.md)
     fn identifier(&self) -> String {
         "dev.ibuilder.app".to_string()

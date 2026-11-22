@@ -104,7 +104,8 @@ https://raw.githubusercontent.com/Absenti/iBuilder/main/apps.json
 ```
 
 The client re-signs the IPA with the user's certificate; the kind of certificate decides what iBuilder can do (see the
-README). The size and sha256 in the source are those of the file as released. Each release has `<ipa>.sha256` next to the
+README). The same holds for a game the app exports: with no `.p12` imported its framework is signed ad hoc (stamped
+`signature=adhoc-export`, never booted inside the app), and the installer re-signs it with the rest of the IPA. The size and sha256 in the source are those of the file as released. Each release has `<ipa>.sha256` next to the
 IPA; compare it with `shasum -a 256` and with the entry in `apps.json`.
 
 To release:

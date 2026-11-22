@@ -204,7 +204,8 @@ nm -gU "$LIBSHIM" 2>/dev/null | awk '$2=="T"{print $3}' | sort > "$WD/shim-expor
 echo "  $LIBSHIM ($(stat -f %z "$LIBSHIM") bytes), $(wc -l < "$WD/shim-exports.txt" | tr -d ' ') global functions" >&2
 # every [DllImport("__Internal")] gameapp_* the C# declares must be defined here: the contract with the managed half
 missing=0
-IMPORTS="$(grep -h 'extern [^;(]*gameapp_[a-z_0-9]*(' "$ROOT"/app/gameapp/GameApp*.cs | grep -o 'gameapp_[a-z_0-9]*(' | tr -d '(' | sort -u)"
+# the snapshot's imports and the ones the C# patches add (their `+` lines: app/patches/0096 imports gameapp_gpu_bc_textures and gameapp_sign_framework_again)
+IMPORTS="$( { grep -h 'extern [^;(]*gameapp_[a-z_0-9]*(' "$ROOT"/app/gameapp/GameApp*.cs; cat "$ROOT"/app/patches/*.patch 2>/dev/null | grep '^+' | grep 'extern [^;(]*gameapp_[a-z_0-9]*(' || true; } | grep -o 'gameapp_[a-z_0-9]*(' | tr -d '(' | sort -u)"
 # one grep for all the symbols (it was one per symbol): every wanted `_name` that is not a whole line of the export list
 MISSING_SYMS="$(printf '_%s\n' $IMPORTS | grep -vxF -f "$WD/shim-exports.txt" || true)"
 for sym in $MISSING_SYMS; do echo "  MISSING export: ${sym#_}" >&2; missing=1; done
