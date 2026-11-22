@@ -17,7 +17,18 @@
       "iconURL": "https://raw.githubusercontent.com/Absenti/iBuilder/main/docs/assets/icon.png",
       "tintColor": "#EFB15A",
       "category": "utilities",
-      "versions": [],
+      "versions": [
+        {
+          "version": "0.1.0",
+          "buildVersion": "1",
+          "date": "2026-11-22T11:21:28Z",
+          "localizedDescription": "First public release. No game, firmware or key included: use only games you own and keys from your own console.",
+          "downloadURL": "https://github.com/Absenti/iBuilder/releases/download/v0.1.0/GameApp-rust-20261122-110304-ruste60b40aa.ipa",
+          "size": 40825776,
+          "sha256": "9488428539047632f0f5780ab2230b7d94332f3d0badb41b675f3a0309bfda6b",
+          "minOSVersion": "26.0"
+        }
+      ],
       "appPermissions": {
         "entitlements": [
           "com.apple.developer.kernel.increased-memory-limit"

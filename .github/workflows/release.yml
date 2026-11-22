@@ -134,9 +134,12 @@ jobs:
           export APP_VERSION APP_BUILD_NUMBER
           echo "Info.plist: version $APP_VERSION, build $APP_BUILD_NUMBER, minimum iOS $(plutil -extract MinimumOSVersion raw "$plist")"
           ran=0; bad=0
+          # The verifier looks for the BUILD machine's home directory (/Users/$USER/, $HOME/) in the bundle. On a runner that is /Users/runner/, which
+          # also appears in Microsoft's own libcoreclr (built on GitHub runners): a stand-in user and home make the check about the maintainer's machine only.
+          VHOME="$RUNNER_TEMP/verifier-home"; mkdir -p "$VHOME"
           if [ -f app/verify_ipa.sh ]; then
             echo "::group::app/verify_ipa.sh of the tag $TAG"
-            bash app/verify_ipa.sh "$IPA" 2>&1 | tee "$RUNNER_TEMP/verify-tree.txt"; rc=${PIPESTATUS[0]}
+            USER=ci-verifier HOME="$VHOME" bash app/verify_ipa.sh "$IPA" 2>&1 | tee "$RUNNER_TEMP/verify-tree.txt"; rc=${PIPESTATUS[0]}
             echo "::endgroup::"
             ran=$((ran + 1)); [ "$rc" -eq 0 ] || { echo "::error::app/verify_ipa.sh of the tag failed (exit $rc)"; bad=1; }
           else
@@ -155,7 +158,7 @@ jobs:
           done
           if [ -n "$shipped" ]; then
             echo "::group::the verifier shipped with the IPA (${shipped#"$RUNNER_TEMP/"})"
-            bash "$shipped" "$IPA" 2>&1 | tee "$RUNNER_TEMP/verify-shipped.txt"; rc=${PIPESTATUS[0]}
+            USER=ci-verifier HOME="$VHOME" bash "$shipped" "$IPA" 2>&1 | tee "$RUNNER_TEMP/verify-shipped.txt"; rc=${PIPESTATUS[0]}
             echo "::endgroup::"
             ran=$((ran + 1)); [ "$rc" -eq 0 ] || { echo "::error::the shipped verifier failed (exit $rc)"; bad=1; }
           fi
