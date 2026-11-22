@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 
 /// Bump when a change of this crate can change the output of a split (the pipeline's work-folder signature and `stale_split` use [`split_version`]).
 /// 2: the rebased engine (Snowdrop bare zlib caches, NVN2 ray tracing, CIVBSF 0x1118, bnd2 v2, Phyre, KIT, `main`'s `uniq_keys`: docs/shaders/SHADERSPLIT-RUST.md section 10)
-pub const SPLIT_REV: u32 = 2;
+/// 3: Vector Unit APF packages (`FPUV`, `apf.rs`): their entries are decoded and scanned (Beach Buggy Racing 2: 0 shaders before, 496 after)
+pub const SPLIT_REV: u32 = 3;
 
 /// The shader split this build runs, as a short digest (`ShaderBackend::split_version`)
 pub fn split_version() -> String {

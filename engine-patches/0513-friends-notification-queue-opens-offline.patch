@@ -1,0 +1,79 @@
+# (after 0512) host/friends: nn::friends::NotificationQueue opens offline and stays empty (Beach Buggy Racing 2 quit right after start)
+#
+# Why: Beach Buggy Racing 2: Island Adventure (0100C43012344000, base v0, SDK 10.8.2, Vector Unit's engine) quit by itself on an iPhone 15 Pro right after its first textures:
+#   the log's last lines were "ngc: ProfanityFilter host vtable ..." then "svcExitProcess" / "graceful exit", no abort. Measured on a Mac with upstream nxnative e3f2d21 and
+#   the same modules (probes DM_PROBE, nxnative/dm/host/probe.c): the svcExitProcess comes from the game's own exit(-1) (main+0x40a9c8) after its logger's fatal level
+#   (main+0x35e370, level 6) printed "Unable to init game." (nnMain, main+0x26b8): the start-up step "VuGameServices" (vtable main+0xb8b018, init main+0x4c0) returned false
+#   because nn::friends::NotificationQueue::Initialize(const Uid&) returned failure (main+0x584 -> 0x588 cbnz). The host cut that call to RES_FAIL. On the console the queue
+#   is a local object of the friends service (friend:u's notification service), which a console without a connection opens too; it just never receives anything.
+#   The ProfanityFilter line was only the last line before the exit, not the cause (ProfanityFilter::Initialize comes after the queue and is never reached).
+# WHAT IT CHANGES (dm/host/hle_friends.c; dm/host/tests/t_friends.c):
+#   NotificationQueue::Initialize(const Uid&) returns RES_OK (was RES_FAIL). New take-overs, the SDK's own would run on the object the cut constructor leaves empty:
+#   Initialize() (no Uid) RES_OK, Finalize() no-op, Clear() RES_OK. Pop still finds nothing (RES_FAIL), GetSystemEvent still never fires. Friend lists, invitations,
+#   online play sessions and everything else of nn::friends stay cut. Applies to every game, no title or build gate.
+# Upstream: the same change on nxnative's tree (which already has the Finalize / Clear / no-Uid hooks, 977f5ca), local branch game-beach-buggy-racing-2 (not pushed).
+# Defaults: always on; no switch. Marker in the dylib: the hook description "notification queue opens, stays empty".
+# Shader chain: not touched.
+# Tests: t_friends (in HOST_TESTS' host-unit run) checks the new results: Initialize with and without a Uid succeeds, Pop finds nothing, Clear succeeds, Finalize leaves the
+#   object as it was. On the Mac (upstream e3f2d21 + the same change): BBR2 then gets past its start-up, mounts and commits its save and runs its frame loop at 60 fps for
+#   60 s (3,300+ frames; nothing drawn: no shader library for its .apf archive yet). NOT run on a device with this patch.
+
+diff --git a/dm/host/hle_friends.c b/dm/host/hle_friends.c
+index 59dfd78..b606682 100644
+--- a/dm/host/hle_friends.c
++++ b/dm/host/hle_friends.c
+@@ -1,6 +1,6 @@
+ // nn::friends (friends / presence / invitations, out of scope): every interface that connects to the friends service is cut to "unavailable".
+ // Not cut: the getters of Friend / Profile / FriendPresence and the constructors of Friend / Profile / UserPresence (they only read and write the game's own objects and do not go through the service).
+-// Unless stated otherwise, Result returns RES_FAIL; bool returns false; event pointers get a SystemEvent that is bound to a kernel event and never fires.
++// Unless stated otherwise (presence and the notification queue are local and succeed), Result returns RES_FAIL; bool returns false; event pointers get a SystemEvent that is bound to a kernel event and never fires.
+ #include "hle.h"
+ 
+ // Notification event that never fires (GetSystemEvent-style calls return a pointer; bound on the guest thread on first use)
+@@ -37,9 +37,16 @@ HLE_FORCE("_ZN2nn7friends29GetPlayHistoryRegistrationKeyEPNS0_26PlayHistoryRegis
+ // Notification queue
+ HLE_FORCE("_ZN2nn7friends17NotificationQueueC1Ev", "notification queue creates no session (cut)", void, h_fr_NqCtor, void *self) { (void)self; }
+ HLE_FORCE("_ZN2nn7friends17NotificationQueueD1Ev", "notification queue has no session to close (cut)", void, h_fr_NqDtor, void *self) { (void)self; }
+-HLE_FORCE("_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", "notification queue init fails (cut)", Result, h_fr_NqInit, void *self, const void *uid) { (void)self; (void)uid; return RES_FAIL; }
++// Notification queue: a console without a connection opens one too (friend:u's notification service is local; it only queues what the friends daemon receives), and it stays empty.
++// Initialize succeeds, Pop finds nothing, Clear succeeds, the event never fires, Finalize has nothing to close. Beach Buggy Racing 2 takes a failed Initialize as a failed start-up
++// ("Unable to init game.", then exit(-1): VuGameServices init at main+0x584); upstream nxnative branch game-beach-buggy-racing-2. Finalize, Clear and the form without a Uid are
++// taken over too (as upstream 977f5ca does): the SDK's own would run on the object the cut constructor left empty
++HLE_FORCE("_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", "notification queue opens, stays empty (cut)", Result, h_fr_NqInit, void *self, const void *uid) { (void)self; (void)uid; return RES_OK; }
++HLE_FORCE("_ZN2nn7friends17NotificationQueue10InitializeEv", "notification queue opens, stays empty (cut)", Result, h_fr_NqInitNoUid, void *self) { (void)self; return RES_OK; }
++HLE_FORCE("_ZN2nn7friends17NotificationQueue8FinalizeEv", "notification queue has no session to close (cut)", void, h_fr_NqFini, void *self) { (void)self; }
+ HLE_FORCE("_ZN2nn7friends17NotificationQueue14GetSystemEventEv", "notification event never fires (cut)", void *, h_fr_NqGetEv, void *self) { (void)self; return quiet_event(g_ev_notify); }
+ HLE_FORCE("_ZN2nn7friends17NotificationQueue3PopEPNS0_16NotificationInfoE", "notification queue is always empty (cut)", Result, h_fr_NqPop, void *self, void *info) { (void)self; (void)info; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7friends17NotificationQueue5ClearEv", "notification queue is already empty (cut)", Result, h_fr_NqClear, void *self) { (void)self; return RES_OK; }
+ // Invitations
+ HLE_FORCE("_ZN2nn7friends36GetFriendInvitationNotificationEventEv", "invitation notification event never fires (cut)", void *, h_fr_InvEv, void) { return quiet_event(g_ev_invite); }
+ HLE_FORCE("_ZN2nn7friends38TryPopFriendInvitationNotificationInfoEPNS_7account3UidEPmPvm", "no invitations (cut)", int, h_fr_InvPop, void *uid, uint64_t *sz, void *buf, size_t n) {
+diff --git a/dm/host/tests/t_friends.c b/dm/host/tests/t_friends.c
+index d88bdf6..216d9f7 100644
+--- a/dm/host/tests/t_friends.c
++++ b/dm/host/tests/t_friends.c
+@@ -1,4 +1,5 @@
+-// friends service unit test: presence is accepted (Twelve Minutes stops its start-up on a failed UserPresence::Initialize, seedds/nxnative#217),
++// friends service unit test: presence is accepted (Twelve Minutes stops its start-up on a failed UserPresence::Initialize, seedds/nxnative#217) and the notification queue opens
++// empty (Beach Buggy Racing 2 stops its start-up on a failed NotificationQueue::Initialize, engine-patches/0513),
+ // while the calls that would reach the service still fail. Expected results are hand-written, not taken from the implementation.
+ #include "../hle_friends.c"
+ #include <mach-o/getsect.h>
+@@ -23,7 +24,16 @@ int main(void) {
+     CHECK(h_fr_UpInit(presence, uid) == RES_OK, "UserPresence::Initialize succeeds");
+     CHECK(h_fr_UpDesc(presence, "in game") == RES_OK, "UserPresence::SetDescription succeeds");
+     CHECK(h_fr_UpCommit(presence) == RES_OK, "UserPresence::Commit succeeds");
+-    CHECK(h_fr_NqInit(presence, uid) == RES_FAIL, "NotificationQueue::Initialize still fails");
++    CHECK(h_fr_NqInit(presence, uid) == RES_OK, "NotificationQueue::Initialize succeeds (Beach Buggy Racing 2 stops its start-up otherwise)");
++    uint8_t info[0x200] = {0}, obj[0x40], before_obj[sizeof obj];
++    CHECK(h_fr_NqPop(presence, info) != RES_OK, "NotificationQueue::Pop finds no notification");
++    memset(obj, 0x5a, sizeof obj); memcpy(before_obj, obj, sizeof obj);
++    Result (*nq_init_nouid)(void *) = hook("_ZN2nn7friends17NotificationQueue10InitializeEv");
++    Result (*nq_clear)(void *) = hook("_ZN2nn7friends17NotificationQueue5ClearEv");
++    void (*nq_fini)(void *) = hook("_ZN2nn7friends17NotificationQueue8FinalizeEv");
++    if (nq_init_nouid) CHECK(nq_init_nouid(obj) == RES_OK, "NotificationQueue::Initialize without Uid succeeds");
++    if (nq_clear) CHECK(nq_clear(obj) == RES_OK, "NotificationQueue::Clear succeeds on the empty queue");
++    if (nq_fini) { nq_fini(obj); CHECK(!memcmp(obj, before_obj, sizeof obj), "NotificationQueue::Finalize leaves the cut object untouched"); }
+     CHECK(h_fr_OpenSession(uid) == RES_FAIL, "DeclareOpenOnlinePlaySession still fails");
+     // Resolve the actual takeovers: a missing or misspelled overload would run the SDK's friends client instead (PR #2162).
+     Result (*key_uid)(void *, const void *, int) = hook("_ZN2nn7friends29GetPlayHistoryRegistrationKeyEPNS0_26PlayHistoryRegistrationKeyERKNS_7account3UidEb");
