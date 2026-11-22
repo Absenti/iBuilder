@@ -1,0 +1,282 @@
+# 0097-export-info-plist-first-zip64.patch -- the owner's field bug: a FULL export (South Park The Stick of Truth, multi-GB RomFS inside) signed with FlareStore (zsign-based) failed:
+# "Signing failed: Can't get BundleID, BundleVersion, or BundleExecute in Info.plist!". Applies after 0096. UNTESTED ON DEVICE: compiled, its pure part ran in the host harness, and the
+# ZIP64 layout was MEASURED with the export's own ZipArchive (probe97, below).
+#
+# CAUSE: GameAppExport.Plan added the app's Info.plist LAST, after extract/RomFS.img: its local header lay beyond 4 GiB (a ZIP64 offset; measured: byte 4,609,540,297 behind a 4.3 GiB
+#   RomFS), and an unzip that mishandles ZIP64 gives no Info.plist to zsign's GetSignFolderInfo (it needs CFBundleIdentifier and CFBundleExecutable). Also: an Info.plist that could not
+#   be read became an EMPTY dictionary (no CFBundleExecutable, no CFBundleVersion) instead of an error.
+# FIX:
+#   1. The entry order (ExportZip.Order): the app's Info.plist FIRST, the framework's second, the rest of the bundle (the executable, icons, PkgInfo, Frameworks/*) in its order, then the
+#      game's data smaller than 64 MB (flat modules, profile, manifest, games/<id>, small shader files), then its big files by size, RomFS.img last: every piece of bundle metadata below 4 GiB.
+#   2. Past 4 GB (the full IPA, or a light one with very large shaders): before the export, "This IPA is larger than 4 GB: some signing tools (FlareStore and other on-device signers) cannot
+#      open it. Use the slim export (the game's files are copied beside it) if the install fails." with "Light IPA instead (…)" and "Export it anyway (…)"; the log says
+#      "export: 14.6 GB, ZIP64 (entries above 4 GB: …RomFS.img)" (or ", no ZIP64").
+#   3. After writing, before the .part becomes the .ipa (VerifyIpa): the .ipa opened again with ZipArchive, its Payload/<app>/Info.plist parsed, CFBundleIdentifier, CFBundleExecutable and
+#      CFBundleVersion present, its local header offset read from the central directory (ExportZip.LocalHeaderOffset: ZIP64 records and extra fields) and below 4 GiB, logged
+#      ("export: Info.plist checked: <id> · <exe> · <version>, at byte N (below 4 GB)"); else the export fails with what is wrong and the .part is removed.
+#   4. The Info.plist is never written from an empty dictionary: an unreadable bundle Info.plist (InfoPlist, FrameworkPlist's app plist) throws "the app's own Info.plist could not be read (…)",
+#      and a plist missing a required key is refused before writing.
+#   The light (slim) export keeps the RomFS beside the .ipa; it is ordered and checked the same way, and warned about too if it passes 4 GB.
+#
+# VERIFIED (2026-11-22, M1 Pro): check-patches-apply.sh: every patch 0010-0097 applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile
+#   (-t:Compile): 0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness97: … P94;P97): 368 of 368 checks (10 new: the order, ZIP64 before/after, the 4 GB
+#   rule and its words, the required keys, the central directory read back, the wiring); 9 of 10 mutations killed by the harness, the 10th (the ZIP64 extra field's order) by probe97.
+#   probe97 (System.IO.Compression's ZipArchive, ~8.6 GB written and removed): the old order puts Info.plist at byte 4,609,540,297; 0097's order at byte 0; an entry whose sizes and offset
+#   are all ZIP64 is found at its local header (4,399,824,977).
+# NOT VERIFIED: a real FlareStore / zsign install of the new .ipa; whether that signer's unzip also mishandles a ZIP64 RomFS entry (the warning offers the light export for that).
+# NEW UI STRINGS: "A large IPA", ExportZip.Warning, "Light IPA instead (", "Export it anyway ("; log lines ", ZIP64 (entries above 4 GB: ", ", no ZIP64", "export: Info.plist checked: ",
+#   " (below 4 GB)", "could not be read (".
+diff -ruN t96/GameAppExport.cs p/GameAppExport.cs
+--- t96/GameAppExport.cs	2026-11-22 15:55:55
++++ p/GameAppExport.cs	2026-11-22 15:52:38
+@@ -299,9 +299,12 @@
+                 hasIcon = true;
+             }
+         AddBytes(app + "Info.plist", InfoPlist(Path.Combine(bundle, "Info.plist"), titleId, name, hasIcon));
+-        return entries;
++        // patch 0097: the bundle's own files first (the app's Info.plist the very first), the game's small files, then its big ones, RomFS.img last: every piece of bundle metadata below
++        // 4 GiB (its Info.plist was the LAST entry, beyond the RomFS: a signer's unzip that mishandles ZIP64 found none: "Can't get BundleID … in Info.plist!")
++        return ExportZip.Order(entries, e => e.Name, e => e.Size, app, Folder);
+     }
+ 
++
+     /// The game's icon as a size x size PNG, drawn with CoreGraphics and ImageIO (safe off the main thread, where the
+     /// export runs: a UIGraphicsImageRenderer there gave no image and the export had no icon).
+     private static byte[] IconPng(string jpeg, int size)
+@@ -338,8 +341,8 @@
+ 
+     private static byte[] FrameworkPlist(string original, string appPlist, string titleId)
+     {
+-        var dict = (File.Exists(original) ? NSMutableDictionary.FromFile(original) : null) ?? new NSMutableDictionary();
+-        var app = NSDictionary.FromFile(appPlist);
++        var dict = (File.Exists(original) ? NSMutableDictionary.FromFile(original) : null) ?? new NSMutableDictionary();   // every key it needs is set below
++        var app = NSDictionary.FromFile(appPlist) ?? throw new InvalidOperationException($"the app's own Info.plist could not be read ({appPlist}): the export is not made (patch 0097)");
+         var baseId = OriginalBundleId(app);
+         void Set(string key, NSObject value) { if (value != null) dict[key] = value; }
+         Set("CFBundleExecutable", new NSString("DmGameProbe"));
+@@ -359,7 +362,8 @@
+ 
+     private static byte[] InfoPlist(string original, string titleId, string name, bool hasIcon)
+     {
+-        var dict = NSMutableDictionary.FromFile(original) ?? new NSMutableDictionary();
++        // patch 0097: never from an empty dictionary (an export with no CFBundleExecutable or CFBundleVersion: "Can't get BundleID, BundleVersion, or BundleExecute in Info.plist!")
++        var dict = NSMutableDictionary.FromFile(original) ?? throw new InvalidOperationException($"the app's own Info.plist could not be read ({original}): the export is not made");
+         var baseId = OriginalBundleId(dict);
+         dict["CFBundleIdentifier"] = new NSString(GameAppUi.ExportBundleId(baseId, titleId));
+         // The background task (the shader warm-up keeps going when the app is left) is "<runtime bundle id>.build.<n>" and Info.plist must permit THAT id: the player's own, and the one an installer
+@@ -384,6 +388,8 @@
+             dict["CFBundleIcons"] = new NSMutableDictionary { ["CFBundlePrimaryIcon"] = primary };
+             dict.Remove(new NSString("CFBundleIcons~ipad"));
+         }
++        var missing = ExportZip.Missing(k => (dict[k] as NSString)?.ToString());
++        if (missing.Count > 0) throw new InvalidOperationException("the exported Info.plist would have no " + string.Join(", ", missing) + ": the export is not made (an installer cannot sign it)");
+         var data = NSPropertyListSerialization.DataWithPropertyList(dict, NSPropertyListFormat.Xml, NSPropertyListWriteOptions.Immutable, out NSError error);
+         if (data == null) throw new InvalidOperationException("the exported Info.plist could not be written: " + error?.LocalizedDescription);
+         // The player is no "Open in" target for game files: iBuilder's document types and the game types' declarations stay out of its plist (GameAppOpenIn.cs, OpenInPlist; its own .romfs type and the file sharing stay).
+@@ -404,6 +410,7 @@
+         if (DiskSpace.Refuses(free, need))
+             throw new InvalidOperationException($"not enough space: the .ipa needs about {GameAppUi.SizeText(need)}, {GameAppUi.SizeText(free)} is free");
+         log($"export: {entries.Count} files, {GameAppUi.SizeText(total)} -> Exports/{appName}.ipa");
++        log(ExportZip.SizeLine(total, ExportZip.AboveLimit(entries, e => e.Name, e => e.Size)));   // patch 0097
+ 
+         var path = Path.Combine(outDir, appName + ".ipa");
+         var part = path + ".part";
+@@ -441,6 +448,7 @@
+                     done += e.Size;
+                 }
+             }
++            VerifyIpa(part, "Payload/" + appName + ".app/Info.plist", log);   // patch 0097: before it becomes the .ipa
+             File.Move(part, path, true);   // one rename over the old .ipa: it is not deleted before the new one is in place (the .part of 0040)
+             if (slim) PlaceRomfs(romfsSource, Path.Combine(outDir, GameAppUi.RomfsRelativePath(GameAppUi.DisplayName(dump), titleId)), log);
+         }
+@@ -451,6 +459,31 @@
+         }
+         log($"export: done, {GameAppUi.SizeText(new FileInfo(path).Length)} at Exports/{appName}.ipa");
+         return path;
++    }
++
++    /// Patch 0097: the written .ipa opened again: its app Info.plist is there, parses, has CFBundleIdentifier, CFBundleExecutable and CFBundleVersion, and its local header lies below 4 GiB
++    /// (what a signer's unzip needs, ZIP64 or not). Throws with what is wrong: the export fails, the .part is removed.
++    private static void VerifyIpa(string ipa, string plistEntry, Action<string> log)
++    {
++        using var stream = new FileStream(ipa, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16);
++        long offset = ExportZip.LocalHeaderOffset(stream, plistEntry);
++        stream.Position = 0;
++        byte[] bytes;
++        using (var zip = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: true))
++        {
++            var entry = zip.GetEntry(plistEntry) ?? throw new InvalidOperationException($"the written .ipa has no {plistEntry}: the export failed");
++            using var input = entry.Open();
++            using var ms = new MemoryStream();
++            input.CopyTo(ms);
++            bytes = ms.ToArray();
++        }
++        var format = NSPropertyListFormat.Xml;
++        var dict = NSPropertyListSerialization.PropertyListWithData(NSData.FromArray(bytes), NSPropertyListReadOptions.Immutable, ref format, out NSError error) as NSDictionary
++                   ?? throw new InvalidOperationException("the written .ipa's Info.plist does not parse: " + error?.LocalizedDescription);
++        var missing = ExportZip.Missing(k => (dict[k] as NSString)?.ToString());
++        if (missing.Count > 0) throw new InvalidOperationException("the written .ipa's Info.plist has no " + string.Join(", ", missing));
++        if (offset < 0 || offset > ExportZip.Limit) throw new InvalidOperationException($"the written .ipa's Info.plist starts at byte {offset} (beyond 4 GB, or not found): a signer could not read it");
++        log($"export: Info.plist checked: {dict["CFBundleIdentifier"]} · {dict["CFBundleExecutable"]} · {dict["CFBundleVersion"]}, at byte {offset.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} (below 4 GB)");
+     }
+ 
+     [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
+diff -ruN t96/GameAppField.cs p/GameAppField.cs
+--- t96/GameAppField.cs	2026-11-22 15:55:55
++++ p/GameAppField.cs	2026-11-22 15:51:44
+@@ -572,3 +572,118 @@
+     public static string Line(string name, string where, int requests, long bytes) =>
+         $"cover: {name} ({where}): read in {requests.ToString(CultureInfo.InvariantCulture)} request{(requests == 1 ? "" : "s")}, {(Math.Max(0, bytes) / 1024).ToString("N0", CultureInfo.InvariantCulture)} KB";
+ }
++
++/// Patch 0097 (the owner: FlareStore, a zsign-based signer, on a FULL export: "Can't get BundleID, BundleVersion, or BundleExecute in Info.plist!"): the app's Info.plist was the LAST
++/// entry of the .ipa, after the multi-GB RomFS.img, so its local header lay beyond 4 GiB (a ZIP64 offset) and the signer's unzip gave no Info.plist. The bundle's own files come first now,
++/// the game's small files after them, the big ones last (the largest last of all), so every piece of bundle metadata sits below 4 GiB; an .ipa past 4 GB is said before the export, and
++/// the written .ipa is opened again and its Info.plist checked.
++public static class ExportZip
++{
++    public const long Limit = 0xFFFFFFFFL;   // the 32-bit ZIP fields: past this a size or an offset is ZIP64
++    public const long Big = 64L << 20;       // a "big" file of the game's data
++
++    /// The order of the entries: 0 the app's Info.plist, 1 the framework's Info.plist, 2 the rest of the bundle (executable, icons, PkgInfo, Frameworks/*) in their order, 3 the game's
++    /// data under `<app>/<dataFolder>/` smaller than Big in their order, 4 its big files by size, the largest (RomFS.img) last.
++    public static List<T> Order<T>(IEnumerable<T> items, Func<T, string> name, Func<T, long> size, string app, string dataFolder)
++    {
++        var list = (items ?? Enumerable.Empty<T>()).Select((x, i) => (x, i)).ToList();
++        int Rank(T x)
++        {
++            var n = name(x);
++            if (n == app + "Info.plist") return 0;
++            if (n == app + "Frameworks/DmGameProbe.framework/Info.plist") return 1;
++            if (!n.StartsWith(app + dataFolder + "/", StringComparison.Ordinal)) return 2;
++            return size(x) < Big ? 3 : 4;
++        }
++        return list.OrderBy(p => Rank(p.x)).ThenBy(p => Rank(p.x) == 4 ? size(p.x) : 0).ThenBy(p => p.i).Select(p => p.x).ToList();
++    }
++
++    /// The entries whose data starts at or past 4 GiB (or are bigger than it) in this order, with ~`header` bytes of local header each: they need ZIP64.
++    public static List<string> AboveLimit<T>(IEnumerable<T> ordered, Func<T, string> name, Func<T, long> size, long header = 128)
++    {
++        var above = new List<string>();
++        long at = 0;
++        foreach (var x in ordered ?? Enumerable.Empty<T>())
++        {
++            if (at > Limit || size(x) > Limit) above.Add(name(x));
++            at += header + Math.Max(0, size(x));
++        }
++        return above;
++    }
++
++    public static bool OverLimit(long bytes) => bytes > Limit;
++
++    public const string Warning = "This IPA is larger than 4 GB: some signing tools (FlareStore and other on-device signers) cannot open it. Use the slim export (the game's files are copied beside it) if the install fails.";
++
++    /// "export: 14.6 GB, ZIP64 (entries above 4 GB: Payload/…/RomFS.img)", or the plain size line.
++    public static string SizeLine(long total, IReadOnlyList<string> above) =>
++        "export: " + GameAppUi.SizeText(total) + (OverLimit(total) || (above?.Count ?? 0) > 0 ? ", ZIP64 (entries above 4 GB: " + ((above?.Count ?? 0) == 0 ? "none" : string.Join(", ", above)) + ")" : ", no ZIP64");
++
++    /// What zsign's GetSignFolderInfo needs in the app's Info.plist; the export refuses a plist without them (it was written from an empty dictionary when the bundle's could not be read).
++    public static readonly IReadOnlyList<string> Required = new[] { "CFBundleIdentifier", "CFBundleExecutable", "CFBundleVersion" };
++
++    public static List<string> Missing(Func<string, string> value) => Required.Where(k => string.IsNullOrEmpty(value(k))).ToList();
++
++    /// The local header offset of `entryName` in a zip, from its central directory (ZIP64 records and extra fields read); -1 when it is not there or the file is not a zip this reads.
++    public static long LocalHeaderOffset(Stream s, string entryName)
++    {
++        try
++        {
++            long len = s.Length;
++            int tail = (int) Math.Min(len, 65557);
++            var buf = new byte[tail];
++            s.Position = len - tail;
++            if (s.ReadAtLeast(buf, tail, false) != tail) return -1;
++            int eocd = -1;
++            for (int i = tail - 22; i >= 0; i--) if (BitConverter.ToUInt32(buf, i) == 0x06054b50) { eocd = i; break; }
++            if (eocd < 0) return -1;
++            long cdOffset = BitConverter.ToUInt32(buf, eocd + 16), cdSize = BitConverter.ToUInt32(buf, eocd + 12);
++            long entries = BitConverter.ToUInt16(buf, eocd + 10);
++            if (cdOffset == 0xFFFFFFFF || cdSize == 0xFFFFFFFF || entries == 0xFFFF)
++            {
++                int loc = eocd - 20;
++                if (loc < 0 || BitConverter.ToUInt32(buf, loc) != 0x07064b50) return -1;
++                long z64 = (long) BitConverter.ToUInt64(buf, loc + 8);
++                var rec = new byte[56];
++                s.Position = z64;
++                if (s.ReadAtLeast(rec, 56, false) != 56 || BitConverter.ToUInt32(rec, 0) != 0x06064b50) return -1;
++                entries = (long) BitConverter.ToUInt64(rec, 32);
++                cdSize = (long) BitConverter.ToUInt64(rec, 40);
++                cdOffset = (long) BitConverter.ToUInt64(rec, 48);
++            }
++            if (cdSize <= 0 || cdSize > 512L << 20) return -1;
++            var cd = new byte[cdSize];
++            s.Position = cdOffset;
++            if (s.ReadAtLeast(cd, (int) cdSize, false) != cdSize) return -1;
++            var want = System.Text.Encoding.UTF8.GetBytes(entryName);
++            int p = 0;
++            for (long k = 0; k < entries && p + 46 <= cd.Length; k++)
++            {
++                if (BitConverter.ToUInt32(cd, p) != 0x02014b50) return -1;
++                int nameLen = BitConverter.ToUInt16(cd, p + 28), extraLen = BitConverter.ToUInt16(cd, p + 30), commentLen = BitConverter.ToUInt16(cd, p + 32);
++                if (nameLen == want.Length && cd.AsSpan(p + 46, nameLen).SequenceEqual(want))
++                {
++                    long usize = BitConverter.ToUInt32(cd, p + 24), csize = BitConverter.ToUInt32(cd, p + 20), off = BitConverter.ToUInt32(cd, p + 42);
++                    if (off != 0xFFFFFFFF) return off;
++                    int e = p + 46 + nameLen, end = e + extraLen;
++                    while (e + 4 <= end)
++                    {
++                        int id = BitConverter.ToUInt16(cd, e), size = BitConverter.ToUInt16(cd, e + 2);
++                        if (id == 1)
++                        {
++                            int q = e + 4;
++                            if (usize == 0xFFFFFFFF) q += 8;
++                            if (csize == 0xFFFFFFFF) q += 8;
++                            return q + 8 <= e + 4 + size ? (long) BitConverter.ToUInt64(cd, q) : -1;
++                        }
++                        e += 4 + size;
++                    }
++                    return -1;
++                }
++                p += 46 + nameLen + extraLen + commentLen;
++            }
++            return -1;
++        }
++        catch (Exception) { return -1; }
++    }
++}
+diff -ruN t96/GameAppMain.cs p/GameAppMain.cs
+--- t96/GameAppMain.cs	2026-11-22 15:55:55
++++ p/GameAppMain.cs	2026-11-22 15:52:14
+@@ -2250,12 +2250,31 @@
+             + "\n\nWith a free Apple ID an app takes one of your three slots.",
+             UIAlertControllerStyle.Alert);
+         alert.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
+-        var fullAction = UIAlertAction.Create($"Full IPA ({GameAppUi.SizeText(size + romfs)})", UIAlertActionStyle.Default, _ => StartExport(game, tid, slim: false));
+-        var slimAction = UIAlertAction.Create($"Light IPA ({GameAppUi.SizeText(size)})", UIAlertActionStyle.Default, _ => StartExport(game, tid, slim: true));
++        // patch 0097: an .ipa past 4 GB (ZIP64) is said first, with the light export offered
++        var fullAction = UIAlertAction.Create($"Full IPA ({GameAppUi.SizeText(size + romfs)})", UIAlertActionStyle.Default, _ =>
++        {
++            if (ExportZip.OverLimit(size + romfs)) AskBigExport(game, tid, size + romfs, size, slim: false); else StartExport(game, tid, slim: false);
++        });
++        var slimAction = UIAlertAction.Create($"Light IPA ({GameAppUi.SizeText(size)})", UIAlertActionStyle.Default, _ =>
++        {
++            if (ExportZip.OverLimit(size)) AskBigExport(game, tid, size, size, slim: true); else StartExport(game, tid, slim: true);
++        });
+         alert.AddAction(fullAction);
+         alert.AddAction(slimAction);
+         alert.PreferredAction = lightFirst ? slimAction : fullAction;
+         PresentWhenFree(alert);
++    }
++
++    /// Patch 0097: "This IPA is larger than 4 GB…": export it anyway, or the light IPA instead (when the big one is the full one).
++    private void AskBigExport(string game, string tid, long bytes, long lightBytes, bool slim)
++    {
++        Write($"export: {GameAppUi.SizeText(bytes)} asked for: past 4 GB (ZIP64): " + ExportZip.Warning);
++        var a = UIAlertController.Create("A large IPA", ExportZip.Warning, UIAlertControllerStyle.Alert);
++        if (!slim) a.AddAction(UIAlertAction.Create($"Light IPA instead ({GameAppUi.SizeText(lightBytes)})", UIAlertActionStyle.Default, _ => StartExport(game, tid, slim: true)));
++        a.AddAction(UIAlertAction.Create($"Export it anyway ({GameAppUi.SizeText(bytes)})", UIAlertActionStyle.Default, _ => StartExport(game, tid, slim)));
++        a.AddAction(UIAlertAction.Create("Cancel", UIAlertActionStyle.Cancel, null));
++        if (!slim) a.PreferredAction = a.Actions[0];
++        PresentWhenFree(a);
+     }
+ 
+     private void StartExport(string game, string tid, bool slim)
