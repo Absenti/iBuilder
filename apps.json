@@ -19,6 +19,16 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.1.8",
+          "buildVersion": "12",
+          "date": "2026-11-23T14:31:19Z",
+          "localizedDescription": "> [!WARNING]\n> No game, firmware or key is included or downloaded. Use iBuilder only with games you own and the `prod.keys` dumped from your own console. Not affiliated with Nintendo or Apple.\n\n> [!IMPORTANT]\n> **Every game rebuilds its shaders once** after this update: the shader chain moves to `6c53446391cc` (nxnative 033793f0), and a library is named by its chain. iOS's Metal shader cache also starts empty once, so the first play of each game stutters more.\n\n**New**\n- **Shader chain 6c53446391cc**, nxnative's current one: 37 upstream translator and host changes, including the Switch 2 mesh/task fixes. The Rust build gives the same library bytes as upstream (5,348 Ocarina shaders compared).\n- **More games found compatible**: shader readers for EA (FIFA 18: 0 → 330 shaders), CRI CPK, Diablo III, Unreal IoStore and encrypted paks, Smash Bros. Ultimate, Trinity (stored files), Frostbite (stored data), TT Games DAT, Larian LSPK, Blizzard CASC, Camelot CRA, PDAT, Rockstar RPF6, REDengine, RAGE WAD, NXCX, Telltale, GIANTS SHARC, Virtuos VBF, UbiArt IPK v5, MT Framework ARC v9. OpenGL and Vulkan games get their shaders too (glslang is now in the app; the engine compiles them on the phone).\n- **Build screen: Mode Cool / Fast** in place of Close. Cool (default) keeps the app smooth and the phone cooler; Fast builds at full speed, hotter. A running build follows a change.\n- **Faster builds**: a per-shader stream instead of batches; a rebuild after an update or a DLC reuses the shaders that did not change; a build resumed after iOS ended the app keeps half its threads instead of one. The build log now shows where the time went (translator, SPIRV-Cross, cores busy, translator GC).\n- **Settings**: *Check the shader cache* (on: a game iOS's cache forgot after a reboot or an iOS update is prepared again), *Faster shader preparation* (off: the device's full compiler concurrency when cool or charging), *Optimized translator (experimental)* (off: smaller shaders, may show graphics…",
+          "downloadURL": "https://github.com/Absenti/iBuilder/releases/download/v0.1.8/GameApp-rust-20261123-142811-rustcf3c2f55.ipa",
+          "size": 42455597,
+          "sha256": "6f38777d442df4a3d95d8afbfbc26f2979ab44b33eedd545a6567eb26881b966",
+          "minOSVersion": "26.0"
+        },
+        {
           "version": "0.1.7",
           "buildVersion": "10",
           "date": "2026-11-22T19:54:57Z",
