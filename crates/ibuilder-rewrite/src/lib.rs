@@ -10,6 +10,7 @@ pub mod frame;
 pub mod ins;
 pub mod jump_solver;
 pub mod jumps;
+pub mod layout;
 pub mod matching;
 pub mod output;
 pub mod patches;

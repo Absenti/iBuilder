@@ -1,0 +1,9 @@
+## config-key = 079013ef272cc109bebfc8b62fbd2a16
+FileId!STRING:0|KeyLayout!DEC:4|Chunk!DEC:8|Archive!DEC:8|CKey!HEX:16|CSize!DEC:4|EKey!HEX:16|ESize!DEC:4|Encoding!STRING:0|Path!STRING:0|Flags!STRING:0
+data:data/hd/shaders/vs_ui.bin|0|0|1|00000000000000000000000000000000|2568|00000000000000000000010000000020|2523|z|data:data/hd/shaders/vs_ui.bin|table
+data:data/hd/shaders/ps_ui.bin|0|0|1|00000000000000000000000000000000|5012|000000000000000000000100000009fb|5012|n|data:data/hd/shaders/ps_ui.bin|table
+data:data/hd/shaders/cs_lut.bin|0|0|2|00000000000000000000000000000000|2504|00000000000000000000020000000020|3670|b:64K*=n|data:data/hd/shaders/cs_lut.bin|table
+data:data/global/music.opus|0|0|1|00000000000000000000000000000000|400|00000000000000000000010000001d8f|438|b:64K*=n|data:data/global/music.opus|table
+data:data/hd/shaders/bad.bin|0|0|2|00000000000000000000000000000000|2592|00000000000000000000020000000e76|42|z|data:data/hd/shaders/bad.bin|table
+data:data/hd/shaders/short.bin|0|0|1|00000000000000000000000000000000|2600|00000000000000000000010000001f45|2596|n|data:data/hd/shaders/short.bin|table
+data:data/hd/shaders/vs_more.bin|0|0|2|00000000000000000000000000000000|5004|00000000000000000000020000000ea0|4895|z|data:data/hd/shaders/vs_more.bin|table

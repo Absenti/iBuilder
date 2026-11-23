@@ -25,7 +25,7 @@ FRAME_STEP	01007300020FA000	4b159f0f7a360669738390ee8657b4f0	1734e6db8d0a54af	AS
 FRAME_STEP	01007EF00011E000	cd57b23fa4bbad65803d9788c01821ee	0522f0b52514c8ba	The Legend of Zelda: Breath of the Wild
 FRAME_STEP	0100ECD018EBE000	0effe4af1dec3a7966b934d4a7c3d2bf	3e95811b9093c606	Paper Mario: The Thousand-Year Door
 FRAME_STEP	0100F2C0115B6000	5cb42b1cf25469fb0635fd046453d843	5536d41bd577a0d6	The Legend of Zelda: Tears of the Kingdom
-FRAME_STEP	0400486024DEC000	e0f3ccfaf50065ae4ea01eb5aeb13b1a	0b2386f18f0034bd	The Legend of Zelda: Ocarina of Time
+FRAME_STEP	0400486024DEC000	e0f3ccfaf50065ae4ea01eb5aeb13b1a	0a49680646e29fc6	The Legend of Zelda: Ocarina of Time
 FRAME_STEP	0400A3A01EE4C000	816c5358e8178d802fcec4a7ce5a741a	bc2823cbfff5f1c7	Pokemon Pokopia
 MATCH_CUTS	01001F5010DFA000	main:capture demo: the empty result when the weak reference at +0x88 is unset or dead	-	Pokémon Legends: Arceus
 MATCH_CUTS	0100346017304000	main:frame limiter threshold: 0 when N = 1	-	Taiko Risshiden V DX
@@ -33,6 +33,9 @@ MATCH_CUTS	0100346017304000	main:frame limiter threshold: 0 when N = 1	-	Taiko R
 MATCH_CUTS	0100453019AA8000	main:Monolith malloc region and first arena	-	Xenoblade Chronicles X: Definitive Edition
 MATCH_CUTS	01006A800016E000	main:engine region 62 GB → 4 GB (11 instructions in four functions)	-	Super Smash Bros. Ultimate
 MATCH_CUTS	0100726014352000	main:offline allowed without a recent Battle.net login	-	Diablo II: Resurrected
+MATCH_CUTS	01008F2005154000	main:Snowdrop three-pool allocator: 12 GB of ranges → 4 GB	-	South Park: The Fractured But Whole
+MATCH_CUTS	01008F2005154000	sdk:Older VammManager: 64 MB node area and 32 MB large-region alignment	-	South Park: The Fractured But Whole
+MATCH_CUTS	010095300B6A4000	main:South Park 60 fps target	-	South Park: The Stick of Truth
 MATCH_CUTS	0400486024DEC000	main:movie frame: the pictures the player has taken (its +0xc), not 1 more for each frame drawn	-	The Legend of Zelda: Ocarina of Time
 MATCH_CUTS	0400486024DEC000	main:movie pictures a frame: up to 2, the constructor's value for an argument of 2 or more, whatever its caller passes (1)	-	The Legend of Zelda: Ocarina of Time
 MATCH_CUTS	0400486024DEC000	main:movie update cap: 3 pictures a frame, the frame step's largest hold, in place of the limit (2), which also sizes the decoder pipeline	-	The Legend of Zelda: Ocarina of Time
@@ -53,7 +56,7 @@ MATCH_CUTS	sdk	sdk:AllocateAddressRegion: regions of 4 MB and more aligned to 2 
 MATCH_FRAME_STEP	01002B00111A2000	main#0:60 fps frame step: the KIDS frame task, frame-rate block and event cutscene counters	4d29f25150d5d6ab	Hyrule Warriors: Age of Calamity
 MATCH_FRAME_STEP	0100A00019DE0000	main#0:render size from the host's render scale	4e3b160adf47cb59	Hades II
 MATCH_FRAME_STEP	0100F2C0115B6000	main#0:60 fps frame step and render scale	5536d41bd577a0d6	The Legend of Zelda: Tears of the Kingdom
-MATCH_FRAME_STEP	0400486024DEC000	main#0:frame ratio from the host's step	0b2386f18f0034bd	The Legend of Zelda: Ocarina of Time
+MATCH_FRAME_STEP	0400486024DEC000	main#0:frame ratio from the host's step	0a49680646e29fc6	The Legend of Zelda: Ocarina of Time
 MATCH_FRAME_STEP	0400C3F00006E000	main#0:frame interval from the host's step	236905b34e8165d7	Mario Kart World
 MATCH_FRAME_STEP	0400C3F00006E000	main#1:frame interval from the host's step	236905b34e8165d7	Mario Kart World
 MATCH_STUBS	0100453019AA8000	main#0:camera angular integration uses elapsed time	f435a833d11b6ac0	Xenoblade Chronicles X: Definitive Edition

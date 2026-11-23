@@ -1,0 +1,3 @@
+ERR
+null
+a bounded uniform or storage read is not written as a select: float4 _6 = (_3 < ((*spvDescriptorSet0.fp_c25)._m0[0].z >> 4u)) ? (*spvDescriptorSet0.fp_c3)._m0[0] : float4(0.0);

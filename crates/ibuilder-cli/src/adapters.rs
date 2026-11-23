@@ -586,6 +586,7 @@ pub mod shaders {
         ShaderTools {
             xlate: Arc::new(move |argv: &[String]| conv(a.xlate(&argv[1..]))),
             spirv_cross: Arc::new(move |argv: &[String]| conv(b.spirv_cross(&argv[1..]))),
+            glslang: None, // layer_tools: the Mac's glslangValidator ($GLSLANG or on PATH)
         }
     }
 
@@ -612,6 +613,47 @@ pub mod shaders {
         }
     }
 
+    /// GL / Vulkan games (ibuilder-glvk): SPIRV-Cross and glslang from the pipeline's tools (program name first, as `fn_tools` passes it). glslang is the app's
+    /// `gameapp_glslang` (`app/c/glslang_cli.cpp`, the `glslang` callback of `ibuilder_options`); a pipeline without one takes the Mac's `glslangValidator`
+    /// (`$GLSLANG` or on PATH) with feature `shader-host-tools`, else none: an OpenGL game's shaders each fail with `ibuilder_glvk::tools::NO_GLSLANG`.
+    #[cfg(feature = "glvk")]
+    pub fn layer_tools(t: &ShaderTools) -> ibuilder_glvk::tools::FnLayerTools {
+        use ibuilder_glvk::tools::{FnLayerTools, ToolCallback, ToolRun as LayerRun};
+        let named = |f: ToolFn, prog: &'static str| -> ToolCallback {
+            Arc::new(move |argv: &[String]| {
+                let mut full = Vec::with_capacity(argv.len() + 1);
+                full.push(prog.to_string());
+                full.extend_from_slice(argv);
+                let o = f(&full);
+                LayerRun {
+                    rc: o.rc,
+                    stdout: o.stdout,
+                    stderr: o.stderr,
+                }
+            })
+        };
+        let spirv_cross = named(t.spirv_cross.clone(), "spirv-cross");
+        let glslang: Option<ToolCallback> = match &t.glslang {
+            Some(g) => Some(named(g.clone(), "glslangValidator")),
+            None => {
+                #[cfg(feature = "shader-host-tools")]
+                {
+                    use ibuilder_glvk::LayerTools;
+                    let p = ibuilder_glvk::tools::ProcessLayerTools::from_env();
+                    Some(Arc::new(move |argv: &[String]| p.glslang(argv)) as ToolCallback)
+                }
+                #[cfg(not(feature = "shader-host-tools"))]
+                {
+                    None
+                }
+            }
+        };
+        FnLayerTools {
+            spirv_cross,
+            glslang,
+        }
+    }
+
     impl ShaderBackend for RustShaders {
         fn split_version(&self) -> String {
             #[cfg(feature = "shadersplit")]
@@ -621,6 +663,46 @@ pub mod shaders {
             #[cfg(not(feature = "shadersplit"))]
             {
                 "-".to_string()
+            }
+        }
+
+        fn split_revisions(&self) -> Option<ibuilder_pipeline::adapters::SplitRevisions> {
+            #[cfg(feature = "shadersplit")]
+            {
+                use ibuilder_shadersplit::record::{LEGACY, READERS};
+                Some(ibuilder_pipeline::adapters::SplitRevisions {
+                    readers: READERS
+                        .iter()
+                        .map(|r| ibuilder_pipeline::adapters::SplitReader {
+                            name: r.name.to_string(),
+                            rev: r.rev,
+                            claims: r.claims.iter().map(|c| c.to_string()).collect(),
+                        })
+                        .collect(),
+                    legacy: LEGACY.iter().map(|(n, r)| (n.to_string(), *r)).collect(),
+                })
+            }
+            #[cfg(not(feature = "shadersplit"))]
+            {
+                None
+            }
+        }
+
+        fn split_probe(
+            &self,
+            romfs: &Path,
+            dlc: &[PathBuf],
+            shader_map: Option<&Path>,
+        ) -> Option<String> {
+            #[cfg(feature = "shadersplit")]
+            {
+                let dlc: Vec<&Path> = dlc.iter().map(|p| p.as_path()).collect();
+                ibuilder_shadersplit::record::probe_text(romfs, &dlc, shader_map).ok()
+            }
+            #[cfg(not(feature = "shadersplit"))]
+            {
+                let _ = (romfs, dlc, shader_map);
+                None
             }
         }
 
@@ -647,6 +729,9 @@ pub mod shaders {
                 o.dlc = dlc;
                 o.jobs = req.jobs.max(1);
                 o.memo_dir = Some(req.memo_dir);
+                // which readers the game needed, for a targeted re-split (the pipeline keeps it in pack.txt)
+                let record = ibuilder_pipeline::adapters::split_record_path(req.tables_dir);
+                o.record = Some(&record);
                 let l = |s: &str| log.line(s);
                 let st = split(&o, &Ruzstd, &Gate(req.gate), &l)
                     .map_err(|e| PipelineError::failed(e.to_string()))?;
@@ -743,6 +828,60 @@ pub mod shaders {
                 bad: r.bad,
                 files: r.files,
             })
+        }
+
+        // ---- GL / Vulkan games (ibuilder-glvk): their GLSL / SPIR-V -> the host layer's table + MSL; see ibuilder_pipeline::layers ----
+        fn layer_version(&self) -> String {
+            #[cfg(feature = "glvk")]
+            {
+                ibuilder_glvk::layer_version()
+            }
+            #[cfg(not(feature = "glvk"))]
+            {
+                "-".to_string()
+            }
+        }
+
+        fn build_layer(
+            &self,
+            req: &LayerRequest<'_>,
+            log: &dyn Log,
+        ) -> Result<Option<LayerResult>> {
+            #[cfg(feature = "glvk")]
+            {
+                super::build_pool();
+                let tools = layer_tools(req.tools);
+                let r = ibuilder_glvk::game::build_for_game(
+                    req.romfs,
+                    req.main_nso,
+                    req.dlc,
+                    &tools,
+                    req.work,
+                    req.jobs.max(1),
+                );
+                match r {
+                    Ok(None) => Ok(None),
+                    Ok(Some(layer)) => {
+                        layer.write(req.out_dir).map_err(|e| {
+                            PipelineError::failed(format!("{}: {e}", req.out_dir.display()))
+                        })?;
+                        Ok(Some(LayerResult {
+                            api: layer.api.dir().to_string(),
+                            shaders: layer.shaders,
+                            lines: layer.log,
+                        }))
+                    }
+                    Err(e) => {
+                        log.line(&format!("glvk: {e}"));
+                        Err(PipelineError::failed(e.0))
+                    }
+                }
+            }
+            #[cfg(not(feature = "glvk"))]
+            {
+                let _ = (req, log);
+                Ok(None)
+            }
         }
     }
 }

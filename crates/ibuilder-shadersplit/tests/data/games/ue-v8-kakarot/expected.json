@@ -1,0 +1,30 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_at.bin": "2bab51c3fc23606726f0c2a7c6037c2ed29a4cf322d1f491b3e34799ef306749",
+  "pkg/ps_at.bin": "907587efdb7eb4a0fc0ad6063975f4933230149e59d3a3a15bf9a3b0d5959b48",
+  "pkg/vs_at.bin": "ad6ab30ecea4c3d68456bdcbcb71b880b83093ba5e9708e5c1349555e3e8a66c",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f27260dcaf8021cd268b8f3bb26089b8e705fb4fa439743e005608044acf88a0",
+  "tables/shader_map.tsv": "ce208523bcc96e92a9e2674a79ed2233f1e560d969df56570a854f3d5cd17a1f",
+  "tables/shader_pairs.tsv": "58ece828525d0397623b4c8c810f72e82c286beb99342f538fa25b7e6d3804ee"
+ },
+ "log": [
+  "[RED] /AT/Content/Paks/pakchunk0-Switch.pak#AT/Content/BadTag.uexp: the shader record at 0x44 has stage tag SX (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk0-Switch.pak#AT/Content/Oodled.uexp: Oodle- or LZ5-compressed game files: set DM_OODLE_HOST (the Mac host, make -C dm/host GAME=<id> dmhost) and DM_OODLE_MODULES (the rewritten modules) to decode them with the game's own decoder (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk1-Switch.pak#AT/Content/Broken.uexp: ValueError: @ROMFS@/AT/Content/Paks/pakchunk1-Switch.pak: AT/Content/Broken.uexp block 0 does not decode (Error -3 while decompressing data: incorrect data check) (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk2-Switch.pak#AT/Content/Z/Bad00.uexp: ValueError: @ROMFS@/AT/Content/Paks/pakchunk2-Switch.pak: AT/Content/Z/Bad00.uexp block 0 does not decode (Error -3 while decompressing data: invalid block type) (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk2-Switch.pak#AT/Content/Z/Bad01.uexp: ValueError: @ROMFS@/AT/Content/Paks/pakchunk2-Switch.pak: AT/Content/Z/Bad01.uexp block 0 does not decode (Error -3 while decompressing data: invalid block type) (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk2-Switch.pak#AT/Content/Z/Bad02.uexp: ValueError: @ROMFS@/AT/Content/Paks/pakchunk2-Switch.pak: AT/Content/Z/Bad02.uexp block 0 does not decode (Error -3 while decompressing data: invalid block type) (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk2-Switch.pak#AT/Content/Z/Bad03.uexp: ValueError: @ROMFS@/AT/Content/Paks/pakchunk2-Switch.pak: AT/Content/Z/Bad03.uexp block 0 does not decode (Error -3 while decompressing data: invalid block type) (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk2-Switch.pak#AT/Content/Z/Bad04.uexp: ValueError: @ROMFS@/AT/Content/Paks/pakchunk2-Switch.pak: AT/Content/Z/Bad04.uexp block 0 does not decode (Error -3 while decompressing data: invalid block type) (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk2-Switch.pak#AT/Content/Z/Bad05.uexp: ValueError: @ROMFS@/AT/Content/Paks/pakchunk2-Switch.pak: AT/Content/Z/Bad05.uexp block 0 does not decode (Error -3 while decompressing data: invalid block type) (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk2-Switch.pak#AT/Content/Z/Bad06.uexp: ValueError: @ROMFS@/AT/Content/Paks/pakchunk2-Switch.pak: AT/Content/Z/Bad06.uexp block 0 does not decode (Error -3 while decompressing data: invalid block type) (its shaders are left out)",
+  "[RED] /AT/Content/Paks/pakchunk2-Switch.pak#AT/Content/Z/Bad07.uexp: ValueError: @ROMFS@/AT/Content/Paks/pakchunk2-Switch.pak: AT/Content/Z/Bad07.uexp block 0 does not decode (Error -3 while decompressing data: invalid block type) (its shaders are left out)",
+  "[RED] 15 file(s) could not be read, their shaders are left out (first: /AT/Content/Paks/pakchunk0-Switch.pak#AT/Content/BadTag.uexp: the shader record at 0x44 has stage tag SX)",
+  "single-stage programs: 3 vertex shaders are paired with a cover of 1 pixel shader(s) (214481c95c115197)",
+  "shaders: 10 (compute 2, pixel 5, vertex 3); sources at 10; compute shader answers 2 rows; variation pairs 3"
+ ],
+ "shaders": 10,
+ "updates": []
+}

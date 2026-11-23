@@ -1,0 +1,828 @@
+# (after 0520) nvn/memory + frame step: shader-code pools stay out of the raw pool table, guest-file pages are wired before the residency commit, late 30 fps frames paced (Ocarina of Time)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/9143b6ff6217e491c8a3bffe3816d8178c5072e0  ("nvn: keep shader-code pools out of gmem_map, pre-wire guest files, and pace late 30 fps frames (PR #1971)")
+#            author seedds, 2026-11-23 00:08 +0800; Co-authored-by: Stan Bono, uncraftablexd
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why (measured upstream, Ocarina of Time on an 8 GB iPhone 17, 30 fps cap, Kokiri Forest): 223 shader-code pools (317 MB) were resident and wired in the raw pool table for nothing
+#   (the GPU never reads translated shaders' code), starving the guest's file-backed pages: 14-17 fps, 6,000-15,600 page-ins every 10 s. With the change: page-ins 100-400 per 10 s,
+#   27-30 fps (upstream docs/reference/memory.md, PR #1971). The residency commit also paged guest files in from the GPU driver's wiring path, which froze once on an APFS lock (M1 iPad).
+# WHAT IT CHANGES (dm/gfx/nvn/hle_nvn.c, nvn_mtl.m, nvn_mtl.h, nvn_fstep.h; tests t_addr_known, t_file_wire, t_fstep, t_present_crop, t_present_rescue):
+#   - nvnMemoryPoolGetBufferAddress no longer marks a non-virtual SHADER_CODE pool addressed (a buffer made in it, or a pointer scan, still does);
+#   - a shared buffer on file pages (DM_GUEST_FILE) joining the residency set is mlock'ed outside g_res_mu before its change is queued and munlock'ed after res_commit_retiring;
+#   - present_shape matches the window crop's aspect first when DM_SCREEN_ASPECT is set;
+#   - frame step: idle-GPU start-up late frames do not raise the hold, unpaced holds whose GPU work fits a shorter one are probed, and an automatic 30 fps link switches to 60 Hz at
+#     latency 2 when frames are late at hold 2 (an explicit DM_PRESENT_LINK or DM_PRESENT_LATENCY is honoured).
+# Adapted: the res_add hunk (file wire) rejected and was redone by hand: this tree's res_add_at adds the heap in place of a placed resource instead of recursing, so the wire is taken on
+#   that resource (a heap is never a shared buffer, so only plain shared buffers are wired, as upstream). Its Makefile hunk by hand. dm/games/0400486024DEC000/smoke.tsv (a Mac route) not taken.
+#   The frame-step hunks apply beside 0503's DM_FPS_PAYBACK (nopay): with payback off a late frame's debt is still let go.
+# Games: Ocarina of Time (0400486024DEC000); every game for the shader-code pools and the file wire. Switches: none new (DM_GUEST_FILE, DM_SCREEN_ASPECT, DM_PRESENT_LINK, DM_PRESENT_LATENCY exist).
+# Tests (M1 Pro): t_addr_known 25, t_file_wire 12, t_fstep (all its checks), t_present_crop 126, t_present_rescue 113; all in HOST_TESTS.
+# NOT measured here: the page-ins, wired memory and frame rate on an iPhone (the numbers above are upstream's).
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0520, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index 2efe29a5353911309ce26c5204f97a6b4346a9bf..d5e4c5be6243b9446fc9b2e6d19dc8406a3b95ab 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -309,7 +309,14 @@ NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off,
+ }
+ // A GPU address exists only once the driver has given one: here, by a buffer (nvnBufferInitialize) or by a texture (nvnTextureGetTextureAddress). Raw global memory can reach only what these name (mtl_pool_addressed)
+ static void pool_mark_addressed(const pool_t *o) { vpool_taken(o); static __thread const uint8_t *last; if (o->mem && o->mem != last) { last = o->mem; mtl_pool_addressed(o->mem, o->size); } }
+-NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { pool_mark_addressed((const pool_t *)p); return (NVNbufferAddress)((const pool_t *)p)->mem; }
++// A shader-code pool's own address (NVN_MEMORY_POOL_FLAGS_SHADER_CODE, 0x40; not virtual) is asked for to place programs: nvnProgramSetShaders takes code addresses. The GPU never reads that code,
++// as the shaders run translated and their constants are copied into the host's buffers, so it does not put the pool into the raw pool table, where it would be resident and its pages wired.
++// Ocarina of Time on the iPhone: 223 such pools, 317 MB, wired for nothing on an 8 GB device that pages the guest's files out. A buffer made in the pool still puts it in (nvnBufferInitialize)
++NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) {
++    const pool_t *o = (const pool_t *)p;
++    if ((o->flags & (NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_SHADER_CODE)) != NVN_MEMORY_POOL_FLAGS_SHADER_CODE) pool_mark_addressed(o);
++    return (NVNbufferAddress)o->mem;
++}
+ 
+ // ---------- Descriptor pools ----------
+ // One ID space per pool. In NVN a texture or sampler ID indexes the pool the command buffer has bound (SetTexturePool / SetSamplerPool), and two pools may use the same IDs. The replay keeps
+@@ -2117,6 +2124,7 @@ static double g_pres_exp[TWIN], g_pres_exp_last;   // how long that frame should
+ // The hold (60 Hz vsyncs) each present was given, by present number. On-screen intervals are read 8 presents late, so each is judged against the holds of its own presents:
+ // with the frame step at 2 vsyncs every frame stays 33.3 ms, which is not a dropped frame
+ static uint8_t g_hold_ring[16];
++static _Atomic int g_fs_fine;   // nvn_fstep.fine (fstep_tick): frames late at hold 2, the longest a 30 fps cap allows, each shown at the next vsync after its hold (nvn_game_fps)
+ static int fstep_hz(void);
+ static double pres_expect_ms(uint64_t n) {   // the interval between presents n - 1 and n shows frame n - 1: the display link holds it for its own present's hold, the Mac pacer spaces present n by n's, so the larger of the two
+     int k = g_hold_ring[n % 16] > g_hold_ring[(n - 1) % 16] ? g_hold_ring[n % 16] : g_hold_ring[(n - 1) % 16];
+@@ -2227,15 +2235,16 @@ static void tsummary(uint64_t frame) {
+     }
+     LOG("[nvn] timing up to frame %llu:%s", frame, line);
+     { void mtl_pso_line(char *, size_t); char pl[1024]; mtl_pso_line(pl, sizeof pl); LOG("[nvn] pipelines up to frame %llu: %s", frame, pl); }
+-    double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
++    double tgt = 1000.0 / (atomic_load(&g_fs_fine) ? 30 : mtl_fps_target());   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 or at a 30 cap whose late frames the 60 Hz link shows (the over-time / dropped-frame counts below use it)
+     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
+       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > tgt;
+         LOG("[nvn] frame interval up to frame %llu: >%.1fms %u / %u frames, p99 %.2f ms", frame, tgt, over, n, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
+-    { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0; double v[TWIN];   // on-screen present: dropped frame = on screen longer than its hold × 1.5 (pres_expect_ms) or discarded
+-      for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > g_pres_exp[i] * 1.5; } }
++    { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0, over[3] = {0}; double v[TWIN], vs = 1000.0 / fstep_hz();   // on-screen present: dropped frame = on screen longer than its hold × 1.5 (pres_expect_ms) or discarded
++      // over: intervals at their hold, one vsync longer and two or more longer (at hold 2: 33.3 / 50 / 66.7 ms and more; a frame late at hold 2 shows 50 ms on the 60 Hz link, 66.7 on the 30 Hz one)
++      for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > g_pres_exp[i] * 1.5; over[x < g_pres_exp[i] + 0.5 * vs ? 0 : x < g_pres_exp[i] + 1.5 * vs ? 1 : 2]++; } }
+       task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT; double fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS ? vi.phys_footprint / 1048576.0 : -1;
+       double br = dm_brightness_now();   // footprint / brightness are carried on the on-screen present row: does not depend on the tick-entry observation gate (camp runs have it too)
+-      if (k) { qsort(v, k, sizeof *v, dcmp); LOG("[nvn] on-screen up to frame %llu: %u frames, dropped %u (discarded %u), p99 %.2f ms; footprint %.0f MiB; brightness %.2f; thermal %d", frame, k + discard, drop, discard, v[(k * 99) / 100 < k ? (k * 99) / 100 : k - 1], fp, br, dm_thermal_now()); }
++      if (k) { qsort(v, k, sizeof *v, dcmp); LOG("[nvn] on-screen up to frame %llu: %u frames, dropped %u (discarded %u), p99 %.2f ms; intervals at the hold / one vsync longer / two or more %u / %u / %u; footprint %.0f MiB; brightness %.2f; thermal %d", frame, k + discard, drop, discard, v[(k * 99) / 100 < k ? (k * 99) / 100 : k - 1], over[0], over[1], over[2], fp, br, dm_thermal_now()); }
+       g_presn = 0; }
+     power_line(frame);
+     { static uint64_t prev[6], pf; uint64_t v[6]; mtl_vbuf_stats(&v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
+@@ -2552,13 +2561,15 @@ static int fps_present_cap(void) {
+ static nvn_fstep g_fs;   // present thread only
+ static nvn_fgpu g_fg;   // the GPU time at kmin and at the current hold (nvn_fstep_gpu_slowed)
+ static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided yet)
+-// The display link runs at 30 Hz at a 30 cap, except while the game fixes its own step at 1 (BotW's VFR override)
++// The display link runs at 30 Hz at a 30 cap, except while the game fixes its own step at 1 (BotW's VFR override) and while frames are late at hold 2 (nvn_fstep.h fine): the 30 Hz link
++// shows a late frame only on its next tick, 66.7 ms after the one before, where the 60 Hz link, which holds each frame its two vsyncs (g_link_hold_until, nvn_mtl.m), shows it at the next
++// vsync, 50 ms. Ocarina of Time on an iPhone at the launcher's 30 fps cap (frames 36.5 ms) got 33 intervals of 66.7 ms in each 300 on the 30 Hz link
+ int nvn_fps_high_now(void) { return atomic_load(&g_fs_k) == 1 ? 120 : 60; }   // hle_fpslock.c: the target of the next game frame, from the hold in force
+ // The rate of vi::GetDisplayVsyncEvent (hle_sdk16.c, nvn_mtl.m mtl_link_wait_vsync): the Switch's 60 Hz, or 120 while 120 fps is on and its hold is one tick of 1/120 s. A game that
+ // waits for the next vblank each frame is held to the event's rate whatever the present cap: Unity's NVN device waits until its vblank time (set from the event) passes
+ // (The Rogue Prince of Persia: main+0x14f65f0), so at 120 every frame came two ticks late and the hold fell back to 60. The hold's trial at 120 must already have the event at 120
+ int nvn_vsync_hz(void) { return fps_high() && atomic_load(&g_fs_k) == 1 && atomic_load(&g_high_cap) == 120 ? 120 : 60; }
+-int nvn_game_fps(void) { int c = fps_present_cap(); if (c) return c == 30 && atomic_load(&g_fs_k) == 1 && fstep_on() ? 60 : c; uint64_t s = atomic_load(&g_itv2_since); return g_hz > 0 && !g_display_mode && s && now_ns() >= s + 1000000000ull ? 30 : 60; }
++int nvn_game_fps(void) { int c = fps_present_cap(); if (c) return c == 30 && (atomic_load(&g_fs_k) == 1 || atomic_load(&g_fs_fine)) && fstep_on() ? 60 : c; uint64_t s = atomic_load(&g_itv2_since); return g_hz > 0 && !g_display_mode && s && now_ns() >= s + 1000000000ull ? 30 : 60; }
+ static void present_cfg(const win_t *o) {
+     if (g_hz >= 0) return;
+     // The interval mode comes from the game profile (present_interval, default game): whether frames follow the present interval the game sets depends on whether the game's logic counts frames, which differs per game. Environment variables override it, and can override the fixed 60 Hz.
+@@ -2664,6 +2675,15 @@ static int fstep_payback(void) {
+     }
+     return p;
+ }
++// The longest hold the frame step may give at cap c (nvn_fstep_next's kmax), and why it may go no higher, for the log: a 30 fps cap's display link runs at 30 Hz, where a hold of 3
++// would take two ticks (66.7 ms), so it holds 2 and late frames are shown at the next vsync instead (nvn_fstep.h fine)
++static int fstep_kmax(int c, const char **why) {
++    int kmin = fstep_hz() / c;
++    if (fps_high()) { *why = "120 fps: the game steps by its target, so a late frame steps down to 60 and no further"; return 2; }
++    if (!fstep_hold()) { *why = "fps_hold off: frames are not held longer than the cap's vsyncs"; return kmin; }
++    if (kmin >= 2) { *why = "the 30 fps cap's display link runs at 30 Hz, where a hold of 3 would take 66.7 ms; late frames are shown at the next vsync of a 60 Hz link instead"; return 2; }
++    *why = "the games' own interval logic uses 1-3"; return FSTEP_MAX;
++}
+ // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
+ // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs
+ static void fstep_tick(const win_t *o, int c) {
+@@ -2677,11 +2697,11 @@ static void fstep_tick(const win_t *o, int c) {
+     span = nvn_fstep_drain_cut(span, (uint64_t)((g_fs.k ? g_fs.k : fstep_hz() / c) * v), g_fs_drain, drain_before, &pw);
+     if (span < raw) { drain_n++; drain_cut += raw - span; }
+     drain_before = g_fs_drain_late; g_fs_drain = g_fs_drain_late = 0;
+-    double shown = prev ? span / v : 0, gpu = 0; prev = st;
+-    for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; break; } }
++    double shown = prev ? span / v : 0, gpu = 0; prev = st; int gpu_on = 0;
++    for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; gpu_on = 1; break; } }
+     double cpu = shown - pw / v, cost = cpu > gpu ? cpu : gpu;
+-    int kmin = fstep_hz() / c, kmax = fps_high() ? 2 : !fstep_hold() ? kmin : kmin >= 2 ? 2 : FSTEP_MAX, k0 = g_fs.k,   // at 120 fps a late frame must step down whatever fps_hold says: the game steps by the target
+-         kmin0 = g_fs.kmin, probe0 = g_fs.probe;
++    const char *kwhy; int kmin = fstep_hz() / c, kmax = fstep_kmax(c, &kwhy), k0 = g_fs.k;   // at 120 fps a late frame must step down whatever fps_hold says: the game steps by the target
++    int kmin0 = g_fs.kmin, probe0 = g_fs.probe;
+     int fixed = dm_fps_state ? (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED) : 0;
+     uint64_t probes0 = g_fs.probes, failed0 = g_fs.failed;
+     // A screen whose rate is not a multiple of 60 (144, 165 Hz) shows the link's 1/60 s ticks on their nearest refreshes (nvn_mtl.m link_range), so a frame on time can show for one
+@@ -2708,23 +2728,34 @@ static void fstep_tick(const win_t *o, int c) {
+     g_fs.per_vsync = fstep_hz() / 60;
+     g_fs.smax = dm_fps_step_max;   // the stub's largest step (Mario Kart World: 2): frames held longer than the game steps would play in slow motion
+     g_fs.no_payback = fps_high();   // at 120 fps the game steps by its target, not by the step: a late frame is slow motion, so three raise the hold whatever the average
++    g_fs.gpu_on = gpu_on; g_fs.gpu = gpu;   // an idle GPU's late frames do not step up; a hold the GPU does not explain is probed (nvn_fstep.h)
+     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
+     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
+     atomic_store(&g_fs_k, g_fs.k);
++    int fine = g_fs.fine && c == 30 && !fps_high(), fine0 = atomic_exchange(&g_fs_fine, fine);   // only a 30 fps cap's link runs slower than the vsyncs
++    if (fine != fine0) mtl_set_fstep_fine(fine);
++    static int nfine;
++    if (fine != fine0 && nfine < 40) {
++        if (fine) LOG("[nvn] frame step: frames late at hold %d, the longest the 30 fps cap allows (cost %.2f, GPU %.2f vsyncs): each is shown at the next vsync (a 60 Hz display link: 50 ms) instead of a 30 Hz link's next tick (66.7 ms), at present %llu%s", g_fs.k, cost, gpu, (unsigned long long)o->presents, ++nfine == 40 ? "; further changes only counted below" : "");
++        else LOG("[nvn] frame step: %s: the 30 fps cap's own 30 Hz display link again at present %llu%s", c != 30 ? "the cap is no longer 30 fps" : fixed ? "the game fixes its own step" : g_fs.k < kmax ? "the hold may rise again" : "no late frame for 8 s", (unsigned long long)o->presents, ++nfine == 40 ? "; further changes only counted below" : "");
++    }
+     held[g_fs.k]++; if (fixed) fixed_sum += (uint64_t)n;   // the stubs count only the host's steps
+     static int fixed_was, nfix;
+     if (fixed != fixed_was && nfix < 40) { nfix++; if (fixed) LOG("[nvn] frame step: the game fixes its own step at %d vsyncs at present %llu", fixed, (unsigned long long)o->presents); else LOG("[nvn] frame step: the game hands the step back to the host at present %llu", (unsigned long long)o->presents); }
+     fixed_was = fixed;
+     if (k0 && g_fs.k != k0 && nlog < 40) {
+-        char why[160], held[48] = ""; int w = snprintf(why, sizeof why, "probe");
++        char why[256], held[48] = ""; int w = snprintf(why, sizeof why, "probe");
+         if (cslow) w += snprintf(why + w, sizeof why - w, ", CPU %d%% on performance cores", g_fs_pshare);
+         double gr = nvn_fgpu_ratio(&g_fg);   // the failed probes' ratio: the scene's time at kmin is cur over it
+         if (gslow && gr > 0) w += snprintf(why + w, sizeof why - w, ", GPU %.2f at hold %d, %.2f at hold %d by the failed probes", g_fg.cur, g_fg.k, g_fg.cur / gr, kmin);
+         else if (gslow) w += snprintf(why + w, sizeof why - w, ", GPU %.2f× its time at hold %d", g_fg.cur / g_fg.ref, kmin);
+-        if (nvn_fstep_same(&g_fs)) snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
++        if (w >= (int)sizeof why) w = sizeof why - 1;
++        if (nvn_fstep_same(&g_fs)) w += snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
++        if (w >= (int)sizeof why) w = sizeof why - 1;   // snprintf returns the length it would have written
++        if (g_fs.uprobe) snprintf(why + w, sizeof why - w, ", GPU fits a shorter hold, frames not waiting in the pacing");
+         if (g_fs.k > k0 && g_fs.cref > 0) snprintf(held, sizeof held, "; hold %d held at %.2f", kmin, g_fs.cref);   // what a probe compares the longer hold's cost with
+         LOG("[nvn] frame step: hold %d → %d %s at present %llu (%s; cost %.2f, GPU %.2f%s)%s", k0, g_fs.k, fps_high() ? "ticks of 1/120 s" : "vsyncs", (unsigned long long)o->presents,
+-            fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? "3 late frames" : g_fs.probes != probes0 ? why : "trial", cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");
++            fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? (g_fs.up_idle ? "30 late frames, some with the GPU idle" : "3 late frames") : g_fs.probes != probes0 ? why : "trial", cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");
+     }
+     if (probe0 == 1 && g_fs.probe != 1 && !fixed && nlog < 40) {   // whether the controller raised the clock for the shorter deadline, and the GPU time it measured there
+         char gm[96] = "";
+@@ -2737,10 +2768,11 @@ static void fstep_tick(const win_t *o, int c) {
+         if (o->presents % 1800 == 0) { LOG("[nvn] 120 fps: held 1 / 2 ticks %llu / %llu frames, %llu late, %llu up / %llu down (%llu probes, %llu failed trials); standing-frame drains taken out of %llu frames (%.1f ticks)", (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)g_fs.late, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed, (unsigned long long)drain_n, drain_cut / v); memset(held, 0, sizeof held); drain_n = drain_cut = 0; }
+     } else if (o->presents % 1800 == 0) {   // game time against real time (1.000 = normal speed; lower when a device cannot hold 20 fps or after long stalls)
+         uint64_t vs = __atomic_load_n((uint64_t *)(dm_fps_state + 0x30), __ATOMIC_RELAXED) + fixed_sum, t = now_ns();
+-        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late, %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials); standing-frame drains taken out of %llu frames (%.1f vsyncs)",
++        char fn[96] = ""; if (kmax == 2 && kmin == 2) snprintf(fn, sizeof fn, ", now %s (switched to the next vsync %llu× so far)", g_fs.fine ? "at the next vsync" : "on the 30 Hz link", (unsigned long long)g_fs.fines);
++        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late, %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials); standing-frame drains taken out of %llu frames (%.1f vsyncs); cap %d fps, hold at most %d vsyncs: %s%s",
+                     (vs - v0) / 60.0, (t - t0) / 1e9, (vs - v0) / 60.0 / ((t - t0) / 1e9), (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3],
+                     (unsigned long long)g_fs.late, (unsigned long long)g_fs.paid, g_fs.dropped, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed,
+-                    (unsigned long long)drain_n, drain_cut / v);
++                    (unsigned long long)drain_n, drain_cut / v, c, kmax, kwhy, fn);
+         t0 = t; v0 = vs; memset(held, 0, sizeof held); drain_n = drain_cut = 0;
+     }
+ }
+@@ -2766,7 +2798,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
+     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 4), (uint32_t)(movie != 0), __ATOMIC_RELAXED);   // the stubs' copy of the movie state (hle.h)
+     int c = fps_step_cap();
+     if (dm_fps_state) { static int was; if (c != was) { char why[48] = ""; if (movie) snprintf(why, sizeof why, " (a movie of %d pictures a second)", movie); else if (c == 30 && was == 60 && thermal_capped()) snprintf(why, sizeof why, " (thermal state serious)");
+-        LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, why); was = c; } }
++        char kw[256] = ""; const char *kwhy; if (c) snprintf(kw, sizeof kw, ": hold at most %d vsyncs, %s", fstep_kmax(c, &kwhy), kwhy);   // the cap and why the hold may not rise above it, so a log shows both at once
++        LOG("[nvn] frame step cap %d → %d fps at present %llu%s%s", was, c, (unsigned long long)o->presents, why, kw); was = c; } }
+     if (c) fstep_tick(o, c);
+     dm_fps_lock_tick();   // after the frame step: at 120 fps the target follows the hold just decided
+     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
+diff --git a/dm/gfx/nvn/nvn_fstep.h b/dm/gfx/nvn/nvn_fstep.h
+index 2691a4d99a67930221733c8beff1f53a27f17f78..396f425f834ae81f3a5f3abd48c0aabc5672deed 100644
+--- a/dm/gfx/nvn/nvn_fstep.h
++++ b/dm/gfx/nvn/nvn_fstep.h
+@@ -29,6 +29,21 @@
+ // rise set k to kmin with no grace, so three frames late while the clock rose stepped up again, with cref dropped at the cap change and a GPU reference taken at the 30 fps
+ // cap: neither the fit trial (a GPU-bound cost near FSTEP_FIT) nor a probe brought kmin back (t_fstep: the movie and thermal cap cases). A cref kept from before the cap
+ // starts a probe only when the cost at the longer hold is within FSTEP_SAME of it, and a failed probe doubles the hold-off as any other does.
++// The caller may report each frame's GPU time (gpu_on, gpu). A late frame whose GPU was idle (under FSTEP_GPU_IDLE: a loading or progress screen, the first frames after a
++// pipeline prepare) does not count toward the 3 late frames of a step up: nothing is being drawn, so the lateness is the CPU's startup or load work, which the debt rule
++// absorbs, not what the scene costs (FSTEP_RUN late frames in a row step up whatever the GPU). Ocarina of Time stepped 1 → 2 → 3 at presents 9 and 12 of a warm start (cost 1.92 and 5.57 vsyncs, GPU 0.02 and 0.01) while a 118 s archive write ran.
++// And a longer hold that the GPU does not explain is probed: FSTEP_RUN frames in a row at a hold above kmin whose GPU time fits k − 1 and that waited for nothing in the
++// host's pacing (cost within FSTEP_LATE of the time shown) start a probe after the hold-off. Such a game waits for its frames outside the window's acquire (Ocarina of
++// Time: no pacing wait at any hold, its frame time all counted as work), so its cost is the hold itself whatever the hold is, never fits k − 1, and the fit trial never comes:
++// it stayed at hold 3 (18 fps, work 50 ms, GPU 12.5 ms) for about 1,470 presents where hold 1 held at 16.6 ms before. A game whose CPU really needs the longer hold fails the
++// probe; these probes have their own hold-off (uhold), doubled after each one fails up to FSTEP_UHOLD_MAX (60 s), so such a game pays one failed probe a minute at most
++// and not one every 8 s. Late frames with the GPU idle still step up after FSTEP_RUN of them in a row: a CPU-heavy scene that draws almost nothing is not a load.
++// Late frames at the longest hold allowed (kmax: 2 at a 30 fps cap, or kmin with fps_hold off) cannot step up. The caller's display link at the cap's rate (30 Hz) can then only
++// show a late frame on its next tick, 66.7 ms after the one before: Ocarina of Time on an iPhone at the launcher's 30 fps cap (frames 36.5 ms, GPU 32 ms) left one tick in 9 empty,
++// 33 intervals of 66.7 ms in each 300 and the rest 33.3, at 27 fps. So the same late frames that would step up (3 in a row, or FSTEP_RUN with the GPU idle among them) set fine:
++// the caller then shows each frame at the next vsync after its hold instead (a 60 Hz link that holds each frame its k vsyncs), 33.3 or 50 ms and never 66.7, still never faster
++// than the cap. fine ends after FSTEP_HOLD_MAX vsyncs with no such late frame (a scene that fits again; a late frame now and then does not flap the link), when the hold may rise
++// again (the cap rose) and while the game fixes its own step.
+ #pragma once
+ #include <math.h>
+ #include <stdint.h>
+@@ -52,6 +67,8 @@
+ // second half cost at most 1 − FSTEP_RAMP of its first half, and had a late frame (a window on time is judged as a trial), starts another, up to FSTEP_PROBE_MAX frames in all
+ #define FSTEP_RAMP 0.05       // the fall in cost from one half of a grace window to the next that shows the clock still rising (the per-frame noise of a 25 ms frame is 4%, of 15 frames 1%)
+ #define FSTEP_PROBE_MAX 180   // grace frames a probe may take in all (3 s at 60 fps): a clock that keeps rising without reaching the hold is not waited for longer
++#define FSTEP_GPU_IDLE 0.05   // GPU time (in the frame's unit) under which nothing is being drawn: 0.8 ms at 60 fps (Ocarina of Time's progress screen 0.2–0.3 ms, its scenes 12 ms)
++#define FSTEP_UHOLD_MAX 3600.0   // the longest hold-off before a probe of a hold the GPU does not explain (nvn_fstep_unpaced), doubled after each such probe fails: 60 s
+ 
+ typedef struct {
+     int k, step;              // vsyncs each frame stays on screen; the step handed to the game for the next frame (k, or k + 1 while paying back)
+@@ -71,13 +88,19 @@ typedef struct {
+     double run, crun, cref;   // vsyncs at kmin in a row; the cost of its frames on time (running mean; not during a probe's trial, whose frames run while the clock rises);
+                               // crun when the last run of FSTEP_HOLD_MAX or more ended in a step up or a cap change (0 = none yet)
+     double ccur; int ck, cn;  // the cost of the frames on time at the longer hold ck (running mean) and their count
++    int gpu_on; double gpu;   // set by the caller before each call, then cleared: 1 = gpu is the frame's GPU time (the latest finished frame's, in the unit of shown); 0 = not reported
++    int urun;                 // frames in a row at a hold above kmin whose GPU time fits k − 1 and that waited for nothing in the host's pacing (nvn_fstep_unpaced)
++    int ilate_run, uprobe;    // late frames in a row, those with the GPU idle included; 1 = the probe running was started by nvn_fstep_unpaced alone
++    int up_idle;              // 1 = the last step up came from FSTEP_RUN late frames with the GPU idle among them (for the caller's log)
++    double uhold;             // vsyncs since the last step up before such a probe: 1 s, doubled after each one fails up to FSTEP_UHOLD_MAX, back to 1 s when kmin holds
+     int ckmin;                // the kmin run, crun and cref belong to
+     double cref_at[FSTEP_MAX + 1];   // cref of each kmin, kept while another kmin is in force
+     double over[FSTEP_RUN], over_sum; int over_i, over_k;   // the last FSTEP_RUN frames at the hold over_k: shown − k of each (clamped), their sum; the next slot
+     double last_cost[3];      // the last three frames' costs, oldest first
+     int smax;                 // set by the caller: the largest step the game takes (its stub's STEP_MAX; 0 = FSTEP_MAX)
+     int no_payback;           // set by the caller: 1 = the game does not take the step (120 fps: it steps by its target), so three late frames raise the hold whatever the average
+-    uint64_t late, paid, ups, downs, failed, probes; double dropped;   // statistics for the log
++    int fine; double fine_ok; // 1 = frames are late at kmax, shown at the next vsync after their hold; vsyncs since the last late frame while fine (FSTEP_HOLD_MAX ends it)
++    uint64_t late, paid, ups, downs, failed, probes, fines; double dropped;   // statistics for the log (fines: times fine was set)
+ } nvn_fstep;
+ 
+ // A drain of frames standing in the display link's queue in a frame's time (hle_nvn.c fstep_tick, g_fs_drain; nvn_link_drain.h): the acquire waited extra link ticks while the
+@@ -95,22 +118,27 @@ static inline uint64_t nvn_fstep_drain_cut(uint64_t span, uint64_t hold, uint64_
+ 
+ // Whether the cost at the longer hold is the cost that held kmin (a probe without a slowed report)
+ static inline int nvn_fstep_same(const nvn_fstep *s) { return s->cref > 0 && s->cn >= FSTEP_RUN && s->ccur <= FSTEP_SAME * s->cref; }
++// Whether the longer hold is one the GPU does not explain while the frames' time is all the game's own (a probe without a slowed report)
++static inline int nvn_fstep_unpaced(const nvn_fstep *s) { return s->urun >= FSTEP_RUN; }
+ 
+ // Once per frame. shown: real time since the previous frame's start, in vsyncs; cost: the frame's work, max(CPU, GPU), in vsyncs (a GPU that cannot keep up makes frames late too); kmin: 1 at a 60 fps cap, 2 at 30;
+ // kmax: the longest hold (FSTEP_MAX; 2 at a 30 fps cap, where the display link runs at 30 Hz and holds only even counts); fixed: a step the game has set itself (BotW's
+ // VFR override; 0 = none), which the host then holds as it is; slow: the CPU runs below its speed for reasons other than heat, so a cost above k − 1 is no evidence
+ // against kmin (probes). Returns the step for the next frame; s->k is how long that frame stays on screen
+ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int kmin, int kmax, int fixed, int slow) {
+-    const double hold0 = FSTEP_HOLD0 * (s->per_vsync ? s->per_vsync : 1), hold_max = FSTEP_HOLD_MAX * (s->per_vsync ? s->per_vsync : 1);
++    const double hold0 = FSTEP_HOLD0 * (s->per_vsync ? s->per_vsync : 1), hold_max = FSTEP_HOLD_MAX * (s->per_vsync ? s->per_vsync : 1),
++                 uhold_max = FSTEP_UHOLD_MAX * (s->per_vsync ? s->per_vsync : 1);
+     if (kmin < 1) kmin = 1;
+     const int smax = s->smax > 0 && s->smax < FSTEP_MAX ? s->smax : FSTEP_MAX;
+     if (kmax > smax) kmax = smax;
+     if (kmin > smax) kmin = smax;
+     if (kmax < kmin) kmax = kmin;
+     if (!s->hold) s->hold = hold0;
++    if (!s->uhold) s->uhold = hold0;
++    int gpu_on = s->gpu_on; double gpu = s->gpu; s->gpu_on = 0; s->gpu = 0;   // cleared on every return
+     if (fixed > 0) {   // the game's own step: speed is right by construction, nothing to pay back
+         s->k = s->step = fixed < smax ? fixed : smax;
+-        s->debt = 0; s->late_run = s->fit_run = s->trial = s->probe = s->grace = s->tpend = 0; s->run = 0;
++        s->debt = 0; s->late_run = s->ilate_run = s->fit_run = s->trial = s->probe = s->grace = s->tpend = 0; s->run = 0; s->fine = 0;
+         s->kmin = FSTEP_MAX + 1;   // when it ends, k starts again from kmin
+         return s->step;
+     }
+@@ -127,18 +155,23 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
+     if (s->tpend && s->tsince >= hold_max) { s->tpend = 0; s->hold = hold0; }   // the trial's run lasted
+     int cap_probe = kmin < s->kmin && s->kmin <= FSTEP_MAX && s->k > kmin;
+     if (cap_probe) {   // the cap rose: a probe at once, whose grace covers the clocks still set for the longer hold
+-        s->k = kmin; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
++        s->k = kmin; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->uprobe = 0; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = s->ilate_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
+     } else if (kmin < s->kmin || s->k < kmin) s->k = kmin;   // the game's own step ended, or the cap fell
+     if (s->k > kmax) s->k = kmax;
+     s->kmin = kmin;
+     int scr = s->screen; s->screen = 0;
++    int idle = gpu_on && gpu < FSTEP_GPU_IDLE;   // nothing drawn: a late frame is load or startup work, not the scene's cost
+     int late = scr ? scr == 2 : shown > held + FSTEP_LATE + s->shown_slack || cost > held + FSTEP_LATE, grace = s->grace > 0;
+     if (grace && !cap_probe) {   // the completed frame at the old cap does not consume the new hold's grace
+         if (s->grace > FSTEP_GRACE / 2) s->pa += cost; else s->pb += cost;
+         s->plate += late; s->ptotal++;
+         if (!--s->grace && s->ramp && s->plate && s->ptotal + FSTEP_GRACE <= FSTEP_PROBE_MAX && s->pb <= (1 - FSTEP_RAMP) * s->pa) { s->grace = FSTEP_GRACE; s->pa = s->pb = 0; s->plate = 0; }   // still getting cheaper: another window
+     }
+-    if (late) { s->late++; s->late_run = grace ? 0 : s->late_run + 1; s->fit_run = 0; } else s->late_run = 0;
++    // A late frame with the GPU idle neither counts toward the 3 nor ends their run; FSTEP_RUN late frames in a row step up whatever the GPU (a CPU-heavy scene, not a load)
++    if (late) { s->late++; s->late_run = grace ? 0 : s->late_run + !idle; s->ilate_run = grace ? 0 : s->ilate_run + 1; s->fit_run = 0; } else s->late_run = s->ilate_run = 0;
++    // The frame waited for nothing in the host's pacing while held longer than kmin, and its GPU time fits a shorter hold: the hold is not what the GPU needs (nvn_fstep_unpaced)
++    // (k − 1, not kmin: the GPU clock falls at a longer hold, so a GPU that fits kmin there may read above it; a GPU that really needs the hold fails the probe)
++    s->urun = held > kmin && s->k == held && gpu_on && gpu <= FSTEP_FIT * (held - 1) && cost >= shown - FSTEP_LATE ? s->urun + 1 : 0;
+     // The cost of the frames on time (a hitch is not what the scene costs): at kmin, and at the longer hold
+     if (kmin != s->ckmin) {   // another cap: its run starts over, and what held it before comes back
+         if (s->ckmin >= 1 && s->ckmin <= FSTEP_MAX) {
+@@ -161,24 +194,31 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
+     // around it the next three late frames stepped to 30 for a second (Mario Kart World on an M4 Max, 43-68 ms stalls; issue #1823)
+     double omax = 0; for (int i = 0; i < FSTEP_RUN; i++) if (s->over[i] > omax) omax = s->over[i];
+     int short_of_k = scr || s->no_payback || s->over_sum - omax > FSTEP_LATE * FSTEP_RUN;
+-    if (s->late_run >= 3 && s->k < kmax && short_of_k) {   // step up to the cost of the cheapest of the three late frames, at least one vsync
++    if ((s->late_run >= 3 || s->ilate_run >= FSTEP_RUN) && s->k < kmax && short_of_k) {   // step up to the cost of the cheapest of the three late frames, at least one vsync
+         double c3 = s->last_cost[0] < s->last_cost[1] ? s->last_cost[0] : s->last_cost[1]; if (s->last_cost[2] < c3) c3 = s->last_cost[2];
+         int want = (int)ceil(c3 - 0.05);
+         if (want < s->k + 1) want = s->k + 1;
+         if (want > kmax) want = kmax;
+-        if (s->trial || s->tpend || (s->probe == 2 && s->since < hold_max)) { s->failed++; s->trial = 0; s->hold = s->hold * 2 < hold_max ? s->hold * 2 : hold_max; }
+-        else if (s->probe == 2) s->hold = hold0;   // the probe's run at kmin lasted
+-        if (held == kmin && s->run >= hold_max) s->cref = s->crun;   // kmin held 8 s at this cost
+-        s->k = want; s->ups++; s->late_run = s->fit_run = 0; s->since = 0; s->probe = 0; s->tpend = 0;
++        if (s->trial || s->tpend || (s->probe == 2 && s->since < hold_max)) {
++            s->failed++; s->trial = 0; s->hold = s->hold * 2 < hold_max ? s->hold * 2 : hold_max;
++            if (s->uprobe) s->uhold = s->uhold * 2 < uhold_max ? s->uhold * 2 : uhold_max;   // a CPU that needs the hold: probed ever more rarely
++        } else if (s->probe == 2) s->hold = s->uhold = hold0;   // the probe's run at kmin lasted
++        if (held == kmin && s->run >= hold_max) { s->cref = s->crun; s->uhold = hold0; }   // kmin held 8 s at this cost
++        s->up_idle = s->late_run < 3;
++        s->k = want; s->ups++; s->late_run = s->ilate_run = s->fit_run = s->urun = 0; s->since = 0; s->probe = s->uprobe = 0; s->tpend = 0;
+     } else if (s->trial && !grace && !--s->trial) { if (s->probe) { s->probe = 2; s->since = 0; } else { s->tpend = 1; s->tsince = 0; } }   // the trial held: its run is judged by how long it lasts
+     // A frame also fits k − 1 while the running mean of this hold's frames on time does: single frames over the fit among frames under it are
+     // what the shorter hold absorbs, and they kept the trial from ever starting (Ocarina of Time on a Mac after a load's late frames: 13.4 ms of GPU work at hold 2 with one
+     // frame in 20 over 14.2 ms, 30 fps for the rest of the scene where 60 had held; 22 ms at hold 3 under a lowered GPU clock with frames of 29–44 ms, 20 fps for 25 s)
+     double fitc = s->ck == s->k && s->cn && s->ccur < cost ? s->ccur : cost;
++    // Late at the longest hold allowed: shown at the next vsync, as the hold cannot rise (fine above)
++    if (s->k >= kmax && (s->late_run >= 3 || s->ilate_run >= FSTEP_RUN)) { if (!s->fine) s->fines++; s->fine = 1; s->fine_ok = 0; }
++    else if (s->fine) { s->fine_ok = late && !idle ? 0 : s->fine_ok + shown; if (s->k < kmax || s->fine_ok >= hold_max) s->fine = 0; }
+     if (!late) s->fit_run = s->k > kmin && fitc <= FSTEP_FIT * (s->k - 1) ? s->fit_run + 1 : 0;
+     if (s->fit_run >= FSTEP_RUN && s->since >= s->hold && !s->trial) { s->k--; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
+-    else if ((slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
+-        s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
++    else if ((slow || nvn_fstep_same(s) || (nvn_fstep_unpaced(s) && s->since >= s->uhold)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
++        s->uprobe = !slow && !nvn_fstep_same(s);
++        s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = s->ilate_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;   // urun ends with the next frame at kmin (kept for the caller's log)
+     }
+     if (s->nopay && s->debt > 0) { s->dropped += s->debt; s->debt = 0; }   // no payback: the time lost is let go at once, as a console game slows down
+     s->step = s->k + (s->debt >= 1 && s->k < smax);
+diff --git a/dm/gfx/nvn/nvn_mtl.h b/dm/gfx/nvn/nvn_mtl.h
+index d3473f66ac1febd6bf8b3c395d7bd3b42f8b17b7..0a7f37041ee7e30ac9dfd44c8c67ffce3fa27a31 100644
+--- a/dm/gfx/nvn/nvn_mtl.h
++++ b/dm/gfx/nvn/nvn_mtl.h
+@@ -68,5 +68,6 @@ void mtl_ext_tex_release(uint64_t serial);
+ uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]);   // crop: x, y, w, h of the texture to show (NULL = all of it)
+ void mtl_present_layer(uint32_t w, uint32_t h);   // a sized vi layer (hle_vi.c): the picture's shape instead of the display's 16:9
+ void mtl_present_screen(uint32_t w, uint32_t h);   // a screen taller than 16:9 (loader.c, DM_SCREEN_ASPECT): the picture's shape for a texture of that shape
++void mtl_set_fstep_fine(int on);                   // late frames at a 30 fps cap's hold 2 are shown on the 60 Hz link at frame latency 2 (hle_nvn.c fstep_tick)
+ void mtl_present_wait(uint64_t ticket);   // as in nvn_obj.h: wait until that present has been handed to the GPU
+ void mtl_present_wait_texture(uint64_t ticket, uint64_t copy);   // the next acquire of a presented texture, or a queue finish: with a snapshot (copy, from mtl_present) its copy has run on the GPU, else as mtl_present_wait
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 20320208a15ae44a62356e75dbc02bf9c511b6ce..0bb100cb33e0406a301e3498b0d028fe504489d3 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -908,6 +908,47 @@ static void cb_end(id cb, id<MTLResidencySet> also) {
+ // Residency churn by call site (the power line every 300 frames, mtl_res_stats): each commit with changes is a kernel call whose cost grows with what was added or removed
+ enum { RS_SITES = 16 }; static struct { int line; uint64_t n, bytes; } g_rs_site[RS_SITES]; static uint64_t g_rs_rm, g_rs_commits, g_rs_commit_ns;
+ #define res_add(r) res_add_at((r), __LINE__)
++// File pages under a shared buffer that joins the set are wired through the CPU's fault path (mlock) before the commit, and given back after it, when the commit holds them for the GPU.
++// The commit wires an added buffer's pages itself, and pages a file in from the GPU driver's wiring path (IOGPUResourceGroupUpdateResources → the VM → APFS pagein). With the guest's
++// memory in files (DM_GUEST_FILE) on the M1 iPad, that page-in waited for good on an APFS lock held for writing by a launchd thread (its background I/O queue), which itself had stopped
++// 4 ms after it and never ran again: the game froze with sound and no picture (memory.md, "The residency commit froze over the guest's files"). Anonymous memory and Metal's own buffers
++// are not file-backed and are left alone. mlock runs outside g_res_mu so disk page-ins do not stall concurrent res_add / res_remove callers.
++typedef struct { void *p; size_t n; } fwire_t; static fwire_t *g_fwire; static size_t g_nfwire, g_cfwire; static uint64_t g_fwire_n, g_fwire_bytes, g_fwire_ns; static _Atomic uint64_t g_fwire_fail;
++static int range_file_backed(const void *p, size_t n) {
++    vm_address_t a = (vm_address_t)p, e = a + n; natural_t depth = 0;   // vm_region_recurse_64: mach_vm.h is not in the iOS SDK
++    while (a < e) {
++        vm_address_t r = a; vm_size_t sz = 0; vm_region_submap_info_data_64_t info; mach_msg_type_number_t c = VM_REGION_SUBMAP_INFO_COUNT_64;
++        if (vm_region_recurse_64(mach_task_self(), &r, &sz, &depth, (vm_region_recurse_info_t)&info, &c) || !sz || r >= e) return 0;
++        if (info.is_submap) { depth++; continue; }
++        if (info.external_pager) return 1;
++        if (sz >= e - r) break;
++        a = r + sz;
++    }
++    return 0;
++}
++static fwire_t file_wire_prep(id<MTLAllocation> r, uint64_t *ns_out) {
++    id<MTLBuffer> b = (id<MTLBuffer>)r;
++    if (!b.contents) return (fwire_t){NULL, 0};
++    uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)b.contents & ~(pg - 1), hi = ((uintptr_t)b.contents + b.length + pg - 1) & ~(pg - 1);
++    if (!range_file_backed((void *)lo, hi - lo)) return (fwire_t){NULL, 0};
++    uint64_t t0 = commit_now();
++    if (mlock((void *)lo, hi - lo)) {   // the commit pages them in itself, as before
++        if (!atomic_fetch_add(&g_fwire_fail, 1)) MLOG("[RED] residency: file pages under a buffer of %.1f MB could not be wired before the commit (mlock errno %d); the commit pages them in itself", (hi - lo) / 1048576.0, errno);
++        return (fwire_t){NULL, 0};
++    }
++    *ns_out = commit_now() - t0;
++    return (fwire_t){(void *)lo, hi - lo};
++}
++static void file_wire_record(fwire_t fw, uint64_t dt) {   // Caller holds g_res_mu
++    g_fwire_ns += dt; g_fwire_n++; g_fwire_bytes += fw.n;
++    if (g_nfwire == g_cfwire) {   // the list file_unwire undoes; a range it cannot hold is unwired at once (the commit pages it in itself, as before)
++        size_t n = g_cfwire ? 2 * g_cfwire : 64; void *grown = realloc(g_fwire, n * sizeof *g_fwire);
++        if (!grown) { munlock(fw.p, fw.n); return; }
++        g_fwire = grown; g_cfwire = n;
++    }
++    g_fwire[g_nfwire++] = fw;
++}
++static void file_unwire(fwire_t *fw, size_t n) { for (size_t i = 0; i < n; i++) munlock(fw[i].p, fw[i].n); free(fw); }   // a range the game has mapped anew meanwhile fails, harmlessly
+ // Both run on guest threads too (pool_res from mtl_addr, uploads), whose implicit autorelease pools never drain; containsObject: / removeObject: on a weak NSHashTable leave the object
+ // autoreleased in the calling thread's pool (measured in a standalone test: the object outlived its last strong reference until the thread ended), so each has a pool of its own
+ static void res_q_put(id<MTLAllocation> r, int add) {   // Caller holds g_res_mu
+@@ -918,10 +959,27 @@ static void res_add_at(id<MTLAllocation> allocation, int line) { @autoreleasepoo
+     if (!allocation) return;
+     // An indirectly addressed placed texture needs its heap resident. The heap owner below removes it only after the last texture/view has gone.
+     id<MTLAllocation> r = [(id)allocation conformsToProtocol:@protocol(MTLResource)] && ((id<MTLResource>)allocation).heap ? (id)((id<MTLResource>)allocation).heap : allocation;
++    // A shared buffer (a heap never is one) may sit on file pages (DM_GUEST_FILE): wired here, outside g_res_mu, before its change is queued (seedds/nxnative 9143b6ff, by hand on this
++    // tree's res_add_at, which adds the heap in place of a placed resource instead of recursing)
++    int maybe_file = [(id)r conformsToProtocol:@protocol(MTLBuffer)]
++                  && ((id<MTLBuffer>)r).storageMode == MTLStorageModeShared
++                  && ((id<MTLBuffer>)r).length > 0;
++    fwire_t fw = {NULL, 0}; uint64_t fw_ns = 0;
+     pthread_mutex_lock(&g_res_mu);
+     if (!g_res_objects) g_res_objects = [NSHashTable weakObjectsHashTable];
+     if ([g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }   // already resident (a shared texture resolved again): marking the set dirty would cost a commit that changes nothing
++    if (maybe_file) {
++        pthread_mutex_unlock(&g_res_mu);
++        fw = file_wire_prep(r, &fw_ns);   // before its change is queued: the commit that applies the change takes this range with it and gives it back after (res_commit_retiring)
++        pthread_mutex_lock(&g_res_mu);
++        if ([g_res_objects containsObject:r]) {   // another thread added it meanwhile
++            pthread_mutex_unlock(&g_res_mu);
++            if (fw.p) munlock(fw.p, fw.n);
++            return;
++        }
++    }
+     { int k = 0; while (k < RS_SITES - 1 && g_rs_site[k].line && g_rs_site[k].line != line) k++; g_rs_site[k].line = line; g_rs_site[k].n++; g_rs_site[k].bytes += r.allocatedSize; }
++    if (fw.p) file_wire_record(fw, fw_ns);
+     res_q_put(r, 1);
+     [g_res_objects addObject:r];
+     pthread_mutex_unlock(&g_res_mu);
+@@ -1183,6 +1241,7 @@ static void res_commit_retiring(NSArray<id<MTLAllocation>> *staging) { @autorele
+     if (staging) for (id<MTLAllocation> obj in staging) res_remove(obj);
+     pthread_mutex_lock(&g_res_mu);
+     res_op *q = g_res_q; size_t n = g_res_qn; g_res_q = NULL; g_res_qn = g_res_qcap = 0;
++    fwire_t *fw = g_fwire; size_t nfw = g_nfwire; g_fwire = NULL; g_nfwire = g_cfwire = 0;   // the file pages wired for exactly these changes
+     pthread_mutex_unlock(&g_res_mu);
+     uint64_t dt = 0;
+     if (n) {
+@@ -1192,6 +1251,7 @@ static void res_commit_retiring(NSArray<id<MTLAllocation>> *staging) { @autorele
+         dt = commit_now() - t0;
+         pthread_mutex_lock(&g_res_mu); g_rs_commits++; g_rs_commit_ns += dt; pthread_mutex_unlock(&g_res_mu);
+     }
++    file_unwire(fw, nfw);   // after the commit that made those buffers resident; under g_res_commit_mu, so a later commit cannot run before them
+     pthread_mutex_unlock(&g_res_commit_mu);
+     uint64_t slow = n && dt >= g_slow_commit_ns ? slow_commit_log_number(&g_slow_res_commits) : 0;
+     uint64_t adds = 0, removes = 0, added_bytes = 0, removed_bytes = 0;
+@@ -1253,6 +1313,9 @@ void mtl_res_stats(char *out, size_t n) {
+         if (best < 0) break; o += snprintf(out + o, n - o, "%sline %d: %llu, %.0f MB", i ? ", " : "", g_rs_site[best].line, (unsigned long long)g_rs_site[best].n, g_rs_site[best].bytes / 1048576.0); g_rs_site[best].n = 0; }
+     if (o < n) o += snprintf(out + o, n - o, "), removed %llu, %lu allocations in the set (%.0f MB)", (unsigned long long)g_rs_rm, set_n, set_mb);
+     if (o < n) snprintf(out + o, n - o, ", named on %llu command buffers in %.2f ms, longest %.2f ms", (unsigned long long)atomic_exchange(&g_res_names, 0), atomic_exchange(&g_res_name_ns, 0) / 1e6, atomic_exchange(&g_res_name_max, 0) / 1e6);
++    { uint64_t ffail = atomic_load(&g_fwire_fail);
++      if (g_fwire_n + ffail) { o = strlen(out); if (o < n) snprintf(out + o, n - o, ", file-backed buffers wired before their commit %llu, %.0f MB, %.1f ms (refused %llu)", (unsigned long long)g_fwire_n, g_fwire_bytes / 1048576.0, g_fwire_ns / 1e6, (unsigned long long)ffail); }
++      g_fwire_n = g_fwire_bytes = g_fwire_ns = 0; }
+     memset(g_rs_site, 0, sizeof g_rs_site); g_rs_rm = g_rs_commits = g_rs_commit_ns = 0;
+     pthread_mutex_unlock(&g_res_mu);
+ }
+@@ -20168,17 +20231,20 @@ static MTLViewport present_viewport(double pw, double ph, double dw, double dh)
+ }
+ // The shape the picture is shown in, whatever part of the texture it comes from. The Switch's compositor stretches a buffer's crop to the layer, so a crop only picks texels: Super
+ // Mario Galaxy 2 draws its storybook cutscenes anamorphically into 1200x960 of a 1920x1080 swapchain (800x640 handheld). The layer fills the display, 16:9, unless the game sized it
+-// (vi::CreateLayer with a size, hle_vi.c). A screen taller than 16:9 (DM_SCREEN_ASPECT, loader.c) counts only for a texture of its shape: only builds with screen-shape stubs render it.
++// (vi::CreateLayer with a size, hle_vi.c). A screen of another shape than 16:9 (DM_SCREEN_ASPECT, loader.c) counts only for a crop or a texture of its shape: only builds with
++// screen-shape stubs render it. Breath of the Wild presents a whole texture of the taller shape; a game that keeps larger window textures and moves its crop presents a crop of it.
+ static _Atomic uint64_t g_layer_shape, g_screen_shape;   // w | h << 32, 0 = none
+ void mtl_present_layer(uint32_t w, uint32_t h) { atomic_store(&g_layer_shape, (uint64_t)w | (uint64_t)h << 32); }
+ void mtl_present_screen(uint32_t w, uint32_t h) { atomic_store(&g_screen_shape, (uint64_t)w | (uint64_t)h << 32); }
+-static void present_shape(id<MTLTexture> src, double *w, double *h) {
++static void present_shape(id<MTLTexture> src, const int crop[4], double *w, double *h) {
+     uint64_t v = atomic_load(&g_screen_shape);
+-    if (v && fabs(((double)src.width / src.height) / ((double)(uint32_t)v / (double)(v >> 32)) - 1) < 0.01) { *w = src.width; *h = src.height; return; }
++    double sr = v ? (double)(uint32_t)v / (double)(v >> 32) : 0;
++    if (v && crop && crop[2] > 0 && crop[3] > 0 && fabs(((double)crop[2] / crop[3]) / sr - 1) < 0.01) { *w = crop[2]; *h = crop[3]; return; }
++    if (v && fabs(((double)src.width / src.height) / sr - 1) < 0.01) { *w = src.width; *h = src.height; return; }
+     v = atomic_load(&g_layer_shape);
+     *w = v ? (double)(uint32_t)v : 1920; *h = v ? (double)(v >> 32) : 1080;
+ }
+-static MTLViewport present_fit(id<MTLTexture> src, double dw, double dh) { double w, h; present_shape(src, &w, &h); return present_viewport(w, h, dw, dh); }
++static MTLViewport present_fit(id<MTLTexture> src, const int crop[4], double dw, double dh) { double w, h; present_shape(src, crop, &w, &h); return present_viewport(w, h, dw, dh); }
+ // The valid source rectangle of a present (x, y, width, height; the crop of nvnWindowSetCrop, zero = the whole texture); 0 when it lies outside the texture
+ static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r[4]) {
+     r[0] = 0; r[1] = 0; r[2] = src.width; r[3] = src.height;
+@@ -20199,7 +20265,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
+     present_pipeline(dst.pixelFormat);
+     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+     double dw = dst.width, dh = dst.height;
+-    MTLViewport vp = present_fit(src, dw, dh);
++    MTLViewport vp = present_fit(src, crop, dw, dh);
+     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
+     static double last_vp[4];   // Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
+     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
+@@ -20527,7 +20593,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
+     NSUInteger r[4]; if (!present_crop_rect(src, crop, r)) return 0;
+     present_pipeline(dst.pixelFormat);
+     double dw = dst.width, dh = dst.height;
+-    MTLViewport vp = present_fit(src, dw, dh);
++    MTLViewport vp = present_fit(src, crop, dw, dh);
+     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
+     int flipped = atomic_load_explicit(&g_origin_ll, memory_order_relaxed), wrote = 0;
+     static int direct_ok = -1; if (direct_ok < 0) { const char *e = getenv("DM_FX_DIRECT"); direct_ok = !(e && !strcmp(e, "0")); }
+@@ -20641,7 +20707,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     if (!src) { RED_ONCE(8, "present texture could not get an MTLTexture"); return 0; }
+     // The picture's shape for the front end's layout (front.h front_picture_shape): reported when its width / height changes by more than 0.1 %, not on a size change of the same
+     // shape (1280x720 handheld, 1920x1080 docked)
+-    { static double last; double w, h; present_shape(src, &w, &h); double a = w / h;
++    { static double last; double w, h; present_shape(src, crop, &w, &h); double a = w / h;
+       if (fabs(a - last) > last * 0.001) { last = a; MLOG("present: picture shape %.0fx%.0f (%.3f:1) for the front end's layout", w, h, a); front_picture_shape((int)w, (int)h); } }
+     // A texture made on first resolution joins the residency set (res_add), which a submission commits; a window texture presented before any submission has used it was still
+     // outside the committed set when the display command buffer sampled it. Super Smash Bros. Ultimate presents its window texture in its first frames before drawing into it:
+@@ -21058,9 +21124,16 @@ static CAFrameRateRange link_range(int mode) {
+ // and why a fixed-rate screen still has about 20 ms more presentation delay with the link at either latency, remain open (docs/reference/frame-rate.md)
+ __attribute__((weak)) int front_fullscreen(void) { return 0; }   // front_mac.m; graphics unit tests and iOS have none
+ __attribute__((weak)) int front_screen_variable_refresh(void) { return 0; }   // front_mac.m; graphics unit tests and iOS have none
++// Latency 2 also while the automatic 60 Hz link shows the late frames of a 30 fps cap at the next vsync (hle_nvn.c fstep_tick, mtl_set_fstep_fine): at latency 1 it calls back
++// 16.5 ms before the target time and takes a frame whose GPU work is still running, so on a ProMotion screen the present lands one 120 Hz refresh late and the link skips its next
++// tick; the acquire, which counts ticks, then held each frame 50 ms (Ocarina of Time's title on an M1 iPad: 40 ms frames, 25 → 20 fps) or the screen showed them 33 / 38 / 42 ms
++// apart. Latency 2 is the 33 ms lead the 30 Hz link has at latency 1, so the input lag is that of the cap's own link. An explicit DM_PRESENT_LINK keeps its own latency policy.
++static _Atomic int g_fstep_fine;
++void mtl_set_fstep_fine(int on) { atomic_store(&g_fstep_fine, on != 0); }
++static int link_fine_lat(void) { return !g_present_link_env && atomic_load(&g_fstep_fine); }
+ // CAMetalDisplayLink accepts only 1 or 2. Compare its readback with the supported request, or an oversized override rewrites and logs every frame.
+-static int link_latency(void) { return g_present_latency > 0 ? MIN(g_present_latency, 2) : front_fullscreen() && front_screen_variable_refresh() ? 2 : 1; }
+-static const char *link_latency_why(void) { return g_present_latency > 0 ? "DM_PRESENT_LATENCY" : !front_fullscreen() ? "window" : front_screen_variable_refresh() ? "fullscreen, variable refresh" : "fullscreen, fixed refresh"; }
++static int link_latency(void) { return g_present_latency > 0 ? MIN(g_present_latency, 2) : (front_fullscreen() && front_screen_variable_refresh()) || link_fine_lat() ? 2 : 1; }
++static const char *link_latency_why(void) { return g_present_latency > 0 ? "DM_PRESENT_LATENCY" : link_fine_lat() ? "late frames of a 30 fps cap at the next vsync" : !front_fullscreen() ? "window" : front_screen_variable_refresh() ? "fullscreen, variable refresh" : "fullscreen, fixed refresh"; }
+ // The 30 Hz link at a 30 fps target, except in fullscreen on a fixed-rate screen. There the link skipped ticks: Ocarina of Time at a 30 fps cap on a MacBook Air M4 (60 Hz) got
+ // 16.5-25 callbacks a second over stretches of 300 frames, also on frames with under 1 ms of GPU, and each skipped tick kept a frame on screen 66.7 ms (a 180 s walk: 388 and 996
+ // frames over 50 ms; 3-4 in a window, where the same link held 30.0). Why is open (docs/reference/frame-rate.md). The 60 Hz link paces the 30 through the present interval, as it
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+index 269e719652f80900a7044a0c5d6349ef64a4d70e..afbdb8b7a139b5656ebe80f58297fb5b7fcac077 100644
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -260,7 +260,9 @@ t_tex_fit_root: t_tex_fit_root.m $(MTL_T_DEP)
+ check_t_tex_fit_root: t_tex_fit_root
+ 	MTL_DEBUG_LAYER=1 ./t_tex_fit_root
+ t_addr_known: t_addr_known.m $(MTL_T_DEP)
+-	clang $(CFLAGS) -fobjc-arc -o $@ t_addr_known.m $(MTL_T_SRC) $(FW)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_addr_known.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
++t_file_wire: t_file_wire.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_file_wire.m $(MTL_T_SRC) $(FW)
+ t_vbuf_clamp: t_vbuf_clamp.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_vbuf_clamp.m $(MTL_T_SRC) $(FW)
+ t_present_keep: t_present_keep.m $(MTL_T_DEP)
+diff --git a/dm/gfx/tests/t_addr_known.m b/dm/gfx/tests/t_addr_known.m
+index 15994d41b7c6ea6b0e60979d048ee55aa461bc15..271701336627af7d1c006ee30e7ac0d0fa4d28cd 100644
+--- a/dm/gfx/tests/t_addr_known.m
++++ b/dm/gfx/tests/t_addr_known.m
+@@ -1,7 +1,13 @@
+ // mtl_addr_known answers whether a range lies in one memory pool as mtl_addr finds it, with no side effect: hle_nvn.c keys_hash asks it whether a shader's code is mapped, and
+ // through mtl_addr every pool holding shader code went into the residency set though the GPU never reads it (docs/reference/memory.md). A large pool (BIG_MIN or more)
+ // is answered from its range: its lookup would make a chunk buffer over the range
++#define nvn_game_fps nvn_game_fps_mtl_default
+ #include "../nvn/nvn_mtl.m"
++#undef nvn_game_fps
++#define g_ft g_ft_hle
++#include "../nvn/hle_nvn.c"
++#undef g_ft
++uint64_t g_t0_ns;
+ void *front_metal_layer(void) { return NULL; }
+ module_t *module_of(const void *p) { (void)p; return NULL; }
+ module_t *g_mod; int g_nmod;
+@@ -41,6 +47,45 @@ int main(void) { @autoreleasepool {
+     CHECK("asking makes no chunk and nothing resident", g_npool == np0 && g_pool_res_n == rb0);
+     CHECK("mtl_addr makes a chunk for the same range", mtl_addr(bb + (100u << 20), 4096, &mb, &mo) && g_npool == np0 + 1);
+     mtl_pool_del(big);
++
++    // The raw pool table (gmem_map) and shader-code pools: nvnMemoryPoolGetBufferAddress on a non-virtual SHADER_CODE pool keeps it out of the table, so nothing makes it
++    // resident and wires its pages for the table's sake; a buffer made in it (nvnBufferInitialize) puts it in, as does any other pool's own address
++    PFNNVNDEVICEGETPROCADDRESSPROC get = (PFNNVNDEVICEGETPROCADDRESSPROC)h_nvnBootstrapLoader("nvnDeviceGetProcAddress");
++    PFNNVNMEMORYPOOLBUILDERSETDEFAULTSPROC pb_def = (PFNNVNMEMORYPOOLBUILDERSETDEFAULTSPROC)get(NULL, "nvnMemoryPoolBuilderSetDefaults");
++    PFNNVNMEMORYPOOLBUILDERSETSTORAGEPROC pb_sto = (PFNNVNMEMORYPOOLBUILDERSETSTORAGEPROC)get(NULL, "nvnMemoryPoolBuilderSetStorage");
++    PFNNVNMEMORYPOOLBUILDERSETFLAGSPROC pb_flg = (PFNNVNMEMORYPOOLBUILDERSETFLAGSPROC)get(NULL, "nvnMemoryPoolBuilderSetFlags");
++    PFNNVNMEMORYPOOLINITIALIZEPROC pool_init = (PFNNVNMEMORYPOOLINITIALIZEPROC)get(NULL, "nvnMemoryPoolInitialize");
++    PFNNVNMEMORYPOOLFINALIZEPROC pool_fin = (PFNNVNMEMORYPOOLFINALIZEPROC)get(NULL, "nvnMemoryPoolFinalize");
++    PFNNVNMEMORYPOOLGETBUFFERADDRESSPROC pool_addr = (PFNNVNMEMORYPOOLGETBUFFERADDRESSPROC)get(NULL, "nvnMemoryPoolGetBufferAddress");
++    PFNNVNBUFFERBUILDERSETDEFAULTSPROC bb_def = (PFNNVNBUFFERBUILDERSETDEFAULTSPROC)get(NULL, "nvnBufferBuilderSetDefaults");
++    PFNNVNBUFFERBUILDERSETSTORAGEPROC bb_sto = (PFNNVNBUFFERBUILDERSETSTORAGEPROC)get(NULL, "nvnBufferBuilderSetStorage");
++    PFNNVNBUFFERINITIALIZEPROC buf_init = (PFNNVNBUFFERINITIALIZEPROC)get(NULL, "nvnBufferInitialize");
++    PFNNVNBUFFERFINALIZEPROC buf_fin = (PFNNVNBUFFERFINALIZEPROC)get(NULL, "nvnBufferFinalize");
++    uint8_t *code = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0), *data = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
++    if (code == MAP_FAILED || data == MAP_FAILED) abort();
++    uint64_t cb = (uint64_t)(uintptr_t)code, db = (uint64_t)(uintptr_t)data;
++    NVNmemoryPoolBuilder pb; NVNmemoryPool cp, dp;
++    pb_def(&pb); pb_sto(&pb, code, n);
++    pb_flg(&pb, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED | NVN_MEMORY_POOL_FLAGS_SHADER_CODE);
++    CHECK("shader-code pool initializes", pool_init(&cp, &pb));
++    pb_sto(&pb, data, n);
++    pb_flg(&pb, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED);
++    CHECK("data pool initializes", pool_init(&dp, &pb));
++    CHECK("shader-code pool returns its own address", pool_addr(&cp) == cb);
++    CHECK("data pool returns its own address", pool_addr(&dp) == db);
++    #define IN_TABLE(b) ({ id<MTLBuffer> t_ = gmem_map(); const uint8_t *e_ = (const uint8_t *)t_.contents; int in_ = 0; \
++        for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES && !in_; k++) { uint64_t r_[2]; memcpy(r_, e_ + (size_t)k * DMSH_GMEM_MAP_ENTRY, sizeof r_); in_ = r_[0] <= (b) && (b) < r_[1]; } in_; })
++    CHECK("a shader-code pool's own address keeps it out of the raw pool table", !IN_TABLE(cb + 4096));
++    CHECK("so the table makes it not resident", !pool_resident(cb));
++    CHECK("another pool's address puts it in the table", IN_TABLE(db + 4096));
++    CHECK("and makes it resident", pool_resident(db));
++    NVNbufferBuilder bbld; NVNbuffer cbuf;
++    bb_def(&bbld); bb_sto(&bbld, &cp, 8192, 4096);
++    CHECK("buffer in shader-code pool initializes", buf_init(&cbuf, &bbld));
++    CHECK("a buffer in the shader-code pool puts it in the table", IN_TABLE(cb + 4096));
++    CHECK("and makes it resident", pool_resident(cb));
++    buf_fin(&cbuf); pool_fin(&cp); pool_fin(&dp);
++    munmap(code, n); munmap(data, n);
+     printf("t_addr_known: %d checks, %d failed\n", checks, failed);
+     return failed != 0;
+ } }
+diff --git a/dm/gfx/tests/t_file_wire.m b/dm/gfx/tests/t_file_wire.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa2ea8e0e4510c5cf57b6bc22edc88468b59540d
+--- /dev/null
++++ b/dm/gfx/tests/t_file_wire.m
+@@ -0,0 +1,98 @@
++// File pages under a shared buffer joining the residency set are wired by mlock before the commit (res_add) and unwired right after it (res_commit), when the commit holds
++// them for the GPU. With the guest's memory in files (DM_GUEST_FILE) the commit itself paged the file in from the GPU driver's wiring path, and on the M1 iPad that page-in
++// waited for good on an APFS lock held by a launchd thread, itself waiting: the game froze with sound and no picture (docs/reference/memory.md, "The residency commit froze over
++// the guest's files"). Anonymous memory is not touched; mlock runs outside g_res_mu, so concurrent res_add callers racing on the same buffer balance their locks cleanly.
++#include "../nvn/nvn_mtl.m"
++#include <mach/mach_vm.h>
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(label, c) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
++// The smallest and largest user wiring count over [p, p + n)
++static void wired(const void *p, size_t n, unsigned *lo, unsigned *hi) {
++    mach_vm_address_t a = (mach_vm_address_t)p, e = a + n; *lo = ~0u; *hi = 0;
++    while (a < e) {
++        mach_vm_size_t sz = 0; natural_t depth = 0; vm_region_submap_info_data_64_t info; mach_msg_type_number_t c = VM_REGION_SUBMAP_INFO_COUNT_64;
++        if (mach_vm_region_recurse(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &c) || !sz || a >= e) break;
++        if (info.user_wired_count < *lo) *lo = info.user_wired_count;
++        if (info.user_wired_count > *hi) *hi = info.user_wired_count;
++        if (sz >= e - a) break;
++        a += sz;
++    }
++}
++static int all_resident(const void *p, size_t n) {
++    size_t pg = getpagesize(), np = n / pg; char *v = malloc(np); int ok = v && !mincore(p, n, v);
++    for (size_t i = 0; ok && i < np; i++) ok = (v[i] & MINCORE_INCORE) != 0;
++    free(v); return ok;
++}
++static int in_set(id<MTLAllocation> b) { pthread_mutex_lock(&g_res_mu); int r = [g_res_objects containsObject:b]; pthread_mutex_unlock(&g_res_mu); return r; }
++static void *race_add(void *arg) { res_add((__bridge id<MTLAllocation>)arg); return NULL; }
++int main(void) { @autoreleasepool {
++    mtl_init();
++    size_t pg = getpagesize(), n = 256 * pg;
++    char path[] = "/tmp/t_file_wire.XXXXXX"; int fd = mkstemp(path); if (fd < 0) abort(); unlink(path);
++    if (ftruncate(fd, (off_t)n)) abort();
++    uint8_t *m = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0); if (m == MAP_FAILED) abort();
++    memset(m, 0x5a, n / 2);   // half written, half holes
++    msync(m, n, MS_SYNC); msync(m, n, MS_INVALIDATE);   // written out and dropped: the next touch is a page-in
++    mprotect(m + 16 * pg, 16 * pg, PROT_READ);   // as the write tracking leaves a texture's pages
++    unsigned lo, hi;
++
++    id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:m length:n options:MTLResourceStorageModeShared deallocator:nil];
++    res_add(b);
++    wired(m, n, &lo, &hi);
++    CHECK("the file pages are user-wired once res_add returns, before the commit", lo == 1 && hi == 1);
++    CHECK("and resident: the commit has nothing to page in", all_resident(m, n));
++    CHECK("the buffer is in the set", in_set(b));
++    res_commit();
++    wired(m, n, &lo, &hi);
++    CHECK("the commit gives the user wiring back", lo == 0 && hi == 0);
++    CHECK("the bytes are the file's", m[0] == 0x5a && m[n - 1] == 0);
++
++    // Wiring someone else holds over the range is left as it was (mlock counts)
++    mlock(m, 8 * pg);
++    id<MTLBuffer> b2 = [g_dev newBufferWithBytesNoCopy:m length:n options:MTLResourceStorageModeShared deallocator:nil];
++    res_add(b2); res_commit();
++    wired(m, 8 * pg, &lo, &hi);
++    CHECK("an mlock taken outside stays", lo == 1 && hi == 1);
++    munlock(m, 8 * pg);
++
++    // Added twice before one commit: wired once, given back once
++    id<MTLBuffer> b3 = [g_dev newBufferWithBytesNoCopy:m + 128 * pg length:64 * pg options:MTLResourceStorageModeShared deallocator:nil];
++    res_add(b3); res_add(b3);
++    wired(m + 128 * pg, 64 * pg, &lo, &hi);
++    CHECK("a second res_add of a buffer in the set wires nothing more", lo == 1 && hi == 1);
++    res_commit();
++    wired(m + 128 * pg, 64 * pg, &lo, &hi);
++    CHECK("and the commit leaves nothing wired", lo == 0 && hi == 0);
++
++    // Concurrent res_add on the same file-backed buffer: unlocked mlock races balance cleanly
++    id<MTLBuffer> b4 = [g_dev newBufferWithBytesNoCopy:m + 192 * pg length:64 * pg options:MTLResourceStorageModeShared deallocator:nil];
++    pthread_t th[4];
++    for (int i = 0; i < 4; i++) pthread_create(&th[i], NULL, race_add, (__bridge void *)b4);
++    for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
++    wired(m + 192 * pg, 64 * pg, &lo, &hi);
++    CHECK("concurrent res_add leaves one user wire before the commit", lo == 1 && hi == 1);
++    res_commit();
++    wired(m + 192 * pg, 64 * pg, &lo, &hi);
++    CHECK("and the commit leaves nothing wired after concurrent res_add", lo == 0 && hi == 0);
++
++    // Anonymous memory: no wiring at all
++    uint8_t *a = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (a == MAP_FAILED) abort();
++    id<MTLBuffer> ab = [g_dev newBufferWithBytesNoCopy:a length:n options:MTLResourceStorageModeShared deallocator:nil];
++    res_add(ab);
++    wired(a, n, &lo, &hi);
++    CHECK("an anonymous range is not wired by res_add", hi == 0);
++    res_commit();
++    id<MTLBuffer> own = [g_dev newBufferWithLength:n options:MTLResourceStorageModeShared];
++    res_add(own); res_commit();
++    CHECK("a buffer Metal allocated goes in as before", in_set(own));
++
++    res_remove(b); res_remove(b2); res_remove(b3); res_remove(b4); res_remove(ab); res_remove(own); res_commit();
++    munmap(m, n); munmap(a, n); close(fd);
++    printf("t_file_wire: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }
+diff --git a/dm/gfx/tests/t_fstep.c b/dm/gfx/tests/t_fstep.c
+index 865d79e25381e28cfc426c02a4535fc35fe55ed4..d53cc5f3c31706c8972cde6169a28d26932d83a9 100644
+--- a/dm/gfx/tests/t_fstep.c
++++ b/dm/gfx/tests/t_fstep.c
+@@ -547,6 +547,52 @@ int main(void) {
+         pw = 3; check(nvn_fstep_drain_cut(40, 17, 9, 0, &pw) == 37 && pw == 0, "a drain counted no larger than the pacing wait it was part of");
+         pw = 0; check(nvn_fstep_drain_cut(0, 17, 0, 5, &pw) == 0, "the first frame (no previous start): nothing to cut");
+     }
++    {   // Idle-GPU late frames (#1942): a warm-start progress screen (GPU 0.02 vsyncs) with 10 late frames does not step up, while FSTEP_RUN (30) late frames in a row still step up
++        sim m = {0}; run(&m, 60, 0.5, 1, 3, 0);
++        for (int i = 0; i < 10; i++) { m.s.gpu_on = 1; m.s.gpu = 0.02; run(&m, 1, 2.5, 1, 3, 0); }
++        check(m.s.k == 1 && m.s.ups == 0, "idle GPU (0.02 vsyncs): 10 late frames on a progress screen keep hold 1");
++        for (int i = 0; i < FSTEP_RUN; i++) { m.s.gpu_on = 1; m.s.gpu = 0.02; run(&m, 1, 2.5, 1, 3, 0); }
++        check(m.s.k > 1 && m.s.ups == 1 && m.s.up_idle == 1, "idle GPU: FSTEP_RUN late frames in a row still step up (CPU-heavy scene)");
++    }
++    {   // Unpaced hold probe (#1942): a game that waits outside acquire shows cost == shown == hold at hold 3 while GPU fits k - 1 (0.75 vsyncs); probe brings it back to hold 1
++        sim m = {0}; run(&m, 60, 0.5, 1, 3, 0);
++        for (int i = 0; i < 10; i++) { m.s.gpu_on = 1; m.s.gpu = 2.5; run(&m, 1, 2.5, 1, 3, 0); }
++        int at3 = m.s.k == 3;
++        for (int i = 0; i < 300; i++) {
++            double k = m.s.k; double w = k == 1 ? 0.75 : k;   // at hold 3, game's own wait makes cost == shown == 3, GPU 0.75
++            m.s.gpu_on = 1; m.s.gpu = 0.75; run(&m, 1, w, 1, 3, 0);
++        }
++        check(at3 && m.s.k == 1 && m.s.probes >= 1 && m.s.failed == 0, "unpaced hold at hold 3 with GPU 0.75: unpaced probe returns to hold 1");
++    }
++    {   // Unpaced hold probe on a genuinely CPU-bound game (CPU needs hold 2 even when probed): uhold backs off up to FSTEP_UHOLD_MAX (60 s)
++        sim m = {0}; run(&m, 60, 0.5, 1, 3, 0);
++        for (int i = 0; i < 10; i++) { m.s.gpu_on = 1; m.s.gpu = 0.5; run(&m, 1, 1.8, 1, 3, 0); }
++        int at2 = m.s.k == 2;
++        for (int i = 0; i < 6000; i++) {
++            double w = m.s.k == 1 ? 1.8 : 2.0;   // CPU really needs 1.8 vsyncs, GPU is only 0.5
++            m.s.gpu_on = 1; m.s.gpu = 0.5; run(&m, 1, w, 1, 3, 0);
++        }
++        check(at2 && m.s.k == 2 && m.s.failed >= 2 && m.s.uhold > FSTEP_HOLD_MAX, "unpaced probe when CPU really needs hold 2: uhold doubles past 8 s toward 60 s");
++    }
++    {   // Late frames at a 30 fps cap's hold 2 (kmin == kmax == 2): 3 late frames set fine (60 Hz link at next vsync); 8 s on time clears it; fixed step or cap rise clears it
++        sim m = {0}; run(&m, 60, 1.5, 2, 2, 0);
++        check(m.s.k == 2 && !m.s.fine && m.s.fines == 0, "30 fps cap on time: fine stays off");
++        for (int i = 0; i < 3; i++) { m.s.gpu_on = 1; m.s.gpu = 2.0; run(&m, 1, 2.2, 2, 2, 0); }
++        check(m.s.k == 2 && m.s.fine == 1 && m.s.fines == 1, "30 fps cap, 3 late frames at hold 2: fine turns on");
++        // An idle-GPU late frame does not reset fine_ok; 8 s (480 vsyncs = 240 frames at hold 2) on time ends fine
++        for (int i = 0; i < 250; i++) { m.s.gpu_on = 1; m.s.gpu = 1.5; run(&m, 1, 1.5, 2, 2, 0); }
++        check(m.s.fine == 0 && m.s.fines == 1, "30 fps cap, 8 s with no late frame: fine turns off");
++        // Re-enter fine, then fixed step clears it
++        for (int i = 0; i < 3; i++) { m.s.gpu_on = 1; m.s.gpu = 2.0; run(&m, 1, 2.2, 2, 2, 0); }
++        int was_fine = m.s.fine == 1 && m.s.fines == 2;
++        run(&m, 1, 1.5, 2, 2, 2);
++        check(was_fine && m.s.fine == 0, "30 fps cap: a game-fixed step clears fine");
++        // Re-enter fine, then raising the cap (kmax > k) clears it
++        for (int i = 0; i < 3; i++) { m.s.gpu_on = 1; m.s.gpu = 2.0; run(&m, 1, 2.2, 2, 2, 0); }
++        int was_fine2 = m.s.fine == 1;
++        run(&m, 1, 1.5, 1, 3, 0);
++        check(was_fine2 && m.s.fine == 0, "30 fps cap: raising the cap clears fine");
++    }
+     printf("== %d checks, %d failed ==\n", checks, fail);
+     return fail != 0;
+ }
+diff --git a/dm/gfx/tests/t_present_crop.m b/dm/gfx/tests/t_present_crop.m
+index 17ee296587fd7ede2687ba2662e79b0e2db4f261..3a496729895190af21f94f08c94e51f7ce566b46 100644
+--- a/dm/gfx/tests/t_present_crop.m
++++ b/dm/gfx/tests/t_present_crop.m
+@@ -299,7 +299,7 @@ int main(void) { @autoreleasepool {
+         for(int y=0;y<TH;y++)for(int x=0;x<TW;x++)memcpy(sp+4*(y*TW+x),colors[x>=crop54[2]||y>=crop54[3]],4);
+         [sw replaceRegion:MTLRegionMake2D(0,0,TW,TH) mipmapLevel:0 withBytes:sp bytesPerRow:TW*4];free(sp);res_add(sw);res_commit();
+         double sa,sb;
+-        mtl_present_layer(0,0);present_shape(sw,&sa,&sb);EXPECT("no sized layer: the display's width",1920,(int)sa);EXPECT("no sized layer: the display's height",1080,(int)sb);
++        mtl_present_layer(0,0);present_shape(sw,NULL,&sa,&sb);EXPECT("no sized layer: the display's width",1920,(int)sa);EXPECT("no sized layer: the display's height",1080,(int)sb);
+         for(int m4=0;m4<2;m4++) {
+             int outH[2]={H,40};   // 16:9 fills; a 16:10 canvas keeps the bars above and below
+             for(int k=0;k<2;k++) {
+@@ -313,12 +313,28 @@ int main(void) { @autoreleasepool {
+                 EXPECT(k?"5:4 crop on a 16:10 canvas: 16:9 of red, black above and below":"5:4 crop on a 16:9 canvas: all red, no side bars",0,bad);free(o);res_remove(ot);
+             }
+         }
+-        mtl_present_layer(4,3);present_shape(sw,&sa,&sb);EXPECT("a sized layer gives its own shape",4*(int)sb,3*(int)sa);mtl_present_layer(0,0);
++        mtl_present_layer(4,3);present_shape(sw,NULL,&sa,&sb);EXPECT("a sized layer gives its own shape",4*(int)sb,3*(int)sa);mtl_present_layer(0,0);
+         MTLTextureDescriptor *td2=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1920 height:1344 mipmapped:NO];td2.storageMode=MTLStorageModePrivate;td2.usage=MTLTextureUsageShaderRead;
+         id<MTLTexture> tall=[g_dev newTextureWithDescriptor:td2];
+-        present_shape(tall,&sa,&sb);EXPECT("a taller texture without DM_SCREEN_ASPECT: 16:9",1080,(int)sb);
+-        mtl_present_screen(1920,1344);present_shape(tall,&sa,&sb);EXPECT("DM_SCREEN_ASPECT: a texture that follows it keeps the taller shape",1344,(int)sb);
+-        present_shape(sw,&sa,&sb);EXPECT("DM_SCREEN_ASPECT: a 16:9 texture of a build without stubs stays 16:9",1080,(int)sb);mtl_present_screen(0,0);
++        present_shape(tall,NULL,&sa,&sb);EXPECT("a taller texture without DM_SCREEN_ASPECT: 16:9",1080,(int)sb);
++        mtl_present_screen(1920,1344);present_shape(tall,NULL,&sa,&sb);EXPECT("DM_SCREEN_ASPECT: a texture that follows it keeps the taller shape",1344,(int)sb);
++        present_shape(sw,NULL,&sa,&sb);EXPECT("DM_SCREEN_ASPECT: a 16:9 texture of a build without stubs stays 16:9",1080,(int)sb);
++        // A crop whose ratio matches the screen shape takes that shape inside a larger swapchain texture; a crop of another shape stays 16:9
++        const int wide[4]={0,0,64,29}, tallc[4]={0,0,48,36};   // ~2.21:1 and 4:3 inside 64x36
++        mtl_present_screen(2207,1000);present_shape(sw,wide,&sa,&sb);EXPECT("DM_SCREEN_ASPECT: a matching wider crop gives its width",64,(int)sa);EXPECT("DM_SCREEN_ASPECT: a matching wider crop gives its height",29,(int)sb);
++        present_shape(sw,tallc,&sa,&sb);EXPECT("DM_SCREEN_ASPECT: a non-matching crop stays 16:9",1080,(int)sb);
++        mtl_present_screen(4,3);present_shape(sw,tallc,&sa,&sb);EXPECT("DM_SCREEN_ASPECT: a matching taller crop gives its width",48,(int)sa);EXPECT("DM_SCREEN_ASPECT: a matching taller crop gives its height",36,(int)sb);
++        mtl_present_screen(5,4);
++        for(int m4=0;m4<2;m4++) {
++            MTLTextureDescriptor *od=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:40 height:32 mipmapped:NO];od.storageMode=MTLStorageModeShared;od.usage=MTLTextureUsageRenderTarget;
++            id<MTLTexture> ot=[g_dev newTextureWithDescriptor:od];res_add(ot);res_commit();
++            if(m4){EXPECT("Metal 4 present of a matching 5:4 crop",1,present_offscreen_wait(sw,crop54,ot)!=PRESENT_FAILED);}
++            else{id<MTLCommandBuffer> cb=[g_q commandBuffer];EXPECT("classic present of a matching 5:4 crop",1,present_encode(cb,sw,ot,crop54));[cb commit];[cb waitUntilCompleted];}
++            uint8_t *o=malloc(40*32*4);[ot getBytes:o bytesPerRow:40*4 fromRegion:MTLRegionMake2D(0,0,40,32) mipmapLevel:0];
++            int bad=0; for(int i=0;i<40*32;i++) bad+=memcmp(o+4*i,colors[0],4)!=0;
++            EXPECT(m4?"Metal 4: 5:4 crop fills a 5:4 canvas with no bars":"classic: 5:4 crop fills a 5:4 canvas with no bars",0,bad);free(o);res_remove(ot);
++        }
++        mtl_present_screen(0,0);
+         // The front end's layout and the mouse follow the same shape, not the crop's (front_picture_shape): a real present of the 5:4 crop
+         tex_t st={.magic=MAGIC('T', 'E', 'X', 0), .serial =10002};st.d.width=TW;st.d.height=TH;st.d.depth=st.d.levels=1;st.d.format=NVN_FORMAT_RGBA8;st.d.target=NVN_TEXTURE_TARGET_2D;serial_put(st.serial,sw);
+         win_t w3={.ntex=1};w3.tex[0]=(NVNtexture *)&st;set((NVNwindow *)&w3,crop54[0],crop54[1],crop54[2],crop54[3]);
+diff --git a/dm/gfx/tests/t_present_rescue.m b/dm/gfx/tests/t_present_rescue.m
+index e3a4481d67f4fa5aca50741379e7b54fc13c892a..41e84437355d063753789f54217d139d4041e41f 100644
+--- a/dm/gfx/tests/t_present_rescue.m
++++ b/dm/gfx/tests/t_present_rescue.m
+@@ -158,6 +158,13 @@ static void startup_rescue(void) {
+             CHECK("a clamped override does not rewrite the link every frame", link.latencyWrites == writes);
+         }
+     }
++    g_present_latency = 0; test_fullscreen = test_variable_refresh = 0; g_present_link_env = 0;
++    mtl_set_fstep_fine(1); link_sync();
++    CHECK("fine pacing at a 30 fps cap sets frame latency 2 when link rate is automatic", link.preferredFrameLatency == 2);
++    g_present_link_env = 1; link_sync();
++    CHECK("an explicit DM_PRESENT_LINK keeps frame latency 1 even while fine pacing is set", link.preferredFrameLatency == 1);
++    g_present_link_env = 0; mtl_set_fstep_fine(0); link_sync();
++    CHECK("clearing fine pacing restores frame latency 1", link.preferredFrameLatency == 1);
+     g_present_latency = 0; test_fullscreen = test_variable_refresh = 0; link_sync(); g_link = nil; g_link_started = 0;
+ }
+ static void thirty(void) {   // A 30 fps target runs the link at 30 Hz, except in fullscreen on a fixed-rate screen, where it stays at 60 Hz and the present interval paces the 30.

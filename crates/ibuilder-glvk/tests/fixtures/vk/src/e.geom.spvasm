@@ -1,0 +1,62 @@
+; A triangle pass-through geometry stage as DXC writes one (plain arrays, no gl_PerVertex block): it copies the uint at input location 1 to ViewportIndex,
+; which vk_shaders.py geometry_viewport proves and folds into the vertex stage (geomvp:1).
+               OpCapability Geometry
+               OpCapability MultiViewport
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Geometry %main "main" %in_pos %in_vp %out_pos %out_vp
+               OpExecutionMode %main Triangles
+               OpExecutionMode %main Invocations 1
+               OpExecutionMode %main OutputTriangleStrip
+               OpExecutionMode %main OutputVertices 3
+               OpDecorate %in_pos BuiltIn Position
+               OpDecorate %in_vp Location 1
+               OpDecorate %out_pos BuiltIn Position
+               OpDecorate %out_vp BuiltIn ViewportIndex
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+         %v4 = OpTypeVector %float 4
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+         %u3 = OpConstant %uint 3
+         %a4 = OpTypeArray %v4 %u3
+         %au = OpTypeArray %uint %u3
+    %p_in_a4 = OpTypePointer Input %a4
+    %p_in_au = OpTypePointer Input %au
+    %p_in_v4 = OpTypePointer Input %v4
+     %p_in_u = OpTypePointer Input %uint
+   %p_out_v4 = OpTypePointer Output %v4
+    %p_out_u = OpTypePointer Output %uint
+     %in_pos = OpVariable %p_in_a4 Input
+      %in_vp = OpVariable %p_in_au Input
+    %out_pos = OpVariable %p_out_v4 Output
+     %out_vp = OpVariable %p_out_u Output
+         %i0 = OpConstant %int 0
+         %i1 = OpConstant %int 1
+         %i2 = OpConstant %int 2
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+        %pp0 = OpAccessChain %p_in_v4 %in_pos %i0
+         %p0 = OpLoad %v4 %pp0
+               OpStore %out_pos %p0
+        %vp0 = OpAccessChain %p_in_u %in_vp %i0
+         %v0 = OpLoad %uint %vp0
+               OpStore %out_vp %v0
+               OpEmitVertex
+        %pp1 = OpAccessChain %p_in_v4 %in_pos %i1
+         %p1 = OpLoad %v4 %pp1
+               OpStore %out_pos %p1
+        %vp1 = OpAccessChain %p_in_u %in_vp %i1
+         %v1 = OpLoad %uint %vp1
+               OpStore %out_vp %v1
+               OpEmitVertex
+        %pp2 = OpAccessChain %p_in_v4 %in_pos %i2
+         %p2 = OpLoad %v4 %pp2
+               OpStore %out_pos %p2
+        %vp2 = OpAccessChain %p_in_u %in_vp %i2
+         %v2 = OpLoad %uint %vp2
+               OpStore %out_vp %v2
+               OpEmitVertex
+               OpEndPrimitive
+               OpReturn
+               OpFunctionEnd

@@ -1,0 +1,17 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    array<texture2d<float>, 2048> fp_t2d_cb7_2A [[id(0)]];
+    const ulong _12* fp_s0 [[id(1)]];
+};
+
+static inline __attribute__((always_inline))
+float4 h0(uint i, constant array<texture2d<float>, 2048>& fp_t2d_cb7_2A)
+{
+    auto x0 = fp_t2d_cb7_2A[i].samp

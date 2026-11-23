@@ -1,0 +1,391 @@
+# 0102-exported-app-prepares-its-own-shaders.patch -- the owner's field bugs in EXPORTED game apps (player mode). Applies after 0101. With it, outside the patches: crates/ibuilder-pipeline
+# src/settings.rs (apply_default_language, launcher_default_language), src/boot.rs (prepare_boot calls it after the settings and env.txt), tests/default_language.rs.
+# UNTESTED ON DEVICE: compiled, its pure part ran in the host harness, the Rust in cargo test (below). Field logs read: target/agent-work/splogs (South Park The Stick of Truth, light IPA).
+#
+# 1. "Preparing the game" for ever. It is GameBootOverlay (over the game view: "Preparing the game m:ss"), which goes away at the first picture it SEES in gameapp.guest.log. It read the log
+#    from where it stood when the overlay appeared; an exported app boots fast (the field log: present #1 at 0.19 s), so the first picture was already written and the panel stayed up for its
+#    30-minute limit over a game that was running. It now reads from where the log stood when the RUN began (guestLogAtRunStart, BeginRun), checks once at once, and any presented frame ends it
+#    (BootOverlayRule: "present #N").
+# 2. No shader preparation when the exported app is opened. The export carried the main app's games/<id>/warmed.tsv and prepared.tsv (what the MAIN app's Metal cache holds): the exported
+#    app read them as its own (same app build): the field log's "710 libraries ... 0 compiled in 0 s, 710 already warm" and "done". Now: the export leaves this cache state out
+#    (warmed.tsv, prepared.tsv, the host's pso_tail.tsv: PlayerWarm.CacheState); an exported app removes the copies an older export set up, and its markers name its own bundle
+#    (GameWarm.CacheBuild: "<app build> in <bundle id>"), so another app's markers never count. As soon as it opens, it prepares EVERY library of its game in the background (the run of
+#    0076/0086, what was played first), with the lock-screen progress, the player page's line "Preparing the shaders before the first play: N of M (you can play now; it will stutter until
+#    done)" and its bar, and "Pause the preparation" / "Resume the preparation" (kept across launches). Play never waits (no "Still preparing the game" question any more): the run stops for
+#    the game and goes on at the next opening.
+# 3. Never a full preparation before the first frame: the chain counts the seed list alone (profile.rs set_pso_prepare_percent), so a short seed list with a long pso_user.tsv (what the
+#    game used, which travels) was built whole before the first frame on an empty Metal cache. An exported app counts both lists and writes pso_prepare_percent= in its config for about 500
+#    lines (PlayerPrepare.Percent; the chain's rule 2 honours it). The main app is unchanged.
+# 4. The game's language (the owner: the exported South Park started in RUSSIAN although he chose American English in iBuilder). The host's default with no DM_LANG is en-US (hle_oe.c
+#    GetDesiredLanguage), i.e. American English: a missing DM_LANG alone does not give Russian, so the Russian text most likely comes from this "(US Uncensored with RUS MOD)" dump itself
+#    (its mod replaced texts the American English setting shows; another language row, e.g. British English, would tell) -- NOT VERIFIED. What was wrong and is fixed: the settings sheet only
+#    saves values that differ from the row's default, and the row's default is the game's FIRST listed language when American English is not among them (ibuilder-ffi launcher.rs), while the
+#    engine then got en-US: the sheet and the game disagreed. Now a game whose language nobody chose (no settings.tsv row, no env.txt line, no harness) starts in the language its sheet
+#    SHOWS (settings.rs apply_default_language, after env.txt; logged "game settings: DM_LANG=… (no language chosen: …)"), in iBuilder and in an exported app (settings.tsv and launcher.json
+#    travel under ExportedGame/documents/games/<id>/ and are set up in the exported app's Documents at its first launch, never over a choice made there; its settings page edits that copy).
+#
+# VERIFIED (2026-11-23, M1 Pro): check-patches-apply.sh: every patch 0010-0102 applies in order, no fuzz, no offset; the repository's patches give exactly the compiled tree. Compile
+#   (-t:Compile): 0 errors / 40 warnings, the same per file and code as before 0080. Host harness (harness102: … P101;P102): 421 of 421 checks (10 new); 8 of 8 mutations killed. cargo test
+#   -p ibuilder-pipeline 270 passed (3 new: tests/default_language.rs), -p ibuilder-ffi 20 passed; clippy -D warnings and fmt clean.
+# NOT VERIFIED: nothing ran on a device: an exported app's background preparation and its lock-screen progress, the overlay after a quick boot, the language of this RUS-mod dump.
+# NEW UI STRINGS: "Preparing the shaders before the first play: ", " (you can play now; it will stutter until done)", "Shader preparation paused (Resume to go on; you can play now)",
+#   "Pause the preparation", "Resume the preparation"; log lines "of another app's shader cache state removed", "this app prepares the game's shaders in the background",
+#   "game settings: DM_LANG=" (pipeline).
+diff -ruN t101b/GameAppBootOverlay.cs w/GameAppBootOverlay.cs
+--- t101b/GameAppBootOverlay.cs	2026-11-22 21:30:26
++++ w/GameAppBootOverlay.cs	2026-11-22 21:28:17
+@@ -25,7 +25,7 @@
+     private long offset;
+     private int compiled, lines;
+ 
+-    private GameBootOverlay(UIView parent)
++    private GameBootOverlay(UIView parent, long startOffset)
+     {
+         panel = new UIView { UserInteractionEnabled = false, BackgroundColor = UIColor.Black.ColorWithAlpha(0.72f), TranslatesAutoresizingMaskIntoConstraints = false };
+         panel.Layer.CornerRadius = 16;
+@@ -51,12 +51,15 @@
+             detail.BottomAnchor.ConstraintEqualTo(panel.BottomAnchor, -16),
+         });
+         spinner.StartAnimating();
+-        try { offset = new FileInfo(Path.Combine(GameAppMain.Documents, "gameapp.guest.log")).Length; } catch (Exception) { offset = 0; }
++        // patch 0102: from where the guest log stood when the RUN began (not when this panel appeared: a game whose first picture came before it left the panel up for 30 minutes)
++        if (startOffset >= 0) offset = startOffset;
++        else try { offset = new FileInfo(Path.Combine(GameAppMain.Documents, "gameapp.guest.log")).Length; } catch (Exception) { offset = 0; }
++        Tick();   // a first picture already in the log ends it at once
+         timer = NSTimer.CreateRepeatingScheduledTimer(1.0, _ => Tick());
+     }
+ 
+     /// Show it over `parent` (the game's view); it removes itself at the first picture.
+-    internal static GameBootOverlay Show(UIView parent) => new GameBootOverlay(parent);
++    internal static GameBootOverlay Show(UIView parent, long startOffset = -1) => new GameBootOverlay(parent, startOffset);
+ 
+     private void Tick()
+     {
+@@ -90,7 +93,7 @@
+         foreach (Match m in Compiled.Matches(text)) compiled = Math.Max(compiled, int.Parse(m.Groups[1].Value));
+         var l = Lines.Match(text);
+         if (l.Success) lines = int.Parse(l.Groups[1].Value);
+-        return text.Contains("present #1:", StringComparison.Ordinal) || text.Contains("present #1 ", StringComparison.Ordinal);
++        return BootOverlayRule.FirstPicture(text);   // patch 0102: any presented frame (GameAppField.cs)
+     }
+ 
+     private void Hide()
+diff -ruN t101b/GameAppExport.cs w/GameAppExport.cs
+--- t101b/GameAppExport.cs	2026-11-22 21:30:27
++++ w/GameAppExport.cs	2026-11-22 21:28:17
+@@ -71,7 +71,7 @@
+     {
+         if (!IsPlayer) return;
+         var source = Path.Combine(BundleGame, "documents");
+-        int copied = 0;
++        int copied = 0, stale = 0;
+         try
+         {
+             if (Directory.Exists(source))
+@@ -79,6 +79,12 @@
+                 {
+                     var rel = Path.GetRelativePath(source, file);
+                     var dest = Path.Combine(documents, rel);
++                    // patch 0102: an older export carried the main app's cache state (warmed.tsv, prepared.tsv, pso_tail.tsv): never set up here, and a copy an earlier launch set up is removed
++                    if (PlayerWarm.IsCacheState(rel))
++                    {
++                        try { if (File.Exists(dest) && new FileInfo(dest).Length == new FileInfo(file).Length && File.ReadAllBytes(dest).AsSpan().SequenceEqual(File.ReadAllBytes(file))) { File.Delete(dest); stale++; } } catch (Exception) { }
++                        continue;
++                    }
+                     if (File.Exists(dest)) continue;
+                     Directory.CreateDirectory(Path.GetDirectoryName(dest));
+                     // via .part: a copy that stops half way (a full disk, a kill) leaves a .part, never a file under its real name, which every later launch would take for a good one
+@@ -90,6 +96,7 @@
+             File.WriteAllText(Path.Combine(documents, "gameapp.framework"),
+                               $"app_build={GameAppBuild.Id}\ngame={PlayerDump}\nbuilt={(PlayerManifest.TryGetValue("exported", out var e) ? e : "")}\n");
+             if (copied > 0) log?.Invoke($"exported game: {copied} file(s) set up in Documents (settings, saves, profile) for {PlayerDump}");
++            if (stale > 0) log?.Invoke($"exported game: {stale} file(s) of another app's shader cache state removed (this app prepares its own)");
+         }
+         catch (Exception error) { log?.Invoke($"exported game: Documents could not be set up: {error.Message}"); }
+     }
+@@ -264,7 +271,7 @@
+         GameWarmLogic.IngestUsedFile(documents, titleId);   // the shaders played so far travel in games/<id>/used_shaders.tsv, so the player warms them first
+         if (Directory.Exists(games))
+             AddTree(games, app + Folder + "/documents/games/" + titleId + "/",
+-                    rel => rel.StartsWith("rewrite-cache/") || rel.StartsWith("temp/") || rel == "env.txt.part");
++                    rel => rel.StartsWith("rewrite-cache/") || rel.StartsWith("temp/") || rel == "env.txt.part" || PlayerWarm.IsCacheState(rel));   // 0102: this app's Metal cache state never travels
+         var derived = Path.Combine(documents, "profile-derived", titleId);
+         if (Directory.Exists(derived)) AddTree(derived, app + Folder + "/documents/profile-derived/" + titleId + "/");
+ 
+diff -ruN t101b/GameAppField.cs w/GameAppField.cs
+--- t101b/GameAppField.cs	2026-11-22 21:30:27
++++ w/GameAppField.cs	2026-11-22 21:28:17
+@@ -908,3 +908,68 @@
+ 
+     public static string NormalizedLine(int count) => "export: Info.plist normalized for signers (" + count.ToString(CultureInfo.InvariantCulture) + " self-closing tag" + (count == 1 ? "" : "s") + ")";
+ }
++
++/// Patch 0102 (the owner, exported apps): an exported app (player mode) prepares its game's shaders by itself, in the background, as soon as it opens; its game never waits on a full
++/// preparation; and the state that describes ANOTHER app's Metal cache never travels in an export.
++public static class PlayerWarm
++{
++    /// The files of games/<id>/ that describe what THIS app's Metal cache holds (the warm-up's rows, its "all done" marker, the host's prewarm-tail state): an exported app starts with an
++    /// empty cache, so they are not exported (they made the exported South Park skip all 710 libraries as "already warm": "0 compiled in 0 s"), and a copy an older export left is ignored.
++    public static readonly IReadOnlyList<string> CacheState = new[] { "warmed.tsv", "prepared.tsv", "pso_tail.tsv" };
++
++    public static bool IsCacheState(string relative) => relative != null && CacheState.Contains(System.IO.Path.GetFileName(relative), StringComparer.Ordinal);
++
++    /// The build the warm-up's markers name: the app build, and in an exported app its own bundle id too (its Metal cache is its own: a marker the main app wrote never counts there).
++    public static string CacheBuild(string appBuild, bool player, string bundleId) => player ? appBuild + " in " + (bundleId ?? "?") : appBuild;
++
++    /// "Preparing the shaders before the first play: 120 of 900 (you can play now; it will stutter until done)", paused: "Shader preparation paused at 120 of 900 (…)".
++    public static string Line(int done, int total, bool paused)
++    {
++        string N(int n) => n.ToString("N0", CultureInfo.InvariantCulture);
++        var count = total > 0 ? N(Math.Min(done, total)) + " of " + N(total) : N(done);
++        return paused ? "Shader preparation paused at " + count + " (Resume to go on; you can play now)"
++                      : "Preparing the shaders before the first play: " + count + " (you can play now; it will stutter until done)";
++    }
++
++    public const string PauseTitle = "Pause the preparation", ResumeTitle = "Resume the preparation";
++    public const string PausedLine = "Shader preparation paused (Resume to go on; you can play now)";
++}
++
++/// Patch 0102: the share of the prewarm lists an exported game builds before its first frame. Its app starts with an empty Metal cache and its lists are the pack's seed list AND the host's
++/// own pso_user.tsv (what the game used, which travels in the export): the chain counts the seed list alone (profile.rs set_pso_prepare_percent), so a short seed list with a long
++/// pso_user.tsv was built whole before the first frame. The exported app counts both and asks for the share that makes about 500 lines (pso_prepare_percent= in its config).
++public static class PlayerPrepare
++{
++    public const long HeadLines = 500;
++
++    /// The data lines of a prewarm list as the host counts them: a line that is not empty and does not start with '#'.
++    public static long Lines(string text)
++    {
++        long n = 0;
++        foreach (var line in (text ?? "").Split('\n'))
++        {
++            var l = line.TrimEnd('\r');
++            if (l.Length > 0 && l[0] != '#') n++;
++        }
++        return n;
++    }
++
++    /// Null when both lists together are not longer than HeadLines (all of it, the host's default), else ceil(500 * 100 / lines) within 1..99 (profile.rs pso_head_percent).
++    public static int? Percent(long seedLines, long userLines)
++    {
++        long all = Math.Max(0, seedLines) + Math.Max(0, userLines);
++        if (all <= HeadLines) return null;
++        long p = (HeadLines * 100 + all - 1) / all;
++        return (int) Math.Clamp(p, 1, 99);
++    }
++}
++
++/// Patch 0102: "Preparing the game" over the game (GameBootOverlay) went away at the first picture it SAW: it read the guest log from where the log stood when the overlay appeared, so a
++/// game that showed its first picture before that (an exported app's quick boot: present #1 at 0.19 s) left it up for 30 minutes. It reads from where the log stood when the run began,
++/// and any presented frame ends it.
++public static class BootOverlayRule
++{
++    private static readonly Regex Present = new Regex(@"present #\d+[ :]");
++
++    public static bool FirstPicture(string text) => Present.IsMatch(text ?? "");
++}
+diff -ruN t101b/GameAppFieldUi.cs w/GameAppFieldUi.cs
+--- t101b/GameAppFieldUi.cs	2026-11-22 21:30:27
++++ w/GameAppFieldUi.cs	2026-11-22 21:28:31
+@@ -140,6 +140,8 @@
+ 
+     // ---- patch 0089: the main-thread watchdog while a game is on screen (GameAppField.cs MainStall) -----------------------------------------------------
+ 
++    private long guestLogAtRunStart = -1;   // patch 0102: the guest log's length when the run began (the boot overlay reads from there)
++
+     private volatile bool stallWatching;
+     private long stallRanSeq, stallRanTicks;
+ 
+diff -ruN t101b/GameAppLibrary.cs w/GameAppLibrary.cs
+--- t101b/GameAppLibrary.cs	2026-11-22 21:30:27
++++ w/GameAppLibrary.cs	2026-11-22 21:28:17
+@@ -622,8 +622,7 @@
+         playerPlay.TouchUpInside += (_, __) =>
+         {
+             if (PlayerNeedsGameFiles) ShowInFiles(Path.Combine(GameAppMain.Documents, "x"));
+-            else if (GameWarm.FirstStart) AskPlayDuringPrepare();
+-            else PrimaryTapped();
++            else PrimaryTapped();   // patch 0102: Play never waits for the preparation (the run stops it; it goes on after the game)
+         };
+         playerStatus = Theme.Label("", Theme.Font(13, UIFontWeight.Medium), Theme.Muted, 0);
+         playerStatus.TextAlignment = UITextAlignment.Center;
+@@ -649,7 +648,11 @@
+         var footer = Theme.Label("Made with iBuilder", Theme.Font(12, UIFontWeight.Regular), Theme.Dim);
+         footer.TextAlignment = UITextAlignment.Center;
+ 
+-        var column = Theme.Column(18, coverRow, title, playerLast, playerPlay, playerProgress, playerStatus, playerPick, rows);
++        playerWarmToggle = new UIButton(UIButtonType.System) { AccessibilityIdentifier = "player-warm-pause", Hidden = true };   // patch 0102
++        playerWarmToggle.TitleLabel.Font = Theme.Font(13, UIFontWeight.Medium);
++        playerWarmToggle.TintColor = Theme.Accent;
++        playerWarmToggle.TouchUpInside += (_, __) => TogglePlayerWarm();
++        var column = Theme.Column(18, coverRow, title, playerLast, playerPlay, playerProgress, playerStatus, playerWarmToggle, playerPick, rows);
+         column.SetCustomSpacing(6, title);
+         column.SetCustomSpacing(26, playerLast);
+         column.SetCustomSpacing(8, playerPlay);
+@@ -678,6 +681,7 @@
+ 
+     private UIButton playerPick;
+     private UIProgressView playerProgress;
++    private UIButton playerWarmToggle;   // patch 0102: Pause / Resume the preparation
+ 
+     /// Files, filtered to game files (.romfs, declared in Info.plist): the player picks its game's, opened in place.
+     private void FindGameFiles()
+@@ -748,7 +752,15 @@
+         playerPlay.Configuration = c;
+         playerPlay.Enabled = needFiles || next.Enabled;
+         playerPlay.Alpha = playerPlay.Enabled ? 1f : 0.5f;
+-        var prep = GameWarm.Active && !facts.Running ? GameWarm.Status : "";
++        // patch 0102: the preparation's own words (Play stays available); paused by the person: said, with Resume
++        bool warmOwed = !facts.Running && (GameWarm.Active || PlayerWarmPaused);
++        var prep = GameWarm.Active && !facts.Running ? PlayerWarm.Line(GameWarm.Done, GameWarm.Total, false)
++                 : PlayerWarmPaused && !facts.Running ? PlayerWarm.PausedLine : "";
++        if (playerWarmToggle != null)
++        {
++            playerWarmToggle.SetTitle(PlayerWarmPaused ? PlayerWarm.ResumeTitle : PlayerWarm.PauseTitle, UIControlState.Normal);
++            playerWarmToggle.Hidden = !warmOwed;
++        }
+         playerStatus.Text = facts.Running ? "Starting the game…"
+             : needFiles ? (prep.Length > 0 ? prep + "\n\n" : "") + $"Once: in Files, open On My iPhone › iBuilder › Exports › “{GameAppUi.ExportFileName(GameAppUi.DisplayName(game))}”, touch and hold “{GameExport.PlayerRomfsName}”, Copy. "
+                           + $"Then open On My iPhone › “{GameAppUi.DisplayName(game)}” (this app's folder: the button opens it), touch and hold, Paste. A copy inside the phone takes no extra space. Come back here: Play appears."
+diff -ruN t101b/GameAppMain.cs w/GameAppMain.cs
+--- t101b/GameAppMain.cs	2026-11-22 21:30:27
++++ w/GameAppMain.cs	2026-11-22 21:28:31
+@@ -296,6 +296,17 @@
+         try { var f = new FileInfo(path); return f.Exists && f.Length > 0; } catch (Exception) { return false; }
+     }
+ 
++    /// Patch 0102: an exported game's share of the prewarm lists before its first frame, counted over BOTH lists the host reads (the pack's seed list and pso_user.tsv): about 500 lines
++    /// (PlayerPrepare). None when they hold 500 lines or fewer, or cannot be read.
++    private static IEnumerable<string> PlayerPrepareLine(string documents)
++    {
++        var tid = GameAppUi.BaseTitleIdOf(GameExport.PlayerDump) ?? (GameExport.PlayerManifest.TryGetValue("title_id", out var t) ? t : null);
++        if (tid == null) yield break;
++        long Count(string path) { try { return File.Exists(path) ? PlayerPrepare.Lines(File.ReadAllText(path)) : 0; } catch (Exception) { return 0; } }
++        long seed = Count(Path.Combine(GameExport.BundleGame, "shaders", tid, "pso_manifest.tsv")), user = Count(Path.Combine(documents, "games", tid.ToUpperInvariant(), "pso_user.tsv"));
++        if (PlayerPrepare.Percent(seed, user) is int p) yield return "pso_prepare_percent=" + p.ToString(System.Globalization.CultureInfo.InvariantCulture);
++    }
++
+     /// The config gameapp_pipeline.py reads: where the extraction wrote, the host dylib inside THIS bundle, and
+     /// the framework to assemble, sign and load. Written by the app, not by the harness.
+     internal static string ConfigText(string bundlePath, string game = null)
+@@ -307,7 +318,7 @@
+         bool player = GameExport.IsPlayer;
+         if (player) { extract = Path.Combine(GameExport.BundleGame, "extract"); game = GameExport.PlayerDump; }
+         var playerLines = player
+-            ? new[] { "shader_packs=" + Path.Combine(GameExport.BundleGame, "shaders"), "shader_build=0" }
++            ? new[] { "shader_packs=" + Path.Combine(GameExport.BundleGame, "shaders"), "shader_build=0" }.Concat(PlayerPrepareLine(documents)).ToArray()
+             : new string[0];
+         // A Switch 2 package: the chain reads it itself (gameapp_pipeline.extract_nup) before the profile. Not when the file has no content (patch 0073: a stub left by
+         // "Optimize storage" or a placeholder of patch 0071): the chain then builds from the extraction already in Documents/extract (ExeFS and RomFS.img, kept: keep_exefs below).
+@@ -861,7 +872,7 @@
+         top.PresentViewController(gameWindow, false, () =>
+         {
+             Write("game view on screen (landscape, full screen)");
+-            try { GameBootOverlay.Show(gameWindow.View); } catch (Exception error) { Write("boot overlay: " + error.Message); }   // what the player sees until the first picture
++            try { GameBootOverlay.Show(gameWindow.View, guestLogAtRunStart); } catch (Exception error) { Write("boot overlay: " + error.Message); }   // what the player sees until the first picture (0102: from the run's start)
+         });
+         UIApplication.SharedApplication.IdleTimerDisabled = true;   // the screen must not sleep under a game
+     }
+@@ -2797,6 +2808,7 @@
+         stepStarts.Clear();
+         stepStarts[0] = startedAt;
+         lastRunGame = selected;
++        try { var gl = new FileInfo(Path.Combine(GameAppMain.Documents, "gameapp.guest.log")); guestLogAtRunStart = gl.Exists ? gl.Length : 0; } catch (Exception) { guestLogAtRunStart = -1; }   // patch 0102: the boot overlay reads from here
+         buildFinished = false;
+         failedRun = false;
+         lastChainRc = 0;   // patch 0078: the code of this run's chain, once it returns
+diff -ruN t101b/GameAppShelf.cs w/GameAppShelf.cs
+--- t101b/GameAppShelf.cs	2026-11-22 21:30:27
++++ w/GameAppShelf.cs	2026-11-22 21:28:17
+@@ -1035,7 +1035,7 @@
+             // patch 0086: a finished preparation says so ("Shaders prepared", "5,009 prepared"), with no Pause and no bar (prepared.tsv's "all" row of this app build and chain)
+             string preparedText = null;
+             try { var mk = Path.Combine(docs, "games", (tid ?? "").ToUpperInvariant(), "prepared.tsv"); if (tid != null && File.Exists(mk)) preparedText = File.ReadAllText(mk); } catch (Exception) { }
+-            bool prepared = !GameExport.IsPlayer && !thisOne && preparedText != null && GameWarmLogic.PreparedDone(preparedText, GameWarmLogic.Header(GameAppBuild.Id, GameAppBuild.ShaderChain), true);
++            bool prepared = !GameExport.IsPlayer && !thisOne && preparedText != null && GameWarmLogic.PreparedDone(preparedText, GameWarmLogic.Header(GameWarm.CacheBuild, GameAppBuild.ShaderChain), true);
+             var prepare = SettingsRow(GameExport.IsPlayer ? "Prepare the shaders…" : prepared ? "Shaders prepared" : thisOne ? "Pause the preparation" : "Prepare this one now", prepared ? null : () => Then(() => PrepareShadersFor(game)), !prepared, false);
+             var wt = (tid ?? "").ToUpperInvariant();
+             prepare.Value.Text = GameExport.IsPlayer ? (GameWarm.Active ? "Running" : "")
+diff -ruN t101b/GameAppWarm.cs w/GameAppWarm.cs
+--- t101b/GameAppWarm.cs	2026-11-22 21:30:27
++++ w/GameAppWarm.cs	2026-11-22 21:28:17
+@@ -501,6 +501,10 @@
+     private static GameWarmLogic.WarmKind runKind;
+     private static int progressDone, progressTotal;
+     public static bool Active => runState.Active;
++
++    /// Patch 0102: what the warm-up's markers (warmed.tsv, prepared.tsv) are written for: this app build, and in an exported app its own bundle id (PlayerWarm.CacheBuild): a marker another
++    /// app wrote (the main app's, carried by an older export) never counts as this app's Metal cache.
++    public static string CacheBuild => PlayerWarm.CacheBuild(GameAppBuild.Id, GameExport.IsPlayer, NSBundle.MainBundle.BundleIdentifier);
+     /// The run is an exported player's first-start preparation (the title screen offers "play anyway" while it goes).
+     public static bool FirstStart => runState.Active && runKind == GameWarmLogic.WarmKind.SeedList;
+     /// The kind of the run that is going (or went last).
+@@ -529,7 +533,7 @@
+         {
+             if (!HasLibrary(titleId, packRoot)) return false;
+             var marker = Path.Combine(GameAppMain.Documents, "games", titleId.ToUpperInvariant(), "prepared.tsv");
+-            return !GameWarmLogic.PreparedDone(File.Exists(marker) ? File.ReadAllText(marker) : "", GameWarmLogic.Header(GameAppBuild.Id, GameAppBuild.ShaderChain), all);
++            return !GameWarmLogic.PreparedDone(File.Exists(marker) ? File.ReadAllText(marker) : "", GameWarmLogic.Header(CacheBuild, GameAppBuild.ShaderChain), all);
+         }
+         catch (Exception) { return false; }
+     }
+@@ -693,7 +697,7 @@
+ 
+         var gameDir = Path.Combine(documents, "games", titleId.ToUpperInvariant());
+         var warmedPath = Path.Combine(gameDir, "warmed.tsv");
+-        var header = GameWarmLogic.Header(GameAppBuild.Id, chain);
++        var header = GameWarmLogic.Header(CacheBuild, chain);
+         string Stamp() => DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+         if (items.Count == 0)
+         {
+@@ -1076,7 +1080,7 @@
+     private static List<(string Tid, (int Done, int Total) Count)> WarmCountsOf(IEnumerable<string> titles, string root)
+     {
+         var list = new List<(string, (int, int))>();
+-        var header = GameWarmLogic.Header(GameAppBuild.Id, GameAppBuild.ShaderChain);
++        var header = GameWarmLogic.Header(GameWarm.CacheBuild, GameAppBuild.ShaderChain);
+         foreach (var t in titles)
+         {
+             int done = 0, total = -1;
+@@ -1246,13 +1250,28 @@
+     /// An exported player's first launch: prepare the shaders the game needs, once (GameWarm.FirstStartPending says whether it is owed), with the bar and the background task. Nothing for the main app.
+     private void StartFirstStartPrepare()
+     {
+-        if (!GameExport.IsPlayer || GameWarm.Active) return;
++        if (!GameExport.IsPlayer || GameWarm.Active || running) return;
+         var tid = WarmTitleOf(GameExport.PlayerDump);
+-        if (tid == null || !GameWarm.FirstStartPending(tid, WarmPackRoot())) return;
+-        Write("shader warm-up: first start of this app: preparing the shaders the game needs, once (its prewarm list, the learned list, what was used)");
+-        StartWarmTitle(tid, GameExport.PlayerDump, GameWarmLogic.WarmKind.SeedList);
++        // patch 0102: EVERY library of the game (what was played and the seed list first), in the background, as the main app does; its own markers (CacheBuild): the main app's never count here
++        if (tid == null || !GameWarm.FirstStartPending(tid, WarmPackRoot(), all: true)) return;
++        if (PlayerWarmPaused) { Write("shader warm-up: paused by you in this app: Resume the preparation goes on"); return; }
++        Write("shader warm-up: this app prepares the game's shaders in the background (what was played first, then every library); you can play now, it stops for the game and goes on after");
++        StartWarmTitle(tid, GameExport.PlayerDump, GameWarmLogic.WarmKind.Everything, "this app is open");
+     }
+ 
++    private const string PlayerWarmPausedKey = "player_warm_paused";
++    private static bool PlayerWarmPaused => NSUserDefaults.StandardUserDefaults.BoolForKey(PlayerWarmPausedKey);
++
++    /// Patch 0102: the exported app's Pause / Resume of its preparation (kept across launches).
++    private void TogglePlayerWarm()
++    {
++        bool pause = !PlayerWarmPaused;
++        NSUserDefaults.StandardUserDefaults.SetBool(pause, PlayerWarmPausedKey);
++        if (pause) { StopWarm("paused by you"); Write("shader warm-up: paused by you; it stays paused until you resume it"); }
++        else { Write("shader warm-up: resumed by you"); StartFirstStartPrepare(); }
++        RefreshScreen();
++    }
++
+     /// The player pressed Play while the first-start preparation goes: say what it costs to go on, and let the player choose.
+     private void AskPlayDuringPrepare()
+     {
+@@ -1464,7 +1483,7 @@
+         if (GameExport.IsPlayer)
+         {
+             if (playerStatus == null) return;
+-            if (playerProgress != null) { playerProgress.Hidden = !GameWarm.FirstStart; playerProgress.Progress = GameWarm.Fraction; }
++            if (playerProgress != null) { playerProgress.Hidden = !GameWarm.Active; playerProgress.Progress = GameWarm.Fraction; }   // patch 0102: the player's run of every library
+             RefreshScreen();   // the player's status line is composed there (the files to copy, then this status)
+             return;
+         }

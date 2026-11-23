@@ -305,8 +305,9 @@ pub fn pull_variant(msl: &str) -> Result<(String, J), String> {
         return Err(format!("buffer {SLOT} is taken"));
     }
     let members = members(g1)?;
-    if members.iter().any(|x| x.2 >= 16) {
-        return Err("an input at attribute 16 or above".into());
+    // NVN2 has 32 attributes; the layout block holds them all
+    if members.iter().any(|x| x.2 >= 32) {
+        return Err("an input at attribute 32 or above".into());
     }
     let mut head = format!(
         "{}\nstruct main0_in\n{{\n{}\n}};",

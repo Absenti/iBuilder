@@ -1,0 +1,19 @@
+{
+ "dlc": [],
+ "files": {
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f2ba7b14c9b0912d59d94603955272d90ab8f1b5b538d5f541340e5c62f089cb",
+  "tables/shader_map.tsv": "05259c1f53696f05b87c5b188d66858d7eae084a5a15a84ea6a05641a6186526",
+  "tables/shader_pairs.tsv": "5aa0373962553e0efbf27dc253b41c266a952c062b997b4f07f05d24b0e3e7a8"
+ },
+ "log": [
+  "[RED] /Data/a.pac: PACx 403 header: 0x18 bytes at 0x10 lie outside the 0x24 bytes there are (its shaders are left out)",
+  "[RED] /Data/b.pac: PACx 403 root chunk table: 0x4 bytes at 0x48 lie outside the 0x4b bytes there are (its shaders are left out)",
+  "[RED] /Data/c.pac: PACx 403 root chunk table: 0x8 bytes at 0x4c lie outside the 0x53 bytes there are (its shaders are left out)",
+  "[RED] /Data/d.pac: PACx 402 root header: 0x8 bytes at 0x10 lie outside the 0xe bytes there are (its shaders are left out)",
+  "[RED] 4 file(s) could not be read, their shaders are left out (first: /Data/a.pac: PACx 403 header: 0x18 bytes at 0x10 lie outside the 0x24 bytes there are)",
+  "shaders: 0 (); sources ; compute shader answers 0 rows; variation pairs 0"
+ ],
+ "shaders": 0,
+ "updates": []
+}

@@ -30,7 +30,7 @@ BASE_ENGINE="${NXPOCKET_ENGINE_BASE:-$W/out-stage/out-engine/engine}"
 VIDEO_SRC="${HOST_VIDEO_DIR:-$W/out-stage/out-video}"
 HOST_WORK="${HOST_WORK:-$ROOT/target/host-work}"
 HOST_OUT="${HOST_OUT:-$ROOT/dist/host}"
-EXPECT_CHAIN="${EXPECT_CHAIN:-b24b25240cad}"
+EXPECT_CHAIN="${EXPECT_CHAIN:-6c53446391cc}"
 PATCH_DIR="${ENGINE_PATCH_DIR:-$ROOT/engine-patches}"
 KINDS=("$@"); [ ${#KINDS[@]} -gt 0 ] || KINDS=(device simulator)
 export PYTHONDONTWRITEBYTECODE=1
@@ -146,9 +146,24 @@ for KIND in "${KINDS[@]}"; do
   STR="$HOST_WORK/strings-$PLAT.txt"; strings -a "$DYL" > "$STR"
   CHAIN_HITS="$(grep -c "^$CHAIN\$" "$STR")"      # dmsh_chain.h's DMSH_CHAIN, a plain string next to the library directory format "b-%s"
   [ "$CHAIN_HITS" -ge 1 ] || die "$KIND: the chain id $CHAIN is not in the dylib's strings"
-  # markers: paches/0006 (DM_AS_AT), 0401 (DM_AUDREN_TRACE: both hosts), and on the device host (the simulator has no nvn_mtl.m) 0202/0203 (still there) and 0404/0405
+  # markers: paches/0006 (DM_AS_AT), 0401 (DM_AUDREN_TRACE: both hosts), and on the device host (the simulator has no nvn_mtl.m) 0202/0203 (still there), 0404/0405 ... 0512, 0525 (DM_NVN_TEX_EVICT_IDLE), 0535 (DM_MTL_OPT_SIZE); 0538 below
   for m in DM_AS_AT DM_AUDREN_TRACE; do grep -q "$m" "$STR" || die "$KIND: marker $m missing from the dylib"; done
-  if [ "$PLAT" = ios ]; then for m in DM_PSO_NOWAIT DM_LOW_MEMORY DM_RT_SHARE DM_NVN_UPLOAD_IDLE_MS DM_NVN_UPLOAD_SRC_MB DM_PSO_PREPARE_PERCENT DM_PSO_PREPARE_TAIL DM_PSO_USER_FIRST DM_PSO_TAIL_RESUME DM_PSO_TAIL_HOT DM_NVN_TEX_MIP_SKIP DM_STALL_DUMP DM_NVN_VBUF_CLAMP DM_NVN_PRESENT_KEEP DM_NVN_RENDER_COND DM_PSO_ARCHIVE_NOFRAG DM_TEST_NO_BC DM_NO_BC_GPU DM_NO_BC_ASTC DM_MEM_PRESSURE; do grep -q "$m" "$STR" || die "$KIND: marker $m missing from the dylib"; done; fi
+  if [ "$PLAT" = ios ]; then for m in DM_PSO_NOWAIT DM_LOW_MEMORY DM_RT_SHARE DM_NVN_UPLOAD_IDLE_MS DM_NVN_UPLOAD_SRC_MB DM_PSO_PREPARE_PERCENT DM_PSO_PREPARE_TAIL DM_PSO_USER_FIRST DM_PSO_TAIL_RESUME DM_PSO_TAIL_HOT DM_NVN_TEX_MIP_SKIP DM_STALL_DUMP DM_NVN_VBUF_CLAMP DM_NVN_PRESENT_KEEP DM_NVN_RENDER_COND DM_PSO_ARCHIVE_NOFRAG DM_TEST_NO_BC DM_NO_BC_GPU DM_NO_BC_ASTC DM_MEM_PRESSURE DM_NVN_TEX_EVICT_IDLE DM_MTL_OPT_SIZE; do grep -q "$m" "$STR" || die "$KIND: marker $m missing from the dylib"; done; fi
+  # engine-patches/0538: the GL and Vulkan layers' source mode (dm/gfx/layer_msl.h), on the device host (the simulator host has no GL or Vulkan layer): sh_load's log line of each layer
+  if [ "$PLAT" = ios ]; then
+    n538="$(grep -c 'shaders from Metal source: %s/<name>.metal, one library per function, compiled at first use (engine-patches/0538' "$STR")"
+    [ "$n538" = 2 ] || die "$KIND: engine-patches/0538's source mode is not in both layers (log lines found: $n538, want 2: hle_gl.m and hle_vk.m)"
+  fi
+  # engine-patches/0535: paches/0007's src_compile makes its options with [MTLCompileOptions new]; on the copy prebuild_loadable.sh patched and compiled, that line must lie between
+  # 0535's "#define MTLCompileOptions DmMslCompileOptions" and its #undef, or the libraries compiled from source would not be compiled for size (and not match the app's warm-up)
+  if [ "$PLAT" = ios ]; then
+    P7SRC="$(ls "$HOST_WORK/out-$PLAT"/patched-src-*/dm/gfx/nvn/nvn_mtl.m 2>/dev/null | head -1)"
+    [ -f "$P7SRC" ] || die "$KIND: no copy of nvn_mtl.m patched by paches/0007 under $HOST_WORK/out-$PLAT"
+    SPAN="$(awk '/^#define MTLCompileOptions DmMslCompileOptions/ {d = NR} /MTLCompileOptions \*o = \[MTLCompileOptions new\];/ {n++; o = NR} /^#undef MTLCompileOptions/ {u = NR} END {print d + 0, o + 0, u + 0, n + 0}' "$P7SRC")"
+    read -r SPAN_D SPAN_O SPAN_U SPAN_N <<< "$SPAN"
+    [ "$SPAN_D" -gt 0 ] && [ "$SPAN_N" = 1 ] && [ "$SPAN_D" -lt "$SPAN_O" ] && [ "$SPAN_O" -lt "$SPAN_U" ] || die "$KIND: paches/0007's [MTLCompileOptions new] is not inside engine-patches/0535's span (#define line $SPAN_D, options line $SPAN_O (found $SPAN_N times), #undef line $SPAN_U)"
+    say "   paches/0007's src_compile options are 0535's DmMslCompileOptions (lines $SPAN_D < $SPAN_O < $SPAN_U of the patched copy): libraries from source are compiled for size"
+  fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%ss\n' "$KIND" "$(basename "$DYL")" "$(stat -f %z "$DYL")" "$(sha "$DYL")" "platform $GOT_PLATFORM minos $GOT_MINOS" "chain id $CHAIN x$CHAIN_HITS in strings" "$ELAPSED" >> "$SUMMARY"
   cp "$DYL" "$HOST_OUT/host-prebuilt-loadable-$PLAT.dylib.new" && mv "$HOST_OUT/host-prebuilt-loadable-$PLAT.dylib.new" "$HOST_OUT/host-prebuilt-loadable-$PLAT.dylib"
 done
@@ -156,15 +171,17 @@ done
 TESTS_TXT="$HOST_OUT/HOST-TESTS.txt"; rm -f "$TESTS_TXT"
 if [ "${HOST_TESTS:-0}" = 1 ]; then
   say "5b. engine self-tests on this Mac (no game files), logs in $HOST_WORK/logs/test-*.log"
-  TG=010015100B514000; NJ="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-  { echo "engine self-tests run on the built tree ($ENGINE), $(date '+%Y-%m-%d %H:%M:%S'), profile $TG, this Mac: $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+  TG=010015100B514000   # the self-tests' game profile: 010015100B514000 = Super Mario Bros. Wonder (no game file is read)
+  NJ="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  { echo "engine self-tests run on the built tree ($ENGINE), $(date '+%Y-%m-%d %H:%M:%S'), profile $TG (Super Mario Bros. Wonder), this Mac: $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
     echo "(commands as .github/workflows/tests.yml of the engine runs them; none needs a game or a key)"; } > "$TESTS_TXT"
   run_t() { local name=$1 t0=$SECONDS; shift
     if ( cd "$ENGINE" && "$@" ) > "$HOST_WORK/logs/test-$name.log" 2>&1; then echo "PASS  $name  ($((SECONDS - t0))s)  $*"; else echo "FAIL  $name  ($((SECONDS - t0))s)  $*"; fi; }
   { run_t host-unit make -C dm/host/tests GAME=$TG -j"$NJ" run
+    run_t host-memory make -C dm/host/tests GAME=$TG memory
     run_t cpu-texture make -C dm/gfx/tex/tests run
-    for t in rt_recycle_policy gfx_suspend lazy_clear_order zero_colour upload_idle upload_src pso_pending cbs_fault bc_cpu warm_head pso_head pso_user_first pso_binary_archive pso_tail_resume pso_warm pso_admission present_rescue res_commit dispatch_pipeline sparse_pool_cache pso_archive present_crop dispatch_zero env_flag mip_skip_limits pool_census stall_watch submit_compile session_reset vbuf_clamp present_keep drop_reasons render_cond_switch pso_archive_nofrag vbuf pull nobc_order bc_astc bc2astc_gpu astc_hw mem_trim; do run_t "gfx-$t" make -C dm/gfx/tests GAME=$TG check_t_$t; done; } | tee -a "$TESTS_TXT" >&2
-  { echo "not run: dm/gfx/tests t_geometry_mesh (0408's test): t_geometry.m reads g_mdi_v, which nvn_mtl.m of the base tree (nxnative a3663659 + 54 NX2Apple patches, before any patch here) does not define: it does not compile there either;"
+    for t in rt_recycle_policy gfx_suspend lazy_clear_order zero_colour upload_idle upload_src pso_pending cbs_fault bc_cpu warm_head pso_head pso_user_first pso_binary_archive pso_tail_resume pso_warm pso_admission present_rescue res_commit dispatch_pipeline sparse_pool_cache pso_archive present_crop dispatch_zero env_flag mip_skip_limits pool_census stall_watch submit_compile session_reset vbuf_clamp present_keep drop_reasons render_cond_switch pso_archive_nofrag vbuf pull nobc_order bc_astc bc2astc_gpu astc_hw mem_trim dirty_race sbw addr_known file_wire fstep gpu_only_addr pool_chunks pkg_share cpu_tex cpu_storage linear_readback read_owner readback pkg_spare pkg_evict rt_recycle shmap_warm nvn ir_gpu_write present_history tiled_resolve mtl_opt_size vk_msl_src gl_msl_src; do run_t "gfx-$t" make -C dm/gfx/tests GAME=$TG check_t_$t; done; } | tee -a "$TESTS_TXT" >&2
+  { echo "not run: dm/gfx/tests t_geometry_mesh (0408's test; 0520's upstream cases) and t_geometry (0515's part): t_geometry.m reads g_mdi_v, which nvn_mtl.m of the base tree (nxnative a3663659 + 54 NX2Apple patches, before any patch here) does not define: it does not compile there either;"
     echo "         with g_mdi_v renamed to g_mdi_waits in a scratch copy it passes (47 checks). dm/tools/tests/test_x18_select.py (0409): needs the Python module capstone, not installed."; } >> "$TESTS_TXT"
   ! grep -q '^FAIL' "$TESTS_TXT" || die "an engine self-test failed: $TESTS_TXT"
 fi

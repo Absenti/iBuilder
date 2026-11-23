@@ -1,0 +1,17 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/ps_ue.bin": "4fcfa697aaf819623ba3cfd662738273c6dd72b729e701f2da90409f1df8143d",
+  "pkg/vs_ue.bin": "5743697f9f0a2c904ef400f94ef12b171eb1333f9670f51ae3b1f7dc1fcbc8c6",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f2ba7b14c9b0912d59d94603955272d90ab8f1b5b538d5f541340e5c62f089cb",
+  "tables/shader_map.tsv": "85861f7333a016e8474340faab2fafe77c77aabc8935e6be9b1bff121c97e729",
+  "tables/shader_pairs.tsv": "ef3b5ade51299986fd02e412c1a3a5cea3cccc21aef396ce8bb6ae3bdb6ffef2"
+ },
+ "log": [
+  "single-stage programs: 2 vertex shaders are paired with a cover of 1 pixel shader(s) (193da1ca6c4c7748)",
+  "shaders: 6 (pixel 4, vertex 2); sources ue 6; compute shader answers 0 rows; variation pairs 2"
+ ],
+ "shaders": 6,
+ "updates": []
+}

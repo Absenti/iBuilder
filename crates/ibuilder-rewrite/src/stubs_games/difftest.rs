@@ -69,6 +69,8 @@ fn stub_ports_match_the_python_oracle() {
         let opts = Options {
             workers: 2,
             game: Some(case.meta["profile"].clone()),
+            // the oracle is the pinned engine's patch_nso.py, which has no mod_layout: half of these synthetic modules' data shares the code's 16 KB page
+            no_relayout: true,
             ..Default::default()
         };
         let got = rewrite(&file, name, &case.meta["module"], &opts);

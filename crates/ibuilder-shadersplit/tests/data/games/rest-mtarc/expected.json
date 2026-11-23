@@ -1,0 +1,22 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/ps_data.bin": "7a7a6fcec11d416d26e70829de3736ec356a780a4656ea62bed465edc40f0d50",
+  "pkg/vs_data.bin": "f7cc58d2bf3b7ba9187a165c0e921362625f056991fee923b2a23a4f9a53c5ad",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f2ba7b14c9b0912d59d94603955272d90ab8f1b5b538d5f541340e5c62f089cb",
+  "tables/shader_map.tsv": "4a487d8e9fd3abfbc4423e366edf6044394042103329c3a7e32de056789c4309",
+  "tables/shader_pairs.tsv": "3928e89f73e3717ffd1f9ac338eed551ba76f64b3a01e2e058c6165d31417351"
+ },
+ "log": [
+  "[RED] /Data/re/bad.arc: ARC v9 has no complete directory with in-bounds members (its shaders are left out)",
+  "[RED] /Data/re/extra.arc#sc/NX_64/root SPK: control section at 0x130c without a shader header (its shaders are left out)",
+  "[RED] /Data/sf/long.arc#sc\\NX_64\\long: incomplete ARC zlib stream or 0x33 bytes, the entry says 0x32 (its shaders are left out)",
+  "[RED] /Data/sf/v8.arc: ARC version 8: only versions 7 and 9 are known (its shaders are left out)",
+  "[RED] 4 file(s) could not be read, their shaders are left out (first: /Data/re/bad.arc: ARC v9 has no complete directory with in-bounds members)",
+  "single-stage programs: 3 vertex shaders are paired with a cover of 1 pixel shader(s) (56bbb5bc3da26c31)",
+  "shaders: 5 (pixel 2, vertex 3); sources data 5; compute shader answers 0 rows; variation pairs 3"
+ ],
+ "shaders": 5,
+ "updates": []
+}

@@ -1,4 +1,5 @@
-//! The vertex-shader steps of dmsh_entry.py (vs_init, vs_depth, vs_discard, vs_layer_entry, vs_writes) and dmsh_geometry.capture.
+//! The vertex-shader steps of dmsh_entry.py (vs_init, vs_viewport_mask, vs_depth, vs_discard, vs_layer_entry, vs_writes), dmsh_geometry.capture, and the order `finish()`
+//! runs them in (`vertex_entries`).
 use crate::templates as t;
 use crate::text::*;
 use crate::{PostError, failed};
@@ -543,116 +544,9 @@ pub fn drop_point_size(src: &str) -> Result<String, PostError> {
     Ok(o)
 }
 
-/// vs_layer_entry: -> (source with the layer entry points, whether it added them)
+/// vs_layer_entry(full): -> (source with the layer entry points, whether it added them)
 pub fn vs_layer_entry(full: &str) -> Result<(String, Option<(u32, char)>), PostError> {
-    let (i, j) = out_struct_span(full);
-    let (Some(i), Some(j)) = (i, j) else {
-        return Ok((full.to_string(), None));
-    };
-    if !contains(full, "gl_InstanceIndex") || contains(&full[i..j], "[[render_target_array_index]]")
-    {
-        return Ok((full.to_string(), None));
-    }
-    // locs: `\n    float4 (\w+) \[\[user\(locn(\d+)\)\]\];` in full[i:j]
-    let seg = &full[i..j];
-    let sb = seg.as_bytes();
-    let pat = b"\n    float4 ";
-    let mut locs: Vec<(&str, u32)> = Vec::new(); // a later declaration of the same name wins (a dict)
-    let mut from = 0;
-    while let Some(p) = find_b(sb, pat, from) {
-        from = p + 1;
-        let n0 = p + pat.len();
-        let n1 = word_end(sb, n0);
-        if n1 == n0 || !starts(sb, n1, " [[user(locn") {
-            continue;
-        }
-        let d0 = n1 + 12;
-        let d1 = digits_end(sb, d0);
-        if d1 == d0 || !starts(sb, d1, ")]];") {
-            continue;
-        }
-        let v: u32 = seg[d0..d1].parse().unwrap_or(u32::MAX);
-        if let Some(e) = locs.iter_mut().find(|(n, _)| *n == &seg[n0..n1]) {
-            e.1 = v;
-        } else {
-            locs.push((&seg[n0..n1], v));
-        }
-    }
-    // first `\n    out\.(\w+)\.([xyzw]) = as_type<float>\(` over the whole text with the name in locs
-    let fb = full.as_bytes();
-    let pat2 = b"\n    out.";
-    let mut hit: Option<(&str, u8)> = None;
-    let mut from = 0;
-    while let Some(p) = find_b(fb, pat2, from) {
-        from = p + 1;
-        let n0 = p + pat2.len();
-        let n1 = word_end(fb, n0);
-        if n1 == n0
-            || n1 + 1 >= fb.len()
-            || fb[n1] != b'.'
-            || !matches!(fb[n1 + 1], b'x' | b'y' | b'z' | b'w')
-        {
-            continue;
-        }
-        if !starts(fb, n1 + 2, " = as_type<float>(") {
-            continue;
-        }
-        if locs.iter().any(|(n, _)| *n == &full[n0..n1]) {
-            hit = Some((&full[n0..n1], fb[n1 + 1]));
-            break;
-        }
-    }
-    let Some((name, comp)) = hit else {
-        return Ok((full.to_string(), None));
-    };
-    let loc = locs
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, v)| *v)
-        .unwrap();
-    let comp = comp as char;
-    // st = re.sub(r'\n    float gl_PointSize \[\[point_size\]\];', '', full[i:j+3]).replace('struct main0_out', 'struct main0l_out', 1)
-    let st = full[i..j + 3].replace("\n    float gl_PointSize [[point_size]];", "");
-    let st = st.replacen("struct main0_out", "struct main0l_out", 1);
-    let mut st = st[..st.len() - 3].to_string();
-    st.push_str("\n    uint gl_Layer [[render_target_array_index]];\n};");
-    let mut add = format!("\n{st}\n");
-    for (ep, new) in [("main0", "main0_l"), ("main0_z", "main0_lz")] {
-        let Some((a, ae)) = main_entry_m(fb, ep, 0) else {
-            return Ok((full.to_string(), None));
-        };
-        let bpos = match find(full, "{", ae) {
-            Some(x) => x,
-            None => return Ok((full.to_string(), None)),
-        };
-        let mut depth = 0i32;
-        let mut e = bpos;
-        for (k, &c) in fb.iter().enumerate().skip(bpos) {
-            if c == b'{' {
-                depth += 1;
-            }
-            if c == b'}' {
-                depth -= 1;
-            }
-            e = k;
-            if depth == 0 {
-                break;
-            }
-        }
-        let fn0 = full[a..e + 1].replace("main0_out", "main0l_out").replacen(
-            &format!(" {ep}("),
-            &format!(" {new}("),
-            1,
-        );
-        let fn1 = drop_point_size(&fn0)?;
-        add.push('\n');
-        add.push_str(&fn1.replace(
-            "return out;",
-            &format!("out.gl_Layer = as_type<uint>(out.{name}.{comp});\n    return out;"),
-        ));
-        add.push('\n');
-    }
-    Ok((format!("{full}{add}"), Some((loc, comp))))
+    vs_layer_entry_from(full, None)
 }
 
 // ---------------------------------------------------------------------------------------------------------------- dmsh_geometry.capture
@@ -890,4 +784,428 @@ pub fn capture(src: &str) -> Result<String, PostError> {
         pro,
         body.replace("return out;", &epi)
     ))
+}
+
+// ---------------------------------------------------------------------------------------------------------------- vs_viewport_mask
+
+macro_rules! lazy_re {
+    ($name:ident, $pat:expr) => {
+        static $name: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new($pat).expect("static regex"));
+    };
+}
+lazy_re!(RE_NOTE, r#"(?s)//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*""#);
+lazy_re!(RE_VM_OUT, r"(?s)struct main0_out\s*\{(.*?)\};");
+lazy_re!(
+    RE_VM_POS,
+    r"\bfloat4 (\w+) \[\[position(?:, invariant)?\]\];"
+);
+lazy_re!(
+    RE_VM_ENTRY,
+    r"\bvertex\s+main0_out\s+main0\s*\(([^{}]*)\)\s*\{"
+);
+lazy_re!(
+    RE_VM_STORE,
+    r"\bgl_BuiltIn_5253\s*\[\s*0u?\s*\]\s*=\s*([^;\n]+);"
+);
+lazy_re!(RE_VM_TAIL, r"(?:^|[;}])\s*$");
+lazy_re!(RE_VM_RETURN_WORD, r"\breturn\b");
+lazy_re!(RE_VM_RETURN, r"\breturn out;");
+lazy_re!(
+    RE_VU_CAST,
+    r"\A(?:as_type<(?:int|uint)>|int|uint)\((.*)\)\z"
+);
+lazy_re!(RE_VU_LIT, r"\A-?(?:0[xX][0-9a-fA-F]+|[0-9]+)[uU]?\z");
+lazy_re!(
+    RE_VU_CONST,
+    r"\bconstant\s+(\w+)\s*&\s*(\w+)\s*\[\[buffer\(\d+\)\]\]"
+);
+lazy_re!(
+    RE_VU_LOAD,
+    r"\A\(\*(\w+)\.(\w+)\)\.(\w+)\[(0[xX][0-9a-fA-F]+|[0-9]+)[uU]?\]\.([xyzw])\z"
+);
+
+const VM_BUILTIN: &str = "gl_BuiltIn_5253";
+const VM_LOCAL: &str = "dm_vertex_viewport_mask";
+
+fn vm_err(msg: &str) -> PostError {
+    failed("vs_viewport_mask", format!("vertex viewport mask: {msg}"))
+}
+
+/// `_viewport_uniform(src, params, value)`: a store value proven draw-uniform (a literal, a constant scalar argument, or a fixed word of a constant buffer behind a constant
+/// descriptor), through any int / uint casts
+pub fn viewport_uniform(src: &str, params: &str, value: &str) -> bool {
+    let mut value = value.trim().to_string();
+    while let Some(m) = RE_VU_CAST.captures(&value) {
+        value = m[1].trim().to_string();
+    }
+    if RE_VU_LIT.is_match(&value) {
+        return true;
+    }
+    let mut constant: Vec<(String, String)> = Vec::new(); // {name: type}, a later declaration wins
+    for m in RE_VU_CONST.captures_iter(params) {
+        match constant.iter_mut().find(|(n, _)| n == &m[2]) {
+            Some(e) => e.1 = m[1].to_string(),
+            None => constant.push((m[2].to_string(), m[1].to_string())),
+        }
+    }
+    let ty = |n: &str| {
+        constant
+            .iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, t)| t.clone())
+    };
+    if matches!(ty(&value).as_deref(), Some("int" | "uint")) {
+        return true;
+    }
+    let Some(load) = RE_VU_LOAD.captures(&value) else {
+        return false;
+    };
+    let Some(desc_ty) = ty(&load[1]) else {
+        return false;
+    };
+    let struct_body = |name: &str| -> Option<String> {
+        let re = crate::finish::rx::cached(&format!(
+            r"\bstruct\s+{}\s*\{{([^{{}}]*)\}};",
+            regex::escape(name)
+        ))
+        .ok()?;
+        re.captures(src).map(|c| c[1].to_string())
+    };
+    let Some(descriptor) = struct_body(&desc_ty) else {
+        return false;
+    };
+    let Ok(pre) = crate::finish::rx::cached(&format!(
+        r"\bconstant\s+(\w+)\s*\*\s*{}\s*\[\[id\(\d+\)\]\];",
+        regex::escape(&load[2])
+    )) else {
+        return false;
+    };
+    let Some(pointer) = pre.captures(&descriptor).map(|c| c[1].to_string()) else {
+        return false;
+    };
+    let Some(payload) = struct_body(&pointer) else {
+        return false;
+    };
+    let Ok(are) = crate::finish::rx::cached(&format!(
+        r"\b(?:float|int|uint)4\s+{}\[(\d+)\];",
+        regex::escape(&load[3])
+    )) else {
+        return false;
+    };
+    let Some(size) = are.captures(&payload).map(|c| c[1].to_string()) else {
+        return false;
+    };
+    let digits = &load[4];
+    let index = if digits.to_ascii_lowercase().starts_with("0x") {
+        u128::from_str_radix(&digits[2..], 16).ok()
+    } else {
+        digits.parse::<u128>().ok()
+    };
+    match (index, size.parse::<u128>()) {
+        (Some(i), Ok(n)) => i < n,
+        (Some(_), Err(_)) => size.chars().all(|c| c.is_ascii_digit()), // a size past u128 holds any index that fits
+        (None, _) => false,
+    }
+}
+
+/// `src` with every comment and string literal blanked as `vs_viewport_mask` does (each character a space, newlines kept), one space per byte so that the offsets stay those of `src`
+fn blank_notes(src: &str) -> String {
+    RE_NOTE
+        .replace_all(src, |m: &regex::Captures| {
+            m[0].bytes()
+                .map(|b| if b == b'\n' { '\n' } else { ' ' })
+                .collect::<String>()
+        })
+        .into_owned()
+}
+
+/// the text of `code[a..b]` as the Python's blanked copy holds it: one space for each blanked character of `src` (`blank_notes` gives one for each byte)
+fn blanked_text(src: &str, code: &str, a: usize, b: usize) -> String {
+    let cb = code.as_bytes();
+    src[a..b]
+        .char_indices()
+        .map(|(i, c)| {
+            if cb[a + i] == b' ' && c != ' ' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// dmsh_entry.vs_viewport_mask: (raster source, unculled source) for a vertex shader that writes ViewportMaskNV (`gl_BuiltIn_5253`); both are `src` when it writes none.
+/// The raster source keeps the mask in a local and moves the position out of the clip volume before every `return out;` when its bit 0 is clear.
+pub fn vs_viewport_mask(src: &str) -> Result<(String, String), PostError> {
+    if !contains(src, VM_BUILTIN) {
+        return Ok((src.to_string(), src.to_string()));
+    }
+    let code = blank_notes(src);
+    if !contains(&code, VM_BUILTIN) {
+        return Ok((src.to_string(), src.to_string()));
+    }
+    if contains(&code, VM_LOCAL) {
+        return Err(vm_err("local name already used"));
+    }
+    let position = RE_VM_OUT.captures(&code).and_then(|o| {
+        RE_VM_POS
+            .captures(o.get(1).unwrap().as_str())
+            .map(|p| p[1].to_string())
+    });
+    let entry = RE_VM_ENTRY.captures(&code);
+    let (Some(position), Some(entry)) = (position, entry) else {
+        return Err(vm_err("missing position or entry"));
+    };
+    let params = entry.get(1).unwrap().as_str();
+    let begin = entry.get(0).unwrap().end();
+    let cb = code.as_bytes();
+    let (mut depth, mut end) = (1i64, begin);
+    while depth != 0 && end < cb.len() {
+        depth += (cb[end] == b'{') as i64 - (cb[end] == b'}') as i64;
+        end += 1;
+    }
+    if depth != 0 {
+        return Err(vm_err("unterminated entry"));
+    }
+    let body = &src[begin..end - 1];
+    let body_code = &code[begin..end - 1];
+    let store = RE_VM_STORE.captures(body_code);
+    let store = match store {
+        Some(s) if count(&code, VM_BUILTIN) == 1 => s,
+        _ => {
+            return Err(vm_err("requires one draw-uniform element-zero store"));
+        }
+    };
+    let (s0, s1) = (store.get(0).unwrap().start(), store.get(0).unwrap().end());
+    let rhs = store.get(1).unwrap();
+    let rhs_text = blanked_text(src, &code, begin + rhs.start(), begin + rhs.end());
+    let prefix = &body_code[..s0];
+    if count(prefix, "{") != count(prefix, "}")
+        || !RE_VM_TAIL.is_match(prefix)
+        || RE_VM_RETURN_WORD.is_match(prefix)
+        || !viewport_uniform(&code, params, &rhs_text)
+    {
+        return Err(vm_err(
+            "requires an unconditional draw-uniform store before every return",
+        ));
+    }
+    let returns: Vec<(usize, usize)> = RE_VM_RETURN
+        .find_iter(body_code)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    if returns.is_empty() {
+        return Err(vm_err("missing return"));
+    }
+    let cull = format!(
+        "{{ if (({VM_LOCAL} & 1u) == 0u) out.{position} = float4(2.0, 0.0, 0.0, 1.0); return out; }}"
+    );
+    let mut raster = body.to_string();
+    for &(a, b) in returns.iter().rev() {
+        raster = format!("{}{}{}", &raster[..a], cull, &raster[b..]);
+    }
+    let before = format!(
+        "{}\n    int {VM_LOCAL} = 1;{}{VM_LOCAL} = {rhs_text};",
+        &src[..begin],
+        &body[..s0]
+    );
+    let after = &src[end - 1..];
+    Ok((
+        format!("{before}{}{after}", &raster[s1..]),
+        format!("{before}{}{after}", &body[s1..]),
+    ))
+}
+
+/// dmsh_entry.vs_layer_entry(full, source): the layer entry points made from `source` (a folded geometry stage ignores an earlier viewport mask, so `finish()` passes the unculled
+/// source when the shader has one) and appended to `full`; `source` None is `full` itself
+pub fn vs_layer_entry_from(
+    full: &str,
+    source: Option<&str>,
+) -> Result<(String, Option<(u32, char)>), PostError> {
+    let src = source.unwrap_or(full);
+    match layer_entries(src)? {
+        Some((add, lay)) => Ok((format!("{full}{add}"), Some(lay))),
+        None => Ok((full.to_string(), None)),
+    }
+}
+
+/// vs_layer_entry's `{'loc', 'comp'}`: the output location and component the layer is read from
+pub type LayerFrom = (u32, char);
+
+/// what `vs_layer_entry` adds to the text for `source` (the `main0l_out` struct and main0_l / main0_lz), and `{'loc', 'comp'}`; None when no output qualifies
+fn layer_entries(full: &str) -> Result<Option<(String, LayerFrom)>, PostError> {
+    let (i, j) = out_struct_span(full);
+    let (Some(i), Some(j)) = (i, j) else {
+        return Ok(None);
+    };
+    if !contains(full, "gl_InstanceIndex") || contains(&full[i..j], "[[render_target_array_index]]")
+    {
+        return Ok(None);
+    }
+    // locs: `\n    float4 (\w+) \[\[user\(locn(\d+)\)\]\];` in full[i:j]
+    let seg = &full[i..j];
+    let sb = seg.as_bytes();
+    let pat = b"\n    float4 ";
+    let mut locs: Vec<(&str, u32)> = Vec::new(); // a later declaration of the same name wins (a dict)
+    let mut from = 0;
+    while let Some(p) = find_b(sb, pat, from) {
+        from = p + 1;
+        let n0 = p + pat.len();
+        let n1 = word_end(sb, n0);
+        if n1 == n0 || !starts(sb, n1, " [[user(locn") {
+            continue;
+        }
+        let d0 = n1 + 12;
+        let d1 = digits_end(sb, d0);
+        if d1 == d0 || !starts(sb, d1, ")]];") {
+            continue;
+        }
+        let v: u32 = seg[d0..d1].parse().unwrap_or(u32::MAX);
+        if let Some(e) = locs.iter_mut().find(|(n, _)| *n == &seg[n0..n1]) {
+            e.1 = v;
+        } else {
+            locs.push((&seg[n0..n1], v));
+        }
+    }
+    // first `\n    out\.(\w+)\.([xyzw]) = as_type<float>\(` over the whole text with the name in locs
+    let fb = full.as_bytes();
+    let pat2 = b"\n    out.";
+    let mut hit: Option<(&str, u8)> = None;
+    let mut from = 0;
+    while let Some(p) = find_b(fb, pat2, from) {
+        from = p + 1;
+        let n0 = p + pat2.len();
+        let n1 = word_end(fb, n0);
+        if n1 == n0
+            || n1 + 1 >= fb.len()
+            || fb[n1] != b'.'
+            || !matches!(fb[n1 + 1], b'x' | b'y' | b'z' | b'w')
+        {
+            continue;
+        }
+        if !starts(fb, n1 + 2, " = as_type<float>(") {
+            continue;
+        }
+        if locs.iter().any(|(n, _)| *n == &full[n0..n1]) {
+            hit = Some((&full[n0..n1], fb[n1 + 1]));
+            break;
+        }
+    }
+    let Some((name, comp)) = hit else {
+        return Ok(None);
+    };
+    let loc = locs
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| *v)
+        .unwrap();
+    let comp = comp as char;
+    let st = full[i..j + 3].replace("\n    float gl_PointSize [[point_size]];", "");
+    let st = st.replacen("struct main0_out", "struct main0l_out", 1);
+    let mut st = st[..st.len() - 3].to_string();
+    st.push_str("\n    uint gl_Layer [[render_target_array_index]];\n};");
+    let mut add = format!("\n{st}\n");
+    for (ep, new) in [("main0", "main0_l"), ("main0_z", "main0_lz")] {
+        let Some((a, ae)) = main_entry_m(fb, ep, 0) else {
+            return Ok(None);
+        };
+        let bpos = match find(full, "{", ae) {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let mut depth = 0i32;
+        let mut e = bpos;
+        for (k, &c) in fb.iter().enumerate().skip(bpos) {
+            if c == b'{' {
+                depth += 1;
+            }
+            if c == b'}' {
+                depth -= 1;
+            }
+            e = k;
+            if depth == 0 {
+                break;
+            }
+        }
+        let fn0 = full[a..e + 1].replace("main0_out", "main0l_out").replacen(
+            &format!(" {ep}("),
+            &format!(" {new}("),
+            1,
+        );
+        let fn1 = drop_point_size(&fn0)?;
+        add.push('\n');
+        add.push_str(&fn1.replace(
+            "return out;",
+            &format!("out.gl_Layer = as_type<uint>(out.{name}.{comp});\n    return out;"),
+        ));
+        add.push('\n');
+    }
+    Ok(Some((add, (loc, comp))))
+}
+
+/// The vertex entry points `finish()` adds after vs_pad (dmsh_build.py: vs_viewport_mask, capture, vs_depth, vs_writes / vs_discard, vs_tf, vs_layer_entry)
+#[derive(Debug, Clone, Default)]
+pub struct VertexEntries {
+    /// `src` after vs_depth: main0 alone with the GL depth line (and the viewport cull), what the reflection reads
+    pub single: String,
+    /// the text written to `<key>.metal`: every entry point
+    pub full: String,
+    /// `full[..plain_len]` is `plain` (without the layer entry points)
+    pub plain_len: usize,
+    /// main0_discard was added
+    pub discard: bool,
+    /// vs_viewport_mask changed the source (the reflection's `viewport_mask: true`)
+    pub viewport_mask: bool,
+    /// vs_layer_entry's `{'loc', 'comp'}`
+    pub layer_from: Option<(u32, char)>,
+}
+
+/// `finish()`'s vertex entry points for `src` (the source after vs_init, vs_layer, vs_base_instance, vs_pad). `res`: the translator's answer json (the reflection's `rw` for
+/// vs_writes); `tf`: `j['tf']` when the job has a feedback layout (`has_tf`; a layout that is missing then is `Unported`).
+/// Errors: step `vs_viewport_mask` ('vertex viewport mask failed', the message whole), and the ValueErrors of the other steps as before.
+pub fn vertex_entries(
+    src: &str,
+    res: &serde_json::Value,
+    has_tf: bool,
+    tf: Option<&serde_json::Value>,
+) -> Result<VertexEntries, PostError> {
+    let (raster, unculled) = vs_viewport_mask(src)?;
+    let viewport_mask = raster != unculled;
+    let capture = capture(&unculled)?;
+    let (single, mut full) = vs_depth(&raster)?;
+    let layer_source = if viewport_mask {
+        Some(vs_depth(&unculled)?.1)
+    } else {
+        None // `full` before the capture entry
+    };
+    let depth_full_len = full.len();
+    full.push_str(&capture);
+    let rw = reflect_rw(&single, res)?;
+    let discard = vs_writes(&single, rw);
+    if discard {
+        full.push_str(&vs_discard(&unculled)?);
+    }
+    if has_tf {
+        match tf {
+            Some(t) => full.push_str(&crate::tf::vs_tf(&unculled, t, false)?),
+            None => return Err(PostError::Unported("vs_tf without the layout")),
+        }
+    }
+    let plain_len = full.len();
+    let layer = match &layer_source {
+        Some(s) => layer_entries(s)?,
+        None => layer_entries(&full[..depth_full_len])?,
+    };
+    let layer_from = layer.as_ref().map(|(_, l)| *l);
+    if let Some((add, _)) = layer {
+        full.push_str(&add);
+    }
+    Ok(VertexEntries {
+        single,
+        full,
+        plain_len,
+        discard,
+        viewport_mask,
+        layer_from,
+    })
 }

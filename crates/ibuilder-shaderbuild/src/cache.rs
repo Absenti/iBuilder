@@ -15,6 +15,11 @@
 //! * **Other chains** (`cas-<other>.dmsb`) can never hit (the chain is in the digest): `sweep_other_chains` removes them, as the pipeline's `shader_cache_folder` does for the
 //!   engine's `cas-<other>.db` files.
 //!
+//! * **The previous library** (speed-up B6): a rebuild of a game whose library is stale (a game update, a DLC change, a re-split) keeps the old library aside at
+//!   `<out_dir>/prev/b-<chain>.img` with its digests table (`library::digests_path`). `Store::open` finds it there by convention (the stage folder is `<out_dir>/_work/stage`), and a
+//!   lookup the cache misses is served from the old image (`Stored::path` is the old image, the files' ranges are inside it): an unchanged shader is not translated again, and its bytes
+//!   are the ones the digest promises, so the new image is the one a build without the old library makes. The counts are left in `<out_dir>/prev/reuse.tsv` when the store goes.
+//!
 //! Container (all integers little endian): `"DMSBCAS1"`, `u32 meta_len`, `meta` (JSON), `u32 count`, `count` x (`u16 name_len`, `name`, `u64 data_len`), then the files' bytes in that order.
 //! The header is a few hundred bytes: a lookup reads it alone and knows every file's offset and size.
 use serde_json::{Value, json};
@@ -22,6 +27,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const MAGIC: &[u8; 8] = b"DMSBCAS1";
 
@@ -39,7 +45,7 @@ pub struct Meta {
 }
 
 impl Meta {
-    fn to_json(&self) -> Vec<u8> {
+    pub(crate) fn to_json(&self) -> Vec<u8> {
         let cb = match &self.cb {
             Some((k, t)) => json!([k, t]),
             None => Value::Null,
@@ -48,7 +54,7 @@ impl Meta {
             .to_string()
             .into_bytes()
     }
-    fn from_json(b: &[u8]) -> Option<Meta> {
+    pub(crate) fn from_json(b: &[u8]) -> Option<Meta> {
         let v: Value = serde_json::from_slice(b).ok()?;
         let c1 = v
             .get("c1")?
@@ -144,8 +150,10 @@ pub fn encode(meta: &Meta, files: &[(String, Vec<u8>)]) -> Vec<u8> {
 
 /// Reads and checks an entry's header (`None`: absent, damaged, or shorter than its header says)
 pub fn read_header(path: &Path) -> Option<Stored> {
-    let mut f = File::open(path).ok()?;
-    let size = f.metadata().ok()?.len();
+    let file = File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    // the header is a few small reads: one buffered read of the file's start instead of one system call each
+    let mut f = std::io::BufReader::with_capacity(4096, file);
     let mut head = [0u8; 12];
     f.read_exact(&mut head).ok()?;
     if &head[..8] != MAGIC {
@@ -227,6 +235,43 @@ pub struct Store {
     pub cache: PathBuf,
     /// the build's own folder of entries (hard links to cache entries, or entries that were not cacheable)
     pub stage: PathBuf,
+    /// an entry the cache could not take (a full drive): only the shaders cached before that are reused by the next build
+    pub cache_full: std::sync::atomic::AtomicBool,
+    /// the previous library of this chain (`<out_dir>/prev`), when one is there and its digests table matches it
+    prev: Option<crate::library::Previous>,
+    /// `<out_dir>/prev` when a previous library was there (used or not): where the counts go when the store goes
+    prev_dir: Option<PathBuf>,
+    /// "used", or why the previous library was not
+    prev_state: String,
+    lookups: AtomicUsize,
+    prev_hits: AtomicUsize,
+}
+
+/// The folder of the build's out folder that holds the previous library (`<out_dir>/prev/b-<chain>.img` and its digests table)
+pub const PREV_DIR: &str = "prev";
+/// What a store that found a previous library leaves in `<out_dir>/prev` when it goes: `state`, `entries`, `looked`, `hits` rows (`<name> TAB <value>`)
+pub const REUSE_FILE: &str = "reuse.tsv";
+
+impl Drop for Store {
+    /// a previous library was there: what it served is left beside it for the pipeline's log (the build's report does not reach the pipeline)
+    fn drop(&mut self) {
+        let Some(dir) = &self.prev_dir else { return };
+        let text = format!(
+            "state\t{}\nentries\t{}\nlooked\t{}\nhits\t{}\n",
+            self.prev_state,
+            self.prev.as_ref().map_or(0, |p| p.len()),
+            self.lookups.load(Ordering::Relaxed),
+            self.prev_hits.load(Ordering::Relaxed)
+        );
+        let _ = write_atomic(&dir.join(REUSE_FILE), text.as_bytes());
+    }
+}
+
+/// Whether an I/O error is a full drive (ENOSPC; EDQUOT, a quota, says the same to the player)
+pub fn is_disk_full(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::StorageFull
+        || e.kind() == std::io::ErrorKind::QuotaExceeded
+        || matches!(e.raw_os_error(), Some(28) | Some(69))
 }
 
 impl Store {
@@ -235,9 +280,42 @@ impl Store {
         fs::create_dir_all(&cache)?;
         let _ = fs::remove_dir_all(stage);
         fs::create_dir_all(stage)?;
+        // by convention the stage is `<out_dir>/_work/stage`, and the previous library `<out_dir>/prev/b-<chain>.img`
+        let prev_dir = stage
+            .parent()
+            .and_then(Path::parent)
+            .map(|o| o.join(PREV_DIR));
+        let prev_img = prev_dir
+            .as_ref()
+            .map(|d| d.join(format!("b-{chain}.img")))
+            .filter(|p| p.is_file());
+        let (prev, prev_state) = match &prev_img {
+            None => (None, String::new()),
+            Some(img) => match crate::library::Previous::open(img) {
+                Ok(p) => (Some(p), "used".to_string()),
+                Err(why) => (None, format!("not used: {why}")),
+            },
+        };
         Ok(Store {
             cache,
             stage: stage.to_path_buf(),
+            cache_full: std::sync::atomic::AtomicBool::new(false),
+            prev,
+            prev_dir: prev_img.and(prev_dir),
+            prev_state,
+            lookups: AtomicUsize::new(0),
+            prev_hits: AtomicUsize::new(0),
+        })
+    }
+
+    /// `(shaders in the previous library's table, lookups, lookups it served)`; `None` when no previous library was used
+    pub fn previous_counts(&self) -> Option<(usize, usize, usize)> {
+        self.prev.as_ref().map(|p| {
+            (
+                p.len(),
+                self.lookups.load(Ordering::Relaxed),
+                self.prev_hits.load(Ordering::Relaxed),
+            )
         })
     }
 
@@ -250,14 +328,26 @@ impl Store {
     }
 
     /// A hit: the entry's header is read (a damaged or short entry is a miss) and the entry is linked into the stage folder, from which the build reads it
+    /// (speed-up B6) then, on a miss, the previous library: the entry is the old image's ranges of the shader's files
     pub fn lookup(&self, digest: &str) -> Option<Stored> {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
         let cp = self.cache_path(digest);
-        let mut st = read_header(&cp)?;
+        let Some(mut st) = read_header(&cp) else {
+            let hit = self.prev.as_ref()?.lookup(digest)?;
+            self.prev_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(hit);
+        };
         let sp = self.stage_path(digest);
         if sp.exists() || fs::hard_link(&cp, &sp).is_ok() {
             st.path = sp;
         }
         Some(st)
+    }
+
+    /// The stage entry of a shader the cache must not take (`commit` with `cacheable` false): a name that is not a digest, so the library's digests table leaves it out too
+    /// (the next build makes it again, as it does when the cache never had it)
+    pub fn uncached_stage_path(&self, digest: &str) -> PathBuf {
+        self.stage.join(format!("{digest}.nc"))
     }
 
     /// A finished shader: its entry is written whole into the stage folder and, when `cacheable`, linked into the cache (an entry that is already there is left: the same digest is the same bytes)
@@ -269,7 +359,11 @@ impl Store {
         cacheable: bool,
     ) -> std::io::Result<Stored> {
         let bytes = encode(meta, files);
-        let sp = self.stage_path(digest);
+        let sp = if cacheable {
+            self.stage_path(digest)
+        } else {
+            self.uncached_stage_path(digest)
+        };
         write_atomic(&sp, &bytes)?;
         if cacheable {
             let cp = self.cache_path(digest);
@@ -284,6 +378,8 @@ impl Store {
                 if !linked || fs::rename(&tmp, &cp).is_err() {
                     let _ = fs::remove_file(&tmp);
                     // the cache could not take it (a full drive): the build goes on from its stage folder
+                    self.cache_full
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -387,5 +483,15 @@ mod tests {
             vec!["cas-old.dmsb".to_string()]
         );
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_full_drive_is_told_apart() {
+        assert!(super::is_disk_full(&std::io::Error::from_raw_os_error(28)));
+        assert!(super::is_disk_full(&std::io::Error::from(
+            std::io::ErrorKind::StorageFull
+        )));
+        assert!(!super::is_disk_full(&std::io::Error::from_raw_os_error(13)));
+        assert!(!super::is_disk_full(&std::io::Error::other("no")));
     }
 }

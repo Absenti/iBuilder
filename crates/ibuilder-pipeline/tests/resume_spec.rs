@@ -453,6 +453,215 @@ fn with_stub(fx: &mut Fx, kill: bool) -> Arc<Stub> {
     s
 }
 
+/// Speed-up B6 / B2: a backend that builds `library` with its digests table, and tells what it found of the previous library in `<out>/prev` (as the real build's store does)
+struct PrevStub {
+    split_ver: &'static str,
+    library: &'static str,
+    /// "ok", "kill" (the process dies), "fail"
+    mode: &'static str,
+    saw_prev: Mutex<Option<String>>,
+}
+
+impl PrevStub {
+    fn new(split_ver: &'static str, library: &'static str, mode: &'static str) -> Arc<PrevStub> {
+        Arc::new(PrevStub {
+            split_ver,
+            library,
+            mode,
+            saw_prev: Mutex::new(None),
+        })
+    }
+}
+
+impl ShaderBackend for PrevStub {
+    fn split_version(&self) -> String {
+        self.split_ver.into()
+    }
+    fn split(
+        &self,
+        req: &SplitRequest<'_>,
+        _log: &dyn ibuilder_pipeline::log::Log,
+    ) -> ibuilder_pipeline::Result<SplitResult> {
+        fs::create_dir_all(req.pkg_dir)?;
+        fs::create_dir_all(req.tables_dir)?;
+        fs::write(req.pkg_dir.join("ps_a.bin"), b"x")?;
+        for t in SHADER_TABLES {
+            fs::write(req.tables_dir.join(t), "#\n")?;
+        }
+        Ok(SplitResult {
+            shaders: 42,
+            jobs_reused: 0,
+            jobs_ran: 1,
+        })
+    }
+    fn build(
+        &self,
+        req: &BuildRequest<'_>,
+        p: &mut dyn FnMut(&str),
+    ) -> ibuilder_pipeline::Result<PathBuf> {
+        let prev = req.out_dir.join(PREV_LIBRARY);
+        let old = fs::read_to_string(prev.join(format!("b-{}.img", req.chain))).ok();
+        if old.is_some() {
+            assert!(prev.join(format!("b-{}.img.digests", req.chain)).is_file());
+            fs::write(
+                prev.join(PREV_REUSE),
+                "state\tused\nentries\t41\nlooked\t42\nhits\t40\n",
+            )?;
+        }
+        *self.saw_prev.lock().unwrap() = old;
+        for _ in 0..2 {
+            (req.tools.xlate)(&["jobs.json".to_string(), "out".to_string()]);
+        }
+        for _ in 0..3 {
+            (req.tools.spirv_cross)(&["--version".to_string()]);
+        }
+        p("shader cache: hit 40, rebuilt 2");
+        match self.mode {
+            "kill" => panic!("the process was killed"),
+            "fail" => {
+                return Err(ibuilder_pipeline::error::PipelineError::failed(
+                    "a tool broke",
+                ));
+            }
+            _ => {}
+        }
+        fs::create_dir_all(req.out_dir.join("_work/profile").join(req.game_id))?;
+        let img = req.out_dir.join(format!("b-{}.img", req.chain));
+        fs::write(&img, self.library)?;
+        fs::write(
+            req.out_dir.join(format!("b-{}.img.digests", req.chain)),
+            format!("table of {}", self.library),
+        )?;
+        Ok(img)
+    }
+    fn live_translate(
+        &self,
+        _r: &LiveRequest<'_>,
+        _l: &dyn ibuilder_pipeline::log::Log,
+    ) -> ibuilder_pipeline::Result<LiveResult> {
+        Ok(LiveResult::default())
+    }
+}
+
+#[test]
+fn a_stale_library_serves_its_rebuild_and_goes_once_the_new_one_is_in_place() {
+    // speed-up B6: a re-split keeps the old library aside (with its digests table) for the build, through a kill, and removes it after the build that succeeds
+    let mut fx = stage3_fixture();
+    let pack = fx.p(&format!("shaders/{STID}"));
+    let work = fx.p(&format!("shaders/{STID}.work"));
+    let lib = format!("b-{CHAIN}.img");
+    let first = PrevStub::new("split-1", "LIB-1", "ok");
+    fx.ctx.adapters.shaders = Some(first.clone());
+    build_shaders_on_device(&mut fx.ctx).expect("a library");
+    assert_eq!(
+        *first.saw_prev.lock().unwrap(),
+        None,
+        "a first build has no previous library"
+    );
+    assert_eq!(
+        fs::read_to_string(pack.join(format!("{lib}.digests"))).unwrap(),
+        "table of LIB-1",
+        "the digests table goes into the pack with the library"
+    );
+    // B2: the build's time split and the CPU it took
+    assert!(
+        fx.log.contains("stage 3 shaders: build ")
+            && fx.log.contains("translator ")
+            && fx.log.contains("in 2 calls, SPIRV-Cross ")
+            && fx
+                .log
+                .contains("in 3 calls (summed over threads); shader cache hit 40, rebuilt 2"),
+        "{:?}",
+        fx.log.lines()
+    );
+    assert!(
+        fx.log.contains("cores busy on average"),
+        "{:?}",
+        fx.log.lines()
+    );
+
+    // another split version: the pack is stale, its library is kept aside; this build is killed
+    fx.log.clear();
+    let killed = PrevStub::new("split-2", "LIB-2", "kill");
+    fx.ctx.adapters.shaders = Some(killed.clone());
+    assert!(catch_unwind(AssertUnwindSafe(|| build_shaders_on_device(&mut fx.ctx))).is_err());
+    assert!(
+        fx.log.contains("kept aside until the new one is built"),
+        "{:?}",
+        fx.log.lines()
+    );
+    assert_eq!(killed.saw_prev.lock().unwrap().as_deref(), Some("LIB-1"));
+    assert!(!pack.exists(), "the stale pack is gone");
+    assert_eq!(
+        fs::read_to_string(work.join(PREV_LIBRARY).join(&lib)).unwrap(),
+        "LIB-1",
+        "the kill keeps it"
+    );
+
+    // the resumed run takes it again, and once the new library is in place it is gone with the work folder
+    fx.log.clear();
+    let resumed = PrevStub::new("split-2", "LIB-2", "ok");
+    fx.ctx.adapters.shaders = Some(resumed.clone());
+    build_shaders_on_device(&mut fx.ctx).expect("a library");
+    assert_eq!(resumed.saw_prev.lock().unwrap().as_deref(), Some("LIB-1"));
+    assert!(
+        fx.log.contains("half the usual"),
+        "a kill is still a kill: {:?}",
+        fx.log.lines()
+    );
+    assert!(
+        fx.log
+            .contains("stage 3 shaders: 40 of 42 shaders taken from the previous library"),
+        "{:?}",
+        fx.log.lines()
+    );
+    assert_eq!(fs::read_to_string(pack.join(&lib)).unwrap(), "LIB-2");
+    assert_eq!(
+        fs::read_to_string(pack.join(format!("{lib}.digests"))).unwrap(),
+        "table of LIB-2"
+    );
+    assert!(!work.exists());
+
+    // a re-split whose build fails: the previous library goes with the work folder
+    fx.log.clear();
+    let failed = PrevStub::new("split-3", "LIB-3", "fail");
+    fx.ctx.adapters.shaders = Some(failed.clone());
+    assert!(build_shaders_on_device(&mut fx.ctx).is_none());
+    assert_eq!(failed.saw_prev.lock().unwrap().as_deref(), Some("LIB-2"));
+    assert!(!work.exists() && !pack.exists());
+    // a library with no digests table (built before B6, or imported): its rebuild has nothing to take
+    let plain = PrevStub::new("split-3", "LIB-3", "ok");
+    fx.ctx.adapters.shaders = Some(plain.clone());
+    build_shaders_on_device(&mut fx.ctx).expect("a library");
+    fs::remove_file(pack.join(format!("{lib}.digests"))).unwrap();
+    let after = PrevStub::new("split-4", "LIB-4", "ok");
+    fx.ctx.adapters.shaders = Some(after.clone());
+    build_shaders_on_device(&mut fx.ctx).expect("a library");
+    assert_eq!(*after.saw_prev.lock().unwrap(), None);
+    assert_eq!(fs::read_to_string(pack.join(&lib)).unwrap(), "LIB-4");
+}
+
+#[test]
+fn stage_3_ended_twice_in_a_row_resumes_on_one_thread() {
+    // speed-up B1: the first resume keeps half its threads; when it is ended too, the next one is on 1 thread, as before B1
+    let mut fx = stage3_fixture();
+    with_stub(&mut fx, true);
+    assert!(catch_unwind(AssertUnwindSafe(|| build_shaders_on_device(&mut fx.ctx))).is_err());
+    fx.log.clear();
+    with_stub(&mut fx, true);
+    assert!(catch_unwind(AssertUnwindSafe(|| build_shaders_on_device(&mut fx.ctx))).is_err());
+    assert!(fx.log.contains("half the usual"), "{:?}", fx.log.lines());
+    fx.log.clear();
+    with_stub(&mut fx, false);
+    build_shaders_on_device(&mut fx.ctx).expect("a library");
+    assert!(
+        fx.log.contains("2 times in a row") && fx.log.contains("on 1 thread"),
+        "{:?}",
+        fx.log.lines()
+    );
+    assert!(!fx.p(&format!("shaders/{STID}.work")).exists());
+}
+
 #[test]
 fn stage_3_ended_by_a_kill_resumes_without_reading_the_shaders_again() {
     // py: "stage 3 ended by a kill leaves its work folder, with the finished split", "and no library", "the next build does not read the game's shaders again", "it translates on 1 thread",
@@ -479,8 +688,9 @@ fn stage_3_ended_by_a_kill_resumes_without_reading_the_shaders_again() {
     );
     assert!(fx.log.contains("not read again"));
     assert!(
-        fx.log.contains("on 1 thread"),
-        "the unfinished build's safety"
+        fx.log.contains("half the usual") && !fx.log.contains("on 1 thread"),
+        "one kill: the resume keeps half its threads (speed-up B1), {:?}",
+        fx.log.lines()
     );
     assert!(
         pack.join(format!("b-{CHAIN}.img")).is_file() && stub.builds.load(Ordering::SeqCst) == 1

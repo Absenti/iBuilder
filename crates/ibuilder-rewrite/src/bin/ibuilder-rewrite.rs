@@ -55,6 +55,7 @@ fn run() -> Result<(), String> {
                 opts.py_tools = Some(PathBuf::from(it.next().ok_or("--py-tools needs a value")?))
             }
             "--spin-list" => opts.spin_list = true,
+            "--no-relayout" => opts.no_relayout = true,
             // what this build can rewrite, in the format of `tools/gen_patch_tables.py --coverage` (scripts/check-patch-coverage.sh compares the two)
             "--list-ported" => {
                 let mut so = std::io::stdout().lock();
@@ -70,7 +71,7 @@ fn run() -> Result<(), String> {
     }
     opts.games_dirs = games_dirs;
     if pos.len() != 3 {
-        return Err("usage: ibuilder-rewrite [--threads N] [--game ID] [--games-dir DIR] [--py-tools DIR] [--spin-list] <module file> <output dir> <module name> | ibuilder-rewrite --list-ported".into());
+        return Err("usage: ibuilder-rewrite [--threads N] [--game ID] [--games-dir DIR] [--py-tools DIR] [--spin-list] [--no-relayout] <module file> <output dir> <module name> | ibuilder-rewrite --list-ported".into());
     }
     let (src, outdir, name) = (&pos[0], PathBuf::from(&pos[1]), &pos[2]);
     let n = if opts.workers == 0 {

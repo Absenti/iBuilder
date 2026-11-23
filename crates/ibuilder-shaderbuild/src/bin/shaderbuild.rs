@@ -4,7 +4,7 @@
 //! shaderbuild build --pkg <split pkg dir> --profile <profile dir (<id>/game.tsv inside)> --game <title id> --out <dir> --chain <chain id>
 //!                   [--keys <file of 16-hex keys>] [--jobs N] [--tables 0|1] [--pulling 0|1] [--cas <dir>]
 //!                   [--engine <engine dir> | --xlate <bin> --spirv-cross <bin>] [--finisher mock|replay:<library image>|rust]
-//!                   [--tool-memo 0|1] [--finisher-salt <text>]
+//!                   [--tool-memo 0|1] [--finisher-salt <text>] [--xlate-group N]
 //! ```
 //! `--tool-memo 1`: the second cache level (`toolmemo`, the tools' answers); `--finisher-salt`: a text added to the finisher's fingerprint, which is what a change of the finishing code does to
 //! every shader's digest (measuring only: a build after a "finishing change" without changing the code).
@@ -178,6 +178,9 @@ fn main() {
             o.pulling = arg(&args, "--pulling").map(|s| s != "0").unwrap_or(false);
             o.keep_work = args.iter().any(|a| a == "--keep-work");
             o.tool_memo = arg(&args, "--tool-memo").is_some_and(|s| s != "0");
+            if let Some(g) = arg(&args, "--xlate-group").and_then(|s| s.parse().ok()) {
+                o.xlate_group = g;
+            }
             if let Some(k) = arg(&args, "--keys") {
                 let t = std::fs::read_to_string(&k).unwrap_or_else(|e| die(&format!("{k}: {e}")));
                 o.keys = Some(

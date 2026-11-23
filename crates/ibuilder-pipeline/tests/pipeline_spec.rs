@@ -1572,7 +1572,7 @@ fn the_shared_shader_cache() {
     // The Rust build's cache is the FOLDER cas-<chain>.dmsb (one file per shader under <hh>/), not the engine's SQLite file: what it keeps, what it removes (files AND folders), how the limit counts it.
     let mut fx = Fx::new();
     let c = fx.p("shadercache");
-    let mine = "cas-b24b25240cad.dmsb";
+    let mine = "cas-6c53446391cc.dmsb";
     write(c.join("cas-19d183a2b462.db"), "old chain");
     write(c.join("cas-19d183a2b462.db-wal"), "old wal");
     write(
@@ -1584,10 +1584,10 @@ fn the_shared_shader_cache() {
         "old chain, another sub-folder",
     );
     write(
-        c.join("cas-b24b25240cad.db"),
+        c.join("cas-6c53446391cc.db"),
         "the engine's SQLite store of this very chain: unreadable here",
     );
-    write(c.join("cas-b24b25240cad.db-shm"), "its shm");
+    write(c.join("cas-6c53446391cc.db-shm"), "its shm");
     write(
         c.join(format!("{mine}/ab/{}", "ab".repeat(32))),
         "x".repeat(1000),
@@ -1597,7 +1597,7 @@ fn the_shared_shader_cache() {
         "not ours: it does not start with cas",
     );
     assert_eq!(
-        shader_cache_folder(&fx.ctx, "b24b25240cad", false),
+        shader_cache_folder(&fx.ctx, "6c53446391cc", false),
         Some(c.clone())
     );
     assert_eq!(
@@ -1614,7 +1614,7 @@ fn the_shared_shader_cache() {
             .contains("cas-19d183a2b462.dmsb removed (another chain version")
             && fx
                 .log
-                .contains("cas-b24b25240cad.db removed (the engine's SQLite cache"),
+                .contains("cas-6c53446391cc.db removed (the engine's SQLite cache"),
         "{:?}",
         fx.log.lines()
     );
@@ -1624,13 +1624,13 @@ fn the_shared_shader_cache() {
         fx.log.lines()
     );
     assert_eq!(
-        ibuilder_pipeline::shaderpack::shader_cache_name("b24b25240cad"),
+        ibuilder_pipeline::shaderpack::shader_cache_name("6c53446391cc"),
         mine
     );
     // the limit counts the folder's entries (they are in sub-folders): over it, the cache starts again
     fx.set_cfg("shader_cache_gib", "0.0000001");
     fx.log.clear();
-    shader_cache_folder(&fx.ctx, "b24b25240cad", false);
+    shader_cache_folder(&fx.ctx, "6c53446391cc", false);
     assert!(
         ibuilder_pipeline::util::list_names(&c).is_empty() && fx.log.contains("started again"),
         "over its limit it starts again"
@@ -1641,7 +1641,7 @@ fn the_shared_shader_cache() {
         "x".repeat(1000),
     );
     fx.log.clear();
-    shader_cache_folder(&fx.ctx, "b24b25240cad", true);
+    shader_cache_folder(&fx.ctx, "6c53446391cc", true);
     assert!(
         c.join(mine).join("ab").is_dir() && fx.log.contains("kept for now"),
         "resuming: not started again over the limit"
@@ -1656,7 +1656,7 @@ fn the_shared_shader_cache() {
     fx.ctx.cfg.remove("shader_cache");
     // the default limit is 2 GB: a 1 GB cache is within it
     fx.log.clear();
-    shader_cache_folder(&fx.ctx, "b24b25240cad", false);
+    shader_cache_folder(&fx.ctx, "6c53446391cc", false);
     assert!(fx.log.contains("limit 2.00 GB"), "{:?}", fx.log.lines());
     assert!(
         c.join(mine).join("ab").is_dir(),
@@ -1668,7 +1668,7 @@ fn the_shared_shader_cache() {
 fn a_symlink_named_like_a_stale_cache_is_removed_and_never_followed() {
     let fx = Fx::new();
     let c = fx.p("shadercache");
-    write(c.join("cas-b24b25240cad.dmsb/00/e"), "mine");
+    write(c.join("cas-6c53446391cc.dmsb/00/e"), "mine");
     // a dangling symlink (and one to a folder that must survive) named like a stale cache is removed as a file: `remove_dir_all` on it would follow it, `remove_file` on a real folder fails
     write(
         fx.p("elsewhere/keep"),
@@ -1677,12 +1677,12 @@ fn a_symlink_named_like_a_stale_cache_is_removed_and_never_followed() {
     std::os::unix::fs::symlink(fx.p("elsewhere"), c.join("cas-0001.dmsb")).unwrap();
     std::os::unix::fs::symlink(fx.p("nowhere"), c.join("cas-0000.dmsb")).unwrap();
     assert_eq!(
-        shader_cache_folder(&fx.ctx, "b24b25240cad", false),
+        shader_cache_folder(&fx.ctx, "6c53446391cc", false),
         Some(c.clone())
     );
     assert_eq!(
         ibuilder_pipeline::util::list_names(&c),
-        vec!["cas-b24b25240cad.dmsb"]
+        vec!["cas-6c53446391cc.dmsb"]
     );
     assert!(
         fx.p("elsewhere/keep").is_file(),
@@ -1777,7 +1777,7 @@ fn an_exported_game_takes_its_shader_library_from_its_bundle() {
     let packs = fx.p("Bundle.app/ExportedGame/shaders");
     let tid = "0100B8E016F76000";
     write(packs.join(format!("{tid}/shader_map.tsv")), rows(3));
-    write(packs.join(format!("{tid}/b-b24b25240cad.img")), "lib");
+    write(packs.join(format!("{tid}/b-6c53446391cc.img")), "lib");
     fx.profile(&format!("title_id\t{tid}\n"));
     fx.set_cfg("shader_packs", &packs.to_string_lossy());
     use_config_paths(&mut fx.ctx);
@@ -1785,7 +1785,7 @@ fn an_exported_game_takes_its_shader_library_from_its_bundle() {
         fx.log
             .contains("an exported game: its library is in its bundle")
     );
-    fx.set_cfg("shader_chain", "b24b25240cad");
+    fx.set_cfg("shader_chain", "6c53446391cc");
     let got = set_shader_pack(&fx.ctx);
     assert_eq!(got.as_deref(), Some(packs.join(tid).as_path()));
     assert_eq!(

@@ -122,4 +122,42 @@ pub const HMMA_BODY: &str = r######"{
     %(d1)s = as_type<%(dt)s>(d1);
     return as_type<%(rt)s>(d0);
 }"######;
+pub const LOOP_SLOT: u32 = 28;
+pub const LOOP_CAP: u32 = 262144;
+pub const LOOP_ABORT_EVERY: u32 = 1024;
+pub const LOOP_HELPER: &str = r######"
+struct dm_loop_state
+{
+    device atomic_uint* abort;
+    atomic_uint hit;
+};
+static inline __attribute__((always_inline)) bool dm_lg_cap(thread uint& n, device dm_loop_state& s, uint site)
+{
+    if (++n < 262144u) return true;
+    if (n == 262144u)
+    {
+        atomic_fetch_min_explicit(&s.hit, site, memory_order_relaxed);
+        atomic_store_explicit(s.abort, 1u, memory_order_relaxed);
+    }
+    return false;
+}
+static inline __attribute__((always_inline)) bool dm_lg_go(thread uint& n, device dm_loop_state& s, uint site)
+{
+    if (!dm_lg_cap(n, s, site)) return false;
+    return (n & 1023u) != 0u || atomic_load_explicit(s.abort, memory_order_relaxed) == 0u;
+}
+"######;
+pub const BUFFER_POOL_READ: &str = r######"template<typename P> static inline __attribute__((always_inline)) auto dm_buffer_read(constant P* p, uint i, uint c)
+{
+    uint b = reinterpret_cast<constant uint*>(reinterpret_cast<constant uchar*>(p) + p->bias)[i];
+    uint m = c + b;
+    return (&p->e[0])[i].read(m < b ? c : m);
+}
+template<typename P> static inline __attribute__((always_inline)) uint dm_buffer_width(constant P* p, uint i)
+{
+    uint b = reinterpret_cast<constant uint*>(reinterpret_cast<constant uchar*>(p) + p->bias)[i];
+    return (&p->e[0])[i].get_width() - b;
+}
+
+"######;
 pub const HMMA_ARGS: [&str; 18] = ["lane", "blk", "a0", "a1", "a2", "a3", "b0", "b1", "acc0", "acc1", "fl", "aaddr", "ao0", "ao1", "ao2", "ao3", "astr", "d1"];

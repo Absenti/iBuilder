@@ -36,7 +36,7 @@ fn ctx(pairs: bool) -> Ctx {
     );
     let p = format!("{MS}\t{PS}\n");
     Ctx::from_tables(
-        "b24b25240cad",
+        "6c53446391cc",
         Options::ios_source_mode(false),
         &map,
         "",
@@ -232,7 +232,7 @@ fn an_unsupported_domain_keeps_its_source_and_says_so_a_broken_spirv_stops_the_s
     let key = "00000000000000c3";
     let map = format!("ds_main.bin\t0\tds\t{key}\tsynthetic#ds\n");
     let c = Ctx::from_tables(
-        "b24b25240cad",
+        "6c53446391cc",
         Options::ios_source_mode(false),
         &map,
         "",
@@ -258,7 +258,7 @@ fn an_unsupported_domain_keeps_its_source_and_says_so_a_broken_spirv_stops_the_s
     // a SPIR-V file of a size that is not a multiple of four bytes: struct.error in the Python's spirv_io (hull) or spv_single_lane (domain), which `finish` does not catch
     let hs = "00000000000000d4";
     let c2 = Ctx::from_tables(
-        "b24b25240cad",
+        "6c53446391cc",
         Options::ios_source_mode(false),
         &format!("hs_main.bin\t0\ths\t{hs}\tsynthetic#hs\n"),
         "",

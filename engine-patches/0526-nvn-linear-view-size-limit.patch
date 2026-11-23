@@ -1,0 +1,101 @@
+# (after 0525) nvn/texture: linear views check Metal's 2D size limit too (32768 on Apple10), instead of Metal aborting the process
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/3e1ada5b96acb61293ac790bd6dd093a947abed6  ("nvn/texture: check dimensions before making linear views (PR #2908)")
+#            author seedds, 2026-11-22 01:15 +0800; Co-authored-by: heavn-r
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: the buffer-backed (linear view) path bypassed the descriptor's size check, so Metal aborted when Nintendo Switch Sports asked for a 32768-row glyph cache (upstream PR #2908).
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m; test t_linear_readback): tex_2d_size_exceeds_limit (16384, or 32768 for a 2D texture on an Apple10 GPU) shared by tex_desc and the linear path,
+#   which then gives the existing red line instead of an abort.
+# Adapted: the tex_desc hunk by hand (this tree's tex_desc picks the no-BC formats first, 0510 / 0511). Games: Nintendo Switch Sports; any game with very tall textures. Switches: none.
+# Tests (M1 Pro): t_linear_readback (the limit and one pixel past it in either dimension), in HOST_TESTS. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0525, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index bbfb1b44cc188b7dbcd96aa2e73782bdd9c2d267..0bbd85617c5d6954697ace02949febd19bd606ed 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -4254,6 +4254,12 @@ static int tex_view_to_mtl(MTLPixelFormat base_pf, uint32_t format, uint32_t *pf
+     else if (g_bc_cpu && pf && nvn_bc_unpacked(format, &unpacked, &bpp)) *pf = unpacked;
+     return mapped;
+ }
++static int tex_2d_size_exceeds_limit(const tex_t *t) {   // seedds/nxnative 3e1ada5b: shared with the linear-view path (linear_storage_ok), which made no descriptor check
++    unsigned size = MAX(t->d.width, t->d.height);
++    if (size <= 16384) return 0;
++    // Apple10 raised the 2D limit to 32768. Keep the existing bounds for other targets.
++    return size > 32768 || t->d.target != NVN_TEXTURE_TARGET_2D || ![g_dev supportsFamily:MTLGPUFamilyApple10];
++}
+ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
+     uint32_t pf = 0; uint8_t swz[4];
+     // A BC format on a GPU without BC support: create the texture in the uncompressed format the
+@@ -4263,8 +4269,8 @@ static int tex_view_to_mtl(MTLPixelFormat base_pf, uint32_t format, uint32_t *pf
+     if (bc_astc_tex(t, &bc_unpacked, NULL)) { pf = bc_unpacked; bc_astc_pf = 1; }   // no BC (0511): BC1-3 as ASTC 4x4
+     else if (g_bc_cpu && nvn_bc_unpacked(t->d.format, &bc_unpacked, &bc_bpp)) { pf = bc_unpacked; bc_cpu_pf = 1; }
+     if (!pf && (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf)) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
+-    // Metal's limits: 16384 in 2D, 2048 in 3D, 2048 array layers; beyond them Metal aborts the process on an assertion, so they are caught here with a red line
+-    if (t->d.width > 16384 || t->d.height > 16384 || t->d.depth > 2048) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
++    // Catch dimensions that would cause Metal's descriptor validation to abort (16384 in 2D, 32768 on Apple10 for a 2D texture, 2048 in 3D)
++    if (tex_2d_size_exceeds_limit(t) || t->d.depth > 2048) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
+     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+     d.pixelFormat = (MTLPixelFormat)pf;
+     d.width = t->d.width ? t->d.width : 1; d.height = t->d.height ? t->d.height : 1; d.depth = 1; d.arrayLength = 1;
+@@ -5798,6 +5804,8 @@ static int linear_fit(const tex_t *t, uint32_t *pf, void **mb, uint64_t *mo, siz
+     //   its storage held at creation (see tex_init_fill): Rhythm Heaven Groove's 228 linear R8 textures (sprite masks), read from files into CPU_NO_ACCESS pools, were private textures of zeros
+     if (!(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || !t->mem || !t->pool) return 0;
+     if (t->d.target != NVN_TEXTURE_TARGET_2D || t->d.levels > 1 || t->d.samples > 1) return 0;
++    // The fallback through tex_desc logs the same diagnostic as for an oversized private texture.
++    if (tex_2d_size_exceeds_limit(t)) return 0;
+     uint8_t swz[4]; int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+     if (!nvn_fmt_to_mtl(t->d.format, pf, swz) || !*pf || !bpb || bw != 1 || bh != 1) return 0;
+     *row = tex_linear_row(t);
+diff --git a/dm/gfx/tests/t_linear_readback.m b/dm/gfx/tests/t_linear_readback.m
+index 78e7618826c9db2e911bc32cbc9522006339dd56..86468dbdf4bd5980b9f3facb6a802be7f0963e4d 100644
+--- a/dm/gfx/tests/t_linear_readback.m
++++ b/dm/gfx/tests/t_linear_readback.m
+@@ -215,11 +215,45 @@ static void nonlinear_image_readback_case(void) {
+     EXPECT("nonlinear IMAGE readback preserves block-linear rows", 0, read_bad(&tex, pattern, 24));
+     h_nvnTextureFinalize(&tex); h_nvnMemoryPoolFinalize(&pool); defer_drain(); munmap(mem, len);
+ }
++static void linear_size_case(unsigned width, unsigned height, int fits) {
++    const NSUInteger align = tbuf_align([g_dev minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatR8Unorm]);
++    const size_t stride = (width + align - 1) / align * align;
++    const size_t page = (size_t)getpagesize();
++    const size_t len = (stride * height + page - 1) / page * page;
++    void *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
++    if (mem == MAP_FAILED) abort();
++    NVNmemoryPool pool;
++    pool_builder_t pb = {.mem = mem, .size = len, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
++    if (!h_nvnMemoryPoolInitialize(&pool, (const NVNmemoryPoolBuilder *)&pb)) abort();
++    NVNtextureBuilder tb;
++    NVNtexture tex;
++    h_nvnTextureBuilderSetDefaults(&tb);
++    h_nvnTextureBuilderSetWidth(&tb, width);
++    h_nvnTextureBuilderSetHeight(&tb, height);
++    h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_R8);
++    h_nvnTextureBuilderSetFlags(&tb, NVN_TEXTURE_FLAGS_LINEAR);
++    h_nvnTextureBuilderSetStride(&tb, stride);
++    h_nvnTextureBuilderSetStorage(&tb, &pool, 0);
++    if (!h_nvnTextureInitialize(&tex, &tb)) abort();
++    id<MTLTexture> texture = tex_mtl((const tex_t *)&tex);
++    printf("LINEAR_SIZE %ux%u\n", width, height);
++    EXPECT("linear texture resolves within the device limit", fits, texture != nil);
++    if (fits) EXPECT("linear texture at the limit uses its pool's buffer", 1, texture.buffer != nil);
++    texture = nil;
++    h_nvnTextureFinalize(&tex);
++    h_nvnMemoryPoolFinalize(&pool);
++    defer_drain();
++    munmap(mem, len);
++}
+ int main(void) { @autoreleasepool { setenv("DM_TBUF_ALIGN", "64", 1);   // before the first lookup (tbuf_align reads it once); the other cases' rows and offsets are 64-byte aligned
+     mtl_init(); run_case(NVN_FORMAT_RGBA8); run_case(NVN_FORMAT_RGBA8_SRGB);
+     render_target_stride_case();
+     scaled_copy_case();
+     unaligned_upload_case();
+     nonlinear_image_readback_case();
++    unsigned limit = [g_dev supportsFamily:MTLGPUFamilyApple10] ? 32768 : 16384;
++    linear_size_case(64, limit, 1);
++    linear_size_case(64, limit + 1, 0);
++    linear_size_case(limit + 1, 1, 0);
+     printf("LINEAR_READBACK cases=%d failed=%d\n",cases,failed); return failed != 0;
+ } }

@@ -1,0 +1,489 @@
+# (after 0537) gl, vk: the GL and Vulkan layers' shaders from Metal SOURCE: <DM_MSL_DIR>/<api>/msl/<name>.metal, one library per function, compiled on the device at first use
+#
+# Origin:  written in this repository (the OpenGL / Vulkan games on the iPhone). No upstream commit: upstream's layers load only <api>_shaders.metallib, which the Mac's
+#          gl_shaders.py / vk_shaders.py link (`xcrun metal`). Applies after 0537 (patch -p1).
+# Licence: the licence of the tree it patches (the engine's MIT licence, Copyright (c) 2026 seedds and contributors).
+#
+# Why: the iPhone has no `xcrun metal`, so it cannot make a metallib. A game whose GL or Vulkan shaders were translated on the phone (crates/ibuilder-glvk, the Rust port of
+#   gl_shaders.py / vk_shaders.py, wired into stage 3 of the pipeline) ships Documents/shaders/<id>/{gl|vk}/<api>_shaders.tsv and msl/<name>.metal, one function per file (vk_<name>,
+#   gl_<name>: the temporary .metal files the Python compiles one by one before it links the metallib). The layers found none of it: sh_load loaded the table, then logged
+#   "[RED] shader library failed to open .../<api>_shaders.metallib", and every shader was "not in the library".
+# WHAT IT CHANGES (dm/gfx/layer_msl.h (new), dm/gfx/vk/hle_vk.m, dm/gfx/gl/hle_gl.m; tests dm/gfx/tests/t_vk_msl_src.m, t_gl_msl_src.m):
+#   * sh_load: when <DM_MSL_DIR>/<api>/<api>_shaders.metallib does not exist and <DM_MSL_DIR>/<api>/msl is a folder, the layer is in source mode (lmsl_probe): it logs one line
+#     ("shaders from Metal source: <dir>/<name>.metal, ... engine-patches/0538 ...") and no [RED]. The order is: the metallib file, then msl/, then the RomFS trailer (as before).
+#   * layer_fn(name): every function of the game's shader library is looked up through it: [g_lib newFunctionWithName:] when a metallib is loaded (as before), else lmsl_lib's library
+#     of that name: <msl>/<name minus vk_ / gl_>.metal compiled with newLibraryWithSource, once, cached one library per name in a dictionary under a mutex (concurrent first uses may
+#     compile twice; the first stored is kept); a missing file (a variant the tools did not make, vk_<key>_d) gives nil without a compile, as newFunctionWithName gives; a file that
+#     does not compile is reported once with Metal's message ([RED], 50 lines at most per layer) and cached as failed. Only names of letters, digits and '_' after "<api>_" are read.
+#     Sites: hle_vk.m vkCreateShaderModule (vk_<key>), spec_fn (layer_fn_cv: vk_<key>[_d] with its specialization constants), pipe_make (vk_<key>_d); hle_gl.m glCompileShader
+#     (gl_<key>_v / gl_<key>_f). The layer's own shaders (host_msl_lib: gl_util's clr_vs / clr_fs, vk_fan) are not the game's library and are not changed. This tree's hle_vk.m has
+#     no lookup of the viewport variants vk_<key>_vp<n> (upstream's newer layer has one): their files, when the tools write them, are not read here.
+#   * Options: those of the NVN layer's source compiles (iOSBuilder's paches/0007 with engine-patches/0535): mathMode Relaxed, preserveInvariance YES, optimizationLevel Size, and
+#     DM_MTL_OPT_SIZE=0 (dm_envflag.h, the switch 0535 reads; read once here too) gives the Default level. A plain [MTLCompileOptions new] with the three set: 0535 needs its
+#     DmMslCompileOptions only because 0007's line cannot be edited from an engine patch, and its header says why a subclass cannot be used (MTLCompileOptions is a facade: an
+#     instance of a true subclass has none of its properties). The Mac's tools compile with `metal -fpreserve-invariance -fwrapv` and the compiler's default fast math: -fwrapv has
+#     no MTLCompileOptions counterpart.
+#   * Teardown (the layers' session reset): the libraries go with the device (lmsl_teardown).
+# Effect on games already built: none (a game with a metallib loads it as before). Compile cost: every function the game uses is compiled once per run from source at its
+#   vkCreateShaderModule / glCompileShader (Metal's own compile cache serves the next runs); not measured on a phone.
+# Games: the OpenGL (Digimon Story Cyber Sleuth, Balatro, ...) and Vulkan (Super Mario Galaxy, Super Mario 3D All-Stars, ...) games whose shaders were translated on the phone.
+#   Switches: DM_MTL_OPT_SIZE (existing).
+# Tests (M1 Pro): t_vk_msl_src (23 checks, DM_MTL_OPT_SIZE unset and 0), t_gl_msl_src (12 checks, both); t_vk_desc, t_vk_1d, t_vk_fan, t_vk_dontcare, t_vk_swapchain_life,
+#   t_vk_clear_int, t_registration pass on the patched tree. t_gl_imports fails at test_lod_bias (line 427) on the tree BEFORE this patch as well (not in build-host.sh's list).
+#   NOT run on a device: no GL or Vulkan game was played with shaders from source.
+# Shader chain: not touched (6c53446391cc; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0537, in the order of the numbers of this folder (scripts/build-host.sh does).
+--- a/dm/gfx/gl/hle_gl.m
++++ b/dm/gfx/gl/hle_gl.m
+@@ -27,6 +27,7 @@
+ #include <mach/mach.h>
+ #include "../../host/host_image.h"
+ #include "../msl_mount.h"
++#include "../layer_msl.h"   // engine-patches/0538: the shaders from Metal source (layer_fn)
+ #include <dispatch/dispatch.h>
+ #include <math.h>
+ #include <stdatomic.h>
+@@ -244,6 +245,9 @@
+     if (d && *d && !access(p, F_OK)) {
+         g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@(p)] error:&err];
+         if (!g_lib) GLOG("[RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String);
++    } else if (lmsl_probe(d, "gl")) {   // engine-patches/0538: no metallib, <d>/gl/msl/<name>.metal (translated on the phone): each function compiled at first use (layer_fn)
++        GLOG("shaders from Metal source: %s/<name>.metal, one library per function, compiled at first use (engine-patches/0538; mathMode Relaxed, preserveInvariance, optimizationLevel %s)",
++             g_lmsl_dir, lmsl_opt_size() ? "Size" : "Default: DM_MTL_OPT_SIZE=0");
+     } else {
+         msl_map m;
+         if (dm_msl_trailer_map("gl/gl_shaders.metallib", &m)) {
+@@ -259,6 +263,15 @@
+     }
+ }
+ static const shinfo *sh_find(const char *key, int frag) { shinfo k; memcpy(k.key, key, 16); k.frag = frag; return g_nsh ? bsearch(&k, g_sh, g_nsh, sizeof *g_sh, sh_cmp) : NULL; }
++// engine-patches/0538: every function of the game's shader library goes through layer_fn: from the metallib (a file in DM_MSL_DIR, or the RomFS trailer) when sh_load loaded one,
++// else from its own Metal source file (source mode, layer_msl.h: <DM_MSL_DIR>/gl/msl/<name without gl_>.metal, compiled once and cached). nil: not in either
++static void gl_src_red(const char *name, const char *path, const char *why) {
++    static _Atomic int n; if (atomic_fetch_add(&n, 1) < 50) GLOG("[RED] shader %s does not compile from Metal source %s: %s", name, path, why);
++}
++static id<MTLFunction> layer_fn(NSString *name) {
++    if (g_lib) return [g_lib newFunctionWithName:name];
++    return [lmsl_lib(g_dev, name, gl_src_red) newFunctionWithName:name];
++}
+ 
+ 
+ static void dev_init_once(void) {
+@@ -2295,7 +2308,7 @@
+     sh_capture(s);
+     int frag = s->type == GL_FRAGMENT_SHADER;
+     s->si = sh_find(s->key, frag); s->compiled = 1;
+-    @autoreleasepool { s->fn = s->si && g_lib ? [g_lib newFunctionWithName:[NSString stringWithFormat:@"gl_%s_%c", s->key, frag ? 'f' : 'v']] : nil; }
++    @autoreleasepool { s->fn = s->si ? layer_fn([NSString stringWithFormat:@"gl_%s_%c", s->key, frag ? 'f' : 'v']) : nil; }   // engine-patches/0538: the metallib's, or compiled from gl/msl/<key>_<v|f>.metal
+     if (!s->fn) { static int n; if (n++ < 50) GLOG("[RED] %s shader %s (%zu bytes of GLSL) is not in the library (DM_GL_CAPTURE collects it)", s->type == GL_VERTEX_SHADER ? "vertex" : "fragment", s->key, s->len); }
+     else OLOG("CompileShader %s", s->key);
+ }
+@@ -2913,7 +2926,7 @@
+     g_next_swap = 0;
+     g_frames = 0;
+ 
+-    g_lib = nil; g_util = nil;
++    g_lib = nil; g_util = nil; lmsl_teardown();
+     dm_msl_trailer_teardown();
+     g_samp0 = nil;
+     g_tex0 = nil; g_cube0 = nil; g_tex3d0 = nil; g_arr0 = nil;
+--- /dev/null
++++ b/dm/gfx/layer_msl.h
+@@ -0,0 +1,95 @@
++// The GL and Vulkan layers' shaders from Metal SOURCE (engine-patches/0538): one .metal file per function, compiled on the device at first use.
++// The iPhone has no `xcrun metal`, so a game whose GL / Vulkan shaders were translated on the phone ships <DM_MSL_DIR>/<api>/<api>_shaders.tsv and <DM_MSL_DIR>/<api>/msl/<name>.metal
++// instead of <api>_shaders.metallib: the file of function <api>_<name> (vk_<key>, vk_<key>_d, vk_<key>_vp<n>; gl_<key>_v, gl_<key>_f) holds that function alone, as the temporary
++// .metal files gl_shaders.py / vk_shaders.py compile one by one before they link the metallib (crates/ibuilder-glvk writes them). The layer (hle_gl.m, hle_vk.m) includes this file
++// once and asks layer_fn for every function of the game's library; with no metallib, lmsl_lib compiles that name's file with newLibraryWithSource, once: one library per name, cached
++// under a lock (a name whose file is missing or does not compile is cached as such, and reported once).
++// Options: the family of the NVN layer's source compiles (iOSBuilder's paches/0007 with engine-patches/0535): mathMode Relaxed, preserveInvariance YES, optimizationLevel Size
++// (DM_MTL_OPT_SIZE=0: Default, the switch 0535 reads, read here once too). A plain [MTLCompileOptions new] with the three set: 0535's DmMslCompileOptions exists only because 0007's
++// line cannot be edited, and a subclass of the class (a facade) would have none of its properties. The Mac's gl_shaders.py / vk_shaders.py compile with `metal -fpreserve-invariance
++// -fwrapv` (fast math, the compiler's default); -fwrapv has no MTLCompileOptions counterpart.
++#ifndef DM_LAYER_MSL_H
++#define DM_LAYER_MSL_H
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include "../host/dm_envflag.h"
++
++static char g_lmsl_dir[1024];   // <DM_MSL_DIR>/<api>/msl, set by lmsl_probe when that folder exists (source mode); empty otherwise
++static char g_lmsl_api[4];      // "vk" / "gl": every function name starts with it and "_", which the file name drops
++static pthread_mutex_t g_lmsl_mu = PTHREAD_MUTEX_INITIALIZER;
++static NSMutableDictionary<NSString *, id> *g_lmsl_libs;   // under g_lmsl_mu: name -> its id<MTLLibrary>, or NSNull (no file, or it did not compile)
++static _Atomic uint64_t g_lmsl_compiled, g_lmsl_failed, g_lmsl_missing, g_lmsl_ns;   // libraries compiled, compiles failed, names without a file, and the compiles' total time
++
++static int lmsl_on(void) { return g_lmsl_dir[0] != 0; }
++// Source mode: <d>/<api>/msl is a folder. Called by sh_load when <d>/<api>/<api>_shaders.metallib does not exist; returns 1 (and sets the folder) when it does
++static int lmsl_probe(const char *d, const char *api) {
++    struct stat st; char p[sizeof g_lmsl_dir];
++    g_lmsl_dir[0] = 0; strlcpy(g_lmsl_api, api, sizeof g_lmsl_api);
++    if (!d || !*d || (size_t)snprintf(p, sizeof p, "%s/%s/msl", d, api) >= sizeof p - 128) return 0;   // room for the longest file name lmsl_lib accepts
++    if (stat(p, &st) || !S_ISDIR(st.st_mode)) return 0;
++    strlcpy(g_lmsl_dir, p, sizeof g_lmsl_dir);
++    return 1;
++}
++static int lmsl_opt_size(void) {
++    static int v, bad; static dispatch_once_t once;
++    dispatch_once(&once, ^{ v = dm_env_flag("DM_MTL_OPT_SIZE", 1, &bad); });
++    return v;
++}
++// The options every library compiled here gets (one object per compile: Metal keeps none of it)
++static MTLCompileOptions *lmsl_options(void) {
++    MTLCompileOptions *o = [MTLCompileOptions new];
++    o.mathMode = MTLMathModeRelaxed; o.preserveInvariance = YES;
++    if (lmsl_opt_size()) o.optimizationLevel = MTLLibraryOptimizationLevelSize;
++    return o;
++}
++// The file of a function name: <dir>/<name without "<api>_">.metal. Only the names the tools make (letters, digits, '_'; 112 characters at most) are looked up
++static int lmsl_path(NSString *name, char *p, size_t n) {
++    const char *s = name.UTF8String; size_t a = strlen(g_lmsl_api);
++    if (!s || strncmp(s, g_lmsl_api, a) || s[a] != '_' || !s[a + 1] || strlen(s + a + 1) > 112) return 0;
++    for (const char *c = s + a + 1; *c; c++) if (!((*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || *c == '_')) return 0;
++    return (size_t)snprintf(p, n, "%s/%s.metal", g_lmsl_dir, s + a + 1) < n;
++}
++// The library of function name, compiled from its file on the first call (concurrent first calls may both compile; the first stored is kept). nil: not source mode, no such file,
++// or it does not compile (logged once, with Metal's message, by red: the layer's own [RED] log line, called with the name, the path and the message)
++static id<MTLLibrary> lmsl_lib(id<MTLDevice> dev, NSString *name, void (*red)(const char *name, const char *path, const char *why)) {
++    if (!lmsl_on() || !dev || !name) return nil;
++    pthread_mutex_lock(&g_lmsl_mu);
++    id have = g_lmsl_libs[name];
++    pthread_mutex_unlock(&g_lmsl_mu);
++    if (have) return have == [NSNull null] ? nil : have;
++    char p[sizeof g_lmsl_dir + 128]; id<MTLLibrary> lib = nil;
++    if (!lmsl_path(name, p, sizeof p)) { if (red) red(name.UTF8String, "", "not a function name of the layer's library"); atomic_fetch_add(&g_lmsl_failed, 1); }
++    else {
++        NSError *err = nil;
++        NSString *src = [NSString stringWithContentsOfFile:@(p) encoding:NSUTF8StringEncoding error:&err];
++        if (!src) atomic_fetch_add(&g_lmsl_missing, 1);   // a variant the tools did not make (vk_<key>_d of a shader without a second output): nil, as newFunctionWithName gives
++        else {
++            uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++            lib = [dev newLibraryWithSource:src options:lmsl_options() error:&err];
++            atomic_fetch_add(&g_lmsl_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
++            if (lib) atomic_fetch_add(&g_lmsl_compiled, 1);
++            else { atomic_fetch_add(&g_lmsl_failed, 1); if (red) red(name.UTF8String, p, err.localizedDescription.UTF8String ? err.localizedDescription.UTF8String : "no message"); }
++        }
++    }
++    pthread_mutex_lock(&g_lmsl_mu);
++    if (!g_lmsl_libs) g_lmsl_libs = [NSMutableDictionary new];
++    id first = g_lmsl_libs[name];
++    if (first) lib = first == [NSNull null] ? nil : first;
++    else g_lmsl_libs[name] = lib ? (id)lib : (id)[NSNull null];
++    pthread_mutex_unlock(&g_lmsl_mu);
++    return lib;
++}
++// The layer's teardown (session reset): the libraries go with the device; the folder is probed again by the next sh_load
++static void lmsl_teardown(void) {
++    pthread_mutex_lock(&g_lmsl_mu);
++    g_lmsl_libs = nil; g_lmsl_dir[0] = 0;
++    atomic_store(&g_lmsl_compiled, 0); atomic_store(&g_lmsl_failed, 0); atomic_store(&g_lmsl_missing, 0); atomic_store(&g_lmsl_ns, 0);
++    pthread_mutex_unlock(&g_lmsl_mu);
++}
++#endif
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -831,6 +831,16 @@
+ check_t_vk_fan: RUN_ENV = MTL_DEBUG_LAYER=1
+ t_vk_desc: t_vk_desc.m ../vk/hle_vk.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_desc.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
++# engine-patches/0538: the GL and Vulkan layers' shaders from Metal source (dm/gfx/layer_msl.h: <DM_MSL_DIR>/<api>/msl/<name>.metal, no metallib), with DM_MTL_OPT_SIZE unset and 0
++t_vk_msl_src: t_vk_msl_src.m ../vk/hle_vk.m ../layer_msl.h $(MTL_T_DEP)
++	clang $(CFLAGS) -I../../third_party/vulkan-headers/include -fobjc-arc -o $@ t_vk_msl_src.m $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
++.PHONY: check_t_vk_msl_src check_t_gl_msl_src
++check_t_vk_msl_src: t_vk_msl_src
++	MTL_DEBUG_LAYER=1 ./t_vk_msl_src && MTL_DEBUG_LAYER=1 ./t_vk_msl_src off
++t_gl_msl_src: t_gl_msl_src.m ../gl/hle_gl.m ../gl/gl_aliases.h ../layer_msl.h ../../host/hle.c ../../host/hle.h $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_gl_msl_src.m ../../host/hle.c $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
++check_t_gl_msl_src: t_gl_msl_src
++	MTL_DEBUG_LAYER=1 ./t_gl_msl_src && MTL_DEBUG_LAYER=1 ./t_gl_msl_src off
+ t_gl_imports: t_gl_imports.m ../gl/hle_gl.m ../gl/gl_aliases.h ../../host/hle.c ../../host/hle.h $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_gl_imports.m ../../host/hle.c $(MTL_T_SRC) ../nvn/nvn_mtl.m $(FW)
+ .PHONY: check_t_gl_imports gl-imports gl-imports-cpu gl-arguments
+--- /dev/null
++++ b/dm/gfx/tests/t_gl_msl_src.m
+@@ -0,0 +1,86 @@
++// The GL layer's shaders from Metal SOURCE (engine-patches/0538, dm/gfx/layer_msl.h): a DM_MSL_DIR with gl/gl_shaders.tsv and gl/msl/<key>_v.metal / <key>_f.metal and no
++// gl_shaders.metallib, as a game translated on the phone ships (crates/ibuilder-glvk). glCompileShader finds gl_<key>_v / gl_<key>_f in its own file, compiled once with the options
++// of the NVN layer's source compiles (mathMode Relaxed, preserveInvariance, optimizationLevel Size; Default with DM_MTL_OPT_SIZE=0); the program links and makes a pipeline; a shader
++// whose file does not compile, or has none, has no function (its program's draws are skipped, as for a shader missing from a metallib).
++//   t_gl_msl_src        DM_MTL_OPT_SIZE unset (Size)
++//   t_gl_msl_src off    DM_MTL_OPT_SIZE=0 (Default)
++#include "../gl/hle_gl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++struct dm_flags g_flag;
++pthread_key_t g_key18;   // written by hle.c's counter gate for mrs x18, cntpct_el0; in the host it is defined in loader.c (never created here: no gate runs)
++void svc_thread_dump(void) {}
++void dm_vi_layer_size(int *w, int *h) { *w = *h = 0; }
++void dm_vi_layer_crop(int c[4]) { memset(c, 0, 4 * sizeof *c); }
++int dm_opmode(void) { return 1; }
++uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
++uint64_t guest_ns(void) { return 0; }
++uint64_t guest_ticks(void) { return 0; }
++void guest_clock_read_wait(void) {}
++void thr_svc_enter(uint64_t *r, uint64_t a) { (void)r; (void)a; }
++void thr_svc_leave(void) {}
++void dm_spin_wait(uint64_t r, uint64_t a) { (void)r; (void)a; }
++uint64_t svc_dispatch(int n, uint64_t *r, uint64_t a) { (void)n; (void)r; (void)a; return 0; }
++uint64_t unimpl_stubs[4096];
++void *hlecount_wrap(const char *kind, const char *name, void *fn) { (void)kind; (void)name; return fn; }
++static int checks, fails;
++#define CHECK(c, ...) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
++
++static void key_of(const char *src, char key[17]) {   // the layer's key: sha256(source)[:8] in hex (the GLSL is only hashed here)
++    uint8_t h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(src, (CC_LONG)strlen(src), h);
++    for (int i = 0; i < 8; i++) snprintf(key + 2 * i, 3, "%02x", h[i]);
++}
++static void put(const char *dir, NSString *name, NSString *text) { [text writeToFile:[@(dir) stringByAppendingPathComponent:name] atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
++static GLuint shader(GLenum type, const char *src) { GLuint s = h_glCreateShader(type); h_glShaderSource(s, 1, &src, NULL); h_glCompileShader(s); return s; }
++
++int main(int argc, char **argv) { @autoreleasepool {
++    int off = argc > 1 && !strcmp(argv[1], "off");
++    if (off) setenv("DM_MTL_OPT_SIZE", "0", 1); else unsetenv("DM_MTL_OPT_SIZE");
++    char root[] = "/tmp/t_gl_msl_src.XXXXXX"; if (!mkdtemp(root)) { perror("mkdtemp"); return 1; }
++    char gl[1100], msl[1100]; snprintf(gl, sizeof gl, "%s/gl", root); snprintf(msl, sizeof msl, "%s/gl/msl", root);
++    mkdir(gl, 0755); mkdir(msl, 0755);
++    const char *vs = "#version 330\nvoid main() { gl_Position = vec4(0.0); }\n", *fs = "#version 330\nout vec4 c;\nvoid main() { c = vec4(1.0); }\n",
++               *bad = "#version 330\nout vec4 c;\nvoid main() { c = vec4(0.5); }\n", *none = "#version 330\nout vec4 c;\nvoid main() { c = vec4(0.25); }\n";
++    char kv[17], kf[17], kbad[17], knone[17]; key_of(vs, kv); key_of(fs, kf); key_of(bad, kbad); key_of(none, knone);
++    put(gl, @"gl_shaders.tsv", [NSString stringWithFormat:@"# GL shader ABI 2\n# GL shaders (t_gl_msl_src)\n%s\tvert\tr:-1:0\n%s\tfrag\tr:-1:0\n%s\tfrag\tr:-1:0\n%s\tfrag\tr:-1:0\n", kv, kf, kbad, knone]);
++    NSString *hdr = @"#include <metal_stdlib>\nusing namespace metal;\n";
++    put(msl, [NSString stringWithFormat:@"%s_v.metal", kv], [hdr stringByAppendingFormat:
++        @"struct VO { float4 p [[position, invariant]]; };\nvertex VO gl_%s_v(uint v [[vertex_id]]) { VO o; o.p = float4(float(v & 1), float(v >> 1), 0, 1); return o; }\n", kv]);
++    put(msl, [NSString stringWithFormat:@"%s_f.metal", kf], [hdr stringByAppendingFormat:@"fragment float4 gl_%s_f() { return float4(exp(0.5f), 0, 0, 1); }\n", kf]);
++    put(msl, [NSString stringWithFormat:@"%s_f.metal", kbad], [hdr stringByAppendingFormat:@"fragment float4 gl_%s_f() { return 1 +; }\n", kbad]);
++
++    setenv("DM_MSL_DIR", root, 1);
++    dev_init();
++    CHECK(!g_lib && lmsl_on() && strstr(g_lmsl_dir, "/gl/msl") && !strcmp(g_lmsl_api, "gl"), "no gl_shaders.metallib and a gl/msl folder: source mode (%s)", g_lmsl_dir);
++    CHECK(g_nsh == 4, "the table's 4 rows are read (%d)", g_nsh);
++    MTLCompileOptions *o = lmsl_options();
++    CHECK(o.mathMode == MTLMathModeRelaxed && o.preserveInvariance && o.optimizationLevel == (off ? MTLLibraryOptimizationLevelDefault : MTLLibraryOptimizationLevelSize),
++          "options: mathMode %ld, preserveInvariance %d, optimizationLevel %ld", (long)o.mathMode, o.preserveInvariance, (long)o.optimizationLevel);
++
++    GLuint v = shader(GL_VERTEX_SHADER, vs), f = shader(GL_FRAGMENT_SHADER, fs);
++    CHECK(shader_of(v)->fn && shader_of(v)->fn.functionType == MTLFunctionTypeVertex && shader_of(f)->fn && shader_of(f)->fn.functionType == MTLFunctionTypeFragment,
++          "gl_<key>_v and gl_<key>_f from <key>_v.metal and <key>_f.metal");
++    CHECK(atomic_load(&g_lmsl_compiled) == 2 && !atomic_load(&g_lmsl_failed), "two libraries compiled (%llu)", (unsigned long long)g_lmsl_compiled);
++    GLuint v2 = shader(GL_VERTEX_SHADER, vs);
++    CHECK(shader_of(v2)->fn && atomic_load(&g_lmsl_compiled) == 2, "the same source compiled again: the cached library");
++    GLuint pr = h_glCreateProgram(); h_glAttachShader(pr, v); h_glAttachShader(pr, f); h_glLinkProgram(pr);
++    prog_t *p = prog_of(pr);
++    CHECK(p && p->linked && p->fn[0] == shader_of(v)->fn && p->fn[1] == shader_of(f)->fn, "the program links with both functions");
++    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
++    pd.vertexFunction = p->fn[0]; pd.fragmentFunction = p->fn[1]; pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
++    NSError *pe = nil;
++    CHECK([g_dev newRenderPipelineStateWithDescriptor:pd error:&pe], "a render pipeline from them (%s)", pe ? pe.localizedDescription.UTF8String : "ok");
++
++    GLuint b = shader(GL_FRAGMENT_SHADER, bad), b2 = shader(GL_FRAGMENT_SHADER, bad), n = shader(GL_FRAGMENT_SHADER, none);
++    CHECK(shader_of(b)->si && !shader_of(b)->fn && !shader_of(b2)->fn && atomic_load(&g_lmsl_failed) == 1, "a file that does not compile: no function, compiled once (failed %llu)", (unsigned long long)g_lmsl_failed);
++    CHECK(shader_of(n)->si && !shader_of(n)->fn && atomic_load(&g_lmsl_missing) == 1, "a table row without its file: no function (missing %llu)", (unsigned long long)g_lmsl_missing);
++    GLuint pr2 = h_glCreateProgram(); h_glAttachShader(pr2, v); h_glAttachShader(pr2, b); h_glLinkProgram(pr2);
++    CHECK(prog_of(pr2) && !prog_of(pr2)->fn[1], "its program has no fragment function (its draws are skipped)");
++
++    lmsl_teardown();
++    CHECK(!lmsl_on() && !g_lmsl_libs, "teardown drops the libraries and the folder");
++    [[NSFileManager defaultManager] removeItemAtPath:@(root) error:nil];
++    printf("t_gl_msl_src%s: %d checks, %d failed\n", off ? " off" : "", checks, fails);
++    return fails != 0;
++}}
+--- /dev/null
++++ b/dm/gfx/tests/t_vk_msl_src.m
+@@ -0,0 +1,114 @@
++// The Vulkan layer's shaders from Metal SOURCE (engine-patches/0538, dm/gfx/layer_msl.h): a DM_MSL_DIR with vk/vk_shaders.tsv and vk/msl/<name>.metal and no vk_shaders.metallib, as a
++// game translated on the phone ships (crates/ibuilder-glvk). vkCreateShaderModule finds each module's function vk_<key> in its own file, compiled once with the options of the NVN
++// layer's source compiles (mathMode Relaxed, preserveInvariance, optimizationLevel Size; Default with DM_MTL_OPT_SIZE=0); a dual-source variant (vk_<key>_d) and a specialized
++// function (spec_fn's layer_fn_cv) come from their files too; a file that does not compile, a missing one and a name that is not the layer's give nil, each tried once; concurrent
++// first uses of one name end with one cached library; the functions make a render pipeline.
++//   t_vk_msl_src        DM_MTL_OPT_SIZE unset (Size)
++//   t_vk_msl_src off    DM_MTL_OPT_SIZE=0 (Default)
++#include "../vk/hle_vk.m"
++int dm_guest_as_contains(uintptr_t address) { (void)address; return 0; }
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
++void dm_vi_layer_crop(int c[4]) { c[0] = c[1] = c[2] = c[3] = 0; }
++int dm_opmode(void) { return 1; }
++static int checks, fails;
++#define CHECK(c, ...) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
++
++// A "SPIR-V module": the layer only hashes the words (key = sha256[:8] in hex), so any words name a row of the table
++static void key_of(const uint32_t *w, size_t n, char key[17]) {
++    uint8_t h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(w, (CC_LONG)n, h);
++    for (int i = 0; i < 8; i++) snprintf(key + 2 * i, 3, "%02x", h[i]);
++}
++static void put(const char *dir, const char *name, NSString *text) {
++    char p[1024]; snprintf(p, sizeof p, "%s/%s", dir, name);
++    [text writeToFile:@(p) atomically:YES encoding:NSUTF8StringEncoding error:nil];
++}
++static VkShaderModule module(const uint32_t *w, size_t n) {
++    VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = n, .pCode = w};
++    VkShaderModule m = NULL; h_vkCreateShaderModule(&g_device, &ci, NULL, &m); return m;
++}
++
++int main(int argc, char **argv) { @autoreleasepool {
++    int off = argc > 1 && !strcmp(argv[1], "off");
++    if (off) setenv("DM_MTL_OPT_SIZE", "0", 1); else unsetenv("DM_MTL_OPT_SIZE");
++    char root[] = "/tmp/t_vk_msl_src.XXXXXX"; if (!mkdtemp(root)) { perror("mkdtemp"); return 1; }
++    char vk[1100], msl[1100]; snprintf(vk, sizeof vk, "%s/vk", root); snprintf(msl, sizeof msl, "%s/vk/msl", root);
++    mkdir(vk, 0755); mkdir(msl, 0755);
++    static const uint32_t wv[] = {0x07230203, 1}, wf[] = {0x07230203, 2}, wbad[] = {0x07230203, 3}, wnone[] = {0x07230203, 4}, wspec[] = {0x07230203, 5}, wrace[] = {0x07230203, 6};
++    char kv[17], kf[17], kbad[17], knone[17], kspec[17], krace[17];
++    key_of(wv, sizeof wv, kv); key_of(wf, sizeof wf, kf); key_of(wbad, sizeof wbad, kbad); key_of(wnone, sizeof wnone, knone); key_of(wspec, sizeof wspec, kspec); key_of(wrace, sizeof wrace, krace);
++    NSString *hdr = @"#include <metal_stdlib>\nusing namespace metal;\n";
++    put(vk, "vk_shaders.tsv", [NSString stringWithFormat:@"# Vulkan shaders (t_vk_msl_src)\n%s\tvert\t\n%s\tfrag\t\n%s\tfrag\t\n%s\tfrag\t\n%s\tfrag\t\n%s\tfrag\t\n", kv, kf, kbad, knone, kspec, krace]);
++    put(msl, [NSString stringWithFormat:@"%s.metal", kv].UTF8String, [hdr stringByAppendingFormat:
++        @"struct VO { float4 p [[position, invariant]]; float x; };\nvertex VO vk_%s(uint v [[vertex_id]]) { VO o; o.p = float4(float(v & 1) * 2 - 1, float(v >> 1) * 2 - 1, 0, 1); o.x = o.p.x; return o; }\n", kv]);
++    put(msl, [NSString stringWithFormat:@"%s.metal", kf].UTF8String, [hdr stringByAppendingFormat:@"fragment float4 vk_%s() { return float4(sin(0.5f), 0, 0, 1); }\n", kf]);
++    put(msl, [NSString stringWithFormat:@"%s_d.metal", kf].UTF8String, [hdr stringByAppendingFormat:
++        @"struct FO { float4 c [[color(0), index(0)]]; float4 d [[color(0), index(1)]]; };\nfragment FO vk_%s_d() { FO o; o.c = float4(1); o.d = float4(0.5f); return o; }\n", kf]);
++    put(msl, [NSString stringWithFormat:@"%s.metal", kbad].UTF8String, [hdr stringByAppendingFormat:@"fragment float4 vk_%s() { return not_defined_here; }\n", kbad]);
++    put(msl, [NSString stringWithFormat:@"%s.metal", kspec].UTF8String, [hdr stringByAppendingFormat:
++        @"constant int k_c [[function_constant(0)]];\nfragment float4 vk_%s() { return float4(float(k_c), 0, 0, 1); }\n", kspec]);
++    put(msl, [NSString stringWithFormat:@"%s.metal", krace].UTF8String, [hdr stringByAppendingFormat:@"fragment float4 vk_%s() { return float4(0, 1, 0, 1); }\n", krace]);
++
++    CHECK(!lmsl_probe(root, "gl") && !lmsl_on(), "no gl/msl folder: no source mode");
++    setenv("DM_MSL_DIR", root, 1);
++    dev_init();
++    CHECK(!g_lib && lmsl_on() && strstr(g_lmsl_dir, "/vk/msl") && !strcmp(g_lmsl_api, "vk"), "no vk_shaders.metallib and a vk/msl folder: source mode (%s)", g_lmsl_dir);
++    CHECK(g_nsh == 6, "the table's 6 rows are read (%d)", g_nsh);
++    MTLCompileOptions *o = lmsl_options();
++    CHECK(o.mathMode == MTLMathModeRelaxed && o.preserveInvariance && o.optimizationLevel == (off ? MTLLibraryOptimizationLevelDefault : MTLLibraryOptimizationLevelSize),
++          "options: mathMode %ld (Relaxed %ld), preserveInvariance %d, optimizationLevel %ld", (long)o.mathMode, (long)MTLMathModeRelaxed, o.preserveInvariance, (long)o.optimizationLevel);
++    MTLCompileOptions *plain = [MTLCompileOptions new];
++    CHECK([o class] == [plain class] && o.languageVersion == plain.languageVersion && !o.preprocessorMacros && !o.libraries && o.libraryType == plain.libraryType,
++          "nothing else differs from a plain [MTLCompileOptions new] (%s)", object_getClassName(o));
++
++    VkShaderModule mv = module(wv, sizeof wv), mf = module(wf, sizeof wf);
++    CHECK((mv && mv->fn && [mv->fn.name isEqualToString:[NSString stringWithFormat:@"vk_%s", kv]] && mv->fn.functionType == MTLFunctionTypeVertex), "vertex module: vk_<key> from <key>.metal");
++    CHECK(mf && mf->fn && mf->fn.functionType == MTLFunctionTypeFragment, "fragment module: vk_<key> from <key>.metal");
++    CHECK(atomic_load(&g_lmsl_compiled) == 2 && !atomic_load(&g_lmsl_failed) && !atomic_load(&g_lmsl_missing), "two libraries compiled (%llu, failed %llu, missing %llu)",
++          (unsigned long long)g_lmsl_compiled, (unsigned long long)g_lmsl_failed, (unsigned long long)g_lmsl_missing);
++    VkShaderModule mv2 = module(wv, sizeof wv);
++    CHECK(mv2 && mv2->fn && atomic_load(&g_lmsl_compiled) == 2, "the same module again: its library is the cached one (compiled %llu)", (unsigned long long)g_lmsl_compiled);
++    id<MTLLibrary> l1 = lmsl_lib(g_dev, [NSString stringWithFormat:@"vk_%s", kv], NULL), l2 = lmsl_lib(g_dev, [NSString stringWithFormat:@"vk_%s", kv], NULL);
++    CHECK(l1 && l1 == l2, "one library per name");
++
++    id<MTLFunction> fd = layer_fn([NSString stringWithFormat:@"vk_%s_d", kf]);
++    CHECK(fd && fd.functionType == MTLFunctionTypeFragment && atomic_load(&g_lmsl_compiled) == 3, "the dual-source variant vk_<key>_d from <key>_d.metal");
++    CHECK(!layer_fn([NSString stringWithFormat:@"vk_%s_d", kv]) && atomic_load(&g_lmsl_missing) == 1, "a variant the tools did not make: nil, no compile (missing %llu)", (unsigned long long)g_lmsl_missing);
++    CHECK(!layer_fn([NSString stringWithFormat:@"vk_%s_d", kv]) && atomic_load(&g_lmsl_missing) == 1, "and it is looked for once");
++
++    VkShaderModule mbad = module(wbad, sizeof wbad), mbad2 = module(wbad, sizeof wbad), mnone = module(wnone, sizeof wnone);
++    CHECK(mbad && !mbad->fn && mbad2 && !mbad2->fn && atomic_load(&g_lmsl_failed) == 1, "a file that does not compile: nil, compiled once (failed %llu)", (unsigned long long)g_lmsl_failed);
++    CHECK(mnone && !mnone->fn && atomic_load(&g_lmsl_missing) == 2, "a table row without its file: nil (missing %llu)", (unsigned long long)g_lmsl_missing);
++    CHECK(!layer_fn(@"vk_../t") && !layer_fn(@"gl_0123") && !layer_fn(@"vk_") && atomic_load(&g_lmsl_failed) == 4, "names that are not the layer's: nil, no file read (failed %llu)", (unsigned long long)g_lmsl_failed);
++
++    VkShaderModule ms = module(wspec, sizeof wspec);
++    CHECK(ms && ms->fn && ms->fn.functionConstantsDictionary.count == 1, "a function with a specialization constant");
++    int c7 = 7; VkSpecializationMapEntry me = {0, 0, 4}; VkSpecializationInfo si = {1, &me, 4, &c7};
++    id<MTLFunction> sp = spec_fn(ms->fn, ms->key, 0, &si);
++    CHECK(sp && sp != ms->fn, "spec_fn specializes it through layer_fn_cv");
++    NSError *ce = nil;
++    CHECK(!layer_fn_cv([NSString stringWithFormat:@"vk_%s", knone], [MTLFunctionConstantValues new], &ce) && ce, "layer_fn_cv of a name without a library: nil and an error");
++
++    uint64_t before = atomic_load(&g_lmsl_compiled); NSString *rn = [NSString stringWithFormat:@"vk_%s", krace];
++    __block _Atomic int got = 0;
++    dispatch_apply(8, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) { (void)i; if (layer_fn(rn)) atomic_fetch_add(&got, 1); });
++    uint64_t made = atomic_load(&g_lmsl_compiled) - before;
++    CHECK(got == 8 && made >= 1 && made <= 8 && lmsl_lib(g_dev, rn, NULL) == lmsl_lib(g_dev, rn, NULL), "8 concurrent first uses: 8 functions, %llu compiles, one library kept", (unsigned long long)made);
++
++    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
++    pd.vertexFunction = mv->fn; pd.fragmentFunction = mf->fn; pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
++    NSError *pe = nil;
++    CHECK([g_dev newRenderPipelineStateWithDescriptor:pd error:&pe], "a render pipeline from the two functions (%s)", pe ? pe.localizedDescription.UTF8String : "ok");
++    pd.fragmentFunction = fd; pd.colorAttachments[0].blendingEnabled = YES;
++    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSource1Color; pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSource1Color;
++    CHECK([g_dev newRenderPipelineStateWithDescriptor:pd error:&pe], "and a dual-source one (%s)", pe ? pe.localizedDescription.UTF8String : "ok");
++
++    lmsl_teardown();
++    CHECK(!lmsl_on() && !g_lmsl_libs && !atomic_load(&g_lmsl_compiled), "teardown drops the libraries and the folder");
++    [[NSFileManager defaultManager] removeItemAtPath:@(root) error:nil];
++    printf("t_vk_msl_src%s: %d checks, %d failed\n", off ? " off" : "", checks, fails);
++    return fails != 0;
++}}
+--- a/dm/gfx/vk/hle_vk.m
++++ b/dm/gfx/vk/hle_vk.m
+@@ -24,6 +24,7 @@
+ #include <CoreFoundation/CoreFoundation.h>
+ #include "../../host/host_image.h"
+ #include "../msl_mount.h"
++#include "../layer_msl.h"   // engine-patches/0538: the shaders from Metal source (layer_fn)
+ #include <dispatch/dispatch.h>
+ #include <math.h>
+ #include <stdatomic.h>
+@@ -206,6 +207,9 @@
+     if (d && *d && !access(p, F_OK)) {
+         g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@(p)] error:&err];
+         if (!g_lib) LOG("[vk] [RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String);
++    } else if (lmsl_probe(d, "vk")) {   // engine-patches/0538: no metallib, <d>/vk/msl/<name>.metal (translated on the phone): each function compiled at first use (layer_fn)
++        VLOG("shaders from Metal source: %s/<name>.metal, one library per function, compiled at first use (engine-patches/0538; mathMode Relaxed, preserveInvariance, optimizationLevel %s)",
++             g_lmsl_dir, lmsl_opt_size() ? "Size" : "Default: DM_MTL_OPT_SIZE=0");
+     } else {
+         msl_map m;
+         if (dm_msl_trailer_map("vk/vk_shaders.metallib", &m)) {
+@@ -221,6 +225,20 @@
+     }
+ }
+ static const shinfo *sh_find(const char *key) { shinfo k; memcpy(k.key, key, 16); return g_nsh ? bsearch(&k, g_sh, g_nsh, sizeof *g_sh, sh_cmp) : NULL; }
++// engine-patches/0538: every function of the game's shader library goes through layer_fn: from the metallib (a file in DM_MSL_DIR, or the RomFS trailer) when sh_load loaded one,
++// else from its own Metal source file (source mode, layer_msl.h: <DM_MSL_DIR>/vk/msl/<name without vk_>.metal, compiled once and cached). nil: not in either
++static void vk_src_red(const char *name, const char *path, const char *why) {
++    static _Atomic int n; if (atomic_fetch_add(&n, 1) < 50) LOG("[vk] [RED] shader %s does not compile from Metal source %s: %s", name, path, why);
++}
++static id<MTLFunction> layer_fn(NSString *name) {
++    if (g_lib) return [g_lib newFunctionWithName:name];
++    return [lmsl_lib(g_dev, name, vk_src_red) newFunctionWithName:name];
++}
++static id<MTLFunction> layer_fn_cv(NSString *name, MTLFunctionConstantValues *cv, NSError **err) {   // the same, specialized (spec_fn)
++    id<MTLLibrary> lib = g_lib ? g_lib : lmsl_lib(g_dev, name, vk_src_red);
++    if (!lib) { if (err) *err = [NSError errorWithDomain:@"hle_vk" code:1 userInfo:@{NSLocalizedDescriptionKey: @"not in the shader library"}]; return nil; }
++    return [lib newFunctionWithName:name constantValues:cv error:err];
++}
+ 
+ static void dev_init_once(void) {
+     @autoreleasepool {
+@@ -995,7 +1013,7 @@
+     for (int i = 0; i < 8; i++) snprintf(m->key + 2 * i, 3, "%02x", h[i]);
+     sh_capture(m->key, ci->pCode, ci->codeSize);
+     m->si = sh_find(m->key);
+-    @autoreleasepool { if (m->si && g_lib) m->fn = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s", m->key]]; }
++    @autoreleasepool { if (m->si) m->fn = layer_fn([NSString stringWithFormat:@"vk_%s", m->key]); }   // engine-patches/0538: the metallib's, or compiled from vk/msl/<key>.metal
+     if (!m->fn) LOG("[vk] [RED] shader %s (%zu bytes of SPIR-V) is not in the library", m->key, ci->codeSize);
+     else OLOG("CreateShaderModule %s", m->key);
+     vk_live_add(m, dtor_shmod);
+@@ -1052,7 +1070,7 @@
+             else RED1("specialization constant of Metal type %lu not handled", (unsigned long)c.type);
+         }
+     NSError *err = nil;
+-    id<MTLFunction> f = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s%s", key, dual ? "_d" : ""] constantValues:cv error:&err];
++    id<MTLFunction> f = layer_fn_cv([NSString stringWithFormat:@"vk_%s%s", key, dual ? "_d" : ""], cv, &err);
+     if (!f) LOG("[vk] [RED] shader %s with its specialization constants: %s", key, err.localizedDescription.UTF8String);
+     return f;
+ }
+@@ -1071,7 +1089,7 @@
+             else if (st->stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+                 if (dual && m->fn) {   // pipelines may be built on several threads
+                     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu);
+-                    if (!m->tried_d) { m->tried_d = 1; m->fn_d = [g_lib newFunctionWithName:[NSString stringWithFormat:@"vk_%s_d", m->key]]; }
++                    if (!m->tried_d) { m->tried_d = 1; m->fn_d = layer_fn([NSString stringWithFormat:@"vk_%s_d", m->key]); }
+                     pthread_mutex_unlock(&mu);
+                 }
+                 pd.fragmentFunction = spec_fn(dual && m->fn_d ? m->fn_d : m->fn, m->key, dual && m->fn_d, st->pSpecializationInfo); p->fs = m->si;
+@@ -2030,7 +2048,7 @@
+     atomic_store(&g_fan_pipes, 0);
+     atomic_store(&g_n_resume, 0);
+     g_fan_ps = nil; g_fan_failed = 0;
+-    g_lib = nil;
++    g_lib = nil; lmsl_teardown();
+     dm_msl_trailer_teardown();
+     g_dss_off = nil;
+     g_ev = nil;

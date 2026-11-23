@@ -1,0 +1,46 @@
+OK
+{"sites":[{"barrier":false,"function":"main0","line":12,"site":1},{"barrier":true,"function":"main0","line":16,"site":2}]}
+#include <metal_stdlib>
+using namespace metal;
+
+struct dm_loop_state
+{
+    device atomic_uint* abort;
+    atomic_uint hit;
+};
+static inline __attribute__((always_inline)) bool dm_lg_cap(thread uint& n, device dm_loop_state& s, uint site)
+{
+    if (++n < 262144u) return true;
+    if (n == 262144u)
+    {
+        atomic_fetch_min_explicit(&s.hit, site, memory_order_relaxed);
+        atomic_store_explicit(s.abort, 1u, memory_order_relaxed);
+    }
+    return false;
+}
+static inline __attribute__((always_inline)) bool dm_lg_go(thread uint& n, device dm_loop_state& s, uint site)
+{
+    if (!dm_lg_cap(n, s, site)) return false;
+    return (n & 1023u) != 0u || atomic_load_explicit(s.abort, memory_order_relaxed) == 0u;
+}
+struct Args { device uint* buf [[id(0)]]; };
+
+static inline void arrive()
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+kernel void main0(constant Args& a [[buffer(0)]], uint tid [[thread_index_in_threadgroup]], device dm_loop_state& dm_loop [[buffer(28)]])
+{
+    uint dm_lg = 0u;
+    uint count = 0u;
+    for (uint i = 0u;(i < 300u + tid) && dm_lg_go(dm_lg, dm_loop, 1u) /* dm_loop_site 1: main0 */; i++)
+    {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    { uint dm_lg_b2 = 0u; for (uint i = 0u;((arrive(), i < 2048u)) && dm_lg_cap(dm_lg_b2, dm_loop, 2u) /* dm_loop_site 2: main0 */; i++)
+    {
+
+        count++;
+    } }
+    a.buf[8u + tid] = count;
+}

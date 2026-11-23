@@ -1,0 +1,16 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    const device _20* vp_s0 [[id(0)]];
+};
+
+kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])
+{
+    packed_uint3 _57 = *(const device packed_uint3*)&(*spvDescriptorSet0.vp_s0)._m0[int(_9)];
+}

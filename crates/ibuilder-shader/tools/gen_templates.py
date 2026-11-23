@@ -17,7 +17,8 @@ const('BORDER_LIVE_FC', rw.BORDER_LIVE_FC)
 const('ZSNAP', rw.ZSNAP)
 const('UWORD', rw.UWORD)
 const('TG_FENCE', rw.TG_FENCE)
-const('MEMBAR', rw._MEMBAR)
+# membar_fence's texts: the engine's chain no longer has the step (SPIRV-Cross writes the fences at MSL 3.2); kept as they were for steps::membar_fence until no caller is left
+const('MEMBAR', 'threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture);')
 const('MEMBAR_FENCE', 'atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture, memory_order_seq_cst, thread_scope_device);   // MEMBAR (membar_fence)')
 const('BLEND_ZERO_PARAM', rw.BLEND_ZERO_PARAM)
 bits, rb = abi.BLEND_ZERO_BITS, abi.BLEND_ROUND_BITS
@@ -34,5 +35,14 @@ const('POOL_MARK', rf.POOL_MARK)
 const('SHARED_ALIAS', rw.SHARED_ALIAS)
 const('GATHER4', rw.GATHER4)
 const('HMMA_BODY', rw.HMMA_BODY)
+# compute loop containment (compute_loops), raw_noinline, the buffer texture pools (pool_arrays)
+out.append(f'pub const LOOP_SLOT: u32 = {abi.LOOP_SLOT};\npub const LOOP_CAP: u32 = {rw.LOOP_CAP};\npub const LOOP_ABORT_EVERY: u32 = {rw.LOOP_ABORT_EVERY};\n')
+# the helper compute_loops inserts after `using namespace metal;`, taken from its output for a one-loop kernel
+probe = 'using namespace metal;\nkernel void main0()\n{\n    for (;;)\n    {\n    }\n}\n'
+head = 'using namespace metal;\n'
+looped = rw.compute_loops(probe)[0]
+assert looped.startswith(head)
+const('LOOP_HELPER', looped[len(head):looped.index('kernel void main0(')])
+const('BUFFER_POOL_READ', rf.BUFFER_POOL_READ)
 out.append('pub const HMMA_ARGS: [&str; %d] = [%s];\n' % (len(rw.HMMA_ARGS), ', '.join('"%s"' % a for a in rw.HMMA_ARGS)))
 sys.stdout.write(''.join(out))

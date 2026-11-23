@@ -9,7 +9,7 @@
 #   LIBDIFF  the libdiff binary (ibuilder-shaderbuild, features host-tools,f2-finish)  [required for (3)]
 set -uo pipefail
 D="${1:?usage: verify-chain.sh <app Documents> <reference run folder>}"; R="${2:?usage: verify-chain.sh <app Documents> <reference run folder>}"
-TID=0100DFA027504000; CHAIN="${CHAIN:-b24b25240cad}"; bad=0
+TID=0100DFA027504000; CHAIN="${CHAIN:-6c53446391cc}"; bad=0
 n=0; d=0
 for m in main sdk subsdk0; do for e in patched.bin fixups.tsv sites.tsv gates.tsv cuts.tsv obs.tsv changed.tsv; do
   if cmp "$D/extract/rewrite/$m/$m.$e" "$R/extract/rewrite/$m/$m.$e"; then n=$((n+1)); else d=$((d+1)); fi

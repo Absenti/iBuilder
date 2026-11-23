@@ -23,7 +23,7 @@ fn the_synthetic_game_is_the_pythons_library_and_gets_the_pythons_jobs() {
     let d = dir_of();
     let (game, py, eng) = (
         d.join("game"),
-        d.join("py/b-b24b25240cad.img"),
+        d.join("py/b-6c53446391cc.img"),
         d.join("eng"),
     );
     if !have(&game.join("pkg")) || !have(&py) || !have(&eng) {

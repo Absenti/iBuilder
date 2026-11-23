@@ -85,6 +85,8 @@ fn rust_output_on(case: &str, module: &str, threads: usize) -> BTreeMap<String, 
             module,
             &Options {
                 workers: threads,
+                // the oracle is the pinned engine's patch_nso.py, which has no mod_layout: these synthetic modules' data shares the code's 16 KB page
+                no_relayout: true,
                 ..Default::default()
             },
         )

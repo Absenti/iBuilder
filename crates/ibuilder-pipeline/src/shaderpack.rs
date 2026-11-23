@@ -391,6 +391,18 @@ pub fn set_shader_pack(ctx: &Ctx) -> Option<PathBuf> {
     let tid = ctx.title_id()?;
     let pack = ctx.shader_packs.join(&tid);
     let smap = pack.join("shader_map.tsv");
+    if !map_has_rows(&smap)
+        && let Some(api) = crate::layers::layer_of(&pack)
+    {
+        // GL / Vulkan (crate::layers): the host's layer finds <DM_MSL_DIR>/<api>/<api>_shaders.tsv and the MSL beside it
+        if !ctx.env.truthy("DM_MSL_DIR") {
+            ctx.env.set("DM_MSL_DIR", &pack.to_string_lossy());
+        }
+        ctx.log(&format!(
+            "shader pack: Documents/shaders/{tid} holds the game's {api} layer library (DM_MSL_DIR)"
+        ));
+        return Some(pack);
+    }
     if !map_has_rows(&smap) {
         ctx.log(&format!(
             "shader pack: none for {tid} -- the game runs without its shaders and draws nothing; stage 3 translates them on this device (or import {tid}{SHADER_PACK_SUFFIX} made on a Mac)"

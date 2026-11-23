@@ -214,7 +214,7 @@ fn the_shader_options_are_checked_before_anything_is_written() {
     ] {
         let mut b = a.clone();
         match set {
-            "chain" => b.shader_chain = Some("b24b25240cad".into()),
+            "chain" => b.shader_chain = Some("6c53446391cc".into()),
             "engine" => b.engine = Some(d.join("engine")),
             _ => b.shader_jobs = Some(2),
         }
@@ -234,14 +234,14 @@ fn the_shader_options_are_checked_before_anything_is_written() {
             .contains("--shader-chain"),
         "the chain is required"
     );
-    a.shader_chain = Some("b24b25240cad/..".into());
+    a.shader_chain = Some("6c53446391cc/..".into());
     assert!(
         check_shader_args(&a)
             .unwrap_err()
             .contains("letters and digits"),
         "the chain names files"
     );
-    a.shader_chain = Some("b24b25240cad".into());
+    a.shader_chain = Some("6c53446391cc".into());
     a.shader_jobs = Some(0);
     assert!(check_shader_args(&a).unwrap_err().contains("--shader-jobs"));
     a.shader_jobs = None;
@@ -297,14 +297,14 @@ fn the_config_carries_the_shader_rows_only_with_shaders_and_set_wins() {
         "stage 3 stays off (status none) unless asked for"
     );
     a.shaders = true;
-    a.shader_chain = Some("b24b25240cad".into());
+    a.shader_chain = Some("6c53446391cc".into());
     a.shader_jobs = Some(3);
     a.set = vec![
         ("shader_cache_gib".into(), "4".into()),
         ("shader_jobs".into(), "5".into()),
     ];
     let c = make_config(&a);
-    assert_eq!(c.get("shader_chain"), Some("b24b25240cad"));
+    assert_eq!(c.get("shader_chain"), Some("6c53446391cc"));
     assert_eq!(c.get("shader_cache_gib"), Some("4"));
     assert_eq!(c.get("shader_jobs"), Some("5"), "--set is applied last");
     assert_eq!(
@@ -320,7 +320,7 @@ fn a_mock_run_with_shaders_runs_stage_3_between_the_rewrite_and_the_assembly() {
     let d = TempDir::new("cli-shmock");
     let mut a = args(&d);
     a.shaders = true;
-    a.shader_chain = Some("b24b25240cad".into());
+    a.shader_chain = Some("6c53446391cc".into());
     a.set = vec![("shader_free_gib".into(), "0".into())];
     let r = run(&a).expect("run");
     assert!(r.chain.all_ok(), "{:?}", r.chain.status);
@@ -362,7 +362,7 @@ fn a_mock_run_whose_shaders_fail_is_not_a_success() {
     let d = TempDir::new("cli-shfail");
     let mut a = args(&d);
     a.shaders = true;
-    a.shader_chain = Some("b24b25240cad".into());
+    a.shader_chain = Some("6c53446391cc".into());
     a.set = vec![("shader_free_gib".into(), "1000000".into())];
     let r = run(&a).expect("run");
     let st = r.chain.status.get("shaders").cloned().unwrap_or_default();

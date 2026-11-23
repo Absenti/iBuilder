@@ -1,0 +1,133 @@
+# (after 0518) host/svc: UnmapMemory gives back the whole anonymous host pages of the stack it copied back (dirty stack pages no longer stay resident)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/6c50d74e5a29fd8debc86aea3ffa000d515d005d  ("host/svc: release unmapped stack pages (PR #2720)")
+#            author seedds, 2026-11-22 10:23 +0800; Co-authored-by: Esteban Viera
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: MapMemory dirties the destination when it copies the stack in; UnmapMemory copied the bytes back and removed the mapping but left the dirty pages resident across the stack region
+#   (upstream PR #2720; Cuphead: 27 stack maps a run).
+# WHAT IT CHANGES (dm/host/hle_svc.c; test t_svc_memory): a device-shared destination is refused before the copy-back; after it, whole anonymous host pages are released (partial pages can
+#   hold live neighbours, file-backed stacks keep their backing).
+# Games: games that map stacks with svcMapMemory (Cuphead upstream). Switches: none. Applies as is (the review's candidate 0521); paches/0006 still applies after it.
+# Tests (M1 Pro): t_svc_memory with upstream's new stack_pages_released and the device-shared copy-back case (hand-merged into this tree's main list), `make -C dm/host/tests memory`
+#   (plain, unlimited map, 16 KB pages with ASan): added to HOST_TESTS as host-memory. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0518, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/host/hle_svc.c b/dm/host/hle_svc.c
+index aa40c303d75b98659c4a2b6c769e05dce6b965ab..01c4441ce13ae5f1ae706b9cbb5287a9d9119f44 100644
+--- a/dm/host/hle_svc.c
++++ b/dm/host/hle_svc.c
+@@ -640,8 +640,8 @@ static int map_source_busy(uint64_t addr, uint64_t size) { // g_map_lock held; n
+     return 0;
+ }
+ // Device-shared memory. On Horizon, NVN gives a memory pool's storage to the GPU through nvmap, whose device mapping (svcMapDeviceAddressSpaceAligned, KPageTableBase::LockForMapDeviceAddressSpace)
+-// sets KMemoryAttribute_DeviceShared on those pages and counts each mapping. UnmapPhysicalMemory and a SetHeapSize that shrinks refuse any page with an attribute set (ResultInvalidCurrentMemory,
+-// 0xD401; Atmosphère's KPageTableBase::UnmapPhysicalMemory and SetHeapSize), so the pages stay mapped until the pool is finalized. Without this, the host gave such pages back (guest_release put
++// sets KMemoryAttribute_DeviceShared on those pages and counts each mapping. UnmapMemory, UnmapPhysicalMemory and a shrinking SetHeapSize refuse ranges with that attribute
++// (ResultInvalidCurrentMemory, 0xD401), so the pages stay mapped until the pool is finalized. Without this, the host gave such pages back (guest_release put
+ // fresh pages under them) while the pool's zero-copy Metal buffer still held the old ones: the CPU then wrote one copy and the GPU read the other. PR #1616 found that on Monster Jam Steel Titans 2,
+ // whose light-grid compute shaders read stale counts from the pool and hung the GPU. hle_nvn.c registers each pool's storage at nvnMemoryPoolInitialize and removes it at nvnMemoryPoolFinalize;
+ // a range registered twice (two pools over the same storage) stays shared until both are gone
+@@ -966,7 +966,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+         if (g_flag.svc) LOG("MapMemory %#llx <- %#llx +%#llx", dst, src, size);
+         regs[0] = 0; return 0;
+     }
+-    case 0x05: {  // UnmapMemory(dst, src, size): contents are moved back to the source region; a 16K page may be shared with an adjacent mapping, permissions are not revoked
++    case 0x05: {  // UnmapMemory(dst, src, size): copy the contents back to the source and discard eligible stack pages
+         uint64_t dst = regs[0], src = regs[1], size = regs[2];
+         uint32_t result = map_arguments(dst, src, size);
+         if (result) { regs[0] = result; return 0; }
+@@ -974,9 +974,17 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+         int k = map_find(dst, size);
+         if (!k || g_map[k - 1].base != dst || g_map[k - 1].size != size || g_map[k - 1].src != src) {
+             pthread_mutex_unlock(&g_map_lock); LOG("UnmapMemory does not match a mapping %#llx+%#llx", dst, size); regs[0] = 0xD401; return 0; }
++        if (device_shared(dst, size, "UnmapMemory")) { pthread_mutex_unlock(&g_map_lock); regs[0] = 0xD401; return 0; }
+         dm_guest_write_prepare((void *)src, size);
+         memcpy((void *)src, (void *)dst, size);
+         map_del(k - 1);
++        // Random stack addresses leave dirty pages throughout the region. Reclaim whole anonymous host pages and preserve any 4 KiB neighbors
++        // sharing an edge page. MapMemory reopens reclaimed pages. File-backed stacks retain their backing.
++        if (!g_gf_n) {
++            uintptr_t mask = (size_t)getpagesize() - 1;
++            uintptr_t release_lo = (dst + mask) & ~mask, release_hi = (dst + size) & ~mask;
++            if (release_hi > release_lo) (void)guest_release(release_lo, release_hi, 0);
++        }
+         pthread_mutex_unlock(&g_map_lock);
+         regs[0] = 0; return 0;
+     }
+diff --git a/dm/host/tests/t_svc_memory.c b/dm/host/tests/t_svc_memory.c
+index 6772f489a06dc38ef0904476a12f7718c42723af..d975dba05663f78e8b5deb848dba91faa284763b 100644
+--- a/dm/host/tests/t_svc_memory.c
++++ b/dm/host/tests/t_svc_memory.c
+@@ -185,8 +185,7 @@ static void alias_lifecycle(void) {
+     assert(pages(1, alias + g_alias_cap - P, 2 * P) == BAD);
+ }
+ 
+-// Device-shared memory (an NVN memory pool's storage, hle_nvn.c) is not given back: UnmapPhysicalMemory or a shrinking SetHeapSize over any page of it fails with InvalidCurrentMemory and
+-// leaves every page and byte as it was, as on Horizon; once the pool is gone (each registration removed) both work again (PR #1616, Monster Jam Steel Titans 2)
++// Device-shared memory (an NVN memory pool's storage, hle_nvn.c) stays mapped until the last pool releases it.
+ static void device_shared_refused(void) {
+     assert(!pages(1, alias, 16 * P));
+     memset((void *)alias, 0x6d, 16 * P);
+@@ -210,6 +209,51 @@ static void device_shared_refused(void) {
+     assert(resize(0) == BAD);
+     dm_device_share((void *)(heap + 1024 * 1024), P, 0);
+     assert(!resize(0));
++
++    size_t pg = memory_getpagesize(), size = 2 * pg - P;
++    uintptr_t dst = stack + P;
++    assert(!pages(1, alias, size));
++    memset((void *)alias, 0x43, size);
++    assert(!map(dst, alias, size));
++    *(uint8_t *)dst = 0x52;
++    // The first guest page can block the unmap even when it is outside the whole host pages being reclaimed.
++    dm_device_share((void *)dst, P, 1);
++    assert(unmap(dst, alias, size) == BAD);
++    expect(dst, dst, size, 0xb, 0, 3);
++    assert(*(uint8_t *)alias == 0x43 && *(uint8_t *)dst == 0x52);
++    dm_device_share((void *)dst, P, 0);
++    assert(!unmap(dst, alias, size) && *(uint8_t *)alias == 0x52);
++    assert(!pages(0, alias, size));
++}
++
++// Unmap the middle mapping while the 4 KiB neighbors on both sides are still live.
++static void stack_pages_released(void) {
++    size_t pg = memory_getpagesize(), last = 3 * pg - P, size = last - P;
++    uintptr_t dst = stack + P, src = alias + P;
++    assert(!pages(1, alias, 3 * pg));
++    memset((void *)src, 0x5a, size);
++    *(uint8_t *)alias = 0x18;
++    *(uint8_t *)(alias + last) = 0x29;
++    assert(!map(stack, alias, P) && !map(stack + last, alias + last, P));
++    assert(!map(dst, src, size));
++    memset((void *)dst, 0x6b, size);
++    assert(!unmap(dst, src, size));
++    assert(*(uint8_t *)src == 0x6b && *(uint8_t *)(src + size - 1) == 0x6b);
++    assert(*(uint8_t *)stack == 0x18 && *(uint8_t *)(stack + last) == 0x29);
++    if (g_gf_n) {
++        assert(*(uint8_t *)(stack + pg) == 0x6b);
++    } else {
++        size_t native_pg = (size_t)getpagesize();
++        for (uintptr_t p = stack + pg; p < stack + 2 * pg; p += native_pg) {
++            char resident;
++            assert(!mincore((void *)p, native_pg, &resident) && !(resident & MINCORE_INCORE));
++        }
++    }
++    memset((void *)src, 0x7c, size);
++    assert(!map(dst, src, size) && *(uint8_t *)dst == 0x7c && *(uint8_t *)(dst + size - 1) == 0x7c);
++    assert(!unmap(dst, src, size));
++    assert(!unmap(stack, alias, P) && !unmap(stack + last, alias + last, P));
++    assert(!pages(0, alias, 3 * pg));
+ }
+ 
+ static void ownership(void) {
+@@ -610,7 +654,7 @@ int main(int argc, char **argv) {
+     if (!getenv("DM_ALIAS_SIZE")) assert(info(I_AliasSize) == SWITCH_ALIAS);   // the Mac's alias region is a Switch's, whatever the profile can give an iPhone; DM_ALIAS_SIZE=<mem_alias> runs these tests on an iPhone's
+ #endif
+     layout_order();
+-    lazy_commit(); alias_lifecycle(); device_shared_refused(); ownership(); module_sources(); module_back_patch(); failures(); release_fallback(); file_rule(); file_sweep(); heap_regrow(); concurrency(); fragmented_queries();
++    lazy_commit(); alias_lifecycle(); device_shared_refused(); ownership(); stack_pages_released(); module_sources(); module_back_patch(); failures(); release_fallback(); file_rule(); file_sweep(); heap_regrow(); concurrency(); fragmented_queries();
+     guest_helper();
+     if (!DM_GAME_MEM_MAP_LIMIT) metadata_limit();
+ #ifdef TEST_REAL_DIRTY

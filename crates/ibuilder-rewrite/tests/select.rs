@@ -35,6 +35,8 @@ fn x18_conditional_selects_match_the_python_oracle() {
             module,
             &Options {
                 workers: 2,
+                // the oracle is the pinned engine's patch_nso.py, which has no mod_layout: these synthetic modules' data shares the code's 16 KB page
+                no_relayout: true,
                 ..Default::default()
             },
         )

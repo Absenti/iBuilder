@@ -1,0 +1,22 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "428be7745ee267f651e87bba6ad1b257b501f60157477009568ac928906e6698",
+  "pkg/ps_data.bin": "f31e71aa10db650cf237760798c51774e1157946ae76fdf7eeab0bde54bbed18",
+  "pkg/vs_data.bin": "682293e25f505401bc91ac3b0fa3aedc27d1707c72e06bd4793db06be42b2d6c",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "b386ee6ec4436b61837374b0aa969b5a0d112a173277c9d7d33300416ec9e852",
+  "tables/shader_map.tsv": "586bc07ddc5df8b6654af8aff74bdbd40bb829f993d33e97f116feca35529a77",
+  "tables/shader_pairs.tsv": "dc6e62237d4b9981a5e3e34c5ec8f602b1b85f0661e1c32041ea135c9c12c652"
+ },
+ "log": [
+  "[RED] /Data/cut.ipk: entry 0 of 3 runs past the IPK table (0x6c bytes): not the layout of a version 5 archive (its shaders are left out)",
+  "[RED] /Data/tiny.ipk: 32 bytes, shorter than a UbiArt IPK header (0x30) (its shaders are left out)",
+  "[RED] /Data/v6.ipk: UbiArt IPK version 6 (only versions 5 and 7 are read) (its shaders are left out)",
+  "[RED] 3 file(s) could not be read, their shaders are left out (first: /Data/cut.ipk: entry 0 of 3 runs past the IPK table (0x6c bytes): not the layout of a version 5 archive)",
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (5408bde4b919df14)",
+  "shaders: 6 (compute 1, pixel 2, vertex 3); sources data 6; compute shader answers 1 rows; variation pairs 3"
+ ],
+ "shaders": 6,
+ "updates": []
+}

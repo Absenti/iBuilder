@@ -6,7 +6,7 @@ S = os.environ['S'] + '/shader'
 ap = argparse.ArgumentParser()
 ap.add_argument('--engine', default=S + '/engine'); ap.add_argument('--keys', default='all'); ap.add_argument('--jobs', type=int, default=4)
 ap.add_argument('--out', required=True); ap.add_argument('--tables', default='0'); ap.add_argument('--cprofile', action='store_true')
-ap.add_argument('--cas', default=None); ap.add_argument('--chain', default='b24b25240cad'); ap.add_argument('--tag', default='run')
+ap.add_argument('--cas', default=None); ap.add_argument('--chain', default='6c53446391cc'); ap.add_argument('--tag', default='run')
 a = ap.parse_args()
 import shader_device as sd
 tl = os.path.join(a.engine, 'dm/gfx/tools')

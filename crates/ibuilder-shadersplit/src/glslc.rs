@@ -65,6 +65,11 @@ pub fn glslc_section(d: &[u8], h: usize, size: usize) -> Res<Option<Vec<StagePai
 
 /// `glslc_program(d, h, size, label)`: a GLSLC output of several stages, compiled together as one program
 pub fn glslc_program(d: &[u8], h: usize, size: usize, label: &str) -> Res<Vec<Shader>> {
+    glslc_program_at(d, h, size, label, h)
+}
+
+/// [`glslc_program`] labelled with the offset `hl` (a window of a file: `glslc_shaders_window`)
+fn glslc_program_at(d: &[u8], h: usize, size: usize, label: &str, hl: usize) -> Res<Vec<Shader>> {
     let secs = glslc_section(d, h, size)?.unwrap_or_default();
     let mut sts = Vec::new();
     for (ctl, code) in &secs {
@@ -94,7 +99,7 @@ pub fn glslc_program(d: &[u8], h: usize, size: usize, label: &str) -> Res<Vec<Sh
     Ok(sts
         .iter()
         .zip(&secs)
-        .map(|(st, (ctl, code))| sh(format!("{label}#GLSLC@{h:#x}#var"), st.unwrap(), ctl, code))
+        .map(|(st, (ctl, code))| sh(format!("{label}#GLSLC@{hl:#x}#var"), st.unwrap(), ctl, code))
         .collect())
 }
 
@@ -105,8 +110,71 @@ pub fn glslc_shaders(
     need: bool,
     skip: &[(usize, usize)],
 ) -> Res<Vec<Shader>> {
+    glslc_shaders_ranges(d, label, need, skip, None)
+}
+
+/// [`glslc_shaders`] with `ranges` (9f834e41): the byte ranges `(h, h + size)` of the outputs it accepted, in the order it accepted them (TT Games' DAT members, `ttdat.rs`)
+pub fn glslc_shaders_ranges(
+    d: &[u8],
+    label: &str,
+    need: bool,
+    skip: &[(usize, usize)],
+    ranges: Option<&mut Vec<(usize, usize)>>,
+) -> Res<Vec<Shader>> {
+    glslc_shaders_core(
+        d,
+        label,
+        need,
+        skip,
+        ranges,
+        &mut find_all(d, &GLSLC_MAGIC),
+        0,
+    )
+}
+
+/// `glslc_shaders(d, label, need=need, offsets=offsets)`: only the outputs at the given offsets (the magic need not be there: such an offset is passed over as the Python's is)
+pub fn glslc_shaders_at(d: &[u8], label: &str, need: bool, offsets: &[usize]) -> Res<Vec<Shader>> {
+    glslc_shaders_core(d, label, need, &[], None, &mut offsets.iter().copied(), 0)
+}
+
+/// The one GLSLC output that starts at `d[0]`, `d` being the bytes of a larger file from `base` on (at least the output's length and its section headers, `glslc_window`): the shaders are labelled
+/// with their offset in that file, as `glslc_shaders(file, label, need=False, offsets=(base,))` labels them
+pub fn glslc_shaders_window(d: &[u8], label: &str, base: usize) -> Res<Vec<Shader>> {
+    glslc_shaders_core(d, label, false, &[], None, &mut std::iter::once(0), base)
+}
+
+/// How many bytes from an output's start `glslc_shaders` may look at: its length when that fits the file, else only its header (it is then passed over); at least the section headers
+/// the layout may name (16 headers of 0x98 bytes from +0xa8)
+pub fn glslc_window(head: &[u8], left: u64) -> Res<u64> {
+    let (size, _, _, _) = glslc_layout(head, 0)?;
+    if size as u64 <= left {
+        Ok((size as u64).max(0xa8 + 0x98 * 16).min(left))
+    } else {
+        Ok((head.len() as u64).min(left))
+    }
+}
+
+fn glslc_shaders_core(
+    d: &[u8],
+    label: &str,
+    need: bool,
+    skip: &[(usize, usize)],
+    mut ranges: Option<&mut Vec<(usize, usize)>>,
+    offsets: &mut dyn Iterator<Item = usize>,
+    base: usize,
+) -> Res<Vec<Shader>> {
     let mut out = Vec::new();
-    for h in find_all(d, &GLSLC_MAGIC) {
+    // `accept(h, size, programs)`
+    let mut accept = |out: &mut Vec<Shader>, h: usize, size: usize, programs: Vec<Shader>| {
+        if !programs.is_empty()
+            && let Some(r) = ranges.as_deref_mut()
+        {
+            r.push((h, h + size));
+        }
+        out.extend(programs);
+    };
+    for h in offsets {
+        let hl = h + base; // the offset the labels give
         if skip.iter().any(|&(a, b)| a <= h && h < b) {
             continue;
         }
@@ -121,12 +189,14 @@ pub fn glslc_shaders(
             }
             let secs = glslc_section(d, h, size)?.unwrap_or_default();
             if secs.len() > 1 {
-                out.extend(glslc_program(d, h, size, label)?);
+                let p = glslc_program_at(d, h, size, label, hl)?;
+                accept(&mut out, h, size, p);
             } else if let Some((ctl, code)) = secs.first()
                 && let Some(st) = glslc_stage(ctl, code)?
                 && check(st, ctl, code)?.is_none()
             {
-                out.push(sh(format!("{label}#GLSLC@{h:#x}"), st, ctl, code));
+                let p = vec![sh(format!("{label}#GLSLC@{hl:#x}"), st, ctl, code)];
+                accept(&mut out, h, size, p);
             }
             continue;
         }
@@ -140,7 +210,8 @@ pub fn glslc_shaders(
             None => continue,
         };
         if find_in(d, &CTL_MAGIC, c + 4, h + size).is_some() {
-            out.extend(glslc_program(d, h, size, label)?);
+            let p = glslc_program_at(d, h, size, label, hl)?;
+            accept(&mut out, h, size, p);
             continue;
         }
         // The output's own section header says where its control section and code area are (glslc_section), and is read first
@@ -149,12 +220,13 @@ pub fn glslc_shaders(
             && let Some(st) = glslc_stage(&sec[0].0, &sec[0].1)?
             && check(st, &sec[0].0, &sec[0].1)?.is_none()
         {
-            out.push(sh(
-                format!("{label}#GLSLC@{h:#x}"),
+            let p = vec![sh(
+                format!("{label}#GLSLC@{hl:#x}"),
                 st,
                 &sec[0].0,
                 &sec[0].1,
-            ));
+            )];
+            accept(&mut out, h, size, p);
             continue;
         }
         // Without a usable section header: the code area right after the control section's +0x20 length
@@ -176,7 +248,8 @@ pub fn glslc_shaders(
         if check(st, ctl, code)?.is_some() {
             continue;
         }
-        out.push(sh(format!("{label}#GLSLC@{h:#x}"), st, ctl, code));
+        let p = vec![sh(format!("{label}#GLSLC@{hl:#x}"), st, ctl, code)];
+        accept(&mut out, h, size, p);
     }
     if out.is_empty() && need {
         red!("{label}: no GLSLC output");
@@ -475,6 +548,196 @@ fn adrp_targets(d: &[u8], lo: i64, hi: i64) -> HashMap<i64, Vec<i64>> {
     out
 }
 
+/// One candidate pair of [`adjacent_shader`]: (the code area's offset, its stage, the control section, the code area)
+pub type Adjacent<'a> = (usize, St, &'a [u8], &'a [u8]);
+
+/// `adjacent_shader(d, c, start, end)` (9f834e41): an unreferenced control section's unique adjacent code area (TT Games), right after its length (as it is, or at 16-byte alignment) or
+/// right before it, inside `[start, end)` (`end` None: the data's end). Headerless compute neighbours can both pass the size checks: then only one headed candidate, or one whose code has an
+/// EXIT in an instruction slot of a valid scheduling stream, is taken; an ambiguous pair is left out
+pub fn adjacent_shader(
+    d: &[u8],
+    c: usize,
+    start: usize,
+    end: Option<usize>,
+) -> Res<Option<Adjacent<'_>>> {
+    let end = end.unwrap_or(d.len());
+    if c < start || c + 0x760 > end {
+        return Ok(None);
+    }
+    let (cn, kn) = (u32le(d, c + 0x20)? as usize, u32le(d, c + 0x704)? as usize);
+    if cn < 0x760 || c + cn > end || kn < 8 {
+        return Ok(None);
+    }
+    let ctl = &d[c..c + cn];
+    let mut ks: Vec<i64> = Vec::new();
+    for k in [
+        (c + cn) as i64,
+        ((c + cn + 15) & !15) as i64,
+        c as i64 - kn as i64,
+    ] {
+        if !ks.contains(&k) {
+            ks.push(k); // dict.fromkeys: once each, in order
+        }
+    }
+    let mut cands: Vec<Adjacent<'_>> = Vec::new();
+    for k in ks {
+        if k < start as i64 || k as usize + kn > end {
+            continue;
+        }
+        let k = k as usize;
+        let code = &d[k..k + kn];
+        if contains(code, &CTL_MAGIC) {
+            continue;
+        }
+        let st = glslc_stage(ctl, code)?;
+        if st == Some(St::Cs) && sl(code, 0, 4) != CS_MAGIC && code.iter().all(|&b| b == 0) {
+            continue; // zero padding is not a headerless compute program
+        }
+        if let Some(st) = st
+            && check(st, ctl, code)?.is_none()
+        {
+            cands.push((k, st, ctl, code));
+        }
+    }
+    if cands.len() > 1 {
+        let headed: Vec<&Adjacent<'_>> = cands
+            .iter()
+            .filter(|v| {
+                let m = sl(v.3, 0, 4);
+                m == GFX_MAGIC || m == CS_MAGIC
+            })
+            .collect();
+        if headed.len() == 1 {
+            return Ok(Some(*headed[0]));
+        }
+        // Maxwell's control word has three 21-bit schedules and a zero high bit: misaligned metadata can hold EXIT bytes too, but is not a stream of valid scheduling groups
+        let exits = |v: &Adjacent<'_>| -> Res<bool> {
+            let (st, code) = (v.1, v.3);
+            let s = if sl(code, 0, 4) == CS_MAGIC { 0x100 } else { 0 }; // as dmsh_build.py's compute header
+            let c1 = u32le(ctl, 0x700)? as usize;
+            let e = if s < c1 && c1 <= code.len() {
+                c1
+            } else {
+                code.len()
+            } as i64;
+            if st != St::Cs {
+                return Ok(false);
+            }
+            let mut i = s as i64;
+            while i < e - 7 {
+                if u64le(code, i as usize)? >> 63 != 0 {
+                    return Ok(false);
+                }
+                i += 32;
+            }
+            let mut i = s as i64;
+            while i < e - 7 {
+                if (i - s as i64) % 32 != 0 && u64le(code, i as usize)? >> 52 == 0xe30 {
+                    return Ok(true);
+                }
+                i += 8;
+            }
+            Ok(false)
+        };
+        let mut kept = Vec::new();
+        for v in cands {
+            if exits(&v)? {
+                kept.push(v);
+            }
+        }
+        cands = kept;
+    }
+    Ok(if cands.len() == 1 {
+        Some(cands[0])
+    } else {
+        None
+    })
+}
+
+/// `referenced_shader_copy(d, ctl, uses)` (9f834e41): a control section that carries its assembly source (`!!NVvp5.0` / `!!NVfp5.0` at +0x14's offset) stored apart from the code the
+/// program copies into its pool: near a reference to the control (`uses`: the offsets of the adds that build its address), an ADRP/ADD x1 of a headed code area of the source's stage, then
+/// `MOV w2, #<code length>` and a direct call in the same straight-line sequence. → (stage, the code area), or None when there is not exactly one such code area
+pub fn referenced_shader_copy<'a>(
+    d: &'a [u8],
+    ctl: &[u8],
+    uses: &[i64],
+) -> Res<Option<(St, &'a [u8])>> {
+    if ctl.len() < 0x760 {
+        return Ok(None);
+    }
+    let source = u32le(ctl, 0x14)? as usize;
+    let stage = match at(ctl, source, 9) {
+        b"!!NVvp5.0" => St::Vs,
+        b"!!NVfp5.0" => St::Ps,
+        _ => return Ok(None),
+    };
+    let size = u32le(ctl, 0x704)? as usize;
+    if !(0 < size && size <= 0xffff) {
+        return Ok(None);
+    }
+    let branches = |ins: u32| {
+        ins & 0x7c00_0000 == 0x1400_0000 // B / BL
+            || ins & 0xfe00_0000 == 0xd600_0000 // BR / BLR / RET and authenticated forms
+            || ins & 0xff00_0010 == 0x5400_0000 // B.cond
+            || matches!(ins & 0x7e00_0000, 0x3400_0000 | 0x3600_0000) // CBZ / CBNZ / TBZ / TBNZ
+    };
+    let w = |o: i64| u32::from_le_bytes(d[o as usize..o as usize + 4].try_into().unwrap());
+    let n = d.len() as i64;
+    let mut cands: Vec<usize> = Vec::new();
+    for &u in uses {
+        let mut pc = (u - 0x34).max(0);
+        while pc < (n - 8).min(u + 0x34) {
+            let (page, add) = (w(pc), w(pc + 4));
+            let here = pc;
+            pc += 4;
+            // ADRP x1 followed by ADD x1, x1, #offset (the copy source)
+            if page & 0x9f00_001f != 0x9000_0001 || add & 0xffc0_03ff != 0x9100_0021 {
+                continue;
+            }
+            let mut delta = (((page >> 5) & 0x7ffff) << 2 | (page >> 29) & 3) as i64;
+            if delta & 0x10_0000 != 0 {
+                delta -= 0x20_0000;
+            }
+            let addr = (here & !0xfff) + (delta << 12) + ((add >> 10) & 0xfff) as i64;
+            if addr < 0 || at(d, addr as usize, 4) != GFX_MAGIC {
+                continue;
+            }
+            let code = at(d, addr as usize, size);
+            if sph_stage(code) != Some(stage) || check(stage, ctl, code)?.is_some() {
+                continue;
+            }
+            let mut length = false;
+            let mut a = here + 8;
+            while a < (n - 3).min(here + 0x20) {
+                let ins = w(a);
+                if ins >> 26 == 0x25 {
+                    // BL with source and length still in the argument registers
+                    let (lo, hi) = if u <= a { (u, a) } else { (a, u) };
+                    let quiet = (lo + 4..hi).step_by(4).all(|o| !branches(w(o)));
+                    if length && quiet && !cands.contains(&(addr as usize)) {
+                        cands.push(addr as usize);
+                    }
+                    break;
+                }
+                if ins == 0x5280_0002 | (size as u32) << 5 {
+                    length = true; // MOV w2, #size
+                } else if ins & 0xffe0_ffff == 0xaa00_03e0 || ins & 0xffc0_03e0 == 0xf900_03e0 {
+                    // MOV x0, Xn / STR Xt, [sp, #offset]
+                } else if ins & 31 > 2 && matches!(ins & 0xff00_0000, 0x9100_0000 | 0x8b00_0000) {
+                    // an unrelated ADD
+                } else {
+                    break;
+                }
+                a += 4;
+            }
+        }
+    }
+    if cands.len() != 1 {
+        return Ok(None);
+    }
+    Ok(Some((stage, at(d, cands[0], size))))
+}
+
 /// `raw_shaders(d, label, known)`: control sections in main that are in no GLSLC output and no BNSH file (see the Python's docstring for the whole story)
 pub fn raw_shaders(
     cx: &Ctx<'_>,
@@ -604,6 +867,14 @@ pub fn raw_shaders(
                 break;
             }
         }
+        // a code area the code copies from by address, next to a reference to the control section (9f834e41)
+        if why && !code_of.contains_key(&c) {
+            let uses = built.get(&(c as i64)).map(|v| v.as_slice()).unwrap_or(&[]);
+            if let Some((st, code)) = referenced_shader_copy(d, ctl, uses)? {
+                out.push(sh(format!("{label}#RAW@{c:#x}"), st, ctl, code));
+                why = false;
+            }
+        }
         if why
             && !code_of.contains_key(&c)
             && let Some(k) = adjacent(c)?
@@ -616,6 +887,14 @@ pub fn raw_shaders(
                 out.push(sh(format!("{label}#PHYRE@{k:#x}"), st, ctl, code));
                 why = false;
             }
+        }
+        // TT Games: a unique neighbour of an unreferenced control section (9f834e41)
+        if why
+            && !code_of.contains_key(&c)
+            && let Some((_, st, ctl, code)) = adjacent_shader(d, c, 0, None)?
+        {
+            out.push(sh(format!("{label}#RAW@{c:#x}"), st, ctl, code));
+            why = false;
         }
         if why {
             cx.print(&format!("[RED] {label} control section @{c:#x}: no code area: no data record points at one, the code builds the address of none right after or right before it, and none of its length ends at it; left out"));

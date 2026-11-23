@@ -1,0 +1,291 @@
+# (after 0526) host/nvn: the guest clock is frozen and guest clock reads parked during the first-submission prepare step and the pipeline archive open (Vanillaware games skipped frames into a crash)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/8d888054ff67be537b1320beb9aa69984b7f3a5f  ("host/nvn: freeze guest clock and park clock reads during prepare and archive open")
+#            author seedds, 2026-11-23 03:19 +0800; Co-authored-by: Aoba_d1snet
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: mtl_prepare() (prewarm head, 0412) and pso4_init() (opening the .mtl4a archives) stall the render thread for seconds while the guest clock and the other guest threads ran on:
+#   Vanillaware's main thread bounds its render-thread wait by GetSystemTick, skipped hundreds of frames and freed a texture frame 1 still used (13 Sentinels: Aegis Rim, SIGSEGV at
+#   main+0x309128 / +0x309e28; Unicorn Overlord has the same loop).
+# WHAT IT CHANGES (dm/host/hle_os.c, dm.h, hle.h, dm/gfx/nvn/nvn_mtl.m; tests t_shmap_warm, new t_clock_freeze): freeze reasons 3 (NVN prepare) and 4 (archive init) join reason 1
+#   (background) in parking guest clock reads (GFZ_WAIT_MASK), composing by bitmask; mtl_prepare wraps its first-submission step in reason 3, pso4_init in reason 4 (not for the prebuild tool).
+# Adapted: hle_os.c by hand (this tree's guest_clock_read_wait also honours the teardown parking); pso4_init by hand (this tree's is a locked once-block, upstream's a dispatch_once:
+#   the freeze is taken inside the lock); the tail of the prewarm runs in the background (0412) and is not frozen, as upstream's. Upstream's t_sync_wait case needs a t_sync_wait that links
+#   hle_os.c (an upstream change not in this tree): the same check is a new host test t_clock_freeze, linked as t_objmap is.
+# Games: 13 Sentinels: Aegis Rim (01003FC01670C000, and the Asian release 01008D7016438000); Unicorn Overlord has the same loop (upstream's note); any game whose first prepare or archive open takes seconds. Switches: none.
+# Tests (M1 Pro): t_clock_freeze (host-unit run), t_shmap_warm 16, t_gfx_suspend 22; in HOST_TESTS. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0526, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 0bbd85617c5d6954697ace02949febd19bd606ed..b1b49b763dbe20c2e9e4259823d9743f151bb2da 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -103,6 +103,9 @@ static inline uint64_t tex_slot_h(const uint64_t *tex, const uint64_t *img, unsi
+ static int prepare_on(void);
+ static int g_warm_started;
+ static void warm_claim(void);
++#ifndef guest_clock_freeze_for
++void guest_clock_freeze_for(int reason, int on);
++#endif
+ static _Atomic int g_gfx_teardown;
+ static os_unfair_lock g_arch_retire_lk = OS_UNFAIR_LOCK_INIT;
+ static NSString *g_arch_retire_dir;
+@@ -2526,9 +2529,15 @@ static void up_owner_check(const char *where) {
+ 
+ static uint64_t g_sub_serial;   // Submission index (used by the parallel precompile's 'predict only once per submission')
+ static int g_pkg_kept;   // a texture written during this submission kept its texture (tex_mtl_): the next submission starts a write generation, as a write would
+-// The first submission: the prepare step (warm_start), before anything of it is encoded. No GPU work: the submit entry (hle_nvn.c) calls it outside the graphics gate
++// The first submission: the prepare step (warm_start), before anything of it is encoded. No GPU work: the submit entry (hle_nvn.c) calls it outside the graphics gate.
++// Freeze the guest clock and park guest clock reads across it (reason 3, hle_os.c): the step can stall the render thread for seconds or minutes, and without this a game
++// whose main thread bounds its render-thread wait skips hundreds of frames and tears down frame 1's resources while frame 1 is still waiting here (13 Sentinels: Aegis Rim)
+ void mtl_prepare(void) {
+-    if (!g_warm_started && prepare_on()) { mtl_init(); shmap_load(); }
++    if (!g_warm_started && prepare_on()) {
++        guest_clock_freeze_for(3, 1);
++        mtl_init(); shmap_load();
++        guest_clock_freeze_for(3, 0);
++    }
+ }
+ static void sub_cut_begin(void); static void ts_sub_begin(void), ts_boundary(void); static int ts_on(void);
+ static void tu_tick(void);
+@@ -6966,6 +6975,9 @@ static inline int passdump(void) {
+ // failed in about half the runs)
+ __attribute__((weak)) uint64_t guest_ns(void) { return now_ns(); }
+ __attribute__((weak)) uint64_t guest_ns_at_host_time(uint64_t host_ns) { return host_ns; }
++#ifndef guest_clock_freeze_for
++__attribute__((weak)) void guest_clock_freeze_for(int reason, int on) { (void)reason; (void)on; }
++#endif
+ static uint64_t att_bytes(id<MTLTexture> t, NSUInteger level) {
+     if (!t) return 0;
+     NSUInteger w = MAX(t.width >> level, 1), h = MAX(t.height >> level, 1);
+@@ -11917,6 +11929,10 @@ static void pso4_init(void) {
+     os_unfair_lock_lock(&g_pso4_lk);
+     if (!g_pso4_done) {
+         g_pso4_done = 1;
++        // Opening the pipeline archives can take seconds on a slow external disk even with DM_PSO_PREPARE=0 or no prewarm list: hold guest clock reads (reason 4, hle_os.c;
++        // seedds/nxnative 8d888054, around this tree's locked once-block)
++        int freeze = !g_pre_tool;
++        if (freeze) guest_clock_freeze_for(4, 1);
+         (^void(void){
+         if (!pso4_on() || ![(id)g_dev respondsToSelector:@selector(newCompilerWithDescriptor:error:)]) return;   // no Metal 4 compiler (t_pso_pending's fake device): the MTLDevice path
+         const char *e = getenv("DM_PSO_ARCHIVE"); NSString *user = pso_user_path();
+@@ -12013,6 +12029,7 @@ static void pso4_init(void) {
+             if (!g_ep) MLOG("[RED] pipeline archive: Metal made no pipeline serializer: nothing is captured into %s", g_arch_dir.UTF8String);
+         }
+         })();
++        if (freeze) guest_clock_freeze_for(4, 0);
+     }
+     os_unfair_lock_unlock(&g_pso4_lk);
+ }
+diff --git a/dm/gfx/tests/t_shmap_warm.m b/dm/gfx/tests/t_shmap_warm.m
+index 39355689d1d6a0a0b37fa536dfd85b3e178c33a5..cbd8e67f467cc6b5ec4017a740518b3a771082ce 100644
+--- a/dm/gfx/tests/t_shmap_warm.m
++++ b/dm/gfx/tests/t_shmap_warm.m
+@@ -1,7 +1,17 @@
+ // Reading the shader map is one thing and starting the prewarm another. The map is read once from any thread (shmap_read_once: the prefetch at nvnProgramSetShaders, the submit thread), inside a
+ // dispatch_once; the prewarm and its prepare step run on the submit path, at the first submission, and reach shmap_load again (pso_prebuild). With the prewarm inside the once, that second call on
+ // the same thread trapped in _dispatch_once_wait: every game with a window and a prebuild, at its first program.
++static unsigned g_freeze_mask;
++static int g_freeze_on[8], g_freeze_off[8];
++static void test_clock_freeze(int reason, int on) {
++    if (reason >= 0 && reason < 8) {
++        if (on) { g_freeze_mask |= 1u << reason; g_freeze_on[reason]++; }
++        else { g_freeze_mask &= ~(1u << reason); g_freeze_off[reason]++; }
++    }
++}
++#define guest_clock_freeze_for test_clock_freeze
+ #include "../nvn/nvn_mtl.m"
++#undef guest_clock_freeze_for
+ #include <stdlib.h>
+ #include <unistd.h>
+ 
+@@ -42,11 +52,15 @@ int main(void) { @autoreleasepool {
+ 
+     mtl_prepare();   // the first submission: the prewarm, then the prebuild, which calls shmap_load again on this thread
+     EXPECT_EQ("the first submission starts the prewarm", 1, g_warm_started);
++    EXPECT_EQ("the prepare step balanced its guest clock freeze (reason 3)", 1, g_freeze_on[3] == 1 && g_freeze_off[3] == 1);
++    EXPECT_EQ("pso4_init balanced its guest clock freeze (reason 4)", 1, g_freeze_on[4] == 1 && g_freeze_off[4] == 1);
++    EXPECT_EQ("no guest clock freeze left held after prepare", 0, g_freeze_mask);
+     EXPECT_EQ("the prebuild path was reached: the compiler it needs exists", 1, hybrid_on());
+     EXPECT_EQ("the item is still there", 1, g_warm_items.count);
+ 
+     mtl_prepare(); shmap_load();   // later calls: nothing starts twice
+     EXPECT_EQ("the prewarm starts once", 1, g_warm_started);
++    EXPECT_EQ("later calls do not freeze again", 1, g_freeze_on[3] == 1 && g_freeze_on[4] == 1);
+ 
+     // Embedded DMMSLTR1 shader trailer in DM_ROMFS serves shmap_read / msl_data / msl_has when DM_MSL_DIR lacks the files, while DM_MSL_DIR still wins when present
+     dm_gfx_teardown();
+diff --git a/dm/host/dm.h b/dm/host/dm.h
+index bb91b21382cc19f392899d58ee575d16d6aad317..b10a4abf5b4d3bd56b9e133d722b2b625657ebe4 100644
+--- a/dm/host/dm.h
++++ b/dm/host/dm.h
+@@ -151,8 +151,8 @@ int dm_detclock_enabled(void);
+ void dm_guest_clock_advanced(void);
+ void guest_clock_freeze(int on);
+ void dm_movie_active(int active);   // iOS movie decoder recovery waits for activation; Stop / Flush / Finalize cancel the wait
+-void guest_clock_freeze_for(int reason, int on);   // Freeze by reason (1 background, 2 system keyboard); see hle_os.c
+-void guest_clock_read_wait(void);     // A guest read of the system counter: counts it in dm_clock_reads and waits while the app is in the background (hle_os.c)
++void guest_clock_freeze_for(int reason, int on);   // Freeze by reason (0 tick hold, 1 background, 2 system keyboard, 3 NVN prepare, 4 NVN archive init); see hle_os.c
++void guest_clock_read_wait(void);     // A guest read of the system counter: counts it in dm_clock_reads and waits while backgrounded or preparing (hle_os.c)
+ extern __thread uint64_t dm_clock_reads;   // the calling thread's guest reads of the system counter (hle_os.c; thr_yield tells clock waits by them)
+ void dm_guest_frame_tick(void);        // Called on every present (hle_nvn.c): when DM_DETCLOCK is on, advances the guest clock by one fixed step
+ uint64_t dm_nvn_frame_count(void);
+diff --git a/dm/host/hle.h b/dm/host/hle.h
+index d6cf3391e55e78c12e0fd6b993095218bd982b2c..e13a32b97d5a7be077503c3e04a820d786c38693 100644
+--- a/dm/host/hle.h
++++ b/dm/host/hle.h
+@@ -31,8 +31,8 @@ void dm_guest_clock_advanced(void);
+ uint64_t dm_guest_frame(void);        // Incremented each time the host presents a frame; unaffected by machine load
+ void guest_clock_freeze(int on);
+ void dm_movie_active(int active);   // iOS movie decoder recovery waits for activation
+-void guest_clock_freeze_for(int reason, int on);   // Freeze by reason (1 background, 2 system keyboard); see hle_os.c
+-void guest_clock_read_wait(void);     // A guest read of the system counter: counts it in dm_clock_reads and waits while the app is in the background (hle_os.c)
++void guest_clock_freeze_for(int reason, int on);   // Freeze by reason (0 tick hold, 1 background, 2 system keyboard, 3 NVN prepare, 4 NVN archive init); see hle_os.c
++void guest_clock_read_wait(void);     // A guest read of the system counter: counts it in dm_clock_reads and waits while backgrounded or preparing (hle_os.c)
+ extern __thread uint64_t dm_clock_reads;   // the calling thread's guest reads of the system counter (hle_os.c; thr_yield tells clock waits by them)
+ 
+ // Forced takeover: even if the SDK module has a definition, all references to that symbol at load time (JUMP_SLOT/GLOB_DAT/ABS64) are resolved to the host implementation.
+diff --git a/dm/host/hle_os.c b/dm/host/hle_os.c
+index 627266af17437f63bb4a9f7d57b8f83e3c035746..93d5e7475623166693ea68adf66abb55cd447c00 100644
+--- a/dm/host/hle_os.c
++++ b/dm/host/hle_os.c
+@@ -88,14 +88,18 @@ static void guest_clock_freeze_apply(int on) {
+     if (on && !atomic_load(&g_gfz)) { atomic_store(&g_gfrozen, now_ns() - atomic_load(&g_glag)); atomic_store(&g_gfz, 1); }
+     else if (!on && atomic_load(&g_gfz)) { atomic_store(&g_glag, now_ns() - atomic_load(&g_gfrozen)); atomic_store(&g_gfz, 0); }
+ }
+-// Freezing has several unrelated reasons (0 freeze tick for testing / loading screen, 1 App in background, 2 system keyboard up): freeze if any holds, release only when all are lifted --
+-// otherwise "switch to background and back while the keyboard is up" would be released early by the unfreeze on returning to foreground
++// Freezing has several unrelated reasons (0 freeze tick for testing / loading screen, 1 App in background, 2 system keyboard up, 3 NVN prepare step, 4 NVN pipeline archive init):
++// freeze if any holds, release only when all are lifted -- otherwise "switch to background and back while the keyboard is up" or "archive init finishes inside the prepare step"
++// would release the clock early
+ static pthread_mutex_t g_gfz_mu = PTHREAD_MUTEX_INITIALIZER; static unsigned g_gfz_reasons;
+ // A suspended application does not run: Horizon suspends the whole process out of focus, iOS suspends a background app. The host freezes the guest clock in the background but its
+ // guest threads go on until they block, so a guest reading the clock twice there saw no time pass. Super Mario Galaxy 2's frame pacing (main+0x5926a8) took the interval between two
+-// frames as its period, got 0, and the next frame's loop that steps by it (main+0x9abd0) never ended. Guest reads of the system counter (the cntpct gate, svc GetSystemTick) wait while
+-// the app is in the background (reason 1); host work (dm_host_work: inside a submit or present, which the graphics suspend waits for) reads the frozen clock, as do the other reasons
+-static pthread_cond_t g_gfz_cv = PTHREAD_COND_INITIALIZER; static _Atomic int g_gfz_bg;
++// frames as its period, got 0, and the next frame's loop that steps by it (main+0x9abd0) never ended. The same stall on the render thread during the host's first-submission prepare
++// step or pipeline archive open (reasons 3 and 4: seconds on a slow disk or cold prebuild) let Vanillaware's main thread skip hundreds of frames and advance into texture teardown
++// before frame 1 finished (13 Sentinels: Aegis Rim, SIGSEGV at main+0x309128 / +0x309e28; seedds/nxnative 8d888054). Guest reads of the system counter (the cntpct gate, svc
++// GetSystemTick) wait while any GFZ_WAIT_MASK reason holds; host work (dm_host_work: inside a submit or present, which the graphics suspend waits for) reads the frozen clock, as do the other reasons
++enum { GFZ_WAIT_MASK = (1u << 1) | (1u << 3) | (1u << 4) };
++static pthread_cond_t g_gfz_cv = PTHREAD_COND_INITIALIZER; static _Atomic int g_gfz_wait;
+ // Each read also counts on the reading thread: a run of yields whose passes read the clock is a wait for a time, which the yield back-off sleeps from its start (hle_thread.c thr_yield)
+ __thread uint64_t dm_clock_reads;
+ __attribute__((weak)) int dm_teardown_is_parking(void) { return 0; }
+@@ -103,9 +107,9 @@ __attribute__((weak)) void dm_teardown_check_current_thread(void) {}
+ void guest_clock_read_wait(void) {
+     dm_clock_reads++;
+     if (dm_teardown_is_parking()) { dm_teardown_check_current_thread(); return; }
+-    if (!atomic_load(&g_gfz_bg) || atomic_load(&dm_host_work)) return;
++    if (!atomic_load(&g_gfz_wait) || atomic_load(&dm_host_work)) return;
+     pthread_mutex_lock(&g_gfz_mu);
+-    while ((g_gfz_reasons & 2u) && !dm_teardown_is_parking()) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);
++    while ((g_gfz_reasons & GFZ_WAIT_MASK) && !dm_teardown_is_parking()) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);
+     pthread_mutex_unlock(&g_gfz_mu);
+     if (dm_teardown_is_parking()) dm_teardown_check_current_thread();
+ }
+@@ -113,15 +117,16 @@ void guest_clock_freeze_for(int reason, int on) {
+     pthread_mutex_lock(&g_gfz_mu);
+     if (on) g_gfz_reasons |= 1u << reason; else g_gfz_reasons &= ~(1u << reason);
+     guest_clock_freeze_apply(g_gfz_reasons != 0);
+-    atomic_store(&g_gfz_bg, (g_gfz_reasons & 2u) != 0);
+-    if (!(g_gfz_reasons & 2u)) pthread_cond_broadcast(&g_gfz_cv);   // after the clock is running again: a released read sees it continue
++    int wait = (g_gfz_reasons & GFZ_WAIT_MASK) != 0;
++    atomic_store(&g_gfz_wait, wait);
++    if (!wait) pthread_cond_broadcast(&g_gfz_cv);   // after the clock is running again: a released read sees it continue
+     pthread_mutex_unlock(&g_gfz_mu);
+ }
+ void dm_guest_clock_wake_teardown(void) {
+     pthread_mutex_lock(&g_gfz_mu);
+     g_gfz_reasons = 0;
+     guest_clock_freeze_apply(0);
+-    atomic_store(&g_gfz_bg, 0);
++    atomic_store(&g_gfz_wait, 0);
+     pthread_cond_broadcast(&g_gfz_cv);
+     pthread_mutex_unlock(&g_gfz_mu);
+ }
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 1ffa8a76be9c497cef97f7e683315e610955c2a2..29c8b3d439577dcb6eefb2243b46c72fc801c7d4 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -91,6 +91,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	$(B)/t_nro
+ 	$(B)/t_symbols
+ 	$(B)/t_gates
++	$(B)/t_clock_freeze
+ 	$(B)/t_server_environment
+ 	$(B)/t_pad_map
+ 	$(B)/t_pad_motion
+@@ -282,6 +283,10 @@ $(B)/t_nv: t_nv.c ../../gfx/hle_nv.c ../hle.h ../dm.h $(GAME_H) | $(B)
+ run: $(B)/t_objmap
+ $(B)/t_objmap: t_objmap.c ../hle_os.c ../hle.h ../dm.h $(GAME_H) ../hle_profile.c ../hle_profile.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_objmap.c ../hle_profile.c
++# The guest clock's freeze reasons: the NVN prepare step and pipeline archive open park guest clock reads as the background does (engine-patches/0527, seedds/nxnative 8d888054)
++run: $(B)/t_clock_freeze
++$(B)/t_clock_freeze: t_clock_freeze.c ../hle_os.c ../hle.h ../dm.h $(GAME_H) ../hle_profile.c ../hle_profile.h | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_clock_freeze.c ../hle_profile.c
+ # nn::nfc answered without nfc:user (NFC disabled), beside the nfp no-tag answers
+ run: $(B)/t_nfc
+ $(B)/t_nfc: t_nfc.c ../hle_sdk16.c ../hle.h ../dm.h $(GAME_H) ../hle_profile.c ../hle_profile.h | $(B)
+diff --git a/dm/host/tests/t_clock_freeze.c b/dm/host/tests/t_clock_freeze.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ddccef432f0f606b0ca3464cf58c5aebebaed3e
+--- /dev/null
++++ b/dm/host/tests/t_clock_freeze.c
+@@ -0,0 +1,54 @@
++// The guest clock's freeze reasons (hle_os.c guest_clock_freeze_for / guest_clock_read_wait): reason 2 (system keyboard) freezes the clock without parking clock reads; reasons 3
++// (NVN prepare) and 4 (NVN pipeline archive init) park guest reads that are not host work, and compose with reason 1 (background): a parked read wakes only once all are lifted.
++// The check is seedds/nxnative 8d888054's clock_freeze_wait (its t_sync_wait links hle_os.c through infrastructure this tree does not have: here hle_os.c alone, as t_objmap)
++#include "../hle_os.c"
++#include <assert.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <sched.h>
++module_t *g_mod; int g_nmod;
++__thread _Atomic int dm_host_work;
++void *module_sym(module_t *m, const char *name) { (void)m; (void)name; return NULL; }
++void *guest_sym(const char *name) { (void)name; return NULL; }
++int dm_sdk_ounce(void) { return 1; }
++void dm_guest_clock_advanced(void) {}
++void crash_watch_frame(void) {}
++typedef struct { _Atomic int entered, done; } cw_arg_t;
++static void *cw_reader(void *p) {
++    cw_arg_t *a = p;
++    atomic_store(&a->entered, 1);
++    guest_clock_read_wait();
++    atomic_store(&a->done, 1);
++    return NULL;
++}
++int main(void) {
++    alarm(10);
++    // Reason 2 (system keyboard) freezes the clock without parking clock reads.
++    guest_clock_freeze_for(2, 1);
++    guest_clock_read_wait();
++    guest_clock_freeze_for(2, 0);
++    // Reasons 3 (NVN prepare) and 4 (NVN archive init) park non-host-work readers and compose with reason 1 (background).
++    guest_clock_freeze_for(3, 1);
++    guest_clock_freeze_for(4, 1);
++    dm_host_work++;
++    guest_clock_read_wait();   // host work never parks itself
++    dm_host_work--;
++    cw_arg_t a = {0};
++    pthread_t th;
++    assert(!pthread_create(&th, NULL, cw_reader, &a));
++    while (!atomic_load(&a.entered)) sched_yield();
++    usleep(15000);
++    assert(!atomic_load(&a.done));
++    guest_clock_freeze_for(4, 0);   // reason 3 still holds
++    usleep(15000);
++    assert(!atomic_load(&a.done));
++    guest_clock_freeze_for(1, 1);   // background overlaps prepare
++    guest_clock_freeze_for(3, 0);   // reason 1 still holds
++    usleep(15000);
++    assert(!atomic_load(&a.done));
++    guest_clock_freeze_for(1, 0);   // all wait reasons lifted: reader wakes
++    assert(!pthread_join(th, NULL));
++    assert(atomic_load(&a.done));
++    printf("t_clock_freeze: guest clock freeze reasons 1-4 passed\n");
++    return 0;
++}

@@ -1,0 +1,17 @@
+# GL shader ABI 2
+# GL shaders (dm/gfx/tools/gl_shaders.py): key = sha256(GLSL source)[:16], Metal function gl_<key>_v / gl_<key>_f; a: vertex inputs, u: default uniform block members (offset:type:count:stride), r: argument buffer (slot:count), b: the block (id:size), n: named blocks (name=id:size), t: combined samplers (texture-id:sampler-id:type), o: fragment outputs
+# Glslang Version: 11:16.6.0; spirv-cross Git commit: vulkan-sdk-1.4.363.0+ Timestamp: 2026-09-16T11:27:19
+044b93e254f8c319	frag	r:0:3 o:dm_FragColor=0 b:2:32 u:_fa_=0:vec4:2:16 t:samp0=0:1:sampler2D	/doom/d.frag
+1a592aedeb3b04e4	vert	r:0:1 a:uv=1:vec2 a:col=2:vec4 a:pos=0:vec3 b:0:64 u:mvp=0:mat4:0:0	/legacy/l.vert
+30da25c68ea3b458	vert	r:-1:0 a:position=0:vec4	/glsl/g.glsl
+41646f8cb74b3475	vert	r:0:1 a:a_uv=1:vec2 a:a_pos=0:vec4 b:0:128 u:u_mvp=0:mat4:0:0	/mvgl/sh.mvgl:shader\m_vp.shad
+72b00bdada96db6d	frag	r:0:3 o:gm_FragColor=0 b:0:32 u:flip=0:bool:0:0 u:tint=16:vec4:0:0 t:texture=1:2:sampler2D	/es/a.frag
+7530c127aa3f9d0e	frag	r:0:3 o:o_color=0 b:2:16 u:u_tint=0:vec4:0:0 t:u_diffuse=0:1:sampler2D	/mvgl/sh.mvgl:shader\m_fp.shad
+777a384290159166	vert	r:0:1 a:a_texcoord=1:vec2 a:a_position=0:vec4 b:0:64 u:u_matrix=0:mat4:0:0	/dup/a.vert
+7b0ad52a20755ac7	frag	r:-1:0 o:gm_FragColor=0	/gdx/x.fs
+81bf59c0227e1b16	frag	r:0:5 o:o_color=0 b:2:8 u:u_off=0:ivec2:0:0 t:u_tex=0:1:sampler2D:2 t:u_t2=3:4:sampler2D	/es3/s.frag
+8addd60289f5dd51	vert	r:0:1 a:a_nrm=1:vec3 a:a_pos=0:vec3 b:0:136 u:u_LightEnv.m_dirLights.dir=0:vec3:2:16 u:u_LightEnv.m_dirLights.color=32:vec4:0:0 u:u_LightEnv.m_ambient=48:float:0:0 u:u_weights=64:float:4:16 u:u_on=128:bool:0:0	/es3/s.vert
+a227d5831b8edf7a	frag	r:0:2 o:dm_LegacyFragData0=0 o:dm_LegacyFragData1=1 t:tex=0:1:sampler2D	/legacy/l.frag
+a8ce72e1394a1499	vert	r:-1:0 a:p=0:vec4	main.nso#0
+ab3f3e94cf0d3ad9	vert	r:0:1 a:a_color=1:vec4 a:a_position=0:vec4 b:0:64 u:u_projTrans=0:mat4:0:0	/gdx/x.vs
+cde7362aed88dcf2	vert	r:0:1 a:attr_Vertex=0:vec4 a:attr_Color=1:vec4 n:matrices_ubo=0:128	/doom/d.vert

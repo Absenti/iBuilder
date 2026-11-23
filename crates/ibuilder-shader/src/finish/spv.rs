@@ -1,16 +1,16 @@
-//! The SPIR-V side of `finish`: `dmsh_build.spv_single_lane` (one-lane subgroups, SPIR-V words rewritten), `dmsh_atomic.cross_args` (MSL 3.1 for image atomics),
+//! The SPIR-V side of `finish`: `dmsh_build.spv_single_lane` (one-lane subgroups, SPIR-V words rewritten), `dmsh_build.XC` (the spirv-cross arguments),
 //! `dmsh_geometry.flatten_sets` (auxiliary descriptor sets into the ordinary set-0 ABI).
 use std::collections::HashMap;
 
+/// `dmsh_build.XC`: `dmsh_chain.CROSS_MSL` (MSL 3.2 for every shader) and the padded fragment outputs
 pub const XC: [&str; 6] = [
     "--msl",
     "--msl-version",
-    "20300",
+    "30200",
     "--msl-argument-buffers",
     "--msl-texture-buffer-native",
     "--msl-pad-fragment-output",
 ];
-const MSL_VERSION_ATOMICS: &str = "30100";
 
 fn words(d: &[u8]) -> Result<Vec<u32>, String> {
     if !d.len().is_multiple_of(4) {
@@ -26,36 +26,9 @@ fn bytes(w: &[u32]) -> Vec<u8> {
     w.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-/// `dmsh_atomic.uses_image_atomics(spv)`; Err when the file is not a SPIR-V module
-pub fn uses_image_atomics(data: &[u8], name: &str) -> Result<bool, String> {
-    if data.len() < 20 || data[..4] != [0x03, 0x02, 0x23, 0x07] {
-        return Err(format!("not a SPIR-V module: {name}"));
-    }
-    if memchr::memmem::find(data, &[0x3c, 0x00, 0x06, 0x00]).is_none() {
-        return Ok(false);
-    }
-    let w = words(&data[..data.len() / 4 * 4])?;
-    let mut i = 5;
-    while i < w.len() {
-        let (n, op) = ((w[i] >> 16) as usize, w[i] & 0xffff);
-        if op == 60 {
-            return Ok(true);
-        }
-        if n == 0 {
-            return Err(format!("malformed SPIR-V instruction in {name}"));
-        }
-        i += n;
-    }
-    Ok(false)
-}
-
-/// `cross_args(XC, spv)`: the spirv-cross arguments for this module (without the program name and without the files)
-pub fn cross_args(data: &[u8], name: &str) -> Result<Vec<String>, String> {
-    let mut a: Vec<String> = XC.iter().map(|s| s.to_string()).collect();
-    if uses_image_atomics(data, name)? {
-        a[2] = MSL_VERSION_ATOMICS.to_string();
-    }
-    Ok(a)
+/// The spirv-cross arguments for a module (without the program name and without the files): `XC` for every shader, whatever the module holds
+pub fn cross_args(_data: &[u8], _name: &str) -> Result<Vec<String>, String> {
+    Ok(XC.iter().map(|s| s.to_string()).collect())
 }
 
 fn sg_op(op: u32) -> Option<&'static str> {

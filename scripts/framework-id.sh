@@ -4,7 +4,7 @@
 # The framework id (GameAppBuild.FrameworkId) is what a built game's stamp is compared with after an app update: the same id boots the game already built ("Play"), another id
 # rebuilds it. It hashes only what shapes a built framework and its boot (scripts/lib-hash.sh, framework_id_listing, has the list and why each input is there).
 #
-# The inputs are found as build-app.sh finds them: scripts/local.env if present, NXPOCKET_ENGINE (default $IOSBUILDER_WORKTREE/out-stage/out-engine/engine, IOSBUILDER_WORKTREE
+# The inputs are found as build-app.sh finds them: scripts/local.env if present, NXPOCKET_ENGINE (default target/host-work/engine when scripts/build-host.sh left it there, else $IOSBUILDER_WORKTREE/out-stage/out-engine/engine, IOSBUILDER_WORKTREE
 # defaulting to $IOSBUILDER), GAMEAPP_HOST (default dist/host/host-prebuilt-loadable-{ios,sim}.dylib, else the worktree's out-load-ui/). Nothing is written.
 #
 # usage: scripts/framework-id.sh                 the listing (name TAB value), then "framework id <16 hex>"
@@ -19,7 +19,7 @@ for a in "$@"; do
 done
 IOSBUILDER="${IOSBUILDER:-${IOSBUILDER_MAIN:-}}"
 W="${IOSBUILDER_WORKTREE:-$IOSBUILDER}"
-ENGINE="${NXPOCKET_ENGINE:-$W/out-stage/out-engine/engine}"
+ENGINE="${NXPOCKET_ENGINE:-$( [ -d "$ROOT/target/host-work/engine/dm/tools/nx_extract" ] && echo "$ROOT/target/host-work/engine" || echo "$W/out-stage/out-engine/engine")}"   # as build-app.sh finds it: the tree scripts/build-host.sh leaves in target/host-work, else the out-stage engine
 case "$KIND" in device) SUF=ios ;; simulator) SUF=sim ;; esac
 HOST_DYLIB="${GAMEAPP_HOST:-$( [ -f "$ROOT/dist/host/host-prebuilt-loadable-$SUF.dylib" ] && echo "$ROOT/dist/host/host-prebuilt-loadable-$SUF.dylib" || echo "$W/out-load-ui/host-prebuilt-loadable-$SUF.dylib" )}"
 SHADER_CHAIN="$(grep -o 'DMSH_CHAIN "[0-9a-f]*"' "$ENGINE/dm/gfx/nvn/dmsh_chain.h" 2>/dev/null | cut -d'"' -f2)"

@@ -1,0 +1,75 @@
+# (after 0533) host/loader: a module whose data starts in the 16 KB page that ends its code is refused at load with a message (it would SIGBUS in relocate)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/17454fc314f95d505b45e48a69576c92f4718073  ("rewriter/layout: give module data a 16 KB page of its own (PR #3138)")
+#            author seedds, 2026-11-22 22:26 +0800; Co-authored-by: Gabriel Tran
+# Upstream:  https://github.com/seedds/nxnative/commit/65dfeb337877946dac160d6ebed1b1961520db4d  ("rewriter/layout: preserve read-only jump table offsets")
+#            author seedds, 2026-11-23 03:16 +0800
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: Horizon maps modules at 4 KB, macOS and iOS at 16 KB with W^X: map_image seals [0, round16K(text_end)) read + execute (and on iOS it is in __TEXT), so data starting below
+#   that is read-only and the first relocation into it is a SIGBUS (FINAL FANTASY VIII Remastered's Math.nro, data at 0x2000, and Platform.nro, 0x3000; upstream PR #3138).
+#   The rewriter moves ro / data / bss up so data starts at round16K(text_end) (upstream dm/tools/mod_layout.py, 17454fc3 + 65dfeb33; ours is crates/ibuilder-rewrite/src/layout.rs).
+# WHAT IT CHANGES (dm/host/loader.c read_layout; test t_nro): the loader's half of 17454fc3: DATA_OFF < round16K(TEXT_END) in a module's fixups table stops the load with
+#   "data at ... shares a 16 KB page with code: rewrite the module again", instead of a SIGBUS later. 65dfeb33 changes the rewriter only (read-only jump table offsets): nothing of it
+#   is in the engine; it is named for the pair. The Python rewriter itself (mod_layout.py, patch_nso.py) is not taken: the app's rewriter is the Rust one.
+# Effect on games already built: a module laid out by a rewriter without the relayout and whose data shares the code's last 16 KB page now stops at load with that message
+#   (it would have faulted at its first data relocation); rebuild it with the current rewriter. Every other module loads as before.
+# Games: FINAL FANTASY VIII Remastered (01008B900DC0A000); any NRO / NSO whose data starts within 16 KB of its code's end. Switches: none.
+# Tests (M1 Pro): t_nro gains four layout cases (data on its own 16 KB page, on a 16 KB boundary, at 0x2000 after 0x1800 of code, 4 KB aligned only): the last two stop the load
+#   (host-unit run of HOST_TESTS). Upstream's tests are the rewriter's (test_mod_layout.py), not ported here. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0533, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index 5dc4680e1efe103e715d241ba927b47848a73cd4..5627a157d678107431a77825c1807913397ab5cf 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -321,6 +321,10 @@ static void read_layout(module_t *m, const char *dir) {
+     if ((m->back_off || m->back_len) && (m->patch_off >= 0 || !m->back_len || m->back_off % 0x4000 || m->back_len % 0x4000 || m->back_off < m->key_page_off + m->key_page_size
+                                          || m->back_off + m->back_len != m->image_size))
+         die("%s: back patch area, but BACK_OFF / BACK_LEN missing or wrong", path);
++    // map_image seals [0, text_end rounded up to 16 KB) read + execute (and gen_embed.py puts it in __TEXT on iOS): data below that would be read-only and SIGBUS in relocate()
++    // (FINAL FANTASY VIII Remastered's Math.nro and Platform.nro). patch_nso.py moves ro and data up (mod_layout.py); stop here on a copy rewritten before that
++    if (m->data_off < ((m->text_end + 0x3FFF) & ~0x3FFFull))
++        die("%s: data at %#llx shares a 16 KB page with code (text ends at %#llx): rewrite the module again with dm/tools/patch_nso.py", m->name, (unsigned long long)m->data_off, (unsigned long long)m->text_end);
+ }
+ 
+ // Frame step state (the page after the key page, read-write; layout in patch_nso.py FRAME_STEP): the rewriter's stubs step the game by the host's whole vsyncs capped at this
+diff --git a/dm/host/tests/t_nro.c b/dm/host/tests/t_nro.c
+index c34d74d37c6cb5955e8fceea6a01269998005106..debc65c70bd9c67df85eeef279bd344f935da4d2 100644
+--- a/dm/host/tests/t_nro.c
++++ b/dm/host/tests/t_nro.c
+@@ -55,6 +55,21 @@ static void fixture(int i) {
+ static void load(int i) { assert(h_ro_LoadModule(&handles[i - 1], raw[i - 1], NULL, 32, 1) == 0); }
+ static void unload(int i) { h_ro_UnloadModule(&handles[i - 1]); assert(!g_mod[i].loaded); }
+ 
++// read_layout's 16 KB check (engine-patches/0534, seedds/nxnative 17454fc3): data starting below text_end rounded up to 16 KB would be sealed read + execute with the code and
++// SIGBUS in relocate(), so the loader stops on such a module (FINAL FANTASY VIII Remastered's Math.nro / Platform.nro before the rewriter's relayout). In a child: die() aborts
++static int layout_dies(uint64_t text_end, uint64_t data_off) {
++    char dir[] = "/tmp/t_nro_layout.XXXXXX"; assert(mkdtemp(dir));
++    char path[1100]; snprintf(path, sizeof path, "%s/lay.fixups.tsv", dir);
++    FILE *f = fopen(path, "w"); assert(f);
++    fprintf(f, "# PATCH_OFF 100000\n# KEY_PAGE_OFF 8000\n# KEY_PAGE_SIZE 4000\n# TEXT_END %llx\n# DATA_OFF %llx\n", (unsigned long long)text_end, (unsigned long long)data_off);
++    fprintf(f, "# KEY_K18_IDX 0\t0\n# KEY_KTLS_IDX 1\t1\n# KEY_KTLR_IDX 2\t2\n# KEY_KGATE_IDX 3\t3\n");
++    fclose(f);
++    pid_t child = fork(); assert(child >= 0);
++    if (!child) { module_t m = {0}; snprintf(m.name, sizeof m.name, "lay"); freopen("/dev/null", "w", stderr); read_layout(&m, dir); _exit(0); }
++    int st = 0; assert(waitpid(child, &st, 0) == child);
++    unlink(path); rmdir(dir);
++    return !(WIFEXITED(st) && WEXITSTATUS(st) == 0);
++}
+ int main(void) {
+     FILE *manifest = tmpfile(); assert(manifest);
+     fputs("# NRO manifest\n\nrefused 00 128\n", manifest);
+@@ -145,6 +160,11 @@ int main(void) {
+ 
+     for (int i = 0; i < g_nmod; i++) { free(g_mod[i].symh); free(g_mod[i].pristine); }
+     free(g_mod); free(g_loaded);
++    assert(!layout_dies(0x5000, 0x8000));   // text ends inside the first 16 KB page past 0x4000: data from 0x8000 has a page of its own
++    assert(!layout_dies(0x4000, 0x4000));   // text ends on a 16 KB boundary: data may start there
++    assert(layout_dies(0x1800, 0x2000));    // FINAL FANTASY VIII Remastered's Math.nro: data at 0x2000 in the code's 16 KB page
++    assert(layout_dies(0x5000, 0x7000));    // 4 KB aligned (Horizon's page), not 16 KB
++    puts("module layout: data sharing a 16 KB page with code is refused (0534): OK");
+     puts("NRO relocation, load order, lifecycle, weak symbols, refusal and loading alone (reload, isolation from linked loads, no second load, no initialized data): OK");
+     return 0;
+ }

@@ -187,11 +187,30 @@ pub struct MockShaders {
     pub splits: AtomicUsize,
     pub builds: AtomicUsize,
     pub fail_build: bool,
+    /// the per-reader revisions the backend reports (None: only the split version)
+    pub revisions: Option<crate::adapters::SplitRevisions>,
+    /// the record a split leaves (`split_record_path`)
+    pub record: Option<String>,
+    /// what `split_probe` answers, and how often it was asked
+    pub probe: Option<String>,
+    pub probes: AtomicUsize,
 }
 
 impl ShaderBackend for MockShaders {
     fn split_version(&self) -> String {
         "mocksplit001".into()
+    }
+    fn split_revisions(&self) -> Option<crate::adapters::SplitRevisions> {
+        self.revisions.clone()
+    }
+    fn split_probe(
+        &self,
+        _romfs: &Path,
+        _dlc: &[std::path::PathBuf],
+        _shader_map: Option<&Path>,
+    ) -> Option<String> {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        self.probe.clone()
     }
     fn split(&self, req: &SplitRequest<'_>, log: &dyn Log) -> Result<SplitResult> {
         self.splits.fetch_add(1, Ordering::SeqCst);
@@ -213,6 +232,9 @@ impl ShaderBackend for MockShaders {
                 req.tables_dir.join(t),
                 format!("package\tindex\tstage\tdm_ctl_sha16\tsource\n{rows}"),
             )?;
+        }
+        if let Some(r) = &self.record {
+            fs::write(crate::adapters::split_record_path(req.tables_dir), r)?;
         }
         log.line(&format!("progress: {}/{} files", 1, 1));
         Ok(SplitResult {
@@ -266,6 +288,7 @@ pub fn mock_tools() -> ShaderTools {
     ShaderTools {
         xlate: t.clone(),
         spirv_cross: t,
+        glslang: None,
     }
 }
 

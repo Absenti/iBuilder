@@ -68,6 +68,8 @@ struct FloatAdd<'a> {
     addr: &'a str,
     addr2: &'a str,
     val: &'a str,
+    /// the retry flag, declared before the loop: kept as `bool AGAIN = false;`, its value on the loop's normal exit, for a later read
+    again: &'a str,
 }
 
 /// one line `<text>\n` at the cursor: the text up to the newline, the cursor after the newline
@@ -196,6 +198,7 @@ fn float_add_at(src: &str, p: usize) -> Option<FloatAdd<'_>> {
         addr,
         addr2,
         val,
+        again,
     })
 }
 
@@ -215,6 +218,7 @@ pub fn float_add_msl(src: &str) -> Cow<'_, str> {
                 let o = out.get_or_insert_with(|| String::with_capacity(src.len()));
                 o.push_str(&src[at..m.start]);
                 o.push_str(&format!("{}atomic_fetch_add_explicit((device atomic_float*)&{}, {}, memory_order_relaxed);\n", m.ind, m.addr, m.val));
+                o.push_str(&format!("{}bool {} = false;\n", m.ind, m.again));
                 at = m.end;
             }
             p = m.end;

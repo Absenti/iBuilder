@@ -3,6 +3,11 @@
 //! The translator reads such a shader as a compute kernel with its SPH taken off and its stage memory in shared memory (job `stage_memory`); `to_stage` wraps that kernel into the
 //! Metal stage function. `info` / `memory` / `own_shared` are what `job_for` calls (the build driver's mesh branch), `to_stage` / `pixel_reads` what `finish` calls.
 //!
+//! A payload past Metal's (`MESH_PAYLOAD_MAX`, 16 KB) goes through a device buffer the host binds at `MESH_SPILL_SLOT` in both stages (`payload_spill`): word 0 its slice count, then
+//! a slice of the payload's words (rounded to 4) for each of the draw's task workgroups. The task stores its payload in its threadgroup's slice behind a device-scope fence and hands
+//! its mesh threadgroups the slice's word offset in Metal's payload; the mesh shader's input is then a shared memory of its own (job `stage_input_words`, the translator's
+//! `dm_stage_in`), read from the slice instead of sitting in the mesh shader's stage memory. A task's stage memory has no input area either: its outputs follow word 0.
+//!
 //! Python `ValueError`s are `Err(message)` with the Python's text; the places the Python would raise another exception (an `IndexError` on a short SPH, a `KeyError` on an
 //! information dict of a kind that is neither `ts` nor `ms`) are `Err` with a message that says so (the Python's build stops there).
 use super::abi;
@@ -30,6 +35,20 @@ pub const METAL_MAX_GRID: i64 = abi::MESH_GRID;
 pub const METAL_MAX_SHARED: i64 = 0x8000;
 /// bytes of stage memory from which a mesh shader's array is a device slice
 pub const SPILL_MIN: i64 = 6000;
+/// `abi.MESH_PAYLOAD_MAX` (`DMSH_MESH_PAYLOAD_MAX`): Metal's limit of an object function's payload; a larger payload goes through a device buffer (`payload_spill`)
+pub const MESH_PAYLOAD_MAX: i64 = abi::MESH_PAYLOAD_MAX;
+/// `abi.MESH_SPILL_SLOT` (`DMSH_MESH_SPILL_SLOT`): the payload spill buffer's index in the object and mesh tables
+pub const MESH_SPILL_SLOT: i64 = abi::MESH_SPILL_SLOT;
+
+/// `payload_spill(i)`: whether a task or mesh shader's payload exceeds Metal's object payload limit and goes through a device buffer
+pub fn payload_spill(i: &MeshInfo) -> bool {
+    i.payload > MESH_PAYLOAD_MAX
+}
+
+/// `payload_words(i)`: words of one task workgroup's slice in the payload spill buffer (16-byte aligned)
+pub fn payload_words(i: &MeshInfo) -> i64 {
+    ((i.payload + 15) & !15) >> 2
+}
 
 /// the key of an SPH output component: the point size, the position, or generic attribute n
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,13 +334,18 @@ fn per_primitive(i: &MeshInfo) -> i64 {
 
 /// `memory(i)`: (the stage memory's offsets for the translator: the workgroup's number, the input, the outputs, the primitive bytes [, ...]; the shared memory's bytes)
 pub fn memory(i: &MeshInfo) -> (Vec<i64>, i64) {
-    let out = INPUT + ((i.payload + 15) & !15);
     if i.kind == "ts" {
+        let out = INPUT; // a task shader reads no ISBERD 0x30..0x38 input: its outputs follow word 0's block
         return (
             vec![WORKGROUP, INPUT, out, out + i.payload],
             out + ((i.payload + 3) & !3),
         );
     }
+    let out = if i.task.unwrap_or(false) && payload_spill(i) {
+        INPUT
+    } else {
+        INPUT + ((i.payload + 15) & !15)
+    };
     let (v_blocks, p_blocks) = (blocks_of(i.max_v), blocks_of(i.max_p));
     let prim =
         out + (v_blocks * i.vertex.len() as i64 + p_blocks * per_primitive(i)).max(1) * BLOCK * 4;
@@ -535,6 +559,22 @@ fn find_kernel(msl: &str) -> Option<(usize, usize, String, String, String, Strin
     None
 }
 
+/// `re.search(rf'(?<![.\w]){re.escape(name)}(?!\s*\[)(?=\s*[,)])', text)`: the name handed on whole (to a helper function), not indexed
+fn passed_on(text: &str, name: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(at, _)| {
+        if text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c == '.' || word(c))
+        {
+            return false;
+        }
+        let after = text[at + name.len()..].trim_start_matches(super::pycompat::is_py_space);
+        after.starts_with(',') || after.starts_with(')')
+    })
+}
+
 /// `_device(msl)`: the text with its threadgroup address space turned to device, as `tg_spill` does a kernel's
 fn device(msl: &str) -> String {
     let mut out: Vec<String> = Vec::new();
@@ -636,10 +676,40 @@ pub fn to_stage(
         .map(|p| RE_ATTRS.replace(p, "").into_owned())
         .collect();
     let local = strip(&local).to_string();
+    let pspill = (kind == "ts" || i.task == Some(true)) && payload_spill(i);
+    let slice_w = payload_words(i);
+    let mut rest = &msl[ke..];
+    // A payload-spilled mesh shader's input: its dm_stage_in array leaves the body, which reads the task's device slice through dm_in_t instead (word 0 its workgroup's number)
+    let mut sin: Option<String> = None;
+    if pspill
+        && kind == "ms"
+        && let Some(n) = RE_KERNEL_TAIL.captures(rest)
+    {
+        if n[1].parse::<i64>().ok() != Some(slice_w) {
+            return Err(format!(
+                "ms: dm_stage_in has {} words, expected {slice_w}",
+                &n[1]
+            ));
+        }
+        let name = n[2].to_string();
+        rest = &rest[n.get(0).unwrap().end()..];
+        if passed_on(rest, &name) {
+            return Err("ms: dm_stage_in is passed to a helper function".into());
+        }
+        sin = Some(name);
+    }
     let mut all_plain = plain.clone();
     all_plain.push(format!("threadgroup spvUnsafeArray<uint, {words}>& {mem}"));
+    if let Some(s) = &sin {
+        all_plain.push(format!("dm_in_t {s}"));
+    }
+    let in_t = if sin.is_some() {
+        "struct dm_in_t { const device uint* p; uint w0; uint operator[](int k) const { return k ? p[k] : w0; } uint operator[](uint k) const { return k ? p[k] : w0; } };\n"
+    } else {
+        ""
+    };
     let mut src = format!(
-        "{}static inline __attribute__((always_inline)) void dm_stage_body({})\n{{\n{}{}",
+        "{}{in_t}static inline __attribute__((always_inline)) void dm_stage_body({})\n{{\n{}{}",
         &msl[..ks],
         all_plain.join(", "),
         if local.is_empty() {
@@ -647,7 +717,7 @@ pub fn to_stage(
         } else {
             format!("    {local}\n")
         },
-        &msl[ke..]
+        rest
     );
     let spill = kind == "ms"
         && i.threads == 32
@@ -659,6 +729,9 @@ pub fn to_stage(
     }
     let mut call_args = names.clone();
     call_args.push(mem.clone());
+    if sin.is_some() {
+        call_args.push("dm_in".into());
+    }
     let call = format!("dm_stage_body({});", call_args.join(", "));
     let mut own: BTreeMap<String, String> = BTreeMap::new();
     for p in &params {
@@ -694,12 +767,12 @@ pub fn to_stage(
     } else {
         "mem_flags::mem_threadgroup"
     };
+    let fence = "    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);\n";
     let (start, release): (String, String);
     if spill {
         let w4 = words / 4;
         let h = "(device atomic_uint*)dm_scr";
         let flag = format!("{h} + {}u + dm_t", abi::MESH_SCRATCH_FLAGS / 4);
-        let fence = "    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);\n";
         let mut s = String::new();
         s.push_str("    uint dm_t = ~0u;\n");
         s.push_str(&format!("    if ({lid} == 0u)\n    {{\n"));
@@ -743,9 +816,23 @@ pub fn to_stage(
         );
         release = String::new();
     }
-    let mut head = format!("struct dm_payload_t {{ uint w[{}]; }};\n", pay.max(1));
+    let mut head = if pspill {
+        "struct dm_payload_t { ulong off; };\n".to_string()
+    } else {
+        format!("struct dm_payload_t {{ uint w[{}]; }};\n", pay.max(1))
+    };
     let mut sig_v = params.clone();
     sig_v.extend(extra.iter().cloned());
+    if pspill && (kind == "ts" || sin.is_some()) {
+        sig_v.push(format!(
+            "{} uint* dm_spill [[buffer({MESH_SPILL_SLOT})]]",
+            if kind == "ts" {
+                "device"
+            } else {
+                "const device"
+            }
+        ));
+    }
     let sig = sig_v.join(", ");
     let draw = format!("constant uint* dm_draw [[buffer({})]]", abi::MESH_DRAW_SLOT);
     let scr = if spill {
@@ -757,8 +844,17 @@ pub fn to_stage(
         String::new()
     };
     if kind == "ts" {
+        let store = if pspill {
+            format!(
+                "    if ({tg} >= dm_spill[0]) {{ if ({lid} == 0u) dm_grid.set_threadgroups_per_grid(uint3(0u, 1u, 1u)); return; }}\n    ulong dm_off = 4ul + ulong({tg}) * {slice_w}ul;\n    device uint* dm_slice = dm_spill + dm_off;\n    for (uint i = {lid}; i < {pay}u; i += {thr}u) dm_slice[i] = {mem}[{out}u + i];\n    threadgroup_barrier(mem_flags::mem_device);\n{fence}    if ({lid} == 0u) dm_payload.off = dm_off;\n"
+            )
+        } else {
+            format!(
+                "    for (uint i = {lid}; i < {pay}u; i += {thr}u) dm_payload.w[i] = {mem}[{out}u + i];\n"
+            )
+        };
         return Ok(format!(
-            "{src}\n{head}[[object]] void main0({sig}, object_data dm_payload_t& dm_payload [[payload]], mesh_grid_properties dm_grid, {draw})\n{{\n{start}    if ({lid} == 0u) {mem}[{wg}] = dm_draw[1] + {tg};\n    threadgroup_barrier({bar});\n    {call}\n    threadgroup_barrier({bar});\n    for (uint i = {lid}; i < {pay}u; i += {thr}u) dm_payload.w[i] = {mem}[{out}u + i];\n    if ({lid} == 0u) dm_grid.set_threadgroups_per_grid(uint3(min({mem}[{}], {METAL_MAX_GRID}u), 1u, 1u));\n}}\n",
+            "{src}\n{head}[[object]] void main0({sig}, object_data dm_payload_t& dm_payload [[payload]], mesh_grid_properties dm_grid, {draw})\n{{\n{start}    if ({lid} == 0u) {mem}[{wg}] = dm_draw[1] + {tg};\n    threadgroup_barrier({bar});\n    {call}\n    threadgroup_barrier({bar});\n{store}    if ({lid} == 0u) dm_grid.set_threadgroups_per_grid(uint3(min({mem}[{}], {METAL_MAX_GRID}u), 1u, 1u));\n}}\n",
             out + 1
         ));
     }
@@ -897,7 +993,17 @@ pub fn to_stage(
     }
     let task = i.task.ok_or("KeyError: 'task'")?;
     let entry = |name: &str, gl: bool| -> String {
-        let fill = if task {
+        let fill = if task && pspill {
+            format!(
+                "{}{}    if ({lid} == 0u) {mem}[{wg}] = {tg};\n",
+                if spill { "" } else { fence },
+                if sin.is_some() {
+                    format!("    dm_in_t dm_in = {{ dm_spill + dm_payload.off, {tg} }};\n")
+                } else {
+                    String::new()
+                }
+            )
+        } else if task {
             format!(
                 "    for (uint i = {lid}; i < {pay}u; i += {thr}u) {mem}[{inp}u + i] = dm_payload.w[i];\n    threadgroup_barrier({bar});\n    if ({lid} == 0u) {{ {mem}[{wg}] = {tg}; {mem}[{inp}] = {tg}; }}\n"
             )

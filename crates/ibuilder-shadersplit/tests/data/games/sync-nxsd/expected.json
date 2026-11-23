@@ -1,0 +1,21 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "90d8470f05e5fe9d550e9aa353a3d44d3aab4a641844c4acfdcd455b89c03175",
+  "pkg/ps_data.bin": "0d363ca69077313905e3ec8400cace12a2d0c77d01fea725ccf7ee8dd2f2840b",
+  "pkg/vs_data.bin": "e9258e3b36fb9ec510bb15349e863f50a15b699efe8847790b41981e6e86bb15",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "bb53c0cfb0257f26329881e70dec75c6e91f09695b5cb5a67aae626c7e6517f6",
+  "tables/shader_map.tsv": "147dde416399c46c43ba03dc6ae254fab386a31be4e11c3ffeb60b3abe30bf02",
+  "tables/shader_pairs.tsv": "b77f6d9f9ddd5008bf065b5edc6db02181c042b6c91567d5be0fa8473e238be4"
+ },
+ "log": [
+  "[RED] /Data/badver.bin NXSD: unsupported version 0x101 (its shaders are left out)",
+  "[RED] /Data/gap.bin NXSD: code sections overlap or have gaps (its shaders are left out)",
+  "[RED] 2 file(s) could not be read, their shaders are left out (first: /Data/badver.bin NXSD: unsupported version 0x101)",
+  "single-stage programs: 2 vertex shaders are paired with a cover of 1 pixel shader(s) (c6db5bbe6c4030bd)",
+  "shaders: 5 (compute 1, pixel 2, vertex 2); sources data 5; compute shader answers 1 rows; variation pairs 2"
+ ],
+ "shaders": 5,
+ "updates": []
+}

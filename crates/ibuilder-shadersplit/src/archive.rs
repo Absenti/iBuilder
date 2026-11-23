@@ -254,6 +254,10 @@ fn pacx4_unchunk(
         if c == u {
             out.extend_from_slice(raw);
         } else {
+            if u > i32::MAX as usize {
+                // lz4.block.decompress takes the size as a C int
+                red!("OverflowError: signed integer is greater than maximum");
+            }
             let mut buf = lz4_buffer(u)?;
             let k = lz4_flex::block::decompress_into(raw, &mut buf)
                 .map_err(|e| Failure::Red(format!("LZ4BlockError: {e}")))?;
@@ -273,29 +277,24 @@ fn pacx4_unchunk(
 
 /// `pacx4_parts(d, label)`: (name, bytes) of the root and of each block of a PACx 403 archive whose root names a shader type
 pub fn pacx4_parts(d: &[u8], label: &str) -> Res<Vec<(String, Vec<u8>)>> {
-    let h = span(d, 0x10, 12, &format!("{label}: PACx 403 header"))?;
+    // `field(d, '<III4xII', 0x10, ...)`: the root's offset, stored length, length, then the two table lengths (760c7fe8: both headers and the root's chunk table checked before they are read)
+    let h = span(d, 0x10, 0x18, &format!("{label}: PACx 403 header"))?;
     let (roff, rstored, rlen) = (
         u32le(h, 0)? as usize,
         u32le(h, 4)? as usize,
         u32le(h, 8)? as usize,
     );
-    let (deps, ctab) = (u32le(d, 0x20)? as usize, u32le(d, 0x24)? as usize);
-    let nb = span(
-        d,
-        0x30 + deps,
-        4,
-        &format!("{label}: PACx 403 root chunk table"),
-    )?;
+    let (deps, ctab) = (u32le(h, 0x10)? as usize, u32le(h, 0x14)? as usize);
+    let table = format!("{label}: PACx 403 root chunk table");
+    let nb = span(d, 0x30 + deps, 4, &table)?;
     let n = u32le(nb, 0)? as usize;
     if n == 0 || 4 + 8 * n > ctab {
         red!("{label}: PACx 403 root chunk count {n} in a table of {ctab:#x} bytes");
     }
+    let ct = span(d, 0x34 + deps, 8 * n, &table)?;
     let mut chunks = Vec::new();
     for i in 0..n {
-        chunks.push((
-            u32le(d, 0x34 + deps + 8 * i)? as usize,
-            u32le(d, 0x38 + deps + 8 * i)? as usize,
-        ));
+        chunks.push((u32le(ct, 8 * i)? as usize, u32le(ct, 8 * i + 4)? as usize));
     }
     if chunks.iter().map(|c| c.0).sum::<usize>() != rstored {
         red!("{label}: the PACx 403 root chunks do not add up to its stored length {rstored:#x}");
@@ -307,7 +306,8 @@ pub fn pacx4_parts(d: &[u8], label: &str) -> Res<Vec<(String, Vec<u8>)>> {
     if !contains(&root, b"Shader") {
         return Ok(vec![]); // the type tree names no shader type
     }
-    let (trees, info) = (u32le(&root, 0x10)? as usize, u32le(&root, 0x14)? as usize);
+    let rh = span(&root, 0x10, 8, &format!("{label}: PACx 402 root header"))?;
+    let (trees, info) = (u32le(rh, 0)? as usize, u32le(rh, 4)? as usize);
     let mut out = vec![("root".to_string(), root.clone())];
     if info == 0 {
         return Ok(out);
@@ -367,19 +367,28 @@ pub fn pacx4_parts(d: &[u8], label: &str) -> Res<Vec<(String, Vec<u8>)>> {
 pub const MTARC: &[u8] = b"ARC\0";
 pub const MTSPK: &[u8] = b"SPK\0";
 
-/// `mtarc_members(d, label)`: (path, data) of each entry of Capcom's MT Framework archive
-pub fn mtarc_members(d: &[u8], label: &str) -> Res<Vec<(String, Vec<u8>)>> {
+/// `_zlib_header(d)`: the two bytes of a zlib header (deflate, a window up to 32 KB, the check bits)
+fn zlib_header(d: &[u8]) -> bool {
+    d.len() >= 2
+        && d[0] & 0xf == 8
+        && d[0] >> 4 <= 7
+        && (d[0] as u32 * 256 + d[1] as u32).is_multiple_of(31)
+}
+
+/// `mtarc_members(d, label)`'s directory: (version, entry count, path width, extra bytes per entry), checked as the Python checks it before the first member
+fn mtarc_layout(d: &[u8], label: &str) -> Res<(u16, usize, usize, usize)> {
     field_ok(d, 4, 4, label)?;
     let (ver, n) = (u16le(d, 4)?, u16le(d, 6)? as usize);
-    if ver != 7 {
-        red!("{label}: ARC version {ver}: only version 7 is known");
+    if ver != 7 && ver != 9 {
+        red!("{label}: ARC version {ver}: only versions 7 and 9 are known");
     }
     if n == 0 {
-        return Ok(vec![]);
+        return Ok((ver, 0, 0, 0));
     }
-    // The version does not name the width. Check every member against the end of its candidate directory and the archive
-    let directory_rank = |width: usize| -> Res<i32> {
-        let step = width + 16;
+    let mask: u32 = if ver == 7 { 0x1fffffff } else { 0xffffffff };
+    // Check every member against the end of its candidate directory and the archive; the last member need not end at EOF. Version 7 does not name the width: prefer the wide layout when both fit
+    let directory_rank = |width: usize, extra: usize| -> Res<i32> {
+        let step = width + 16 + extra;
         let table_end = 8 + n * step;
         if table_end > d.len() {
             return Ok(-1);
@@ -387,13 +396,10 @@ pub fn mtarc_members(d: &[u8], label: &str) -> Res<Vec<(String, Vec<u8>)>> {
         let mut has_data = false;
         let mut o = 8;
         while o < table_end {
-            let (stored, size, offset) = (
-                u32le(d, o + width + 4)? as usize,
-                u32le(d, o + width + 8)? as usize,
-                u32le(d, o + width + 12)? as usize,
-            );
+            let (stored, size) = (u32le(d, o + width + 4)? as usize, u32le(d, o + width + 8)?);
+            let offset = u32le(d, o + width + 12 + extra)? as usize;
             o += step;
-            if stored == 0 && size & 0x1fffffff == 0 && offset == 0 {
+            if stored == 0 && size & mask == 0 && offset == 0 {
                 continue; // an empty member needs no offset
             }
             if offset < table_end || offset + stored > d.len() {
@@ -401,42 +407,130 @@ pub fn mtarc_members(d: &[u8], label: &str) -> Res<Vec<(String, Vec<u8>)>> {
             }
             has_data |= stored != 0;
         }
-        Ok(has_data as i32)
+        Ok(has_data as i32) // zero-filled padding can look like an all-empty directory
     };
-    let wide = directory_rank(128)?;
+    if ver == 9 {
+        if directory_rank(64, 4)? < 0 {
+            red!("{label}: ARC v9 has no complete directory with in-bounds members");
+        }
+        return Ok((ver, n, 64, 4));
+    }
+    let wide = directory_rank(128, 0)?;
     let width = if wide == 1 {
         128
     } else {
-        let short = directory_rank(64)?;
+        let short = directory_rank(64, 0)?;
         if wide < 0 && short < 0 {
             red!("{label}: ARC v7 has no complete directory with in-bounds members");
         }
         if wide >= short { 128 } else { 64 }
     };
-    let mut out = Vec::new();
-    for i in 0..n {
-        let o = 8 + i * (width + 16);
-        let pb = at(d, o, width);
-        let pb = pb.split(|&b| b == 0).next().unwrap_or(&[]);
-        let path: String = pb.iter().map(|&b| b as char).collect(); // latin-1
-        let (csz, usz, off) = (
-            u32le(d, o + width + 4)? as usize,
-            (u32le(d, o + width + 8)? & 0x1fffffff) as usize,
-            u32le(d, o + width + 12)? as usize,
-        );
-        let mut data = at(d, off, csz).to_vec();
-        if csz != usz {
-            data = inflate::zlib_decompress(&data).map_err(|e| {
-                Failure::Red(format!("{label}#{path}: invalid ARC zlib stream: {e}"))
-            })?;
-        }
-        if data.len() != usz {
+    Ok((ver, n, width, 0))
+}
+
+/// Member `i` of `mtarc_members(d, label)`: (path, data). The data is a zlib stream bounded to the declared length, or stored when the two lengths are equal and (version 9) it is not a
+/// complete zlib stream of that length
+fn mtarc_member(
+    d: &[u8],
+    label: &str,
+    lay: (u16, usize, usize, usize),
+    i: usize,
+) -> Res<(String, Vec<u8>)> {
+    let (ver, _, width, extra) = lay;
+    let mask: u32 = if ver == 7 { 0x1fffffff } else { 0xffffffff };
+    let o = 8 + i * (width + 16 + extra);
+    let pb = at(d, o, width);
+    let pb = pb.split(|&b| b == 0).next().unwrap_or(&[]);
+    let path: String = pb.iter().map(|&b| b as char).collect(); // latin-1
+    let (csz, usz) = (
+        u32le(d, o + width + 4)? as usize,
+        (u32le(d, o + width + 8)? & mask) as usize,
+    );
+    let off = u32le(d, o + width + 12 + extra)? as usize;
+    let mut data = at(d, off, csz).to_vec();
+    if csz != usz {
+        let z = inflate::run_as_zlib(&data, inflate::Wrap::Zlib, Some(usz + 1))
+            .map_err(|e| Failure::Red(format!("{label}#{path}: invalid ARC zlib stream: {e}")))?;
+        if !z.eof || z.out.len() != usz {
             red!(
-                "{label}#{path}: {:#x} bytes, the entry says {usz:#x}",
-                data.len()
+                "{label}#{path}: incomplete ARC zlib stream or {:#x} bytes, the entry says {usz:#x}",
+                z.out.len()
             );
         }
-        out.push((path.replace('\\', "/"), data));
+        data = z.out;
+    } else if ver == 9
+        && zlib_header(&data)
+        && let Ok(z) = inflate::run_as_zlib(&data, inflate::Wrap::Zlib, Some(usz + 1))
+        && z.eof
+        && z.used == data.len()
+        && z.out.len() == usz
+    {
+        data = z.out;
+    }
+    if data.len() != usz {
+        red!(
+            "{label}#{path}: {:#x} bytes, the entry says {usz:#x}",
+            data.len()
+        );
+    }
+    Ok((path.replace('\\', "/"), data))
+}
+
+/// `mtspk_headed(d, c)`: the 0x20-byte shader header of Resident Evil HD Remaster's packages directly before the control section at c
+fn mtspk_headed(d: &[u8], c: usize) -> Res<bool> {
+    if c < 0x28 || c + 0x708 > d.len() {
+        return Ok(false);
+    }
+    let h = c - 0x20;
+    let w = |k: usize| u32le(d, h + 4 + 4 * k);
+    let (total, zero, nctl, ncode, nctl2) = (w(0)?, w(3)?, w(4)?, w(5)?, w(6)?);
+    Ok(at(d, h, 4) == at(d, 4, 4)
+        && zero == 0
+        && nctl >= 0x708
+        && nctl == nctl2
+        && total as u64 == nctl as u64 + ncode as u64
+        && nctl == u32le(d, c + 0x20)?
+        && ncode == u32le(d, c + 0x704)?)
+}
+
+/// `mtspk_headed_shaders(d, label)`: every shader a record of binding data, the 0x20-byte header, the control section and directly after it the code area; every control magic in the
+/// package must belong to one
+fn mtspk_headed_shaders(d: &[u8], label: &str) -> Res<Vec<Shader>> {
+    let mut out = Vec::new();
+    let n = count_nonoverlapping(d, &CTL_MAGIC);
+    let (mut c, mut end) = (find(d, &CTL_MAGIC, 0), 8usize);
+    while let Some(cc) = c {
+        if cc < end + 0x20 || !mtspk_headed(d, cc)? {
+            red!("{label} SPK: control section at {cc:#x} without a shader header");
+        }
+        let (nctl, ncode) = (u32le(d, cc - 0x0c)? as usize, u32le(d, cc - 8)? as usize);
+        let g = cc + nctl;
+        if ncode < 0x34 || g + ncode > d.len() || !eq_at(d, g, &GFX_MAGIC) {
+            red!("{label} SPK: no graphics code area after the control at {cc:#x}");
+        }
+        let (ctl, code) = (&d[cc..g], &d[g..g + ncode]);
+        let st = sph_stage(code);
+        let why = match st {
+            Some(st) => check(st, ctl, code)?.map(str::to_string),
+            None => Some("no stage in the SPH".to_string()),
+        };
+        if let Some(w) = why {
+            red!("{label} SPK @{cc:#x}: {w}");
+        }
+        out.push(Shader::new(
+            format!("{label}#MTSPK@{cc:#x}"),
+            st.unwrap(),
+            ctl,
+            code,
+        ));
+        end = g + ncode;
+        c = find(d, &CTL_MAGIC, end);
+    }
+    if out.len() != n {
+        red!(
+            "{label} SPK: {n} control magics, {} shaders read",
+            out.len()
+        );
     }
     Ok(out)
 }
@@ -449,6 +543,9 @@ pub fn mtspk_shaders(d: &[u8], label: &str) -> Res<Vec<Shader>> {
         Some(c) => c,
         None => red!("{label} SPK: no shader control section"),
     };
+    if mtspk_headed(d, c)? {
+        return mtspk_headed_shaders(d, label);
+    }
     field_ok(d, c + 0x704, 4, &format!("{label} SPK"))?;
     let ncode0 = u32le(d, c + 0x704)? as usize;
     // In a code-first package the next shader's code also follows this control. Its *own* code comes before it at the declared distance.
@@ -513,8 +610,11 @@ pub fn mtspk_shaders(d: &[u8], label: &str) -> Res<Vec<Shader>> {
     )
 }
 
+/// `mtarc_shaders(d, label, out)`: the shader packages of an MT Framework archive (`mtarc_members` is a generator in the Python: a member is decoded and read before the next one is decoded)
 pub fn mtarc_shaders(d: &[u8], label: &str, out: &mut Vec<Shader>) -> Res<()> {
-    for (path, m) in mtarc_members(d, label)? {
+    let lay = mtarc_layout(d, label)?;
+    for i in 0..lay.1 {
+        let (path, m) = mtarc_member(d, label, lay, i)?;
         if starts(&m, MTSPK) {
             out.extend(mtspk_shaders(&m, &format!("{label}#{path}"))?);
         }
@@ -1160,7 +1260,8 @@ pub fn idrk_shaders(
     Ok(())
 }
 
-/// `ipk_shaders(path, rel, out)`: the `.fxb` effect files of a UbiArt IPK archive (big-endian, version 7), each scanned like a file
+/// `ipk_shaders(path, rel, out)`: the `.fxb` effect files of a UbiArt IPK archive (big-endian; version 7: a 0x38-byte header, directory then name; version 5 (e0c30043, Just Dance 2022): a
+/// 0x30-byte header, name then directory), each scanned like a file
 pub fn ipk_shaders(
     cx: &Ctx<'_>,
     src: &dyn crate::source::Source,
@@ -1169,10 +1270,10 @@ pub fn ipk_shaders(
 ) -> Res<()> {
     let io = |e: std::io::Error| Failure::Red(format!("OSError: {e}"));
     let label = format!("/{rel}");
-    let h = src.read(0, 0x38).map_err(io)?;
-    if h.len() < 0x38 {
+    let mut h = src.read(0, 0x30).map_err(io)?;
+    if h.len() < 0x30 {
         red!(
-            "{label}: {} bytes, shorter than a UbiArt IPK header (0x38)",
+            "{label}: {} bytes, shorter than a UbiArt IPK header (0x30)",
             h.len()
         );
     }
@@ -1181,43 +1282,66 @@ pub fn ipk_shaders(
         u32be(&h, 12)? as u64,
         u32be(&h, 16)? as usize,
     );
-    if ver != 7 {
-        red!("{label}: UbiArt IPK version {ver} (only version 7 is read)");
+    if ver != 5 && ver != 7 {
+        red!("{label}: UbiArt IPK version {ver} (only versions 5 and 7 are read)");
+    }
+    let hdr_len: u64 = if ver == 5 { 0x30 } else { 0x38 };
+    if hdr_len > 0x30 {
+        h.extend(src.read(0x30, (hdr_len - 0x30) as usize).map_err(io)?);
+        if (h.len() as u64) < hdr_len {
+            red!(
+                "{label}: {} bytes, shorter than a UbiArt IPK header ({hdr_len:#x})",
+                h.len()
+            );
+        }
     }
     let t = src
-        .read(0x38, base.saturating_sub(0x38) as usize)
+        .read(hdr_len, base.saturating_sub(hdr_len) as usize)
         .map_err(io)?;
-    if base < 0x38 || t.len() as u64 != base - 0x38 {
+    if base < hdr_len || t.len() as u64 != base - hdr_len {
         red!("{label}: the IPK header puts its data at {base:#x}, outside the file");
     }
+    let latin1 = |b: &[u8]| -> String { b.iter().map(|&c| c as char).collect() };
     let mut p = 0usize;
     for i in 0..n {
-        let r = (|| -> Res<(String, u32, u32, u64)> {
-            let (noff, size, csize) =
-                (u32be(&t, p)? as usize, u32be(&t, p + 4)?, u32be(&t, p + 8)?);
-            p += 20;
-            let off = if noff != 0 { u64be(&t, p)? } else { 0 };
-            p += 8 * noff;
-            let pl = u32be(&t, p)? as usize;
-            let dname: String = at(&t, p + 4, pl).iter().map(|&b| b as char).collect();
-            p += 4 + pl;
-            let nl = u32be(&t, p)? as usize;
-            let name = format!(
-                "{dname}{}",
-                at(&t, p + 4, nl)
-                    .iter()
-                    .map(|&b| b as char)
-                    .collect::<String>()
+        // `struct.error` (an unpack past the table, or one of the reader's own length checks) is the one red line below
+        let r = (|| -> Option<(String, u32, u32, u64)> {
+            let (noff, size, csize) = (
+                u32be(&t, p).ok()? as usize,
+                u32be(&t, p + 4).ok()?,
+                u32be(&t, p + 8).ok()?,
             );
-            p += 4 + nl + 8;
-            Ok((name, size, csize, off))
+            p += 20;
+            if p + 8 * noff > t.len() {
+                return None; // offset list truncated
+            }
+            let off = if noff != 0 { u64be(&t, p).ok()? } else { 0 };
+            p += 8 * noff;
+            let l1 = u32be(&t, p).ok()? as usize;
+            if p + 4 + l1 > t.len() {
+                return None; // entry string 1 truncated
+            }
+            let s1 = latin1(&t[p + 4..p + 4 + l1]);
+            p += 4 + l1;
+            let l2 = u32be(&t, p).ok()? as usize;
+            if p + 4 + l2 + 8 > t.len() {
+                return None; // entry string 2 or trailer truncated
+            }
+            let s2 = latin1(&t[p + 4..p + 4 + l2]);
+            p += 4 + l2 + 8;
+            let (d, fname) = if ver == 5 { (s2, s1) } else { (s1, s2) };
+            let name = if !d.is_empty() && !d.ends_with('/') {
+                format!("{d}/{fname}")
+            } else {
+                format!("{d}{fname}")
+            };
+            Some((name, size, csize, off))
         })();
-        let (name, size, csize, off) = match r {
-            Ok(x) => x,
-            Err(_) => red!(
-                "{label}: entry {i} of {n} runs past the IPK table ({:#x} bytes): not the layout of a version 7 archive",
-                t.len() + 0x38
-            ),
+        let Some((name, size, csize, off)) = r else {
+            red!(
+                "{label}: entry {i} of {n} runs past the IPK table ({:#x} bytes): not the layout of a version {ver} archive",
+                t.len() as u64 + hdr_len
+            )
         };
         if !name.ends_with(".fxb") || format!("/{name}").contains("/shaders_dev/") {
             continue;
@@ -1431,32 +1555,27 @@ pub fn snowdrop_zlib_capped(d: &[u8], label: &str, max_raw: usize) -> Res<Vec<Sh
         let mut raw: Vec<u8> = Vec::new();
         let (mut got, mut pos) = (0usize, h);
         while got < nraw {
-            // a file over 64 KB is stored as consecutive zlib streams of 64 KB each (the list's Block column)
-            let lim = pos + (nraw - got).min(0x10000) + 0x500;
-            let seg = &d[pos.min(d.len())..lim.min(d.len())];
-            // one turn may carry ~1000x its input: ask for no more than the room left under the cap (+1, to tell "fits exactly" from "passes it")
-            let room = max_raw.saturating_sub(raw.len());
-            let part = match zlibx::decompress(seg, Some(room.saturating_add(1))) {
-                Ok(z) => z,
-                Err(e) => red!("{label} Snowdrop zlib record @{h:#x}, block @{pos:#x}: {e}"),
-            };
-            if part.out.len() > room {
+            // a file over 64 KB is stored as consecutive zlib streams of 64 KB each (the list's Block column): each block must decode to exactly its size (nxnative e74c3fa7)
+            let size = (nraw - got).min(0x10000);
+            if raw.len() + size > max_raw {
                 red!(
                     "{label} Snowdrop zlib record @{h:#x}: block @{pos:#x} decodes past {max_raw} bytes, the most one cache file may take (its head announces {nraw})"
                 );
             }
-            if !part.eof || part.out.is_empty() {
-                red!("{label} Snowdrop zlib record @{h:#x}: block @{pos:#x} not finished");
+            let lim = (pos + size + 0x500).min(d.len());
+            let seg = &d[pos.min(lim)..lim];
+            let part = match zlibx::decompress(seg, Some(size + 1)) {
+                Ok(z) => z,
+                Err(e) => red!("{label} Snowdrop zlib record @{h:#x}, block @{pos:#x}: {e}"),
+            };
+            if part.out.len() != size || !part.eof {
+                red!(
+                    "{label} Snowdrop zlib record @{h:#x}: block @{pos:#x} did not finish at {size} raw bytes"
+                );
             }
-            got += part.out.len();
+            got += size;
             raw.extend_from_slice(&part.out);
-            pos = pos.min(d.len()) + part.used;
-        }
-        if raw.len() != nraw {
-            red!(
-                "{label} Snowdrop zlib record @{h:#x}: expected {nraw} raw bytes, got {}",
-                raw.len()
-            );
+            pos = pos.min(lim) + part.used;
         }
         end = pos;
         out.extend(snowdrop_objects(&raw, &format!("{label}#SDFZLIB@{h:#x}"))?);
@@ -1547,6 +1666,10 @@ pub fn ue3_body(d: &[u8], label: &str) -> Res<Vec<u8>> {
     let mut i = i0;
     while i < d.len() {
         if !eq_at(d, i, &UE3_TAG) || i + 16 > d.len() {
+            // Borderlands: Game of the Year Edition pads cooked packages to a 32 KiB boundary after the last chunk (02614c26)
+            if d[i..].iter().all(|&b| b == 0) {
+                break;
+            }
             red!(
                 "{label}: no compressed chunk at {i:#x} (the chunks do not run to the end of the package)"
             );

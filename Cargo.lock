@@ -234,6 +234,7 @@ version = "0.1.0"
 dependencies = [
  "ibuilder-alloc",
  "ibuilder-cli",
+ "ibuilder-glvk",
  "ibuilder-macho",
  "ibuilder-mods",
  "ibuilder-nup",
@@ -259,6 +260,22 @@ dependencies = [
  "ibuilder-profile",
  "ibuilder-testkit",
  "libc",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "ibuilder-glvk"
+version = "0.1.0"
+dependencies = [
+ "ibuilder-nso",
+ "ibuilder-profile",
+ "ibuilder-shader",
+ "ibuilder-shadersplit",
+ "ibuilder-testkit",
+ "lz4_flex",
+ "rayon",
+ "regex",
  "serde_json",
  "sha2",
 ]

@@ -8,7 +8,10 @@ use ibuilder_shaderbuild::tablerows::{c1_lines, cb_lines, rows_of};
 
 #[test]
 fn per_shader_rows_assemble_to_the_whole_image_tables() {
-    let p = old("shader/runs/s1800-cap/b-b24b25240cad.img");
+    // `$TABLES_IMAGE`: another library image (a local real-data check), else the Grizzy sample
+    let p = std::env::var("TABLES_IMAGE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| old("shader/runs/s1800-cap/b-6c53446391cc.img"));
     if !have(&p) {
         return;
     }

@@ -1,7 +1,8 @@
-# gitleaks configuration (the CI "secrets" job runs `gitleaks git`): the default rules, minus one false positive.
+# gitleaks configuration (the CI "secrets" job runs `gitleaks git`): the default rules, minus false positives.
 # Two synthetic test files carry shader and module records with a "key" field (a shader hash or a module name, not a
-# credential), which the generic-api-key rule reads as an API key. Only those two files are allowed; every rule still
-# runs on every other file.
+# credential), which the generic-api-key rule reads as an API key. The synthetic CASC game (its build manifests'
+# "config-key", the content hash of a build config) and its generator (the same constant, taken from upstream's
+# test_split_casc.py builders) read the same way. Only these files are allowed; every rule still runs on every other file.
 [extend]
 useDefault = true
 
@@ -10,4 +11,6 @@ description = "synthetic shader/module records in test fixtures"
 paths = [
   '''^crates/ibuilder-cli/tests/shaders_glue\.rs$''',
   '''^crates/ibuilder-shaderbuild/tests/fixtures/rt_cases\.json$''',
+  '''^crates/ibuilder-shadersplit/tests/data/games/sync-casc/RomFS/(data|Pack/old)/build_manifest\.psv$''',
+  '''^crates/ibuilder-shadersplit/tools/gen_sync5\.py$''',
 ]

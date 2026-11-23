@@ -72,6 +72,24 @@ fn run_game(
     }
     o.dlc = dlc.iter().map(|p| p.as_path()).collect();
     o.jobs = jobs;
+    // `DM_SPLIT_REGISTERED_MAP` (tools/gen_registered.py): a registered shader map beside the game
+    let registered = exp["registered"].as_str().map(|r| g.join(r));
+    o.registered = registered.as_deref();
+    // `DM_NRO_DIR`: the NROs the game decodes at run time (a CRA archive's file table is in one)
+    let nro_dir = exp["nro_dir"].as_str().map(|r| g.join(r));
+    o.nro_dir = nro_dir.as_deref();
+    // `sys.argv[9]`: the play captures beside the game (tools/gen_split_rest.py), listed in a manifest of absolute paths written here
+    let play = exp["glslc_play"].as_array().map(|ps| {
+        let list: Vec<String> = ps
+            .iter()
+            .map(|p| g.join(p.as_str().unwrap()).display().to_string())
+            .collect();
+        std::fs::create_dir_all(&out).unwrap();
+        let m = out.join("play.json");
+        std::fs::write(&m, serde_json::to_string(&list).unwrap()).unwrap();
+        m
+    });
+    o.glslc_play = play.as_deref();
     let log = Mutex::new(Vec::new());
     let r = split(&o, &Ruzstd, &NoGate, &|l| {
         log.lock().unwrap().push(l.to_string())
@@ -125,7 +143,11 @@ fn every_synthetic_game_is_split_to_the_bytes_of_the_python() {
             // the Python's own stdout lines (bar the progress counter and the unordered compute-source lines)
             // (a KIT member's message names its file by the path the engine opened: the generator wrote the RomFS part as @ROMFS@)
             let romfs = g.join("RomFS").display().to_string();
-            let log: Vec<String> = log.iter().map(|l| l.replace(&romfs, "@ROMFS@")).collect();
+            let game = g.display().to_string();
+            let log: Vec<String> = log
+                .iter()
+                .map(|l| l.replace(&romfs, "@ROMFS@").replace(&game, "@GAME@"))
+                .collect();
             for l in exp["log"]
                 .as_array()
                 .unwrap()
@@ -135,6 +157,7 @@ fn every_synthetic_game_is_split_to_the_bytes_of_the_python() {
                 if l.starts_with("shaders: ")
                     || l.starts_with("single-stage programs")
                     || l.starts_with("[RED]")
+                    || l.starts_with("[WARN]")
                 {
                     assert!(
                         log.iter().any(|m| m == l),

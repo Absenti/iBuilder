@@ -496,6 +496,11 @@ pub fn scan_blob(
         out.extend(shn_shaders(d, label)?);
         return Ok(());
     }
+    // Media.Vision's NXVS / NXFS / NXCS container, a file of its own (nxsh_shader, strict)
+    if d.len() >= 4 && crate::mvgl::nxsh_stage(&d[..4]).is_some() {
+        out.extend(crate::mvgl::nxsh_shader(d, 0, label, true)?);
+        return Ok(());
+    }
     if starts(d, CIVBSF) {
         out.extend(civbsf_shaders(d, label)?);
         return Ok(());
@@ -598,7 +603,8 @@ pub fn scan_blob(
         return Ok(());
     }
     if starts(d, b"NARC") {
-        unsupported!("Camelot NARC container (cra.py: {label})");
+        // Camelot's containers (cra.rs): each member packed by its first byte, so its size says nothing about the budget above
+        return crate::cra::narc_scan(cx, d, label, out, depth);
     }
     if starts(d, b"BAHS") {
         out.extend(bahs_shaders(cx, d, label)?);
@@ -623,6 +629,10 @@ pub fn scan_blob(
     }
     if starts(d, TFXO) {
         out.extend(tfxo_shaders(d, label)?);
+        return Ok(());
+    }
+    if starts(d, crate::sharc::MAGIC) {
+        out.extend(crate::sharc::sharc_shaders(d, label)?);
         return Ok(());
     }
     if starts(d, SHAD) {
@@ -672,6 +682,14 @@ pub fn scan_blob(
             out.extend(ph);
             return Ok(());
         }
+        // an RYHP container that wraps whole GLSLC outputs (Trails into Reverie's .fx*.phyre)
+        if starts(d, b"RYHP") && contains(d, &GLSLC_MAGIC) {
+            let g = glslc_shaders(d, label, false, &[])?;
+            if !g.is_empty() {
+                out.extend(g);
+                return Ok(());
+            }
+        }
     }
     if starts(d, b"VIPR") {
         // Star Fox's resource containers: two of them wrap the engine's NDSR upscaler networks, 40 shaders each, as a file inside
@@ -691,6 +709,9 @@ pub fn scan_blob(
     }
     if contains(d, &sumo_nx()) || contains(d, NVNSH) {
         out.extend(sumo_shaders(d, label)?);
+    }
+    if crate::mvgl::has_embedded(d) {
+        out.extend(crate::mvgl::nxsh_embedded(d, label)?);
     }
     Ok(())
 }
@@ -798,6 +819,15 @@ const STREAM_MIN: u64 = 16 << 20;
 fn scan_file_in(cx: &Ctx<'_>, f: &FileRef) -> Res<FileResult> {
     let rel = &f.rel;
     let (stem, ext) = splitext(rel);
+    {
+        // an NXSD container, by its magic before anything else (TETRIS THE GRAND MASTER 4 keeps them beside a .dict)
+        let src = f.loc.open().map_err(ioerr)?;
+        if src.read(0, 4).map_err(ioerr)? == crate::nxsd::MAGIC {
+            let d = src.read_all().map_err(ioerr)?;
+            let found = crate::nxsd::nxsd_shaders(&d, &format!("/{rel}"))?;
+            return finish(cx, rel, found, [], Trees::new());
+        }
+    }
     if matches!(ext, ".data" | ".patch" | ".debug" | ".nxpc")
         && cx.files.exists(f.root, &format!("{stem}.dict"))
     {
@@ -812,6 +842,14 @@ fn scan_file_in(cx: &Ctx<'_>, f: &FileRef) -> Res<FileResult> {
     // ---- formats read through their own file layout (the branches of scan_file_in before the generic read)
     if h4 == [0x58, 0x24, 0xf3, 0xa9] {
         unsupported!("Next Level Games archive index (.dict beside .data: {rel})");
+    }
+    if h4 == crate::telltale::TTCZ || h4 == crate::telltale::TTCN {
+        // a Telltale .ttarch2 (ttarch2_shaders): only its effect pack holds shaders; an archive whose entry table names none is not read whole
+        if crate::telltale::ttarch2_named(&src)? {
+            let d = src.read_all().map_err(ioerr)?;
+            found.extend(crate::telltale::ttarch2_shaders(&d, &label)?);
+        }
+        return finish(cx, rel, found, [], trees);
     }
     if rel.ends_with(".pkdswitch") {
         let idx_rel = format!("{}.pkiswitch", &rel[..rel.len() - ".pkdswitch".len()]);
@@ -837,9 +875,20 @@ fn scan_file_in(cx: &Ctx<'_>, f: &FileRef) -> Res<FileResult> {
         idrk_shaders(&src, &label, &mut found)?;
         return finish(cx, rel, found, [], trees);
     }
+    if h4 == crate::rage_wad::MAGIC && rel.rsplit('/').next() == Some(crate::rage_wad::NAME) {
+        // RAGE WAD variant with split GLSLC arrays (noire_wad_shaders)
+        found = crate::rage_wad::noire_wad_shaders(&src, &label)?;
+        return finish(cx, rel, found, [], trees);
+    }
     if starts(&head, b"bnd2") {
         let d = src.read_all().map_err(ioerr)?;
         found.extend(bnd2_shaders(&d, &label)?);
+        return finish(cx, rel, found, [], trees);
+    }
+    if h4 == crate::sharc::MAGIC {
+        // GIANTS Engine shader archive
+        let d = src.read_all().map_err(ioerr)?;
+        found = crate::sharc::sharc_shaders(&d, &label)?;
         return finish(cx, rel, found, [], trees);
     }
     if starts(&head, b"PAK")
@@ -905,7 +954,47 @@ fn scan_file_in(cx: &Ctx<'_>, f: &FileRef) -> Res<FileResult> {
         return finish(cx, rel, found, [], trees);
     }
     if h4 == b"SRYK" {
-        unsupported!("Phyre VBF archive (vbf.py: {rel})");
+        // a Virtuos VBF archive (vbf.py): its compiled effects and loose GPU programs, read one member at a time
+        let es = crate::vbf::entries(&src).map_err(Failure::Red)?;
+        for e in &es {
+            if crate::vbf::wanted(&e.0) {
+                let d = crate::vbf::read(&src, e).map_err(Failure::Red)?;
+                found.extend(phyre_shaders(&d, &format!("/{rel}/{}", e.0))?);
+            }
+        }
+        return finish(cx, rel, found, [], trees);
+    }
+    if h4 == crate::redengine::FZLC {
+        // REDengine 3's static shader cache (fzlc_shaders)
+        found.extend(crate::redengine::fzlc_shaders(cx, &src, &label)?);
+        return finish(cx, rel, found, [], trees);
+    }
+    // REDengine 3's material cache: the footer is required even under the engine's file name, which also lets a damaged first flag be named
+    if crate::redengine::is_rdhs(&src, &head, rel)? {
+        found.extend(crate::redengine::rdhs_shaders(cx, &src, &label)?);
+        return finish(cx, rel, found, [], trees);
+    }
+    if crate::nxcx::is_nxcx(&head)
+        && let Some(archive) = crate::nxcx::nxcx_shaders(&src, &label)?
+    {
+        return finish(cx, rel, archive, [], trees);
+    }
+    if h4 == crate::falcom::PKA_MAGIC {
+        // a Falcom .pka no job took (falcom_pka_jobs plans every one): its blobs, read one at a time
+        let es = crate::falcom::falcom_pka_index(&src, &label)?;
+        crate::falcom::falcom_pka_shaders(cx, &src, rel, &es, &mut found)?;
+        return finish(cx, rel, found, [], trees);
+    }
+    if head.len() >= 8 && h4 == [0, 0, 0, 0] && u32le(&head, 4)? != 0 {
+        // a Falcom .pkg (no magic): its table, then its entries, without reading the package whole
+        let n = u32le(&head, 4)? as u64;
+        if 8 + 0x50 * n <= src.len()
+            && u32le(&src.read(8 + 0x48, 4).map_err(ioerr)?, 0)? as u64 == 8 + 0x50 * n
+            && let Some(es) = crate::falcom::falcom_pkg(&src)?
+        {
+            crate::falcom::falcom_pkg_shaders(cx, &src, &es, &label, &mut found)?;
+            return finish(cx, rel, found, [], trees);
+        }
     }
     // ---- the generic path: the bytes, decoded when they are zstd
     let big = src.len() > STREAM_MIN;

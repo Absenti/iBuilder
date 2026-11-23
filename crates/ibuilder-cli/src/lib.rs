@@ -93,7 +93,7 @@ pub fn check_shader_args(a: &CliArgs) -> Result<(), String> {
     }
     let chain = a.shader_chain.as_deref().unwrap_or("");
     if chain.is_empty() {
-        return Err("--shaders needs --shader-chain ID (the shader chain of the host: its library is b-<chain>.img; b24b25240cad for the reference host)".into());
+        return Err("--shaders needs --shader-chain ID (the shader chain of the host: its library is b-<chain>.img; 6c53446391cc for the reference host)".into());
     }
     if !chain.bytes().all(|c| c.is_ascii_alphanumeric()) {
         return Err(format!(

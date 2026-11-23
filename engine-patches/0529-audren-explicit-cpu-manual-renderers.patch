@@ -1,0 +1,311 @@
+# (after 0528) host/audren: a renderer the game itself opens as CPU + manual is left to the game (no host render thread, capture or catch-up)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/b2d41ac5759357f0f132adc9b5c59038d32943e6  ("host/audren: leave explicit CPU/manual renderers to the game (issue #3212)")
+#            author seedds, 2026-11-23 03:13 +0800; Co-authored-by: Damien Frigewski
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: games that open nn::audio::AudioRenderer in CPU + manual mode (renderingDevice 1, executionMode 1) drive ExecuteAudioRendererRendering themselves (often into a circular buffer
+#   sink and a direct AudioOut); the host still started render_main, captured the DeviceSink in ar_exec and ran catch-up renders and 50 ms waits in Update (upstream issue #3212).
+# WHAT IT CHANGES (dm/host/hle_audren.c; tests t_audren_work, t_audio): manual is kept per renderer (ar_t.manual): the caller's parameter goes through as it is, no render thread is started or joined,
+#   Update / ImplExec / Exec forward to the SDK's originals, unbound manual slots are bound apart from the host-driven ones so both kinds coexist.
+# Adapted: ar_open by hand (this tree's slot reset keeps cq_mu / cq_cv and has render_active: a manual renderer starts with render_active 0, so the teardown does not wait for a thread).
+#   0453's real-time policy and 0454's tails apply to host-driven renderers only, as before.
+# Games: games with an explicit CPU / manual renderer (issue #3212). Switches: none.
+#   t_audio's render-thread teardown race (part 3, a test of the base tree) opened its renderer as CPU + manual: it now opens it as DSP / auto (device 0, mode 0), the host-driven
+#   renderer whose render_main it is about; as CPU + manual it would have no render thread to race.
+# Tests (M1 Pro): t_audren_work, t_audren_layout, t_audio (host-unit run of HOST_TESTS). NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0528, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/host/hle_audren.c b/dm/host/hle_audren.c
+index 05fb82d978d3ee0da41b049c52d252dbd876ba16..d6dfbff1872379149212694c1ba81f666505be01 100644
+--- a/dm/host/hle_audren.c
++++ b/dm/host/hle_audren.c
+@@ -95,6 +95,7 @@ HLE_FORCE("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererPar
+           size_t, h_ar_WorkSize, const uint8_t *param) {
+     static size_t (*orig)(const uint8_t *); if (!orig) orig = gsym("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererParameterE");
+     if (!ar_in_process()) return orig(param);
++    if (*(int32_t *)(param + P_DEVICE) == 1 && *(int32_t *)(param + P_MODE) == 1) return orig(param);
+     uint8_t p[P_SIZE]; cpu_manual(p, param); size_t n = orig(p);
+     size_t service = *(int32_t *)(param + P_DEVICE) == 0 ? ar_service_work_size(p) : 0;
+     size_t guest_n = service ? service : n;
+@@ -110,6 +111,7 @@ typedef struct {
+     void *handle[2];                         // AudioRendererHandle (renderer object, client state); handle[0] NULL: a free slot
+     uint8_t *sys;                            // its AudioRenderSystem, from its first render or update (ar_of_sys)
+     _Atomic int open;
++    int manual;                              // opened explicitly as CPU + manual (device 1, mode 1): driven by the game, no host render thread, capture or catch-up
+     void *render_tt;                         // the render thread (ThreadType from dm_guest_thread_spawn): Close joins it before the SDK tears the renderer down
+     void *pcmout; int render_active;         // host PCM output key and active flag (under cq_mu) for host-thread teardown sync
+     int16_t frame[FRAME_MAX * DM_AUDIO_SINK_CHANNELS]; int frame_n;   // the latest frame (six channels plus their stereo fold)
+@@ -266,10 +268,18 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
+     if (!orig_ev) orig_ev = gsym("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm");
+     if (!orig) orig = gsym("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleERKNS0_22AudioRendererParameterEPvm");
+     if (t_in_open || !ar_in_process()) return ev ? orig_ev(handle, ev, param, work, sz) : orig(handle, param, work, sz);
+-    uint8_t p[P_SIZE]; cpu_manual(p, param);
+-    LOG("audren: OpenAudioRenderer%s rate %d samples per frame %d mix buffers %d submixes %d voices %d sinks %d effects %d splitters %d (original device %d mode %d → CPU / manual) work buffer %p+%#zx",
+-        ev ? "" : " (no event)", *(int32_t *)param, *(int32_t *)(param + 4), *(int32_t *)(param + 8), *(int32_t *)(param + 0xc), *(int32_t *)(param + 0x10), *(int32_t *)(param + 0x14),
+-        *(int32_t *)(param + 0x18), *(int32_t *)(param + 0x24), *(int32_t *)(param + P_DEVICE), *(int32_t *)(param + P_MODE), work, sz);
++    int manual = *(int32_t *)(param + P_DEVICE) == 1 && *(int32_t *)(param + P_MODE) == 1;
++    uint8_t p[P_SIZE];
++    if (!manual) cpu_manual(p, param);
++    const uint8_t *open_p = manual ? param : p;
++    if (manual)
++        LOG("audren: OpenAudioRenderer%s rate %d samples per frame %d mix buffers %d submixes %d voices %d sinks %d effects %d splitters %d (explicit CPU / manual: driven by the game) work buffer %p+%#zx",
++            ev ? "" : " (no event)", *(int32_t *)param, *(int32_t *)(param + 4), *(int32_t *)(param + 8), *(int32_t *)(param + 0xc), *(int32_t *)(param + 0x10), *(int32_t *)(param + 0x14),
++            *(int32_t *)(param + 0x18), *(int32_t *)(param + 0x24), work, sz);
++    else
++        LOG("audren: OpenAudioRenderer%s rate %d samples per frame %d mix buffers %d submixes %d voices %d sinks %d effects %d splitters %d (original device %d mode %d → CPU / manual) work buffer %p+%#zx",
++            ev ? "" : " (no event)", *(int32_t *)param, *(int32_t *)(param + 4), *(int32_t *)(param + 8), *(int32_t *)(param + 0xc), *(int32_t *)(param + 0x10), *(int32_t *)(param + 0x14),
++            *(int32_t *)(param + 0x18), *(int32_t *)(param + 0x24), *(int32_t *)(param + P_DEVICE), *(int32_t *)(param + P_MODE), work, sz);
+     // The application's buffer follows the DSP service contract; the local server's larger CPU command representation is a backend cost. Keep a full-size caller buffer
+     // when it fits the backend, otherwise supply the backend storage here. The nested no-event open receives this same buffer and starts no second thread.
+     void *owned = NULL;
+@@ -287,7 +297,7 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
+     // A game that opens a CPU renderer itself gets the SDK's contract: the SDK keeps its event, as on Horizon. The nested open (t_in_open) gets the outer open's event
+     void *sev = ev && *(int32_t *)(param + P_DEVICE) == 0 ? rev_take() : NULL;
+     if (ev && *(int32_t *)(param + P_DEVICE) == 0 && !sev) LOG("[RED] audren: all renderer events in use: the SDK keeps the game's event, which must then outlive the renderer");
+-    t_in_open = 1; Result r = ev ? orig_ev(handle, sev ? sev : ev, p, work, sz) : orig(handle, p, work, sz); t_in_open = 0;
++    t_in_open = 1; Result r = ev ? orig_ev(handle, sev ? sev : ev, open_p, work, sz) : orig(handle, open_p, work, sz); t_in_open = 0;
+     if (r) { free(owned); rev_set(sev, NULL); LOG("[RED] audren: SDK OpenAudioRenderer failed %#x", r); return r; }
+     if (owned) objmap_put(handle[0], owned);   // Close releases it only after the render thread and the SDK have finished with it
+     // The renderer event as the service gives it. With the DSP service (device 0, what the game asked for) OpenAudioRenderer attaches the service's kernel event (auto-clear,
+@@ -315,12 +325,14 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
+         if (!a->cq_init) { pthread_mutex_init(&a->cq_mu, NULL); pthread_cond_init(&a->cq_cv, NULL); a->cq_init = 1; }
+         pthread_mutex_lock(&a->cq_mu);
+         memset(a->handle, 0, sizeof *a - offsetof(ar_t, handle));
+-        a->handle[0] = handle[0]; a->handle[1] = handle[1]; a->render_active = 1; atomic_store(&a->open, 1);
++        a->handle[0] = handle[0]; a->handle[1] = handle[1]; a->manual = manual; a->render_active = !manual; atomic_store(&a->open, 1);   // manual: no host render thread (seedds/nxnative b2d41ac5)
+         pthread_mutex_unlock(&a->cq_mu);
+     }
+     pthread_mutex_unlock(&g_ar_mu);
+-    LOG("audren: renderer %d opened from %s+%#llx", a ? ar_index(a) : -1, m ? m->name : "host", m ? (unsigned long long)((uint8_t *)ra - m->base) : 0ULL);
+-    if (!a) { LOG("[RED] audren: more than %d renderers: this one is not rendered", AR_MAX); return r; }
++    LOG("audren: renderer %d opened from %s+%#llx%s", a ? ar_index(a) : -1, m ? m->name : "host", m ? (unsigned long long)((uint8_t *)ra - m->base) : 0ULL,
++        manual ? " (explicit CPU / manual: driven by the game)" : "");
++    if (!a) { LOG("[RED] audren: more than %d renderers: this one is not %s", AR_MAX, manual ? "tracked" : "rendered"); return r; }
++    if (manual) return r;
+     a->render_tt = dm_guest_thread_spawn(render_main, a, 9, 0x10000);
+     if (!a->render_tt) { pthread_mutex_lock(&a->cq_mu); a->render_active = 0; pthread_mutex_unlock(&a->cq_mu); }
+     return r;
+@@ -346,11 +358,11 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close
+         pthread_mutex_unlock(&a->cq_mu);
+         dm_guest_thread_join(a->render_tt);
+         a->render_tt = NULL;
+-    }
++    } else if (a) atomic_store(&a->open, 0);
+     void *owned = objmap_del(obj), *sev = rev_find(obj);
+     orig(obj, state);
+     free(owned);
+-    if (a) { pthread_mutex_lock(&g_ar_mu); a->handle[0] = NULL; a->sys = NULL; pthread_mutex_unlock(&g_ar_mu); }
++    if (a) { pthread_mutex_lock(&g_ar_mu); a->handle[0] = NULL; a->sys = NULL; a->manual = 0; pthread_mutex_unlock(&g_ar_mu); }
+     if (sev) {   // the SDK's Close does not touch the event (SDK 3 to 18); destroying it closes the renderer's ends, and the game's copied read end stays the game's
+         static void (*destroy)(void *); if (!destroy) destroy = gsym("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE");
+         destroy(sev); rev_set(sev, NULL);
+@@ -625,21 +637,54 @@ static size_t impl_sys_off(void) {
+     if (!atomic_exchange(&found, off + 1)) LOG("audren: AudioRenderSystem at +%#zx in AudioRendererImpl", off);
+     return off;
+ }
+-// A render from the host's render thread names the thread's renderer and its system; a game that executes its own CPU renderer renders into that renderer's frame, which nothing plays, as before
+-static Result ar_exec(uint8_t *sys) {
+-    ar_t *a = t_ar;
+-    if (a && !a->sys) { pthread_mutex_lock(&g_ar_mu); a->sys = sys; pthread_mutex_unlock(&g_ar_mu); }
+-    if (!a) a = ar_of_sys(sys);
++// Resolve the renderer for ExecuteAudioRendererRendering. The host's render_main always sets t_ar.
++// A call from a guest thread (!t_ar) is the game executing its own explicit CPU+manual renderer:
++// match by sys, or bind the sole unbound manual slot; if several manual slots are unbound, it is still manual.
++static ar_t *ar_exec_owner(uint8_t *sys, int *manual_out) {
++    *manual_out = 0;
++    if (t_ar) {
++        if (!t_ar->sys) { pthread_mutex_lock(&g_ar_mu); t_ar->sys = sys; pthread_mutex_unlock(&g_ar_mu); }
++        return t_ar;
++    }
++    pthread_mutex_lock(&g_ar_mu);
++    ar_t *found = NULL, *unk_man = NULL; int n_unk_man = 0;
++    for (int i = 0; i < AR_MAX && !found; i++) {
++        if (!g_ar[i].handle[0]) continue;
++        if (g_ar[i].sys == sys) found = &g_ar[i];
++        else if (!g_ar[i].sys && g_ar[i].manual) { unk_man = &g_ar[i]; n_unk_man++; }
++    }
++    if (found) *manual_out = found->manual;
++    else if (n_unk_man == 1) { found = unk_man; found->sys = sys; *manual_out = 1; }
++    else if (n_unk_man > 1) *manual_out = 1;
++    pthread_mutex_unlock(&g_ar_mu);
++    return found;
++}
++HLE_FORCE("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv", "render one frame manually: SDK generates commands + CPU processing, the host takes the DeviceSink output",
++          Result, h_ar_ImplExec, uint8_t *impl) {
++    uint8_t *sys = impl + impl_sys_off();
++    int manual = 0; ar_t *a = ar_exec_owner(sys, &manual);
++    if (manual) {
++        static Result (*orig)(void *);
++        if (!orig) orig = gsym("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv");
++        return orig(impl);
++    }
+     if (!a) { LOG("[RED] audren: a render of a renderer the host did not open"); return RES_FAIL; }
+     return render_once(a, sys, a->frame, &a->frame_n);
+ }
+-HLE_FORCE("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv", "render one frame manually: SDK generates commands + CPU processing, the host takes the DeviceSink output",
+-          Result, h_ar_ImplExec, uint8_t *impl) { return ar_exec(impl + impl_sys_off()); }
+ // SDK 20 (The Legend of Zelda: Breath of the Wild 1.9.0): the public ExecuteAudioRendererRendering (sdk+0x221e90) calls the AudioRendererImpl version through the vtable (sdk+0x22ca88, just x0 += 0x60 and a jump through the PLT to here),
+ // so the takeover above is never reached. The original generates commands here without the update lock; with the render thread on the original and the game thread's RequestUpdate rendering catch-up frames ("nothing rendered since the last update"),
+ // both sides wrote the same command buffer at once and CommandListProcessor::Process sometimes read a half-written command list and crashed (once at 60 s and once at 134 s in the shrine). Taken over here, so rendering goes through the host's locked render as well
+ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem29ExecuteAudioRendererRenderingEv", "render one frame manually (SDK 20, reached through the PLT): same as above, through the host's locked rendering",
+-          Result, h_ars_Exec, uint8_t *sys) { return ar_exec(sys); }
++          Result, h_ars_Exec, uint8_t *sys) {
++    int manual = 0; ar_t *a = ar_exec_owner(sys, &manual);
++    if (manual) {
++        static Result (*orig)(void *);
++        if (!orig) orig = gsym("_ZN2nn5audio6server17AudioRenderSystem29ExecuteAudioRendererRenderingEv");
++        return orig(sys);
++    }
++    if (!a) { LOG("[RED] audren: a render of a renderer the host did not open"); return RES_FAIL; }
++    return render_once(a, sys, a->frame, &a->frame_n);
++}
+ 
+ // At least one rendered frame between two RequestUpdates. An effect's "needs initialization" is set only by the update in which the game flags it as new (e.g. LightLimiterInfo::Update: isNew → parameter status 0);
+ // the next update overwrites it with the game's value; if no commands were generated in between, the DSP never receives the initialization and ApplyLightLimiterEffect later reads a null pointer. The real renderer produces a frame every 5 ms on its own
+@@ -655,7 +700,7 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
+           Result, h_ars_Update, uint8_t *sys, void *o, size_t on, void *p, size_t pn, const void *in, size_t inn) {
+     static Result (*orig)(void *, void *, size_t, void *, size_t, const void *, size_t); if (!orig) orig = gsym("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm");
+     ar_t *a = ar_of_sys(sys);
+-    if (!a) return orig(sys, o, on, p, pn, in, inn);   // two renderers just opened, neither has rendered: at most one catch-up frame less
++    if (!a || a->manual) return orig(sys, o, on, p, pn, in, inn);   // explicit CPU+manual renderers are driven by the game; two renderers just opened, neither has rendered: at most one catch-up frame less
+     uint64_t u = atomic_fetch_add(&a->updates, 1) + 1;
+     pthread_mutex_lock(&a->cq_mu);
+     if (atomic_load(&a->open) && a->updated && atomic_load(&a->renders) == a->last_r) {
+diff --git a/dm/host/tests/t_audio.c b/dm/host/tests/t_audio.c
+index b4c6cdbf49b4b53f435c0852c411917632cdb51f..5c738ad0bcdca9a480e6824a0dcd3a86bd43ca51 100644
+--- a/dm/host/tests/t_audio.c
++++ b/dm/host/tests/t_audio.c
+@@ -349,8 +349,10 @@ static int test_concurrent_close_and_stop_all(void) {
+     uint8_t ar_param[P_SIZE] = {0};
+     *(int32_t *)ar_param = 48000;
+     *(int32_t *)(ar_param + 4) = 240;
+-    *(int32_t *)(ar_param + P_DEVICE) = 1;
+-    *(int32_t *)(ar_param + P_MODE) = 1;
++    // A host-driven renderer (DSP / auto, as most games open it): the host turns it into CPU + manual and runs render_main. One the game opens as CPU + manual itself is left
++    // to the game, with no render thread (engine-patches/0529, seedds/nxnative b2d41ac5), so it would not test render_main's teardown
++    *(int32_t *)(ar_param + P_DEVICE) = 0;
++    *(int32_t *)(ar_param + P_MODE) = 0;
+     static uint8_t ar_work[0x4000] __attribute__((aligned(0x1000)));
+     for (int mode = 0; mode < 3; mode++) {
+         void *ar_handle[2] = {0};
+diff --git a/dm/host/tests/t_audren_work.c b/dm/host/tests/t_audren_work.c
+index 8181b7656ade110a3ef23b31caffa6ed3a31c9ae..a6e30dd8cbe6c55698686daae141d9656c4e88c4 100644
+--- a/dm/host/tests/t_audren_work.c
++++ b/dm/host/tests/t_audren_work.c
+@@ -24,8 +24,9 @@ static void work_free(void *p) {
+ #undef free
+ 
+ enum { SDK_WORK = 0x760000, SERVICE_WORK = 0x61d000 };
+-static int opens, starts, joins, closes, fail_open, nested;
++static int opens, starts, joins, closes, fail_open, nested, multi_open, expect_game_event;
+ static int event_destroys, event_binds, attaches, event_in_handle;
++static int sdk_updates, sdk_impl_execs, sdk_ars_execs;
+ static void *sdk_event, *game_event;
+ static void *sdk_work;
+ static int acquire_during_destroy;
+@@ -52,12 +53,21 @@ static Result sdk_open(void **handle, const uint8_t *param, void *work, size_t s
+     return RES_OK;
+ }
+ static Result sdk_open_ev(void **handle, void *ev, const uint8_t *param, void *work, size_t size) {
+-    assert(ev && ev != game_event);   // the SDK's CPU / manual open keeps this object and signals it on every render: the renderer's, never the game's
++    if (expect_game_event)
++        assert(ev == game_event);   // explicit CPU + manual keeps the game's own event, as on Horizon
++    else
++        assert(ev && ev != game_event);   // the SDK's CPU / manual open keeps this object and signals it on every render: the renderer's, never the game's
+     sdk_event = ev;
+     Result r = nested ? h_ar_Open0(handle, param, work, size) : sdk_open(handle, param, work, size);
+     if (!r && event_in_handle) handle[1] = ev;   // SDK 3 to 12 keep the event in the handle (SDK 3 sdk+0x17dffc, SDK 12 sdk+0x4d274); SDK 18 keeps it at *handle[1]
+     return r;
+ }
++static Result sdk_update(void *sys, void *o, size_t on, void *p, size_t pn, const void *in, size_t inn) {
++    (void)sys; (void)o; (void)on; (void)p; (void)pn; (void)in; (void)inn;
++    sdk_updates++; return RES_OK;
++}
++static Result sdk_impl_exec(void *impl) { (void)impl; sdk_impl_execs++; return RES_OK; }
++static Result sdk_ars_exec(void *sys) { (void)sys; sdk_ars_execs++; return RES_OK; }
+ static void sdk_destroy_event(void *ev) {
+     if (ev == notify_event) {
+         if (acquire_during_destroy) assert(h_ad_Notify21(notify_event) == 0x499);
+@@ -71,7 +81,7 @@ static void sdk_attach(void *ev, uint32_t h, int managed, int clear) {   // the
+     attaches++;
+ }
+ static void sdk_close(void *obj, void *state) {
+-    assert(obj == sdk_work && state == (event_in_handle ? sdk_event : (uint8_t *)sdk_work + 0x80));
++    if (!multi_open) assert(obj == sdk_work && state == (event_in_handle ? sdk_event : (uint8_t *)sdk_work + 0x80));
+     assert(((uint8_t *)obj)[SDK_WORK - 1] == 0x5a);   // storage is alive through SDK teardown
+     closes++;
+ }
+@@ -80,6 +90,9 @@ void *guest_sym(const char *name) {
+     if (!strcmp(name, hle_force_h_ar_Open.name)) return sdk_open_ev;
+     if (!strcmp(name, hle_force_h_ar_Open0.name)) return sdk_open;
+     if (!strcmp(name, hle_force_h_ar_Close.name)) return sdk_close;
++    if (!strcmp(name, hle_force_h_ars_Update.name)) return sdk_update;
++    if (!strcmp(name, hle_force_h_ar_ImplExec.name)) return sdk_impl_exec;
++    if (!strcmp(name, hle_force_h_ars_Exec.name)) return sdk_ars_exec;
+     if (!strcmp(name, "_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE")) return sdk_close;   // an SDK with the renderer in the process (from SDK 3); never called here
+     if (!strcmp(name, "_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE")) return sdk_destroy_event;
+     if (!strcmp(name, "_ZN2nn2os30GetReadableHandleOfSystemEventEPKNS0_15SystemEventTypeE")) return sdk_readable;
+@@ -93,11 +106,12 @@ void *objmap_del(const void *key) {
+     void *value = map_value; map_key = map_value = NULL; return value;
+ }
+ void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack) {
+-    (void)fn; (void)arg; (void)prio; (void)stack; starts++; return (void *)1;
++    (void)fn; (void)prio; (void)stack; starts++; return arg;
+ }
+ void dm_guest_thread_join(void *tt) {
+-    assert(tt == (void *)1 && !atomic_load(&g_ar[0].open));
+-    assert(((uint8_t *)sdk_work)[SDK_WORK - 1] == 0x5a);   // storage also survives the render thread
++    ar_t *a = tt;
++    assert(a >= g_ar && a < g_ar + AR_MAX && !atomic_load(&a->open));
++    assert(((uint8_t *)a->handle[0])[SDK_WORK - 1] == 0x5a);   // storage also survives the render thread
+     joins++;
+ }
+ uint64_t now_ns(void) { return 0; }
+@@ -200,6 +214,45 @@ int main(void) {
+         assert(handle[0] == work && allocations == a && !map_key);
+         h_ar_Close(handle[0], handle[1]);
+     }
++    // Explicit CPU + manual renderer (device 1, mode 1): driven by the game — no host render thread, no event replacement,
++    // no DeviceSink capture, no catch-up renders in Update, and ExecuteAudioRendererRendering forwards straight to the SDK.
++    *(int32_t *)(param + P_DEVICE) = 1; *(int32_t *)(param + P_MODE) = 1;
++    assert(h_ar_WorkSize(param) == SDK_WORK);
++    int s_before = starts, j_before = joins, d_before = event_destroys, b_before = event_binds, at_before = attaches;
++    expect_game_event = 1;
++    assert(!h_ar_Open(handle, event, param, work, SDK_WORK));
++    expect_game_event = 0;
++    assert(handle[0] == work && allocations == a && !map_key);
++    assert(starts == s_before && !g_ar[0].render_tt && g_ar[0].manual);
++    assert(event_destroys == d_before && event_binds == b_before && attaches == at_before && !rev_find(handle[0]));
++    uint8_t manual_impl[0x1100] = {0};   // impl_sys_off() decodes a 12-bit imm (<= 0xfff); keep manual_impl + offset in bounds under sanitizers
++    uint8_t *manual_sys = manual_impl + impl_sys_off();
++    for (int i = 0; i < 6; i++) assert(h_ars_Update(manual_sys, NULL, 0, NULL, 0, NULL, 0) == RES_OK);
++    assert(sdk_updates == 6 && atomic_load(&g_ar[0].catchups) == 0 && atomic_load(&g_ar[0].renders) == 0);
++    assert(h_ar_ImplExec(manual_impl) == RES_OK && sdk_impl_execs == 1);
++    assert(h_ars_Exec(manual_sys) == RES_OK && sdk_ars_execs == 1);
++    assert(atomic_load(&g_ar[0].renders) == 0);
++    h_ar_Close(handle[0], handle[1]);
++    assert(joins == j_before && !g_ar[0].handle[0] && !g_ar[0].manual && event_destroys == d_before);
++    // Coexistence: explicit CPU+manual renderer opened beside an unbound DSP renderer still binds and forwards cleanly.
++    void *work2; assert(!posix_memalign(&work2, WORK_PAGE, SDK_WORK));
++    void *handle2[2];
++    multi_open = 1;
++    assert(!h_ar_Open0(handle, param, work, SDK_WORK));   // slot 0: manual, no render thread
++    assert(starts == s_before && g_ar[0].manual && !g_ar[0].sys);
++    *(int32_t *)(param + P_DEVICE) = 0; *(int32_t *)(param + P_MODE) = 0;
++    assert(!h_ar_Open0(handle2, param, work2, SDK_WORK));   // slot 1: DSP, starts render thread
++    assert(starts == s_before + 1 && !g_ar[1].manual && !g_ar[1].sys);
++    assert(h_ars_Exec(manual_sys) == RES_OK && sdk_ars_execs == 2);
++    assert(g_ar[0].sys == manual_sys && !g_ar[1].sys);
++    assert(h_ars_Update(manual_sys, NULL, 0, NULL, 0, NULL, 0) == RES_OK && sdk_updates == 7);
++    assert(atomic_load(&g_ar[0].catchups) == 0 && atomic_load(&g_ar[1].catchups) == 0);
++    h_ar_Close(handle[0], handle[1]);
++    assert(joins == j_before && !g_ar[0].handle[0] && !g_ar[0].manual);
++    h_ar_Close(handle2[0], handle2[1]);
++    assert(joins == j_before + 1 && !g_ar[1].handle[0]);
++    multi_open = 0;
++    free(work2);
+     free(work);
+     // The output device notification: a second acquire is refused until a release, which destroys the event as the SDK's does (Nintendo Switch Sports Resort, main+0x3af119c)
+     h_ad_NotifyRelease21(notify_event);   // never acquired: nothing to destroy

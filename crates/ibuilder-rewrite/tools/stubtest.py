@@ -217,12 +217,12 @@ class Worker:
         if err.startswith('AssertionError: '): err = err[len('AssertionError: '):]
         return dict(rc=p.returncode, stdout=p.stdout, err=err, files=files)
 
-    def run_rust(self, nso_bytes, prof, module):
+    def run_rust(self, nso_bytes, prof, module):   # --no-relayout: the engine's patch_nso.py has no mod_layout (src/layout.rs, tests/layout.rs)
         nso = os.path.join(self.root, 'in-rs.nso'); out = os.path.join(self.root, 'rs')
         open(nso, 'wb').write(nso_bytes)
         shutil.rmtree(out, ignore_errors=True)
         env = dict(os.environ); env.pop('DM_GAMES_DIR', None)
-        p = subprocess.run([self.args.rust, '--threads', '2', '--game', prof, nso, out, module], capture_output=True, text=True, env=env)
+        p = subprocess.run([self.args.rust, '--threads', '2', '--no-relayout', '--game', prof, nso, out, module], capture_output=True, text=True, env=env)
         files = {}
         if os.path.isdir(out):
             for f in sorted(os.listdir(out)):

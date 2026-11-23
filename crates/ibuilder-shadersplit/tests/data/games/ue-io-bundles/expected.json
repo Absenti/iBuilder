@@ -1,0 +1,21 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_verm.bin": "046a660dcc87531625f22054047afa801289a4792ba7c175e3d666e0cf735668",
+  "pkg/ps_verm.bin": "c3d60b8d97964ff3976d767dae897c44febe466f132e7a980ed54f26adff5cf6",
+  "pkg/vs_verm.bin": "951b3413981c81b06a0a30f0aa4c3cc62c215776b887fb4b74a1d554512db215",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "5cb3c610634a5914ec8c888e8e4b2b6997637a750e6c72251c6f3f6ef92ffe86",
+  "tables/shader_map.tsv": "eaa017e3f9c68197165529cfd0eb6ce851494113693f74e0b3820e55f7e40f23",
+  "tables/shader_pairs.tsv": "22497a1a872bb0eb4b4f85e06ee2e020dc2eb3d8f8058e4a5d0ed692c61bdf59"
+ },
+ "log": [
+  "[RED] /Vermillion/Content/Paks/Broken-Switch.utoc: the container cannot be read (@ROMFS@/Vermillion/Content/Paks/Broken-Switch.utoc: not an IoStore TOC); its shaders are left out",
+  "[RED] /Vermillion/Content/Paks/Vermillion-Switch.utoc#Vermillion/Maps/L_C.umap: Oodle- or LZ5-compressed game files: set DM_OODLE_HOST (the Mac host, make -C dm/host GAME=<id> dmhost) and DM_OODLE_MODULES (the rewritten modules) to decode them with the game's own decoder (its shaders are left out)",
+  "[RED] 1 file(s) could not be read, their shaders are left out (first: /Vermillion/Content/Paks/Vermillion-Switch.utoc#Vermillion/Maps/L_C.umap: Oodle- or LZ5-compressed game files: set DM_OODLE_HOST (the Mac host, make -C dm/host GAME=<id> dmhost) and DM_OODLE_MODULES (the rewritten modules) to decode them with the game's own decoder)",
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (3ccb113abe847c5f)",
+  "shaders: 5 (compute 1, pixel 3, vertex 1); sources verm 5; compute shader answers 1 rows; variation pairs 1"
+ ],
+ "shaders": 5,
+ "updates": []
+}

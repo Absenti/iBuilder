@@ -1,6 +1,8 @@
 //! The Legend of Zelda: Ocarina of Time (Switch 2, 0400486024DEC000): `FRAME_STEP` (the v131072 main's build ID) and `MATCH_FRAME_STEP` (the same stubs found by their
 //! functions' fingerprints) of `dm/games/0400486024DEC000/patches.py`: the frame ratio from the host's step, the dynamic resolution, and the screen shape stubs
 //! (`_camera_aspect`: widescreen / Hor+ for `screen_aspect wide`, the `ANAMORPHIC_ASPECT` capability) that only the build-ID form has.
+//! Ported against the patch file of `tools/overlay/` (the pinned engine's plus nxnative c12000da, the dynamic-resolution threshold scaled by 60 / the target fps, and
+//! b3d287fe, the render scale stubs of the 3D view-size update).
 
 use crate::Res;
 use crate::stubs::{RulePort, StubCtx};
@@ -9,7 +11,7 @@ use ibuilder_a64::asm::{self, b};
 
 pub static PORT: GamePort = GamePort {
     profile: "0400486024DEC000",
-    digest: "0b2386f18f0034bd",
+    digest: "0a49680646e29fc6",
     frame_step: &[("e0f3ccfaf50065ae4ea01eb5aeb13b1a", frame_step_v131072)],
     stubs: &[],
     match_frame_step: &[(
@@ -28,6 +30,7 @@ pub fn frame_step_v131072(ctx: &mut StubCtx) -> Res<()> {
     ctx.others = vec![
         ("dynamic resolution", Some(0x8065e0)),
         ("dynamic resolution update", Some(0x805aa0)),
+        ("render scale", Some(0x31d3200)),
     ];
     ocarina_frame_step(ctx)?;
     camera_aspect(ctx)
@@ -71,19 +74,35 @@ pub fn ocarina_frame_step(ctx: &mut StubCtx) -> Res<()> {
     ctx.emit(w);
     let w = b(site, start)?;
     ctx.put(site, &[w], "frame ratio: the host's step \u{d7} base rate / 60 instead of base rate / the game's frame rate (state page target fps; 0 = the game's ratio)");
-    ocarina_dynamic_resolution(ctx)
+    ocarina_dynamic_resolution(ctx)?;
+    render_scale(ctx)
 }
 
-/// the level function of the game's dynamic resolution, held at full resolution (state +0x40 = 0) or climbing on the load measured at each level (DM_DYNAMIC_RESOLUTION)
-const DRS_CONTROLLER: [u32; 61] = [
-    0xb9404211, 0x35000071, 0x2a1f03e0, 0xd65f03c0, 0xbd400800, 0xbd401001, 0xb9417402, 0xb941a003,
-    0x7100005f, 0x1a9fa042, 0x528001e9, 0x6b09005f, 0x1a89d042, 0xb9420204, 0x11000484, 0xb9020204,
-    0xb9420605, 0xb9420a06, 0x6b0200bf, 0x1a8617e6, 0xb9020602, 0xb9020a06, 0x35000046, 0xb9020e1f,
-    0x91084207, 0x91094208, 0x710020df, 0x5400040b, 0x1e212000, 0x540001ad, 0xb9420e0b, 0x1100056b,
-    0xb9020e0b, 0x7100217f, 0x5400032b, 0xbc2258e0, 0xb8225904, 0x51000469, 0x1100044a, 0x6b09015f,
-    0x1a89d140, 0xd65f03c0, 0xb9020e1f, 0xbc2258e0, 0xb8225904, 0x34000182, 0x51000449, 0xb869590a,
-    0x340000ea, 0x4b0a008a, 0x7109615f, 0x54000088, 0xbc6958e2, 0x1e212040, 0x540000aa, 0x2a0903e0,
-    0xd65f03c0, 0x2a1f03e0, 0xd65f03c0, 0x2a0203e0, 0xd65f03c0,
+/// the level function of the game's dynamic resolution, held at full resolution (state +0x40 = 0) or climbing on the load measured at each level (DM_DYNAMIC_RESOLUTION).
+/// c12000da: the threshold (+0x10) is the game's at 60 fps; under a host target below 60 (state +0, a float: DM_FPS_TARGET 30) it is scaled by 60 / target (83 -> 166)
+const DRS_CONTROLLER: [u32; 68] = [
+    0xb9404211, 0x35000071, 0x2a1f03e0, 0xd65f03c0, // off (state +0x40 0): level 0
+    0xbd401001, 0xbd400202, 0x1e202048, 0x540000ed, 0x52a84e0a, 0x1e270140, 0x1e202040, 0x5400006a,
+    0x1e200821, 0x1e221821, // threshold x 60 / the target fps under 60
+    0xbd400800, 0xb9417402, 0xb941a003, 0x7100005f, 0x1a9fa042, 0x528001e9, 0x6b09005f, 0x1a89d042,
+    0xb9420204, 0x11000484, 0xb9020204, 0xb9420605, 0xb9420a06, 0x6b0200bf, 0x1a8617e6, 0xb9020602,
+    0xb9020a06, 0x35000046, 0xb9020e1f, 0x91084207, 0x91094208, 0x710020df, 0x540003cb, 0x1e212000,
+    0x540001ad, 0xb9420e0b, 0x1100056b, 0xb9020e0b, 0x7100217f, 0x540002eb, 0xbc2258e0, 0xb8225904,
+    0x51000469, 0x1100044a, 0x6b09015f, 0x1a89d140, 0xd65f03c0, 0xb9020e1f, 0xbc2258e0, 0xb8225904,
+    0x34000182, 0x51000449, 0xb869590a, 0x340000ea, 0x4b0a008a, 0x7109615f, 0x54000088, 0xbc6958e2,
+    0x1e212040, 0x5400006a, 0x2a0903e0, 0xd65f03c0, 0x2a0203e0, 0xd65f03c0,
+];
+
+/// b3d287fe: under a host render scale below 1.0 (state +0x10, float bits in 1..0x3f7fffff) level 0, so DM_DYNAMIC_RESOLUTION=1 does not fight DM_RENDER_SCALE;
+/// emitted before the controller only when the render scale function was found
+const DRS_RENDER_SCALE_GUARD: [u32; 7] = [
+    0xb9401211, // ldr w17,[x16,#0x10]   the host render scale's bits
+    0x340000d1, // cbz w17,+6            unset: the controller
+    0x52a7f002, // mov w2,#0x3f800000    1.0
+    0x6b02023f, // cmp w17,w2
+    0x54000062, // b.hs +3               1.0 or more, negative or NaN: the controller
+    0x2a1f03e0, // mov w0,wzr            level 0
+    0xd65f03c0, // ret
 ];
 
 fn ocarina_dynamic_resolution(ctx: &mut StubCtx) -> Res<()> {
@@ -96,15 +115,122 @@ fn ocarina_dynamic_resolution(ctx: &mut StubCtx) -> Res<()> {
         return Ok(());
     };
     ctx.site(site, "017c40bd")?; // ldr s1,[x0,#0x7c]
+    let has_render_scale = ctx.other("render scale").is_some();
     let start = ctx.here();
     let w = asm::adrp(16, ctx.here(), st)?;
     ctx.emit(w);
+    if has_render_scale {
+        for w in DRS_RENDER_SCALE_GUARD {
+            ctx.emit(w);
+        }
+    }
     for w in DRS_CONTROLLER {
         ctx.emit(w);
     }
     let w = b(site, start)?;
-    ctx.put(site, &[w], "dynamic resolution level: 0 (full resolution), or with state +0x40 (DM_DYNAMIC_RESOLUTION) a climb on the load measured at each level");
+    let why = if has_render_scale {
+        "dynamic resolution level: 0 (full resolution) also under a render scale below 1.0, or with state +0x40 (DM_DYNAMIC_RESOLUTION) a climb on the load measured at each level"
+    } else {
+        "dynamic resolution level: 0 (full resolution), or with state +0x40 (DM_DYNAMIC_RESOLUTION) a climb on the load measured at each level"
+    };
+    ctx.put(site, &[w], why);
     ctx.add_capability("DYNAMIC_RESOLUTION");
+    Ok(())
+}
+
+// ---- the render scale stubs (b3d287fe): DM_RENDER_SCALE (state +0x10) on the 3D view-size update (v131072 main+0x31d3200) ----
+
+/// `_bcond` / `_cbz_w` of the render scale stubs (offsets inside a stub body, in bytes)
+fn rs_bcond(frm: i64, to: i64, cond: u32) -> u32 {
+    0x54000000 | ((((to - frm) >> 2) & 0x7ffff) as u32) << 5 | cond
+}
+fn rs_cbz_w(frm: i64, to: i64, rt: u32) -> u32 {
+    0x34000000 | ((((to - frm) >> 2) & 0x7ffff) as u32) << 5 | rt
+}
+
+/// `render_scale_status_body`: 19 words, `state_adrp` is word 4 (ADRP x16 to the state page). At the update's answer (+0xce4, ubfx of its status byte) a host scale in
+/// (0.0, 1.0) whose last stored value (state +0x290) does not match [x20+0xe5c] turns any status but 1 into 0, so that frame recomputes the 3D sizes
+pub fn render_scale_status_body(state_adrp: u32) -> [u32; 19] {
+    let at = |k: i64| 4 * k;
+    [
+        0xd3609c08, // ubfx x8,x0,#32,#8      the original
+        0xa9be47f0, // stp x16,x17,[sp,#-32]!
+        0xd53b4210, // mrs x16,nzcv
+        0xf9000bf0, // str x16,[sp,#16]
+        state_adrp, // x16 = state page
+        0xb9401211, // ldr w17,[x16,#0x10]    the host scale's bits
+        rs_cbz_w(at(6), at(16), 17),
+        0x53177e31,                    // lsr w17,w17,#23        sign + exponent
+        0x7101fe3f,                    // cmp w17,#0x7f
+        rs_bcond(at(9), at(16), 0x2),  // b.hs done
+        0xb9429210,                    // ldr w16,[x16,#0x290]   last scaled value stored
+        0xb94e5e91,                    // ldr w17,[x20,#0xe5c]   current view scale
+        0x6b11021f,                    // cmp w16,w17
+        rs_bcond(at(13), at(16), 0x0), // b.eq done
+        0x7100051f,                    // cmp w8,#1
+        0x1a9f0108,                    // csel w8,w8,wzr,eq      keep status 1; any other -> 0
+        0xf9400bf0,                    // done: ldr x16,[sp,#16]
+        0xd51b4210,                    // msr nzcv,x16
+        0xa8c247f0,                    // ldp x16,x17,[sp],#32
+    ]
+}
+
+/// `render_scale_store_body`: 16 words, `state_adrp` is word 2. At the store (+0xd48, str s0,[x20,#0xe5c]) the game's scale times the host's below 1.0, recorded at state +0x290
+pub fn render_scale_store_body(state_adrp: u32) -> [u32; 16] {
+    let at = |k: i64| 4 * k;
+    [
+        0xadbf7ffe,                   // stp q30,q31,[sp,#-32]!
+        0xa9bf47f0,                   // stp x16,x17,[sp,#-16]!
+        state_adrp,                   // x16 = state page
+        0xd53b4211,                   // mrs x17,nzcv
+        0xbd40121e,                   // ldr s30,[x16,#0x10]    the host scale
+        0x1e2023c8,                   // fcmp s30,#0.0
+        rs_bcond(at(6), at(12), 0xd), // b.le original
+        0x1e2e101f,                   // fmov s31,#1.0
+        0x1e3f23c0,                   // fcmp s30,s31
+        rs_bcond(at(9), at(12), 0xa), // b.ge original
+        0x1e3e0800,                   // fmul s0,s0,s30
+        0xbd029200,                   // str s0,[x16,#0x290]
+        0xbd0e5e80,                   // original: str s0,[x20,#0xe5c]
+        0xd51b4211,                   // msr nzcv,x17
+        0xa8c147f0,                   // ldp x16,x17,[sp],#16
+        0xacc17ffe,                   // ldp q30,q31,[sp],#32
+    ]
+}
+
+fn render_scale(ctx: &mut StubCtx) -> Res<()> {
+    // not found in this build (a red line from the locator): the game's own sizes
+    let Some(f) = ctx.other("render scale") else {
+        return Ok(());
+    };
+    let (status, store) = (f + 0xce4, f + 0xd48);
+    ctx.site(status, "089c60d3")?; // ubfx x8,x0,#32,#8
+    let s = ctx.here();
+    for w in render_scale_status_body(asm::adrp(16, s + 4 * 4, ctx.state)?) {
+        ctx.emit(w);
+    }
+    let w = b(ctx.here(), status + 4)?;
+    ctx.emit(w);
+    let w = b(status, s)?;
+    ctx.put(
+        status,
+        &[w],
+        "dynamic-resolution status: a host render scale not yet stored asks for new 3D sizes (state +0x10)",
+    );
+    ctx.site(store, "805e0ebd")?; // str s0,[x20,#0xe5c]
+    let s = ctx.here();
+    for w in render_scale_store_body(asm::adrp(16, s + 4 * 2, ctx.state)?) {
+        ctx.emit(w);
+    }
+    let w = b(ctx.here(), store + 4)?;
+    ctx.emit(w);
+    let w = b(store, s)?;
+    ctx.put(
+        store,
+        &[w],
+        "final 3D view scale x the host render scale below 1.0 (1.0 = the game's own)",
+    );
+    ctx.render_scale = 1;
     Ok(())
 }
 
@@ -435,4 +561,41 @@ fn camera_aspect(ctx: &mut StubCtx) -> Res<()> {
 
     ctx.add_capability("ANAMORPHIC_ASPECT");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // the words of tools/overlay/dm/games/0400486024DEC000/patches.py (nxnative c12000da + b3d287fe), printed by the Python with an ADRP word of 0x90000010; upstream's
+    // test_ocarina_drs.py runs them natively (it passes on that file: target/agent-work/prof-sync/REPORT.txt)
+    #[rustfmt::skip]
+    const PY_STATUS: [u32; 19] = [0xd3609c08, 0xa9be47f0, 0xd53b4210, 0xf9000bf0, 0x90000010, 0xb9401211, 0x34000151, 0x53177e31, 0x7101fe3f, 0x540000e2,
+        0xb9429210, 0xb94e5e91, 0x6b11021f, 0x54000060, 0x7100051f, 0x1a9f0108, 0xf9400bf0, 0xd51b4210, 0xa8c247f0];
+    #[rustfmt::skip]
+    const PY_STORE: [u32; 16] = [0xadbf7ffe, 0xa9bf47f0, 0x90000010, 0xd53b4211, 0xbd40121e, 0x1e2023c8, 0x540000cd, 0x1e2e101f, 0x1e3f23c0, 0x5400006a,
+        0x1e3e0800, 0xbd029200, 0xbd0e5e80, 0xd51b4211, 0xa8c147f0, 0xacc17ffe];
+    #[rustfmt::skip]
+    const PY_GUARD: [u32; 7] = [0xb9401211, 0x340000d1, 0x52a7f002, 0x6b02023f, 0x54000062, 0x2a1f03e0, 0xd65f03c0];
+
+    #[test]
+    fn render_scale_stub_bodies_are_the_pythons() {
+        assert_eq!(render_scale_status_body(0x90000010), PY_STATUS);
+        assert_eq!(render_scale_store_body(0x90000010), PY_STORE);
+        assert_eq!(DRS_RENDER_SCALE_GUARD, PY_GUARD);
+    }
+
+    #[test]
+    fn drs_controller_keeps_its_off_prefix_and_scales_the_threshold() {
+        // the off check first (state +0x40 0: level 0), then the threshold load, the target fps (state +0, a float) and the 60.0 constant of c12000da
+        assert_eq!(
+            DRS_CONTROLLER[..4],
+            [0xb9404211, 0x35000071, 0x2a1f03e0, 0xd65f03c0]
+        );
+        assert_eq!(
+            DRS_CONTROLLER[4..9],
+            [0xbd401001, 0xbd400202, 0x1e202048, 0x540000ed, 0x52a84e0a]
+        );
+        assert_eq!(DRS_CONTROLLER.len(), 68);
+    }
 }

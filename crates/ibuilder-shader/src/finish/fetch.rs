@@ -1,5 +1,5 @@
 //! `dmsh_fetch.py`: `fold` (a pixel shader's readable-tile version `main0_f`) and `screen_varyings` (the vertex side of a projective sample's tile read).
-//! (`select_guards`, the third function of that file, is a rewrite of the chain: `crate::guards`.)
+//! (`select_guards`, once in that file and now in `dmsh_rewrite.py`, is a rewrite of the chain: `crate::guards`.)
 use super::abi;
 use super::pyjson::J;
 use super::reflect::is_word;

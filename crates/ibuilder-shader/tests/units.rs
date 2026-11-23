@@ -55,3 +55,27 @@ fn text_helpers() {
     assert_eq!(text::block_end(b"{ { } }", 0), Some(6));
     assert_eq!(text::block_end(b"xyz", 1), Some(1));
 }
+
+#[test]
+fn compute_loops_contains_a_compact_loop() {
+    // dmsh_rewrite.compute_loops' site dicts are {'site', 'function', 'line', 'barrier'} (the reflection writes them in that order, finish/mod.rs)
+    let src = "using namespace metal;\nkernel void main0()\n{\n    for (;;) x++;\n}\n";
+    let (out, sites) = ibuilder_shader::cs::compute_loops(src).unwrap();
+    // the tail as dmsh_rewrite.compute_loops writes it for the same text
+    assert!(out.ends_with("kernel void main0(device dm_loop_state& dm_loop [[buffer(28)]])\n{\n    uint dm_lg = 0u;\n    for (;(true) && dm_lg_go(dm_lg, dm_loop, 1u) /* dm_loop_site 1: main0 */;) x++;\n}\n"));
+    assert_eq!(
+        sites[0].to_json(),
+        serde_json::json!({"site": 1, "function": "main0", "line": 4, "barrier": false})
+    );
+}
+
+#[test]
+fn raw_noinline_follows_the_stage() {
+    let src = "x\nstatic inline __attribute__((always_inline))\nuint dmsh_raw_find(uint a)\n";
+    let cs = steps::raw_noinline(src, "cs");
+    assert_eq!(
+        cs,
+        "x\nstatic __attribute__((noinline))\nuint dmsh_raw_find(uint a)\n"
+    );
+    assert_eq!(steps::raw_noinline(&cs, "ms"), src);
+}

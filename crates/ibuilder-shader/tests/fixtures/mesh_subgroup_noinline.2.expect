@@ -1,0 +1,12 @@
+OK
+{}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#inclde <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+
+static __attribute__((noinline))
+uint4 helper0(float uint& gl_Subgroup)

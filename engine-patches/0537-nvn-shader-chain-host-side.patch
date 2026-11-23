@@ -1,0 +1,257 @@
+# (after 0536) nvn: the host side of the shader chain 6c53446391cc: gmem map spans, side-library entry names, vertex viewport masks, task payloads through a buffer
+#
+# Upstream:  https://github.com/seedds/nxnative, the dm/gfx/nvn hunks of 736a2ecb ("chain/gmem: shorten raw load pool checks (PR #1833)", co-author MartinBouteruche),
+#            b989137a ("chain/vertex: compile shader variants together (PR #2951)", co-author Eric Liu), 2e6f6fd0 ("chain/vertex: lower draw-uniform viewport masks (PR #3074)",
+#            co-authors Eliran Zach, PikaMan80), acbb26c3 ("chain/meshstage: spill task payloads past Metal's 16 KB through a device buffer (PR #2264)", co-author FifteenPen);
+#            authors seedds, 2026-11-19..23.
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m, nvn_geometry.inc), each what the 0536 libraries need from the host:
+#   - bind_args: each gmem map entry also holds its byte span when the range fits one 4 GiB window (the translator's raw loads check their last entry with it, 736a2ecb);
+#   - side_entry: a vertex shader's entry points in its pulling / shadow-input libraries by the names the reflection gives (main0_p / main0_zp / main0_v / main0_zv when the
+#     three libraries are cut from one unit), in shader_load, pull_load, vin_fn and the prebuild's pre_desc (b989137a);
+#   - the reflection's viewport_mask: such a vertex shader never takes the lean passthrough geometry path (2e6f6fd0);
+#   - a task shader's payload past 16 KB: Metal's payload carries a slice offset, the payload goes through a buffer at DMSH_MESH_SPILL_SLOT sized to the draw's workgroups
+#     (indirect draws drained to read their count), three new red lines (keys 190-192; g_red_once raised to 193) (acbb26c3).
+# Adapted: the hunks re-made on this tree (NX2Apple + engine-patches 0401..0535); RED_ONCE keys renumbered (upstream 175-177 are taken here).
+# Not taken: ae5d8f51's host part (nvn_live.inc, hle_glslc.c: the Mac recovering shaders compiled during play; the app has its own live translation).
+# Games: every game (all libraries change); Ocarina of Time (raw loads, mesh), Nintendo Switch Sports Resort (task payloads > 16 KB), Mario Tennis Aces (viewport masks). Switches: none.
+# Tests (M1 Pro): scripts/build-host.sh device + simulator with HOST_TESTS=1. NOT run on a device.
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0536, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -3863,7 +3863,7 @@
+     return is_texture;
+ }
+ 
+-static int g_red_once[190];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
++static int g_red_once[193];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+ #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
+ // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
+ // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
+@@ -8079,7 +8079,7 @@
+ 
+ @interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_d, geo_fn; NSString *u_name; id<MTLLibrary> ulib; NSMutableDictionary *ufn; int u_side, ulib_state, u_alpha, u_logic;   // u_name: the typed-output entry point (dmsh_entry.py fs_uint), nil when the shader has none; in the side library <key>_bx when u_side, else in its own (ulib: that library, loaded on first need when u_side; ulib_state as afn_state); ufn: it specialized per pipeline's target classes, alpha test and logic operation (typed_fn); u_alpha / u_logic: it holds those two (the reflection's entry_u_alpha, entry_u_logic); fn_d: the dual-source one (dmsh_entry.py fs_dual)
+     id<MTLLibrary> xlib; int xlib_state;   // the side library <key>_bx, loaded once on first need (bx_lib) for at_fn, lo_fn and typed_fn
+-    uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
++    uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, layer_out, viewport_mask; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+     NSDictionary *rtMetadata;   // immutable RT runtime/catalog JSON, present only for the universal RT library
+     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
+     uint8_t mesh_kind, mesh_notask; uint16_t mesh_threads, mesh_payload;   // an NVN2 task (1) or mesh (2) shader, a mesh shader with no task, its workgroup's threads, its payload's bytes (dmsh_meshstage.py)
+@@ -8101,7 +8101,8 @@
+     id<MTLLibrary> bflib; int bflib_state; NSMutableArray *bffn;   // bflib: the readable-tile version <key>_bf (state as afn_state), bffn: its functions specialized by their numbers (NvBfFn, bf_fn)
+     uint64_t mis[4];   // mis: texture slots 0-255 already reported for a type mismatch (tex_mis_note)
+     NSString *ventry; id<MTLFunction> vfn; int vfn_state;
+-    id<MTLFunction> pfn, wlfn; int pfn_state, has_pull;   // wlfn: the wide-line entry of the pulling library (<ventry>_wl, dmsh_pull.py; nvn_wline.inc), nil when it has none
++    NSString *pentry, *wlentry, *vinentry;   // a vertex shader's entry point in its pulling library, that library's wide-line one, and its entry point in the shadow-input library, as the reflection names them (side_entry); nil: ventry's name (a layer entry point)
++    id<MTLFunction> pfn, wlfn; int pfn_state, has_pull;   // wlfn: the wide-line entry of the pulling library (wlentry, dmsh_pull.py; nvn_wline.inc), nil when it has none
+     id<MTLLibrary> alib; id<MTLFunction> afn[2]; int afn_state, has_alpha, has_bz;   // has_bz: its entry points read the blend weight word (bz_bind)
+     id<MTLLibrary> llib; NSMutableDictionary<NSNumber *, id<MTLFunction>> *lfn; int lfn_state, has_logic; } @end   // llib: the side library <key>_bx for logic operations, lfn: fn's entry point (a shader without the typed-output one, which holds its own) specialized per set of targets (lo_fn; lfn_state as afn_state; has_logic: the reflection names its entry points, dmsh_logic.py)   // afn: the alpha test entry points of fn and fn_d in the side library <key>_bx (alib), (at_fn; afn_state 0 untried, 1 loaded, 2 failed; has_alpha: the reflection names them, dmsh_alpha.py)   // pfn: the same entry of the pulling library <key>_bp (pull_fn; has_pull: the reflection names one, dmsh_pull.py)   // vertex: the entry point loaded (by the depth mode); vfn: the same entry of the shadow-input library <key>_bv (vin_fn; state 0 untried, 1 loaded, 2 failed)
+ @implementation NvShader
+@@ -8442,6 +8443,13 @@
+ }
+ static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e);   // a compute shader's pipeline: from the archive bundled with the app, else built
+ // layer: a vertex shader's layer entry points (entry_layer / entry_layer_z, which also write the layer) instead of main0 / main0_z, for a program whose geometry shader is a slice writer (prog_fold_gs)
++// A vertex shader's entry point in one of its side libraries: side is the reflection's "pull" (<key>_bp, dmsh_pull.py) or "vin" (<key>_bv, dmsh_vin.py), which names the entry point
++// under key (entry, entry_z, entry_wl, entry_z_wl). A reflection that names none there means own, the name that entry point has by the shader's own. When the libraries are cut
++// from one unit (dmsh_side.vs_unit) they are main0_p / main0_zp / main0_v / main0_zv; shader_load, pre_desc and pso_offline.py's vertex_entry take them alike
++static NSString *side_entry(id side, NSString *key, NSString *own) {
++    id n = [side isKindOfClass:[NSDictionary class]] ? ((NSDictionary *)side)[key] : nil;
++    return [n isKindOfClass:[NSString class]] && [n length] ? n : own;
++}
+ static NvShader *shader_load(NSString *pc, int stage, int layer) {
+     NSError *e = nil;
+     NSData *jd = msl_data([NSString stringWithFormat:@"%@/%@.json", g_msl_dir, pc]);
+@@ -8465,10 +8473,10 @@
+     if (o->rf.dyn && !dm_prof()->tex_dyn_slots) {   // dynamic texture handles (TEXD / SAMPD) only where the profile says the game picks them from c2's tables, as before otherwise
+         // (rf.c1 is freed by dealloc when o goes: freeing it here too was a double free, which aborted FINAL FANTASY RESONANCE at its first such shader)
+         MLOG("[RED] shader %s reflection conversion failed: a texture handle the translator could not trace to one slot (profile key tex_dyn_slots off)", pc.UTF8String); return nil; }
+-    NSString *entry = j[@"entry"];
++    NSString *entry = j[@"entry"]; int ez = 0;   // ez: a vertex shader's entry is its near = 0 one
+     if (stage == 0) {
+         atomic_fetch_add(&g_vs_loaded, 1);
+-        if (atomic_load(&g_depth_zero)) { if (j[@"entry_z"]) entry = j[@"entry_z"]; else RED_ONCE(85, "vertex shader %s has no near=0 entry (entry_z): depth stays in the GL convention", pc.UTF8String); }
++        if (atomic_load(&g_depth_zero)) { if (j[@"entry_z"]) { entry = j[@"entry_z"]; ez = 1; } else RED_ONCE(85, "vertex shader %s has no near=0 entry (entry_z): depth stays in the GL convention", pc.UTF8String); }
+         if (layer) entry = atomic_load(&g_depth_zero) ? j[@"entry_layer_z"] : j[@"entry_layer"];
+     }
+     NSDictionary *mst = [j[@"mesh_stage"] isKindOfClass:[NSDictionary class]] ? j[@"mesh_stage"] : nil;
+@@ -8497,10 +8505,15 @@
+             o->geo_words = (uint32_t)reads.count;
+         } }
+     o->fn = fn4_note([lib newFunctionWithName:entry], lib, entry, nil); o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key); o->ventry = entry;
++    if (stage == 0 && !layer) {   // the same entry point in the side libraries <key>_bp and <key>_bv (pull_load, vin_fn), by the names the reflection gives them
++        o->pentry = side_entry(j[@"pull"], ez ? @"entry_z" : @"entry", entry);
++        o->wlentry = side_entry(j[@"pull"], ez ? @"entry_z_wl" : @"entry_wl", [entry stringByAppendingString:@"_wl"]);
++        o->vinentry = side_entry(j[@"vin"], ez ? @"entry_z" : @"entry", entry);
++    }
+     if (o->mesh_notask && !(o->mesh_obj = j[@"entry_object"] ? fn4_note([lib newFunctionWithName:j[@"entry_object"]], lib, j[@"entry_object"], nil) : nil))
+         MLOG("[RED] mesh shader %s: no object entry point (entry_object) in its library: its draws are skipped", pc.UTF8String);
+     // writes the layer: its passes are layered and its pipelines get an input class (pso_desc). main0 / main0_z by the reflection's layer_out (dmsh_entry.py layer_out), the layer entry points always
+-    if (stage == 0) o->layer_out = layer || [j[@"layer_out"] boolValue];
++    if (stage == 0) { o->layer_out = layer || [j[@"layer_out"] boolValue]; o->viewport_mask = !layer && [j[@"viewport_mask"] boolValue]; }
+     if (stage == 0 && !layer) o->has_pull = [j[@"pull"] isKindOfClass:[NSDictionary class]];
+     if (stage == 1) o->has_alpha = [j[@"alpha"] isKindOfClass:[NSDictionary class]];
+     if (stage == 1) o->has_bz = [j[@"blend_zero"] boolValue];
+@@ -10303,8 +10316,9 @@
+     if (!vs->vfn_state) {
+         vs->vfn_state = 2;
+         size_t kl = strlen(vs->key); NSString *path = [NSString stringWithFormat:@"%@/%.*s_bv.metallib", g_msl_dir, (int)(kl > 2 ? kl - 2 : kl), vs->key];
+-        NSError *e = nil; id<MTLLibrary> lib = lib_from_file(path, &e); id<MTLFunction> f = lib && vs->ventry ? fn4_note([lib newFunctionWithName:vs->ventry], lib, vs->ventry, nil) : nil;
+-        if (f && f.functionConstantsDictionary.count) f = fn_spec(lib, vs->ventry, [MTLFunctionConstantValues new], &e);   // as shader_load
++        NSString *name = vs->vinentry ?: vs->ventry;   // the reflection's name for it in this library (shader_load)
++        NSError *e = nil; id<MTLLibrary> lib = lib_from_file(path, &e); id<MTLFunction> f = lib && name ? fn4_note([lib newFunctionWithName:name], lib, name, nil) : nil;
++        if (f && f.functionConstantsDictionary.count) f = fn_spec(lib, name, [MTLFunctionConstantValues new], &e);   // as shader_load
+         const char *why = !lib ? "no library" : !f ? "no entry point" : NULL;
+         if (f && vs->rf.nb && [f newArgumentEncoderWithBufferIndex:vs->rf.abi].encodedLength != vs->arg_len) { why = "its argument buffer differs from the base library's"; f = nil; }
+         if (f) { vs->vfn = f; vs->vfn_state = 1; g_vin_loaded++; }
+@@ -10314,20 +10328,21 @@
+     os_unfair_lock_unlock(&g_vin_lock);
+     return f;
+ }
+-// The pulling entry point (the same name as the shader's own, main0 or main0_z, in <key>_bp: dmsh_pull.py), loaded on first need; a failure is final for the shader (its draws
+-// keep waiting for their pipelines as before)
++// The pulling entry point (in <key>_bp, dmsh_pull.py, under the name the reflection's "pull" gives it: pentry, main0_p / main0_zp when cut from one unit, else the shader's own),
++// loaded on first need; a failure is final for the shader (its draws keep waiting for their pipelines as before)
+ static os_unfair_lock g_pull_lock = OS_UNFAIR_LOCK_INIT;
+ // Loads the pulling entry into vs (pfn_state 1, or 2 when it is not usable). pull_fn holds g_pull_lock around it; shader_prefetch_rest calls it on a shader no other thread has yet
+ static void pull_load(NvShader *vs) {
+     {
+         vs->pfn_state = 2;
+         size_t kl = strlen(vs->key); NSString *path = [NSString stringWithFormat:@"%@/%.*s_bp.metallib", g_msl_dir, (int)(kl > 2 ? kl - 2 : kl), vs->key];
+-        NSError *e = nil; id<MTLLibrary> lib = lib_from_file(path, &e); id<MTLFunction> f = lib && vs->ventry ? fn4_note([lib newFunctionWithName:vs->ventry], lib, vs->ventry, nil) : nil;
+-        if (f && f.functionConstantsDictionary.count) f = fn_spec(lib, vs->ventry, [MTLFunctionConstantValues new], &e);
++        NSString *name = vs->pentry ?: vs->ventry;
++        NSError *e = nil; id<MTLLibrary> lib = lib_from_file(path, &e); id<MTLFunction> f = lib && name ? fn4_note([lib newFunctionWithName:name], lib, name, nil) : nil;
++        if (f && f.functionConstantsDictionary.count) f = fn_spec(lib, name, [MTLFunctionConstantValues new], &e);
+         const char *why = !lib ? "no library" : !f ? "no entry point" : NULL;
+         if (f && vs->rf.nb && [f newArgumentEncoderWithBufferIndex:vs->rf.abi].encodedLength != vs->arg_len) { why = "its argument buffer differs from the base library's"; f = nil; }
+         if (f) { vs->pfn = f; vs->pfn_state = 1;
+-            NSString *wn = [NSString stringWithFormat:@"%@_wl", vs->ventry]; id<MTLFunction> w = fn4_note([lib newFunctionWithName:wn], lib, wn, nil);
++            NSString *wn = vs->wlentry ?: [NSString stringWithFormat:@"%@_wl", vs->ventry]; id<MTLFunction> w = fn4_note([lib newFunctionWithName:wn], lib, wn, nil);
+             if (w && w.functionConstantsDictionary.count) w = fn_spec(lib, wn, [MTLFunctionConstantValues new], &e);
+             vs->wlfn = w; }
+         else { static _Atomic int n; if (n++ < 8) MLOG("[RED] pulling library of %s not usable (%s%s%s): its draws wait for their pipelines", vs->key, why, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); }
+@@ -12898,6 +12913,7 @@
+     if (vj[@"mesh_stage"]) return nil;   // a mesh shader's pair (shader_pairs.tsv holds them for its padding): mesh pipelines are built at the draw (nvn_geometry.inc mtk_pso), no base
+     NSString *ventry = zero && vj[@"entry_z"] ? vj[@"entry_z"] : vj[@"entry"], *fentry = fj[@"entry"] ?: @"main0";
+     int pull = [vj[@"pull"] isKindOfClass:[NSDictionary class]];
++    if (pull) ventry = side_entry(vj[@"pull"], zero && vj[@"entry_z"] ? @"entry_z" : @"entry", ventry);   // its name in the pulling library, as shader_load gives pull_load
+     if (!pull && [vj[@"vertex_inputs"] count]) return nil;   // stage inputs and no pulling library: its pipelines need the draw's layout
+     if ([vj[@"layer_out"] boolValue]) return nil;   // writes the layer (as shader_load takes it): its pipelines take an input primitive class (pso_desc), no pulling pipeline
+     NSDictionary *fr = fj[@"raster"]; if ([fr isKindOfClass:[NSDictionary class]] && [fr[@"primitive_id"] intValue]) return nil;   // reads the primitive ID: its pipelines are built whole (pso_build_ex), no base
+@@ -14908,7 +14924,14 @@
+         uint64_t lo = MAX((uint64_t)p->lo, end), hi = p->hi;
+         if (lo >= hi) continue;
+         if (n == DMSH_GMEM_MAP_ENTRIES) { over++; continue; }
+-        uint64_t e[3] = {lo, hi, p->gpu - p->base}; memcpy(t + (size_t)n++ * DMSH_GMEM_MAP_ENTRY, e, sizeof e); end = hi;
++        uint8_t *entry = t + (size_t)n++ * DMSH_GMEM_MAP_ENTRY;
++        uint64_t e[3] = {lo, hi, p->gpu - p->base};
++        memcpy(entry, e, sizeof e);
++        if (hi - lo <= UINT32_MAX && (lo >> 32) == ((hi - 1) >> 32)) {   // the byte span when the range fits in one 4 GiB window: a raw load checks its last entry with it (dmsh_abi.h DMSH_GMEM_MAP_ENTRY)
++            uint32_t span = (uint32_t)(hi - lo);
++            memcpy(entry + 28, &span, sizeof span);
++        }
++        end = hi;
+     }
+     pthread_mutex_unlock(&g_mu);
+     // Each 2 MiB chunk wholly inside an entry gets a hint, so most accesses skip the binary search. A colliding chunk replaces the hint and the shader's tag check sends the other to the search
+--- a/dm/gfx/nvn/nvn_geometry.inc
++++ b/dm/gfx/nvn/nvn_geometry.inc
+@@ -348,11 +348,12 @@
+ // program's own vertex and fragment stages draw the kept primitives. Instanced or multi-invocation draws, vertex shaders with
+ // storage writes (they would run twice) and transform feedback keep the full kernel and its reader. So does a passthrough shader that writes the layer (its reader has it, the
+ // vertex shader does not): Mario Tennis Fever's atmosphere table (d9c3a99828b4f39f, one 8x8 plane of a 64-plane 3D texture per draw) and its shadow map went to layer 0, and the
+-// other planes stayed zero: a blue wash over the whole scene. DM_NVN_GEO_LEAN=0 turns it off.
++// other planes stayed zero: a blue wash over the whole scene. A VS viewport mask also requires the full path: only the final
++// VTG stage controls the mask, so rerunning the VS raster entry would incorrectly clip a primitive the GS kept. DM_NVN_GEO_LEAN=0 turns it off.
+ static NvShader *geo_lean_pick(NvProg *pr, NvShader *gs, int topology, int instances) {
+     static int lean_on = -1; if (lean_on < 0) { const char *e = getenv("DM_NVN_GEO_LEAN"); lean_on = !(e && !strcmp(e, "0")); }
+     NvShader *vs = pr->sh[0], *base = pr->sh[2];
+-    if (!lean_on || instances > 1 || (gs && gs->geo_invocations != 1) || base->geo_invocations != 1 || !vs || vs->discard_fn || S.tf_on || !pr->sh[1] || !(topology == 0 || topology == 1 || topology == 3)) return NULL;
++    if (!lean_on || instances > 1 || (gs && gs->geo_invocations != 1) || base->geo_invocations != 1 || !vs || vs->discard_fn || vs->viewport_mask || S.tf_on || !pr->sh[1] || !(topology == 0 || topology == 1 || topology == 3)) return NULL;
+     if (!(base->geo_bg_tried & 0x80)) { base->geo_bg_tried |= 0x80; base->geo_bgv_v = shader_get([[[NSString stringWithUTF8String:base->key] substringToIndex:16] stringByAppendingString:@"_bgv"], 0); }
+     if (base->geo_bgv_v && base->geo_bgv_v->layer_out) return NULL;
+     if (!(base->geo_lean_tried >> topology & 1)) {
+@@ -606,6 +607,10 @@
+ // equivalent fallback: the demanded pipeline must finish compiling before its first draw, so each one built at a draw is recorded as an M row (pso_user.tsv) and the prewarm builds
+ // the rows before the game reaches them (docs/reference/shaders.md, Native mesh pipelines compiled at their first draw)
+ static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; uint64_t ind, ind_rec; } g_mtk;   // ind: an indirect draw's threadgroups (mdx_mask), ind_rec: its {count, first} record
++// A task shader's payload past Metal's object payload (DMSH_MESH_PAYLOAD_MAX) goes through a buffer at DMSH_MESH_SPILL_SLOT of both stages (dmsh_meshstage.py payload_spill):
++// the Metal payload carries the slice's word offset only. Word 0 holds the slice count, followed by one 16-byte-aligned slice per task workgroup of the draw
++static int mtk_spill(const NvShader *ts) { return ts && ts->mesh_payload > DMSH_MESH_PAYLOAD_MAX; }
++static NSUInteger mtk_payload_len(const NvShader *ts) { return !ts ? 16 : mtk_spill(ts) ? 16 : (ts->mesh_payload + 15u) & ~15u; }
+ static void draw_(const p_draw *dw, const p_draw_idx *di);
+ static uint64_t g_mtk_n, g_mtk_wait;
+ static nvn_hmap g_pso_mtk = {.klen = sizeof(pso_key)};   // only the submit thread uses it: prewarm workers build pipelines (mtk_build) and the submit thread claims them (warm_claim)
+@@ -631,7 +636,7 @@
+     if (!mf || !of || !f4) return nil;
+     MTL4MeshRenderPipelineDescriptor *m = [MTL4MeshRenderPipelineDescriptor new];
+     m.meshFunctionDescriptor = mf; m.fragmentFunctionDescriptor = f4; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+-    m.objectFunctionDescriptor = of; m.payloadMemoryLength = ts ? (ts->mesh_payload + 15u) & ~15u : 16; m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;   // with no task: a block's first workgroup, one thread a block
++    m.objectFunctionDescriptor = of; m.payloadMemoryLength = mtk_payload_len(ts); m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;   // with no task: a block's first workgroup, one thread a block
+     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageState = d.alphaToCoverageEnabled ? MTL4AlphaToCoverageStateEnabled : MTL4AlphaToCoverageStateDisabled;
+     for (int i = 0; i < 8; i++) pso_col4(m.colorAttachments[i], d.colorAttachments[i]);
+     return m;
+@@ -661,7 +666,7 @@
+     }
+     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+     m.meshFunction = fn_dev_b(ms->fn, !k->border); m.fragmentFunction = fn_dev_b(ff, !k->border); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+-    m.objectFunction = ts ? fn_dev_b(ts->fn, !k->border) : fn_dev(ms->mesh_obj); m.payloadMemoryLength = ts ? (ts->mesh_payload + 15u) & ~15u : 16; m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;
++    m.objectFunction = ts ? fn_dev_b(ts->fn, !k->border) : fn_dev(ms->mesh_obj); m.payloadMemoryLength = mtk_payload_len(ts); m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;
+     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
+     for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
+     m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+@@ -768,6 +773,17 @@
+     za_check(draw_gpu, "object table slot", DMSH_MESH_DRAW_SLOT);
+     if (rec_on()) rec_table_op(RO_T_ADDR, g_ot, draw_gpu, DMSH_MESH_DRAW_SLOT); else [g_ot setAddress:draw_gpu atIndex:DMSH_MESH_DRAW_SLOT];
+     args_dirty(4); encode_args(en, ms, 4, 1);
++    if (mtk_spill(ts)) {   // the task's payload slices: word 0 their count, the slices from word 4 (mesh_tasks_draw drained indirect draws, so g_mtk.count is exact)
++        uint64_t slice = ((uint64_t)ts->mesh_payload + 15u) & ~15ull;
++        uint32_t cap = g_mtk.count;
++        id<MTLBuffer> sb; size_t so = arena_alloc(16 + (size_t)MAX(cap, 1u) * (size_t)slice, &sb);
++        *(uint32_t *)((uint8_t *)sb.contents + so) = cap;
++        uint64_t sg = sb.gpuAddress + so;
++        za_check(sg, "object table slot", DMSH_MESH_SPILL_SLOT);
++        if (rec_on()) rec_table_op(RO_T_ADDR, g_ot, sg, DMSH_MESH_SPILL_SLOT); else [g_ot setAddress:sg atIndex:DMSH_MESH_SPILL_SLOT];
++        enc_r_vbuf(en, DMSH_MESH_SPILL_SLOT, sg);   // tracks g_vt_addr[DMSH_MESH_SPILL_SLOT] so later vertex draws rebind slot 11
++        static int said; if (!said++) MLOG("task shader %s: its %u-byte payload goes through a buffer (%u workgroups, %llu-byte slices)", ts->key, ts->mesh_payload, cap, (unsigned long long)slice);
++    }
+     // A task shader's threadgroups are the draw's workgroups; with no task, the object function's are blocks of DMSH_MESH_GRID of them (mdx_mask writes their count at +16)
+     MTLSize to = MTLSizeMake(ts ? ts->mesh_threads : 1, 1, 1), tm = MTLSizeMake(ms->mesh_threads, 1, 1);
+     if (g_mtk.ind) za_check(g_mtk.ind, "indirect mesh draw record", -1);
+@@ -788,17 +804,31 @@
+     if (ts && ts->mesh_kind != 1) ts = nil;
+     if (!ms || ms->mesh_kind != 2 || !ms->fn || (ts ? !ts->fn : !ms->mesh_notask || !ms->mesh_obj)) {
+         RED_ONCE(150, "DrawMeshTasks without its task and mesh shaders (task %s mesh %s): draw skipped", ts ? ts->key : "-", ms ? ms->key : "-"); return; }
++    if (ts && mtk_spill(ts) != (ms->mesh_payload > DMSH_MESH_PAYLOAD_MAX)) {
++        RED_ONCE(190, "DrawMeshTasks task %s (%u-byte payload) and mesh %s (%u-byte payload) disagree on payload spill: draw skipped", ts->key, ts->mesh_payload, ms->key, ms->mesh_payload); return; }
+     image_prepare(pr, 1u << 3 | 1u << 4);
+     if (g_nubd && (g_enc || ubd_lazy()) && ((ts && ubd_conflict_sh(ts, 3)) || ubd_conflict_sh(ms, 4))) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // as draw_ does for its stages
+     NvProg *raster = pr->geo_lean_raster;   // the pixel stage alone
+     if (!raster || raster->sh[1] != pr->sh[1] || raster->sh[0]) { raster = [NvProg new]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
++    uint32_t first = (uint32_t)dw->first, count = (uint32_t)dw->count;
+     uint64_t ind = 0, ind_rec = 0;
+-    if (dw->ind) { void *mb; uint64_t mo;
++    if (mtk_spill(ts)) {
++        if (dw->ind) {   // size the spill buffer to the exact GPU-written count (as tg_spill does in nvn_mtl.m dispatch) and draw directly from {count, first}
++            mdi_wait();
++            if (!nvn_host_readable(dw->ind, 8)) { RED_ONCE(191, "indirect DrawMeshTasks of %s with payload in a device buffer: its record at %#llx is in an unmapped page of a sparse pool; skipped", ts->key, (unsigned long long)dw->ind); return; }
++            uint32_t rec[2]; memcpy(rec, (const void *)(uintptr_t)dw->ind, 8); count = rec[0]; first = rec[1];
++            static int once; if (!once++) MLOG("task shader %s: indirect draw with %u-byte payload in a device buffer; the replay waits for the GPU to read its %u workgroups", ts->key, ts->mesh_payload, count);
++            if (!count) return;
++        }
++        uint64_t slice = ((uint64_t)ts->mesh_payload + 15u) & ~15ull;
++        if ((uint64_t)count > (g_dev.maxBufferLength - (4u << 20)) / slice) {
++            RED_ONCE(192, "DrawMeshTasks of %s: %u workgroups of %llu-byte payload exceed Metal's largest buffer; skipped", ts->key, count, (unsigned long long)slice); return; }
++    } else if (dw->ind) { void *mb; uint64_t mo;
+         if (!mdx_find(dw->ind, dw->ind, &ind)) { mdx_run(dw, NULL); if (!mdx_find(dw->ind, dw->ind, &ind)) ind = 0; }
+         if (!ind || !mtl_gpu_addr(dw->ind, 8, &mb, &mo, &ind_rec)) { RED_ONCE(154, "DrawMeshTasksIndirect record at %#llx is in no memory pool: draw skipped", (unsigned long long)dw->ind); return; }
+     }
+-    PD("m %llu mesh tasks task=%s mesh=%s fs=%s first=%d count=%d indirect=%#llx", g_stat_pass + !g_enc, ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", dw->first, dw->count, (unsigned long long)dw->ind);   // the draw_ below is a stand-in triangle
+-    g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
++    PD("m %llu mesh tasks task=%s mesh=%s fs=%s first=%d count=%d indirect=%#llx", g_stat_pass + !g_enc, ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", (int)first, (int)count, (unsigned long long)dw->ind);   // the draw_ below is a stand-in triangle
++    g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = first; g_mtk.count = count;
+     g_mtk.ind = ind; g_mtk.ind_rec = ind_rec;
+     g_geo_program = raster;
+     p_draw triangle = {.prim = 4, .count = 3, .instances = 1};

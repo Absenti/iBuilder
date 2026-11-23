@@ -1,0 +1,305 @@
+# (after 0529) nvn/vconv: kept index ranges are indexed by page, so a GPU write invalidates only the ranges it covers (was a walk of every range on a 1 MB-region hash hit)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/b4588a5396cb6c93b5c3a06e7adb7f1a144a8681  ("nvn/vconv: index cached index ranges by page for GPU write invalidation")
+#            author seedds, 2026-11-22 20:44 +0800
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: vc_gpu_write walked every kept index range whenever a GPU write's 1 MB region hit the hashed filter, at every pend_add.
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m; new test t_ir_gpu_write): a two-level reverse index (4 KB pages for ranges of up to 8 pages, 1 MB regions above) from region to the ranges in it,
+#   with a sorted key list for wide writes; ir_clear empties both.
+# Adapted: the main hunk by hand (vc_on reads the profile through dm_prof() here); this tree's session reset now calls ir_clear (it cleared g_ir alone, which would leave the index
+#   pointing at freed entries). Games: games with converted vertex streams (DM_NVN_VCONV_RANGE). Switches: none.
+# Tests (M1 Pro): t_ir_gpu_write 24, t_vbuf 143, t_session_reset; in HOST_TESTS. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0529, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index b1b49b763dbe20c2e9e4259823d9743f151bb2da..9cbab04dd7fa55f0fbb43feb1c68b2236cd5da8b 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -10371,20 +10371,96 @@ static void vconv_fill(int f, uint64_t src, uint32_t stride, uint64_t nv, float
+ // vertices before its start as the range starts at. The indices' range is kept while their pages stay unwritten (write-protected as packaged textures, nvn_dirty_protect),
+ // and never trusted again once a GPU copy, update or fill is queued on them (pend_add). Keeping the conversions too did not pay: the soldiers' attributes change every frame.
+ // DM_NVN_VCONV_CHECK=1 scans the indices again at every reuse and reports differences. DM_NVN_VCONV_RANGE=0 / 1 overrides the profile
+-enum { VC_RGN = 1 << 16 };   // bits of the region filter
++enum { IR_MAX = 1 << 16, IR_SPAN = 8 };   // IR_MAX: cap before clear; IR_SPAN: <= 8 4 KB pages go in level 0 (4 KB), wider ranges in level 1 (1 MB)
+ typedef struct { uint64_t ibuf; int32_t count, itype; } ir_key;
+ typedef struct { uint32_t mn, mx; uint64_t stamp, seen, lo, n; const void *span; int gpuw; } ir_ent;   // gpuw: a GPU write was queued on the indices: never trusted again
++typedef struct { ir_ent *e; uint32_t next; } ir_node;   // 1-based next into g_ir_nodes (0 = end)
++typedef struct { nvn_hmap map; uint64_t *order; uint32_t order_n, order_cap; } ir_level;   // exact region id → 1-based head in g_ir_nodes; order: sorted keys for wide writes
+ static nvn_hmap g_ir = {.klen = sizeof(ir_key)};
+-static uint64_t g_vc_rgn[VC_RGN / 64], g_vc_stat, g_vc_conv, g_vc_whole, g_vc_checks, g_vc_bad;   // g_vc_rgn: 1 MB regions holding a kept index range (hashed); g_vc_conv / g_vc_whole: vertices converted / in the bound ranges
++static ir_level g_ir_lv[2] = { {.map = {.klen = 8}}, {.map = {.klen = 8}} };
++static const unsigned g_ir_shift[2] = { 12, 20 };   // level 0: 4 KB pages, level 1: 1 MB regions
++static ir_node *g_ir_nodes; static uint32_t g_ir_node_n, g_ir_node_cap, g_ir_live;
++static uint64_t g_ir_cand, g_vc_stat, g_vc_conv, g_vc_whole, g_vc_checks, g_vc_bad;   // g_ir_cand: candidate checks in vc_gpu_write; g_vc_conv / g_vc_whole: vertices converted / in the bound ranges
+ static int vc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_VCONV_RANGE"); v = e && *e ? atoi(e) != 0 : dm_prof()->vconv_range; MLOG("vertex conversion of the draw's vertices only: %s", v ? "on" : "off"); } return v; }
+ static int vc_check(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_VCONV_CHECK"); v = e && *e && atoi(e); } return v; }
+-static inline uint32_t vc_rgn(uint64_t r) { return (uint32_t)((r * 0x9E3779B97F4A7C15ull) >> 48) & (VC_RGN - 1); }
+-static void vc_rgn_mark(uint64_t lo, uint64_t n) { for (uint64_t r = lo >> 20; r <= (lo + n - 1) >> 20; r++) { uint32_t b = vc_rgn(r); g_vc_rgn[b >> 6] |= 1ull << (b & 63); } }
+-static int vc_rgn_hit(uint64_t lo, uint64_t n) { for (uint64_t r = lo >> 20; r <= (lo + n - 1) >> 20; r++) { uint32_t b = vc_rgn(r); if (g_vc_rgn[b >> 6] >> (b & 63) & 1) return 1; } return 0; }
++static uint32_t ir_node_push(ir_ent *e, uint32_t next) {
++    if (g_ir_node_n == g_ir_node_cap) {
++        if (g_ir_node_cap > UINT32_MAX / 2) MDIE("index-range reverse index node limit reached");
++        uint32_t cap = g_ir_node_cap ? g_ir_node_cap * 2 : 1024;
++        ir_node *p = realloc(g_ir_nodes, (size_t)cap * sizeof *p);
++        if (!p) MDIE("no memory for the index-range reverse index");
++        g_ir_nodes = p; g_ir_node_cap = cap;
++    }
++    g_ir_nodes[g_ir_node_n] = (ir_node){e, next};
++    return ++g_ir_node_n;   // 1-based handle (0 means empty in nvn_hmap)
++}
++static uint32_t ir_order_lower(const ir_level *lv, uint64_t key) {
++    uint32_t lo = 0, hi = lv->order_n;
++    while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (lv->order[mid] < key) lo = mid + 1; else hi = mid; }
++    return lo;
++}
++static void ir_order_add(ir_level *lv, uint64_t key) {
++    uint32_t at = ir_order_lower(lv, key);
++    if (at < lv->order_n && lv->order[at] == key) return;
++    if (lv->order_n == lv->order_cap) {
++        if (lv->order_cap > UINT32_MAX / 2) MDIE("index-range region order limit reached");
++        uint32_t cap = lv->order_cap ? lv->order_cap * 2 : 64;
++        uint64_t *p = realloc(lv->order, (size_t)cap * sizeof *p);
++        if (!p) MDIE("no memory for the index-range region order");
++        lv->order = p; lv->order_cap = cap;
++    }
++    memmove(lv->order + at + 1, lv->order + at, (lv->order_n - at) * sizeof *lv->order);
++    lv->order[at] = key; lv->order_n++;
++}
++static void ir_clear(void) {
++    nvn_hm_clear(&g_ir, free);
++    for (int l = 0; l < 2; l++) { nvn_hm_clear(&g_ir_lv[l].map, NULL); g_ir_lv[l].order_n = 0; }
++    g_ir_node_n = 0; g_ir_live = 0;
++}
++static void ir_index_add(ir_ent *e) {   // brand-new entry e (e->n > 0, e->lo + e->n does not wrap)
++    uint64_t last = e->lo + e->n - 1;
++    int l = (last >> g_ir_shift[0]) - (e->lo >> g_ir_shift[0]) < IR_SPAN ? 0 : 1;
++    ir_level *lv = &g_ir_lv[l]; unsigned sh = g_ir_shift[l];
++    for (uint64_t r = e->lo >> sh, r1 = last >> sh; r <= r1; r++) {
++        uint32_t head = (uint32_t)(uintptr_t)nvn_hm_get(&lv->map, &r);
++        if (!head) ir_order_add(lv, r);
++        nvn_hm_put(&lv->map, &r, (void *)(uintptr_t)ir_node_push(e, head));
++    }
++    g_ir_live++;
++}
++static void ir_visit_bucket(ir_level *lv, uint64_t r, uint64_t dst, uint64_t last) {
++    uint32_t head = (uint32_t)(uintptr_t)nvn_hm_get(&lv->map, &r);
++    if (!head) return;
++    uint32_t new_head = head, prev = 0, cur = head;
++    while (cur) {
++        ir_node *nd = &g_ir_nodes[cur - 1];
++        uint32_t nxt = nd->next; ir_ent *e = nd->e;
++        g_ir_cand++;
++        if (!e->gpuw && dst <= e->lo + e->n - 1 && last >= e->lo) { e->gpuw = 1; g_ir_live--; }
++        if (e->gpuw) { if (prev) g_ir_nodes[prev - 1].next = nxt; else new_head = nxt; }
++        else prev = cur;
++        cur = nxt;
++    }
++    if (new_head != head) {
++        if (new_head) nvn_hm_put(&lv->map, &r, (void *)(uintptr_t)new_head);
++        else nvn_hm_del(&lv->map, &r);
++    }
++}
+ static void vc_gpu_write(uint64_t dst, uint64_t n) {   // pend_add: a GPU write queued on [dst, dst + n)
+     vk_gpu_write(dst, n ? n : 1);
+-    if (!n || !g_ir.n || !vc_rgn_hit(dst, n)) return;
+-    for (uint32_t i = 0; i < g_ir.cap; i++) { ir_ent *e = g_ir.vals[i]; if (e && dst < e->lo + e->n && dst + n > e->lo) e->gpuw = 1; }
++    if (!n || !g_ir_live) return;
++    uint64_t last = n > UINT64_MAX - dst ? UINT64_MAX : dst + n - 1;
++    for (int l = 0; l < 2 && g_ir_live; l++) {
++        ir_level *lv = &g_ir_lv[l];
++        if (!lv->map.n) continue;
++        uint64_t r0 = dst >> g_ir_shift[l], r1 = last >> g_ir_shift[l];
++        if (r1 - r0 >= IR_SPAN) {
++            for (uint32_t i = ir_order_lower(lv, r0); i < lv->order_n && lv->order[i] <= r1 && g_ir_live; i++)
++                ir_visit_bucket(lv, lv->order[i], dst, last);
++        } else {
++            for (uint64_t r = r0; r <= r1 && g_ir_live; r++) ir_visit_bucket(lv, r, dst, last);
++        }
++    }
+ }
+ static void ix_minmax(const void *p, int isz, int32_t count, uint32_t *mn, uint32_t *mx) {
+     uint32_t a = UINT32_MAX, b = 0;
+@@ -10396,7 +10472,7 @@ static void ix_minmax(const void *p, int isz, int32_t count, uint32_t *mn, uint3
+ // Smallest and largest index of a direct indexed draw whose indices no GPU write queued in this submission covers; 0 = not known (the whole bound range is converted)
+ static int ix_range(const p_draw_idx *di, uint32_t *mn, uint32_t *mx) {
+     int isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4; uint64_t n = (uint64_t)di->count * (uint64_t)isz;
+-    if (di->ind || di->mdi_cnt || di->count <= 0 || !di->ibuf || pend_hits(di->ibuf, n)) return 0;
++    if (di->ind || di->mdi_cnt || di->count <= 0 || !di->ibuf || n > UINT64_MAX - di->ibuf || pend_hits(di->ibuf, n)) return 0;
+     const void *p = (const void *)(uintptr_t)di->ibuf;
+     ir_key k = {di->ibuf, di->count, di->itype}; ir_ent *e = nvn_hm_get(&g_ir, &k); uint64_t now = nvn_dirty_now();
+     if (e && e->gpuw) return 0;
+@@ -10408,8 +10484,15 @@ static int ix_range(const p_draw_idx *di, uint32_t *mn, uint32_t *mx) {
+     }
+     const void *span = nvn_dirty_span(p, (size_t)n);
+     if (!span) return 0;   // not in a tracked memory pool
+-    if (!e) { if (g_ir.n >= 1 << 16) { nvn_hm_clear(&g_ir, free); memset(g_vc_rgn, 0, sizeof g_vc_rgn); } e = calloc(1, sizeof *e); nvn_hm_put(&g_ir, &k, e); }
+-    e->stamp = e->seen = nvn_dirty_now(); nvn_dirty_protect(p, (size_t)n); e->span = span; e->lo = di->ibuf; e->n = n; vc_rgn_mark(e->lo, e->n);   // take the stamp, protect, then read (as pkg_upload)
++    if (!e) {
++        if (g_ir.n >= IR_MAX) ir_clear();
++        e = calloc(1, sizeof *e);
++        if (!e) MDIE("no memory for the index-range cache");
++        e->lo = di->ibuf; e->n = n;
++        nvn_hm_put(&g_ir, &k, e);
++        ir_index_add(e);
++    }
++    e->stamp = e->seen = nvn_dirty_now(); nvn_dirty_protect(p, (size_t)n); e->span = span;   // take the stamp, protect, then read (as pkg_upload)
+     ix_minmax(p, isz, di->count, &e->mn, &e->mx); *mn = e->mn; *mx = e->mx;
+     return 1;
+ }
+@@ -22581,7 +22664,7 @@ void dm_gfx_teardown(void) { @autoreleasepool {
+     g_cpu_tex_n = 0;
+     pthread_mutex_unlock(&g_cpu_tex_mu);
+     nvn_hm_clear(&g_vbuf_unaligned, free);
+-    nvn_hm_clear(&g_ir, free);
++    ir_clear();   // engine-patches/0530: the index ranges and their page index (b4588a53), which would otherwise point at freed entries
+     nvn_hm_clear(&g_pso, hm_rel);
+     nvn_hm_clear(&g_dss, hm_rel);
+     nvn_hm_clear(&g_pso_fail, hm_rel);
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+index 5d9706c0af3ca811d8040ce45f2dcb1eca136f3e..b71971a1341fd14711724f3893a28b538b509c17 100644
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -860,6 +860,9 @@ check_t_float_pad: RUN_ENV = MTL_DEBUG_LAYER=1
+ # Kept vertex conversions: kept from the second submission, equal to vconv_elem, dropped by a write to the source (game, host or GPU), left by a write beside it.
+ t_vconv_keep: t_vconv_keep.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_vconv_keep.m $(MTL_T_SRC) $(FW)
++# Index-range cache GPU-write reverse index (ix_range / vc_gpu_write): exact half-open byte overlap, 4 KB / 1 MB boundaries, wide writes, re-protection, unlinking, and IR_MAX clear.
++t_ir_gpu_write: t_ir_gpu_write.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_ir_gpu_write.m $(MTL_T_SRC) $(FW)
+ # The alpha test through the replay (t_alpha.m), with its shaders from test_dmsh_alpha.py
+ t_alpha: t_alpha.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_alpha.m $(MTL_T_SRC) $(FW)
+diff --git a/dm/gfx/tests/t_ir_gpu_write.m b/dm/gfx/tests/t_ir_gpu_write.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..59a873ad65d8591cf8d82b3a5f3ded32a27afe88
+--- /dev/null
++++ b/dm/gfx/tests/t_ir_gpu_write.m
+@@ -0,0 +1,126 @@
++// Index-range cache GPU-write reverse index (ix_range / vc_gpu_write): exact half-open byte overlap, 4 KB page and 1 MB wide-entry boundaries, wide-write binary search,
++// CPU-dirty re-protection without duplicate registration, dead-entry unlinking, overflow guards, and clearing at IR_MAX (65,536 entries)
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(label, c) do { checks++; if (!(c)) { failed++; printf("FAIL: %s\n", label); } } while (0)
++
++static p_draw_idx make_di(uint64_t ibuf, int32_t count, int32_t itype) {
++    p_draw_idx di; memset(&di, 0, sizeof di);
++    di.ibuf = ibuf; di.count = count; di.itype = itype;
++    return di;
++}
++
++int main(void) { @autoreleasepool {
++    const size_t poolsize = 4u << 20;   // 4 MiB, aligned to 1 MiB so 4 KB and 1 MB boundaries are exact
++    uint8_t *mem = NULL;
++    if (posix_memalign((void **)&mem, 1u << 20, poolsize)) abort();
++    for (size_t i = 0; i < poolsize / 2; i++) ((uint16_t *)mem)[i] = (uint16_t)(i & 1023);
++    nvn_dirty_add_range(mem, poolsize);
++    uint64_t base = (uint64_t)(uintptr_t)mem;
++    uint32_t mn = 0, mx = 0;
++
++    // 1. Half-open byte boundaries & adjacent writes (level 0: single 4 KB page)
++    p_draw_idx d0 = make_di(base + 0x100, 16, 1);   // [base+0x100, base+0x120)
++    CHECK("small entry cached", ix_range(&d0, &mn, &mx) && g_ir.n == 1 && g_ir_live == 1 && g_ir_lv[0].map.n == 1 && g_ir_lv[1].map.n == 0);
++    vc_gpu_write(base + 0x0e0, 0x20);   // [base+0x0e0, base+0x100): adjacent left
++    vc_gpu_write(base + 0x120, 0x20);   // [base+0x120, base+0x140): adjacent right
++    vc_gpu_write(base + 0x100, 0);      // zero-length write
++    vc_gpu_write(UINT64_MAX - 8, 64);   // wrapping high-address write
++    CHECK("adjacent, zero-length, and wrapping writes leave entry intact", ix_range(&d0, &mn, &mx) && g_ir_live == 1);
++
++    // Write to another 4 KB page in the SAME 1 MB region: 0 candidates inspected
++    uint64_t cand0 = g_ir_cand;
++    vc_gpu_write(base + 0x4000, 64);
++    CHECK("write to sibling 4 KB page in same 1 MB region checks 0 candidates", g_ir_cand == cand0 && ix_range(&d0, &mn, &mx));
++
++    // 1-byte write at exact last byte invalidates d0 and unlinks it
++    vc_gpu_write(base + 0x11f, 1);
++    CHECK("1-byte write at last byte invalidates entry", !ix_range(&d0, &mn, &mx) && g_ir_live == 0 && g_ir_lv[0].map.n == 0);
++    cand0 = g_ir_cand;
++    vc_gpu_write(base + 0x100, 32);
++    CHECK("dead entry unlinked: repeated write checks 0 candidates", g_ir_cand == cand0);
++
++    // 2. Multi-page entry crossing a 4 KB boundary (level 0) + re-using an emptied page without duplicating order
++    p_draw_idx d1 = make_di(base + 0xff0, 16, 1);   // [base+0xff0, base+0x1010): spans pages 0 and 1
++    uint32_t order_before = g_ir_lv[0].order_n;
++    CHECK("cross-page entry cached across 2 pages", ix_range(&d1, &mn, &mx) && g_ir_live == 1 && g_ir_lv[0].map.n == 2 && g_ir_lv[0].order_n == order_before + 1);
++    // CPU-dirty re-protection must NOT insert duplicate reverse-index nodes
++    uint32_t nodes_before = g_ir_node_n;
++    dm_guest_write_prepare(mem + 0xff0, 2);
++    *(uint16_t *)(mem + 0xff0) = 9999;
++    CHECK("CPU-dirty re-protect updates range without duplicate index nodes", ix_range(&d1, &mn, &mx) && mx == 9999 && g_ir_node_n == nodes_before && g_ir_live == 1);
++    // Invalidate via the second page, then touch the first page to verify dead node unlinks cleanly without double-decrement
++    vc_gpu_write(base + 0x1000, 4);
++    CHECK("write to second page invalidates cross-page entry", !ix_range(&d1, &mn, &mx) && g_ir_live == 0 && g_ir_lv[0].map.n == 1);
++    // Add another live entry on page 0 so g_ir_live > 0, then write page 0 (non-overlapping with d2) to sweep d1's dead node
++    p_draw_idx d2 = make_di(base + 0x200, 8, 1);
++    CHECK("new entry on page 0 cached", ix_range(&d2, &mn, &mx) && g_ir_live == 1);
++    vc_gpu_write(base + 0xff0, 4);
++    CHECK("dead node swept from page 0 without hurting live sibling or g_ir_live", ix_range(&d2, &mn, &mx) && g_ir_live == 1);
++
++    // 3. Wide entry spanning > IR_SPAN (8) 4 KB pages and crossing a 1 MB region boundary (level 1)
++    uint64_t w_lo = base + (1u << 20) - 0x4000;   // starts 16 KB before 1 MB boundary
++    p_draw_idx dw = make_di(w_lo, 24576, 1);      // 48 KB = 12 pages, spans regions 0 and 1
++    CHECK("wide cross-1MB entry indexed at level 1 across 2 regions", ix_range(&dw, &mn, &mx) && g_ir_lv[1].map.n == 2);
++    vc_gpu_write(w_lo - 16, 16);                  // adjacent left
++    vc_gpu_write(w_lo + 49152, 16);               // adjacent right
++    CHECK("adjacent writes leave wide entry intact", ix_range(&dw, &mn, &mx));
++    vc_gpu_write(base + (1u << 20) + 0x7fff, 1);  // last byte in second 1 MB region
++    CHECK("write in second 1 MB region invalidates wide entry", !ix_range(&dw, &mn, &mx));
++
++    // 4. Wide writes (>= IR_SPAN pages) use sorted-order binary search and only hit overlapping entries
++    ir_clear();
++    p_draw_idx left = make_di(base + 0x2000, 8, 1);                // page 2
++    p_draw_idx mid  = make_di(base + 0x100000 + 0x3000, 8, 1);     // 1 MB + page 3
++    p_draw_idx rght = make_di(base + 0x200000 + 0x4000, 8, 1);     // 2 MB + page 4
++    p_draw_idx midw = make_di(base + 0x120000, 32768, 1);          // 64 KB wide entry in region 1
++    CHECK("four test entries cached", ix_range(&left, &mn, &mx) && ix_range(&mid, &mn, &mx) && ix_range(&rght, &mn, &mx) && ix_range(&midw, &mn, &mx) && g_ir_live == 4);
++    vc_gpu_write(base + 0x080000, 0x100000);   // 1 MB write [0.5 MB, 1.5 MB): covers mid and midw, spares left and rght
++    CHECK("wide write invalidates only entries in its span", ix_range(&left, &mn, &mx) && !ix_range(&mid, &mn, &mx) && !ix_range(&midw, &mn, &mx) && ix_range(&rght, &mn, &mx) && g_ir_live == 2);
++
++    // Wide write spanning >= IR_SPAN (8) 1 MB regions exercises level 1's sorted-order binary search
++    p_draw_idx w_low  = make_di(base + 0x10000, 32768, 1);     // 64 KB in region 0
++    p_draw_idx w_high = make_di(base + 0x220000, 32768, 1);    // 64 KB in region 2
++    CHECK("two wide entries cached at level 1", ix_range(&w_low, &mn, &mx) && ix_range(&w_high, &mn, &mx) && g_ir_lv[1].map.n == 2);
++    vc_gpu_write(base + 0x200000, 16u << 20);   // 16 MB write [base + 2 MB, base + 18 MB): hits w_high and rght, spares w_low and left
++    CHECK("level-1 wide write invalidates only overlapping wide/small entries", ix_range(&w_low, &mn, &mx) && !ix_range(&w_high, &mn, &mx) && ix_range(&left, &mn, &mx) && !ix_range(&rght, &mn, &mx));
++
++    // Integration through pend_add (the production caller of vc_gpu_write)
++    pend_reset();
++    pend_add(base + 0x2000, 4, 1);
++    pend_reset();
++    CHECK("pend_add invalidates overlapping cached index range", !ix_range(&left, &mn, &mx) && ix_range(&w_low, &mn, &mx));
++
++    // 5. Fill cache to IR_MAX (65,536 entries) in region 0, verify O(1) sibling writes, then overflow-clear
++    ir_clear();
++    for (uint32_t i = 0; i < IR_MAX; i++) {
++        // Place 65,536 distinct keys across [base + 0x10000, base + 0x50000) (pages 16..79 in region 0)
++        p_draw_idx di = make_di(base + 0x10000 + (uint64_t)i * 4, 2, 1);
++        if (!ix_range(&di, &mn, &mx)) { CHECK("fill to IR_MAX", 0); break; }
++    }
++    CHECK("cache filled to IR_MAX", g_ir.n == IR_MAX && g_ir_live == IR_MAX);
++    cand0 = g_ir_cand;
++    for (int i = 0; i < 1000; i++) vc_gpu_write(base + 0x80000 + (uint64_t)(i & 15) * 64, 64);   // same 1 MB region, different 4 KB pages
++    CHECK("1000 writes in same 1 MB region on sibling pages check 0 candidates", g_ir_cand == cand0);
++    // Invalidate one specific entry out of 65,536: only its 4 KB page's entries are inspected, not all 65,536
++    cand0 = g_ir_cand;
++    vc_gpu_write(base + 0x10000, 4);
++    CHECK("targeted write checks only one 4 KB page (<= 1024 entries), not full table", g_ir_cand - cand0 == 1024 && g_ir_live == IR_MAX - 1);
++    p_draw_idx hit0 = make_di(base + 0x10000, 2, 1), keep1 = make_di(base + 0x10004, 2, 1);
++    CHECK("targeted write invalidates only overlapping entry", !ix_range(&hit0, &mn, &mx) && ix_range(&keep1, &mn, &mx));
++
++    // 65,537th entry clears both g_ir and the reverse index cleanly
++    p_draw_idx after = make_di(base + 0x300000, 8, 1);
++    CHECK("IR_MAX overflow clears cache and reverse index cleanly",
++          ix_range(&after, &mn, &mx) && g_ir.n == 1 && g_ir_live == 1 && g_ir_lv[0].map.n == 1 && g_ir_lv[1].map.n == 0 && g_ir_node_n == 1);
++    vc_gpu_write(base + 0x300000, 16);
++    CHECK("post-clear entry invalidates normally", !ix_range(&after, &mn, &mx) && g_ir_live == 0);
++
++    printf("%d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }

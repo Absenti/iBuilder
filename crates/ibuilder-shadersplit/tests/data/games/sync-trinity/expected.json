@@ -1,0 +1,20 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/ps_arc.bin": "2e1dc0465e1a3164e1df6784355108c284667f8261da0b2beaa4c178b62ec1ac",
+  "pkg/ps_data.bin": "8734f12c92a825aa44ded94c2d99aca7c97592798567e6503d7a30ad91a98032",
+  "pkg/vs_arc.bin": "dfb392e915315bfceda72a10f01ea8fc5642de715d6df12eade9b25873e7253d",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f2ba7b14c9b0912d59d94603955272d90ab8f1b5b538d5f541340e5c62f089cb",
+  "tables/shader_map.tsv": "a336430c72c1ab7b11caad21e62c812a49ae8799f30dd289e4c7370b93724197",
+  "tables/shader_pairs.tsv": "a943f36cf0034452a97c663b3f0be2f5ce90772b91994651cdaede5c9674a06b"
+ },
+ "log": [
+  "[RED] /arc/data.trpfs#arc/pack_c.trpak: file 1 has compression 0 (5 \u2192 9 bytes), which is not known (its shaders are left out)",
+  "[RED] 1 file(s) could not be read, their shaders are left out (first: /arc/data.trpfs#arc/pack_c.trpak: file 1 has compression 0 (5 \u2192 9 bytes), which is not known)",
+  "single-stage programs: 4 vertex shaders are paired with a cover of 1 pixel shader(s) (4a4060905bb358c5)",
+  "shaders: 7 (pixel 3, vertex 4); sources arc 6, data 1; compute shader answers 0 rows; variation pairs 4"
+ ],
+ "shaders": 7,
+ "updates": []
+}

@@ -1,0 +1,24 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/ps_data.bin": "8436d895884ea2e60d4b15aa641c19c349fb9bae4e4fe49c50dcbb6d8bc266b0",
+  "pkg/vs_data.bin": "7bcfd994c39527710d4f756cba107e7adbe278bd5b584bbebca2513e0d4b33fc",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f2ba7b14c9b0912d59d94603955272d90ab8f1b5b538d5f541340e5c62f089cb",
+  "tables/shader_map.tsv": "41243468079b331787c3e705f3b6c8be4ae7cf5d985ac0ec555ab2f601a0f1e8",
+  "tables/shader_pairs.tsv": "60adf6cfc25f44e31eafe480ec5ce2252257c309471adffeaa274918d7943d08"
+ },
+ "log": [
+  "[RED] /Data/broken.cpk: the CPK cannot be read (@ROMFS@/Data/broken.cpk: no TOC (ITOC only is not read)); scanned as one file",
+  "[RED] /Data/data000.cpk/bad/trunc.dat: string index out of range; not scanned",
+  "[RED] /Data/data000.cpk/bad/size.dat: @ROMFS@/Data/data000.cpk#bad/size.dat: 3336 bytes, the TOC says 3341; not scanned",
+  "[RED] /Data/data000.cpk/bad/plain.bin: not CRILAYLA; not scanned",
+  "[RED] /Data/data001.cpk/pl/y.dat: @ROMFS@/Data/data001.cpk#pl/y.dat: 3592 bytes, the TOC says 2991; not scanned",
+  "[RED] Data/jobfail.cpk: error: unpack_from requires a buffer of at least 16 bytes for unpacking 8 bytes at offset 8 (actual buffer size is 12) (its shaders are left out)",
+  "[RED] 1 file(s) could not be read, their shaders are left out (first: Data/jobfail.cpk: error: unpack_from requires a buffer of at least 16 bytes for unpacking 8 bytes at offset 8 (actual buffer size is 12))",
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (99c3923ff5bf209a)",
+  "shaders: 12 (pixel 6, vertex 6); sources data 12; compute shader answers 0 rows; variation pairs 3"
+ ],
+ "shaders": 12,
+ "updates": []
+}

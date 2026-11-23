@@ -1,0 +1,30 @@
+; A vertex shader that stores gl_InstanceIndex (as a uint) into its output at location 1, the one the geometry stage of e.geom routes to the viewport:
+; vk_shaders.py instance_locations finds location 1 and writes the variant vk_<key>_vp1 with that output as [[viewport_array_index]].
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %pos %inst %out_pos %out_vp
+               OpDecorate %pos Location 0
+               OpDecorate %inst BuiltIn InstanceIndex
+               OpDecorate %out_pos BuiltIn Position
+               OpDecorate %out_vp Location 1
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+         %v4 = OpTypeVector %float 4
+       %uint = OpTypeInt 32 0
+    %p_in_v4 = OpTypePointer Input %v4
+     %p_in_u = OpTypePointer Input %uint
+   %p_out_v4 = OpTypePointer Output %v4
+    %p_out_u = OpTypePointer Output %uint
+        %pos = OpVariable %p_in_v4 Input
+       %inst = OpVariable %p_in_u Input
+    %out_pos = OpVariable %p_out_v4 Output
+     %out_vp = OpVariable %p_out_u Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %p = OpLoad %v4 %pos
+               OpStore %out_pos %p
+          %i = OpLoad %uint %inst
+               OpStore %out_vp %i
+               OpReturn
+               OpFunctionEnd

@@ -1,3 +1,5 @@
+<!-- Title: <type>(<optional scope>): <summary>, 72 characters at most (feat, fix, chore, docs, refactor, perf, test, build, ci, style, revert): CONTRIBUTING.md. -->
+
 ## What and why
 
 <!-- One change per pull request. What does it do, and why? -->

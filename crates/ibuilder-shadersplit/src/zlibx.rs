@@ -325,32 +325,38 @@ fn symbols(
     }
 }
 
-fn run(b: &mut Bits<'_>, out: &mut Vec<u8>, lim: usize) -> Result<Flow, Stop> {
+/// `wrapped`: a zlib stream (header, Adler-32); else a raw deflate stream (`wbits = -15`), which ends with its last block
+fn run(b: &mut Bits<'_>, out: &mut Vec<u8>, lim: usize, wrapped: bool) -> Result<Flow, Stop> {
     // HEAD
-    let h = match b.bits(16) {
-        Some(h) => h,
-        None => return Ok(Flow::Trunc),
-    };
-    let (cmf, flg) = (h & 0xff, h >> 8);
-    if (cmf << 8 | flg) % 31 != 0 {
-        return Err(Stop::Data("incorrect header check"));
-    }
-    if cmf & 15 != 8 {
-        return Err(Stop::Data("unknown compression method"));
-    }
-    if (cmf >> 4) + 8 > 15 {
-        return Err(Stop::Data("invalid window size"));
-    }
-    if flg & 0x20 != 0 {
-        return match b.bits(32) {
-            Some(_) => Err(Stop::NeedDict),
-            None => Ok(Flow::Trunc),
+    if wrapped {
+        let h = match b.bits(16) {
+            Some(h) => h,
+            None => return Ok(Flow::Trunc),
         };
+        let (cmf, flg) = (h & 0xff, h >> 8);
+        if (cmf << 8 | flg) % 31 != 0 {
+            return Err(Stop::Data("incorrect header check"));
+        }
+        if cmf & 15 != 8 {
+            return Err(Stop::Data("unknown compression method"));
+        }
+        if (cmf >> 4) + 8 > 15 {
+            return Err(Stop::Data("invalid window size"));
+        }
+        if flg & 0x20 != 0 {
+            return match b.bits(32) {
+                Some(_) => Err(Stop::NeedDict),
+                None => Ok(Flow::Trunc),
+            };
+        }
     }
     let mut last = false;
     loop {
         // TYPE
         if last {
+            if !wrapped {
+                return Ok(Flow::Done);
+            }
             b.align();
             let a = match b.bits(32) {
                 Some(a) => a.swap_bytes(),
@@ -418,6 +424,15 @@ fn run(b: &mut Bits<'_>, out: &mut Vec<u8>, lim: usize) -> Result<Flow, Stop> {
 
 /// `zlib.decompressobj().decompress(data)` / `.decompress(data, max_length)`, one call: the output, `eof` and the bytes used, or the error text Python raises
 pub fn decompress(data: &[u8], max_length: Option<usize>) -> Result<Z, String> {
+    decompress_wrapped(data, max_length, true)
+}
+
+/// [`decompress`] of a raw deflate stream (no header, no Adler-32): `zlib.decompressobj(-15).decompress(data[, max_length])` (TT Games' DFLT chunks, CRA and RPF6 members)
+pub fn decompress_raw(data: &[u8], max_length: Option<usize>) -> Result<Z, String> {
+    decompress_wrapped(data, max_length, false)
+}
+
+fn decompress_wrapped(data: &[u8], max_length: Option<usize>, wrapped: bool) -> Result<Z, String> {
     let mut b = Bits {
         d: data,
         pos: 0,
@@ -425,7 +440,7 @@ pub fn decompress(data: &[u8], max_length: Option<usize>) -> Result<Z, String> {
         n: 0,
     };
     let mut out = Vec::new();
-    match run(&mut b, &mut out, max_length.unwrap_or(usize::MAX)) {
+    match run(&mut b, &mut out, max_length.unwrap_or(usize::MAX), wrapped) {
         Ok(Flow::Done) => Ok(Z {
             out,
             eof: true,

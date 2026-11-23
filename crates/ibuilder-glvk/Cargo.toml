@@ -1,0 +1,34 @@
+[package]
+name = "ibuilder-glvk"
+description = "Stage 3 for games without NVN shader binaries: the engine's gfx/tools/vk_shaders.py (SPIR-V -> MSL + the Vulkan layer's table), gl_shaders.py (GLSL -> MSL + the GL layer's table, with mvgl.py) and idtech4_programs.py in Rust, byte-identical"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# `ProcessLayerTools`: spirv-cross and glslangValidator as child processes (Mac CLI and tests). The library has no process API (iOS).
+host-tools = []
+
+[dependencies]
+# the NSO loader (`nso.load(...).image`, `.segments`)
+ibuilder-nso = { path = "../ibuilder-nso" }
+# `syms::dynsyms`: main's imports, which say the game's graphics API (game.rs)
+ibuilder-profile = { path = "../ibuilder-profile" }
+# `ToolRun`, the (rc, stdout, stderr) of a native tool, as the NVN chain's tools return it
+ibuilder-shader = { path = "../ibuilder-shader" }
+# the RomFS reader (`DMROMFS1` images read in place, or a folder): `image::walk_root`, `Loc::open`
+ibuilder-shadersplit = { path = "../ibuilder-shadersplit" }
+regex = "1"
+sha2 = { workspace = true }
+serde_json = "1"
+rayon = { workspace = true }
+lz4_flex = { workspace = true }
+
+[dev-dependencies]
+ibuilder-testkit = { path = "../ibuilder-testkit" }
+
+[[bin]]
+name = "glvk"
+path = "src/bin/glvk.rs"
+required-features = ["host-tools"]

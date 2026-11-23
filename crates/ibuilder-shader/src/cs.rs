@@ -661,3 +661,475 @@ mod tg_tests {
         assert!(total > t::TG_MAX as u64, "{total}");
     }
 }
+
+// ------------------------------------------------------------------------------------------------------------------------------ compute_loops
+
+/// one contained loop (`compute_loops`' loop sites, the compute reflection's `loop_sites`)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopSite {
+    pub site: u32,
+    pub function: String,
+    pub line: usize,
+    pub barrier: bool,
+}
+
+impl LoopSite {
+    /// `{'site', 'function', 'line', 'barrier'}` (in that order where serde_json keeps insertion order, its `preserve_order` feature)
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        m.insert("site".into(), self.site.into());
+        m.insert("function".into(), self.function.clone().into());
+        m.insert("line".into(), self.line.into());
+        m.insert("barrier".into(), self.barrier.into());
+        serde_json::Value::Object(m)
+    }
+}
+
+/// Python `\s` / `str.isspace` on the ASCII the MSL is written in
+fn py_space(c: u8) -> bool {
+    is_space(c) || (0x1c..=0x1f).contains(&c)
+}
+
+fn py_strip(s: &str) -> &str {
+    s.trim_matches(|c: char| {
+        c.is_ascii() && py_space(c as u8) || !c.is_ascii() && c.is_whitespace()
+    })
+}
+
+fn skip_py_space(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && py_space(b[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// `_LOOP_COMMENT.sub(lambda m: re.sub(r'[^\n]', ' ', m[0]), text)`: comments and strings blanked byte for byte, their newlines kept (`pool::mask_comments`)
+fn loop_code(text: &str) -> String {
+    crate::pool::mask_comments(text)
+}
+
+/// `rf'\b{re.escape(n)}\s*(?:<[^;\n()]*>)?\s*\('` finditer: the end of each match (just after its `(`)
+fn call_ends(text: &str, n: &str, first_only: bool) -> Vec<usize> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(p) = find(text, n, from) {
+        from = p + 1;
+        if in_word(b, p) {
+            continue;
+        }
+        let k = skip_py_space(b, p + n.len());
+        let open = if k < b.len() && b[k] == b'(' {
+            Some(k)
+        } else if k < b.len() && b[k] == b'<' {
+            // the template argument run stops at the first `;`, newline, `(` or `)`; its last non-space character must be the `>`, and a `(` must follow after spaces
+            let t = b[k + 1..]
+                .iter()
+                .position(|&c| matches!(c, b';' | b'\n' | b'(' | b')'))
+                .map_or(b.len(), |x| k + 1 + x);
+            let mut g = t;
+            while g > k + 1 && py_space(b[g - 1]) {
+                g -= 1;
+            }
+            let u = skip_py_space(b, t);
+            (g > k + 1 && b[g - 1] == b'>' && u < b.len() && b[u] == b'(').then_some(u)
+        } else {
+            None
+        };
+        if let Some(o) = open {
+            out.push(o + 1);
+            if first_only {
+                break;
+            }
+            from = o + 1;
+        }
+    }
+    out
+}
+
+fn uses(text: &str, n: &str) -> bool {
+    !call_ends(text, n, true).is_empty()
+}
+
+/// `\b(?:threadgroup|simdgroup)_barrier\s*\(` anywhere
+fn has_barrier(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut from = 0;
+    while let Some(p) = find_b(b, b"group_barrier", from) {
+        from = p + 1;
+        let w = if p >= 6 && &b[p - 6..p] == b"thread" {
+            p - 6
+        } else if p >= 4 && &b[p - 4..p] == b"simd" {
+            p - 4
+        } else {
+            continue;
+        };
+        let k = skip_py_space(b, p + 13);
+        if !in_word(b, w) && k < b.len() && b[k] == b'(' {
+            return true;
+        }
+    }
+    false
+}
+
+/// `_LOOP` `\b(for|while)\s*\(` finditer: (start, end, is `for`)
+fn loop_matches(masked: &str) -> Vec<(usize, usize, bool)> {
+    let b = masked.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let kw = if starts(b, i, "for") {
+            Some((3, true))
+        } else if starts(b, i, "while") {
+            Some((5, false))
+        } else {
+            None
+        };
+        if let Some((len, is_for)) = kw
+            && !in_word(b, i)
+        {
+            let k = skip_py_space(b, i + len);
+            if k < b.len() && b[k] == b'(' {
+                out.push((i, k + 1, is_for));
+                i = k + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn loop_err(msg: impl Into<String>) -> PostError {
+    failed("compute_loops", msg)
+}
+
+fn not_closed() -> PostError {
+    loop_err("dmsh_hmma16816_f16: block not closed")
+}
+
+/// dmsh_rewrite.compute_loops: compute loop containment. Every loop of `main0` and of the helpers it reaches gets a per-function budget (`dm_lg_go`: past LOOP_CAP iterations, or once
+/// another kernel of the submission raised the abort word, the loop ends) and a loop holding an execution barrier its own one (`dm_lg_cap`, which only raises the abort); the state
+/// (`dm_loop_state`: the abort word's pointer, the kernel's first hit site) comes in at buffer LOOP_SLOT and is passed down to every guarded helper. Returns the text and the loop
+/// sites (the reflection's `loop_sites`); a source with no compute `main0` or no loop is returned as it is. Errors: `compute_loops` (finish(): "compute loop containment failed"),
+/// and `compute_loops (KeyError)` for a `main0` whose body brace is not on a line of its own (a KeyError the Python does not catch: the build stops).
+pub fn compute_loops(msl: &str) -> Result<(String, Vec<LoopSite>), PostError> {
+    let mb = msl.as_bytes();
+    // `^kernel\s+void\s+main0\s*\(` (re.M)
+    let kernel = {
+        let mut from = 0;
+        let mut found = false;
+        while let Some(p) = find_b(mb, b"kernel", from) {
+            from = p + 1;
+            if p != 0 && mb[p - 1] != b'\n' {
+                continue;
+            }
+            let k = skip_py_space(mb, p + 6);
+            if k == p + 6 || !starts(mb, k, "void") {
+                continue;
+            }
+            let k2 = skip_py_space(mb, k + 4);
+            if k2 == k + 4 || !starts(mb, k2, "main0") {
+                continue;
+            }
+            let k3 = skip_py_space(mb, k2 + 5);
+            if k3 < mb.len() && mb[k3] == b'(' {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !kernel {
+        return Ok((msl.to_string(), Vec::new()));
+    }
+    // (name, op, close, body, end) of every function whose brace stands alone on the line after its parameter list
+    struct F {
+        name: String,
+        op: usize,
+        close: usize,
+        body: usize,
+        end: usize,
+    }
+    let mut fns: Vec<F> = Vec::new();
+    let mut from = 0;
+    while let Some(p) = find_b(mb, b"\n{\n", from) {
+        from = p + 1;
+        if p == 0 || mb[p - 1] != b')' {
+            continue;
+        }
+        let close = p - 1;
+        let (mut depth, mut op) = (1i64, close);
+        while depth != 0 && op != 0 {
+            op -= 1;
+            depth += (mb[op] == b')') as i64 - (mb[op] == b'(') as i64;
+        }
+        // `(\w+)\s*$` in msl[:op]
+        let mut w1 = op;
+        while w1 > 0 && py_space(mb[w1 - 1]) {
+            w1 -= 1;
+        }
+        let mut w0 = w1;
+        while w0 > 0 && is_word(mb[w0 - 1]) {
+            w0 -= 1;
+        }
+        if w0 == w1 {
+            continue;
+        }
+        let body = p + 2;
+        let end = block_end(mb, body - 1).ok_or_else(not_closed)?;
+        fns.push(F {
+            name: msl[w0..w1].to_string(),
+            op,
+            close,
+            body,
+            end,
+        });
+    }
+    let mut names: Vec<String> = fns.iter().map(|f| f.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    let mut bodies: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    for f in &fns {
+        bodies
+            .entry(f.name.as_str())
+            .or_default()
+            .push_str(&loop_code(&msl[f.body..f.end]));
+    }
+    let calls: std::collections::HashMap<&str, std::collections::BTreeSet<&str>> = names
+        .iter()
+        .map(|n| {
+            let body = &bodies[n.as_str()];
+            (
+                n.as_str(),
+                names
+                    .iter()
+                    .filter(|c| uses(body, c))
+                    .map(|c| c.as_str())
+                    .collect(),
+            )
+        })
+        .collect();
+    use std::collections::BTreeSet;
+    fn grow<'n>(
+        names: &'n [String],
+        seed: BTreeSet<&'n str>,
+        edge: &dyn Fn(&str, &BTreeSet<&'n str>) -> bool,
+    ) -> BTreeSet<&'n str> {
+        let mut found = seed;
+        loop {
+            let more: Vec<&str> = names
+                .iter()
+                .map(|n| n.as_str())
+                .filter(|n| !found.contains(n) && edge(n, &found))
+                .collect();
+            if more.is_empty() {
+                return found;
+            }
+            found.extend(more);
+        }
+    }
+    if !calls.contains_key("main0") {
+        return Err(failed("compute_loops (KeyError)", "KeyError: 'main0'"));
+    }
+    let reach = grow(&names, BTreeSet::from(["main0"]), &|n, s| {
+        s.iter().any(|c| calls[c].contains(n))
+    });
+    let loops: BTreeSet<&str> = reach
+        .iter()
+        .copied()
+        .filter(|n| !loop_matches(&bodies[n]).is_empty())
+        .collect();
+    let called = |n: &str, s: &BTreeSet<&str>| calls[n].iter().any(|c| s.contains(c));
+    let guarded: BTreeSet<&str> = grow(&names, loops.clone(), &called)
+        .intersection(&reach)
+        .copied()
+        .collect();
+    if loops.is_empty() {
+        return Ok((msl.to_string(), Vec::new()));
+    }
+    if contains(msl, &format!("[[buffer({})]]", t::LOOP_SLOT)) {
+        return Err(loop_err(format!(
+            "compute buffer {} is taken",
+            t::LOOP_SLOT
+        )));
+    }
+    let barriers = grow(
+        &names,
+        names
+            .iter()
+            .map(|n| n.as_str())
+            .filter(|n| has_barrier(&bodies[n]))
+            .collect(),
+        &called,
+    );
+    // the calls of guarded functions in `text`: (index of the call's `)`, the argument to insert there)
+    let call_edits = |text: &str| -> Result<Vec<(usize, String)>, PostError> {
+        let masked = loop_code(text);
+        let tb = text.as_bytes();
+        let mut out = Vec::new();
+        for c in &guarded {
+            for e in call_ends(&masked, c, false) {
+                let tail = close(tb, e, b'(', b')')
+                    .ok_or_else(|| loop_err(format!("loop containment: unclosed call to {c}")))?;
+                let comma = if py_strip(&text[e..tail - 1]).is_empty() {
+                    ""
+                } else {
+                    ", "
+                };
+                out.push((tail - 1, format!("{comma}dm_loop")));
+            }
+        }
+        Ok(out)
+    };
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut sites: Vec<LoopSite> = Vec::new();
+    for f in &fns {
+        let n = f.name.as_str();
+        if !guarded.contains(n) {
+            continue;
+        }
+        let b = f.body;
+        let param = format!(
+            "device dm_loop_state& dm_loop{}",
+            if n == "main0" {
+                format!(" [[buffer({})]]", t::LOOP_SLOT)
+            } else {
+                String::new()
+            }
+        );
+        let comma = if py_strip(&msl[f.op + 1..f.close]).is_empty() {
+            ""
+        } else {
+            ", "
+        };
+        edits.push((f.close, f.close, format!("{comma}{param}")));
+        let body = &msl[f.body..f.end];
+        let masked = loop_code(body);
+        let kb = masked.as_bytes();
+        let mut conditions: Vec<(usize, usize)> = Vec::new();
+        if loops.contains(n) {
+            edits.push((b, b, "\n    uint dm_lg = 0u;".to_string()));
+        }
+        for (ls, le, is_for) in loop_matches(&masked) {
+            let Some(c1) = close(kb, le, b'(', b')') else {
+                return Err(loop_err(format!(
+                    "loop containment: unclosed condition in {n}"
+                )));
+            };
+            let cl = c1 - 1;
+            let (mut lo, mut hi) = (le, cl);
+            if is_for {
+                let semis: Vec<usize> = (lo..hi).filter(|&i| kb[i] == b';').collect();
+                if semis.len() != 2 {
+                    return Err(loop_err(format!("loop containment: unknown loop in {n}")));
+                }
+                (lo, hi) = (semis[0] + 1, semis[1]);
+            }
+            let after = skip_py_space(kb, cl + 1);
+            let mut bl = ls;
+            while bl > 0 && py_space(kb[bl - 1]) {
+                bl -= 1;
+            }
+            // `before = masked[:loop.start()].rstrip()`: its length is `bl`
+            let mut begin = ls;
+            let end;
+            let inside: &str;
+            if !is_for && after < kb.len() && kb[after] == b';' && bl > 0 && kb[bl - 1] == b'}' {
+                // a do / while: its body backwards, nested blocks included
+                let (mut depth, mut start) = (1i64, bl - 1);
+                while depth != 0 && start != 0 {
+                    start -= 1;
+                    depth += (kb[start] == b'}') as i64 - (kb[start] == b'{') as i64;
+                }
+                // `\bdo\s*$` in masked[:start]
+                let mut d = start;
+                while d > 0 && py_space(kb[d - 1]) {
+                    d -= 1;
+                }
+                if !(d >= 2 && &kb[d - 2..d] == b"do" && !in_word(kb, d - 2)) {
+                    return Err(loop_err(format!("loop containment: no do in {n}")));
+                }
+                begin = d - 2;
+                end = after + 1;
+                inside = &masked[start..bl];
+            } else if after < kb.len() && kb[after] == b'{' {
+                end = block_end(kb, after).ok_or_else(not_closed)? + 1;
+                inside = &masked[after..end];
+            } else {
+                let Some(e) = find_b(kb, b";", after) else {
+                    return Err(loop_err(format!("loop containment: no loop body in {n}")));
+                };
+                inside = &masked[after..e];
+                end = e + 1;
+            }
+            let context = format!("{}{inside}", &masked[le..cl]);
+            let barrier = has_barrier(&context) || barriers.iter().any(|c| uses(&context, c));
+            let site = sites.len() as u32 + 1;
+            sites.push(LoopSite {
+                site,
+                function: n.to_string(),
+                line: count(&msl[..b + ls], "\n") + 1,
+                barrier,
+            });
+            let counter = if barrier {
+                format!("dm_lg_b{site}")
+            } else {
+                "dm_lg".to_string()
+            };
+            if barrier {
+                edits.push((b + begin, b + begin, format!("{{ uint {counter} = 0u; ")));
+                edits.push((b + end, b + end, " }".to_string()));
+            }
+            let check = format!(
+                "dm_lg_{}({counter}, dm_loop, {site}u)",
+                if barrier { "cap" } else { "go" }
+            );
+            let mut out = py_strip(&body[lo..hi]).to_string();
+            if out.is_empty() {
+                out = "true".to_string();
+            }
+            let mut ce = call_edits(&out)?;
+            ce.sort();
+            for (at, text) in ce.into_iter().rev() {
+                out.insert_str(at, &text);
+            }
+            edits.push((
+                b + lo,
+                b + hi,
+                format!("({out}) && {check} /* dm_loop_site {site}: {n} */"),
+            ));
+            conditions.push((lo, hi));
+        }
+        for (at, text) in call_edits(body)? {
+            if !conditions.iter().any(|&(lo, hi)| lo <= at && at <= hi) {
+                edits.push((b + at, b + at, text));
+            }
+        }
+    }
+    edits.sort();
+    let mut out = msl.to_string();
+    for (a, b, text) in edits.into_iter().rev() {
+        out.replace_range(a..b, &text);
+    }
+    // `^using namespace metal;\s*\n` (re.M): the helper goes after the last newline of the whitespace that follows
+    let ob = out.as_bytes();
+    let mut head = None;
+    let mut from = 0;
+    while let Some(p) = find_b(ob, b"using namespace metal;", from) {
+        from = p + 1;
+        if p != 0 && ob[p - 1] != b'\n' {
+            continue;
+        }
+        let ws_end = skip_py_space(ob, p + 22);
+        if let Some(nl) = ob[p + 22..ws_end].iter().rposition(|&c| c == b'\n') {
+            head = Some(p + 22 + nl + 1);
+            break;
+        }
+    }
+    let Some(h) = head else {
+        return Err(loop_err("loop containment: no metal namespace"));
+    };
+    out.insert_str(h, t::LOOP_HELPER);
+    Ok((out, sites))
+}

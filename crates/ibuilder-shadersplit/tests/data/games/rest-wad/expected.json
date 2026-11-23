@@ -1,0 +1,21 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "ce225c862b5732046779bbd83099d6ef705f7b3404d5019d9daf4d0ad66d975b",
+  "pkg/ps_data.bin": "8dc6673cd7947decf9ed6c0720839067ee24328e1329147742c4e11562a83b3c",
+  "pkg/vs_data.bin": "4959d619402a31c225fbd826259ecc73faab4f4a83c237fadebd12a7179b6427",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "2cd83af37e9b9a453625dd8cb02565e77674e00165baee4f69eec94350068aed",
+  "tables/shader_map.tsv": "a62fce2be066c17caf2fac5a2f27c9d9032380023b353bd289b2560c5e43bbaf",
+  "tables/shader_pairs.tsv": "5aa0373962553e0efbf27dc253b41c266a952c062b997b4f07f05d24b0e3e7a8"
+ },
+ "log": [
+  "[RED] /Data/b/out.wad.nx/shaders/a.vfp.nx: overlapping or unordered WAD shader members (its shaders are left out)",
+  "[RED] /Data/c/out.wad.nx/shaders/a.vfp.nx#VFP@0x160: invalid VFP record spans (its shaders are left out)",
+  "[RED] /Data/d/out.wad.nx: no VFP shader records (its shaders are left out)",
+  "[RED] 3 file(s) could not be read, their shaders are left out (first: /Data/b/out.wad.nx/shaders/a.vfp.nx: overlapping or unordered WAD shader members)",
+  "shaders: 5 (compute 1, pixel 2, vertex 2); sources data 5; compute shader answers 1 rows; variation pairs 0"
+ ],
+ "shaders": 5,
+ "updates": []
+}

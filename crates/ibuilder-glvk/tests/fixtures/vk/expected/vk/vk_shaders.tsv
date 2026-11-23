@@ -1,0 +1,10 @@
+# Vulkan shaders (dm/gfx/tools/vk_shaders.py): key = sha256(SPIR-V)[:16], Metal function vk_<key>; stage vert/frag/comp:x,y,z/geomvp:location; resource kinds u/b/t/s/c/p and argument-buffer U/B/T/S/o/q
+# spirv-cross Git commit: vulkan-sdk-1.4.363.0+ Timestamp: 2026-09-16T11:27:19
+014251df2ae73ef9	frag	t:1.0=0*20 u:1.2=0 b:1.3=1 T:0.0=2*20@0 S:0.1=2@20	/sub/d.frag
+2d9ed5d4fadbdd78	geomvp:1		/e.geom
+4b736327bc15ce89	comp:8,4,1	c:0.1=0 t:0.2=1 b:0.3=0	/sub/c
+65c88b2b0b7f721a	vert	u:0.0=0	/sub/g.material.bin@0x3a
+acdaa0b367bb0d4f	frag	t:1.0=0*10 s:1.1=0 T:0.0=0*25@0 U:0.1=0@25 B:0.4=0@26 q:0.0=1 o:0.4=1 o:0.1=0	/sub/k.frag
+ed335e438b5b2601	frag	t:0.0=0 s:0.1=0 c:0.2=1	/b.frag
+f22c02a91689f44e	vert	u:1.3=0 p:0.0=1	/a.vert
+ff7028c9e00c68c7	vert		/sub/f.vert

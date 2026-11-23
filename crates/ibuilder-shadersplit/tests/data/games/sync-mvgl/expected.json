@@ -1,0 +1,23 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "7e4f3eeedb7aa724fa3c4971ba2e6e9163f95999de45587d6f0c3b4d14d8d133",
+  "pkg/ps_data.bin": "9534676fe992e7f6140779c5ab36a5fa97565092a397642e18daf864d52bb12a",
+  "pkg/ps_main.bin": "55171ba64049cf813c597632c5fb680a620892a16dac02bddf83d6a541184b09",
+  "pkg/vs_data.bin": "253f24c4d22e6777c551a38e31e90eec25475fb27b14c31fc4ea2293fa6d7381",
+  "pkg/vs_main.bin": "14b4a394e9f6ee96e8d759bdd03f767a1698debb879fb2501f8b6c4f4f19c7c9",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "064ade8e77f3358a76923fa3a032095b9e335134a70dc00b8ee990eae3788db8",
+  "tables/shader_map.tsv": "8a67895f9c56464448101fb27b323523d2984b21dac5bd81ebcb43aededca7ec",
+  "tables/shader_pairs.tsv": "23867bebe1b4a61614ff6e3eea9ba050e0b5d949c28a5b780ba0471e44f05159"
+ },
+ "log": [
+  "[RED] /Pack/weird.mvgl: the MVGL cannot be read (@ROMFS@/Pack/weird.mvgl: unrecognized MVGL header layout) (its shaders are left out)",
+  "[RED] /Pack/bad.mvgl/s\\bad.shad: impossible LZ4 length 0x988 for 0x4 bytes (its shaders are left out)",
+  "[RED] 2 file(s) could not be read, their shaders are left out (first: /Pack/weird.mvgl: the MVGL cannot be read (@ROMFS@/Pack/weird.mvgl: unrecognized MVGL header layout))",
+  "single-stage programs: 3 vertex shaders are paired with a cover of 1 pixel shader(s) (8d0f394872d427cc)",
+  "shaders: 8 (compute 2, pixel 3, vertex 3); sources data 6, main 2; compute shader answers 2 rows; variation pairs 3"
+ ],
+ "shaders": 8,
+ "updates": []
+}

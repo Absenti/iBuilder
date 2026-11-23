@@ -1,0 +1,21 @@
+# 0105-export-leaves-out-the-rebuild-reuse-table.patch -- speed-up B6 (the main agent, 2026-11-23): a shader pack now holds, beside its image, the reuse table b-<chain>.img.digests
+# (crates/ibuilder-shaderbuild/src/library.rs: digest -> entry files and ranges, about 4 MB for 22,000 shaders) that lets a rebuild of the same chain take unchanged shaders from the
+# previous image. It serves only a rebuild inside iBuilder: an exported player never builds. Applies after 0104.
+#
+# FIX: GameExport.Plan's AddTree of Documents/shaders/<id>/ skips every file whose path ends in ".img.digests". The image, pack.txt, the tables and everything else travel as before.
+# VERIFIED (2026-11-23, M1 Pro): every patch 0010-0105 applies in order; compile only (dotnet build -c Release -r ios-arm64 -t:Compile on the last device build's project): 0 errors, the same
+#   warnings per file and code as without 0105.
+# NOT VERIFIED: an export on a device (the size saved, a player booting without the table: it never reads it).
+# NEW STRINGS: none.
+diff -ruN t104/GameAppExport.cs u/GameAppExport.cs
+--- t104/GameAppExport.cs	2026-11-23 04:43:56
++++ u/GameAppExport.cs	2026-11-23 04:44:02
+@@ -265,7 +265,7 @@
+                  ForSigners(FrameworkPlist(Path.Combine(framework, "Info.plist"), Path.Combine(bundle, "Info.plist"), titleId)));
+         AddTree(flat, app + Folder + "/extract/flat/");
+         if (!slim) AddFile(romfs, app + Folder + "/extract/RomFS.img");   // slim: beside the .ipa (RomfsFileName)
+-        AddTree(pack, app + Folder + "/shaders/" + titleId + "/");
++        AddTree(pack, app + Folder + "/shaders/" + titleId + "/", rel => rel.EndsWith(".img.digests"));   // patch 0105: the build's reuse table (speed-up B6, b-<chain>.img.digests) serves only a rebuild in iBuilder, never a player
+         AddFile(profile, app + Folder + "/documents/profile.tsv");
+         var games = Path.Combine(documents, "games", titleId);
+         GameWarmLogic.IngestUsedFile(documents, titleId);   // the shaders played so far travel in games/<id>/used_shaders.tsv, so the player warms them first

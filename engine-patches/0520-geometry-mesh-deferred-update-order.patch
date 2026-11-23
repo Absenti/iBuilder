@@ -1,0 +1,36 @@
+# (after 0519) nvn/geometry: inline buffer updates that a mesh draw's stage-2 bindings or index buffer read land before the draw
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/0cf3a70298dcfdebae7aae8eab9abf9f5e288e01  ("nvn/geometry: order deferred updates before mesh-stage buffer use (PR #3120)")
+#            author seedds, 2026-11-22 22:26 +0800; Co-authored-by: Eliran Zach
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: geo_mesh_draw passes a synthetic VS/FS raster program and no index draw into draw(), so draw_()'s ubd_conflict could not see the lean geometry kernel's stage-2 bindings
+#   or an indexed draw's index buffer: a deferred update they read came after the draw (upstream PR #3120, refs #1314).
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_geometry.inc): ubd_conflict_sh(lean, 2) and the index buffer range are checked before the mesh draw is encoded.
+# Games: Switch 2 titles with composed mesh draws (0408). Switches: none. Applies as is (the review's candidate 0522).
+# Tests: upstream's check_t_geometry_mesh cases NOT ported: t_geometry_mesh does not compile on this tree (g_mdi_v, see build-host.sh). Compiled in every gfx test. NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0519, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/gfx/nvn/nvn_geometry.inc b/dm/gfx/nvn/nvn_geometry.inc
+index c45d4e56e5c6cc64f25d5681363980b37e1813c8..4b90076d5c225daeacd99062c959a9a2a04a6241 100644
+--- a/dm/gfx/nvn/nvn_geometry.inc
++++ b/dm/gfx/nvn/nvn_geometry.inc
+@@ -813,11 +813,16 @@ static int geo_mesh_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+     id<MTLFunction> fn = geo_mesh_fn(pr, dw, di); if (!fn) return 0;
+     uint64_t ib = 0; void *mb; uint64_t mo;
+     if (di && !mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &ib)) { g_geo_why = GCP_IB; return 0; }
++    // The synthetic raster program below keeps only VS/FS and drops di, so draw_()'s ubd_conflict cannot see the lean GS's
++    // stage-2 bindings or an indexed draw's index buffer. Land conflicting inline updates before encoding, as native task/mesh
++    // draws do for their stages; shadowable uniform reads keep their deferral.
++    NvShader *lean = pr->sh[2]->geo_lean_v[3];
++    if (g_nubd && (g_enc || ubd_lazy()) && (ubd_conflict_sh(lean, 2) || (di && di->ibuf && ubd_hits(di->ibuf, di->ibuf + ((uint64_t)di->count << di->itype))))) { g_ubd_conflicts++; rp_end(); ubd_land(); }
+     uint32_t bi = (uint32_t)(dw ? dw->base_instance : di->base_instance);
+     NvProg *raster = pr->geo_lean_raster;
+     if (!raster || raster->sh[0] != pr->sh[0] || raster->sh[1] != pr->sh[1]) { raster = [NvProg new]; raster->sh[0] = pr->sh[0]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
+     if (g_mrun.n && (pr->sh[0] != g_mrun.vs || pr->sh[1] != g_mrun.fs || fn != g_mrun.fn || (__bridge void *)g_enc != (__bridge void *)g_mrun.en)) geo_mesh_flush_draw();
+-    g_geo_mesh.on = 1; g_geo_mesh.miss = 0; g_geo_mesh.fn = fn; g_geo_mesh.prims = geo_mesh_prims(fn); g_geo_mesh.lean = pr->sh[2]->geo_lean_v[3];
++    g_geo_mesh.on = 1; g_geo_mesh.miss = 0; g_geo_mesh.fn = fn; g_geo_mesh.prims = geo_mesh_prims(fn); g_geo_mesh.lean = lean;
+     g_geo_mesh.a = (geo_mesh_args){ib, di ? 1u << di->itype : 0, dw ? (uint32_t)dw->first : 0, (uint32_t)(dw ? dw->count : di->count), di ? di->base_vertex : 0, bi, 0};
+     g_geo_program = raster;
+     p_draw synthetic = {.prim = 4, .count = 3, .instances = 1, .base_instance = (int32_t)bi};

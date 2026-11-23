@@ -18,7 +18,8 @@ use crate::profile::{
     set_game_env,
 };
 use crate::settings::{
-    apply_env_files, apply_game_settings, apply_preset, launcher_stale, write_launcher_settings,
+    apply_default_language, apply_env_files, apply_game_settings, apply_preset, launcher_stale,
+    write_launcher_settings,
 };
 use crate::shaderpack::{set_shader_map, set_shader_pack};
 use crate::shaders::{LiveShaders, build_shaders};
@@ -38,6 +39,7 @@ pub fn prepare_boot(ctx: &Ctx) {
     apply_heap_check(ctx);
     apply_game_settings(ctx);
     apply_env_files(ctx);
+    apply_default_language(ctx); // a language nobody chose: the one the settings sheet shows (an exported game too: its launcher.json travels with it)
     apply_preset(ctx); // the settings' Profile (Memory saver): its values for what the settings and env.txt left unset
     apply_mods(ctx); // the enabled mods' RomFS files and cheats: DM_ROMFS_OVERLAY, DM_CHEATS (a failure never stops the boot)
     set_shader_pack(ctx);

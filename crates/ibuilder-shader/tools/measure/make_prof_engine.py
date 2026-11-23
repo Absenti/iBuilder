@@ -14,7 +14,7 @@ _IT = collections.defaultdict(lambda: [0, 0, 0, 0]); _ITL = _th.Lock(); _PR = []
 _CPROF = os.environ.get('DMSH_CPROFILE') == '1'
 _CAP = os.environ.get('DMSH_CAPTURE')
 _TL = _th.local()
-_STEPS = {'atomic.check_msl', 'rewrite.per_vertex', 'rewrite.precise', 'rewrite.membar_fence', 'rewrite.bit0_mask', 'fetch.select_guards', 'rewrite.mul_extended', 'rewrite.float_add_msl', 'rewrite.gather_offsets', 'rewrite.hmma_msl', 'rewrite.shared_store_msl', 'reflect.pool_arrays', 'wide.wide_loads', 'rewrite.tg_fence', 'rewrite.border_emu', 'rewrite.frag_z_snap', 'rewrite.uniform_tests', 'rewrite.blend_zero', 'rewrite.first_store', 'rewrite.tg_spill', 'rewrite.max_threads', 'entry.vs_init', 'entry.vs_layer', 'entry.vs_base_instance', 'entry.vs_depth', 'entry.vs_discard', 'entry.vs_layer_entry', 'entry.fs_uint', 'entry.fs_dual', 'side.shared_body'}
+_STEPS = {'atomic.check_msl', 'rewrite.per_vertex', 'rewrite.precise', 'rewrite.bit0_mask', 'rewrite.select_guards', 'rewrite.mul_extended', 'rewrite.float_add_msl', 'rewrite.gather_offsets', 'rewrite.hmma_msl', 'rewrite.shared_store_msl', 'reflect.pool_arrays', 'wide.wide_loads', 'wide.constant_reads', 'rewrite.tg_fence', 'rewrite.border_emu', 'rewrite.frag_z_snap', 'rewrite.uniform_tests', 'rewrite.blend_zero', 'rewrite.first_store', 'rewrite.tg_spill', 'rewrite.compute_loops', 'rewrite.max_threads', 'entry.vs_init', 'entry.vs_layer', 'entry.vs_base_instance', 'entry.vs_depth', 'entry.vs_discard', 'entry.vs_layer_entry', 'entry.fs_uint', 'entry.fs_dual', 'side.shared_body'}
 def _timed(name, fn):
     short = name.replace('dmsh_', '', 1)
     def w(*a, **k):

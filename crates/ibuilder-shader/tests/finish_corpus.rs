@@ -18,7 +18,7 @@ fn run_with(name: &str, profile: Option<&str>, extra: &[&str]) {
     let tools = format!("{f2}/engine-cap/dm/gfx/tools");
     let need = [
         format!("{f2}/cap-{name}"),
-        format!("{f2}/runs/{name}/b-b24b25240cad.img"),
+        format!("{f2}/runs/{name}/b-6c53446391cc.img"),
         profile
             .map(|p| format!("{f2}/{p}"))
             .unwrap_or_else(|| format!("{old}/shader/profile")),

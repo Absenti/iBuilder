@@ -10,5 +10,6 @@ using namespace metal;
 kernel void main0()
 {
 atomic_fetch_add_explicit((device atomic_float*)&q);z(, 1.0, memory_order_relaxed);
+bool _70 = false;
 }
 }

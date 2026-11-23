@@ -1,0 +1,21 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_casc.bin": "4ac20f5c25a9626cf4031bef577cd70231f4002e49d6519f439f06cecdf6ecc3",
+  "pkg/ps_casc.bin": "cacecf3f0e3b406b819302f9e82f916ec576f047d7f8785785ad565808e4892b",
+  "pkg/vs_casc.bin": "236c4333d4032878c237454c68f66dc16039a299d82178350bb6b9850c0d0b93",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "7cba01d47f89bc48243be3fd4fb4c699b3d60d4475f0d99f87738fcec66533fc",
+  "tables/shader_map.tsv": "f1c754bdf05ca264d955063de988966c05ccc586c338250d9352f6536fda3ca3",
+  "tables/shader_pairs.tsv": "7400e97f378d9a2d8f8e37a44e4afeef2c49988889b8818f0a4dece60eddd1f4"
+ },
+ "log": [
+  "[RED] @ROMFS@/Pack/old: no manifest in @ROMFS@/Pack/old has the config key 00000000000000000000000000000000 that build_key.txt names; its archives are scanned as loose files",
+  "[RED] /data/data:data/hd/shaders/short.bin: 2596 bytes where the manifest says 2600; not scanned",
+  "[RED] /data/data:data/hd/shaders/bad.bin: Error -3 while decompressing data: invalid block type; not scanned",
+  "single-stage programs: 2 vertex shaders are paired with a cover of 2 pixel shader(s) (a5097fdc2cb02adf e5dcf4e75b24cf51)",
+  "shaders: 5 (compute 1, pixel 2, vertex 2); sources casc 5; compute shader answers 1 rows; variation pairs 4"
+ ],
+ "shaders": 5,
+ "updates": []
+}

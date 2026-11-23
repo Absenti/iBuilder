@@ -16,6 +16,8 @@ game files --split--> pkg/*.bin + tables/*.tsv
 
 The two native tools (the engine's translator `dmsh_xlate` and `spirv-cross`) stay external. They are passed in through the `ShaderTools` trait (argv without the program name); on the Mac they run as child processes (`host-tools`), in the app they are callbacks.
 
+When a library built on the phone is split again: only when the split's global revision changed or a reader its game needs changed (the record each split leaves in `pack.txt`, `split-revs` / `split-uses` / `split-unknown`; `ibuilder-pipeline` `shaders::split_verdict`). Details: [shader-split.md, Targeted re-split](shader-split.md#targeted-re-split-recordrs).
+
 All three libraries use `#![forbid(unsafe_code)]`, spawn no process, and build for `aarch64-apple-ios` and `-ios-sim`. The Mac CLIs are separate binaries.
 
 ## 1. The rewrite chain (`ibuilder-shader`, root modules)

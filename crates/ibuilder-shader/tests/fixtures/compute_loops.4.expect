@@ -1,0 +1,68 @@
+OK
+{"sites":[{"barrier":false,"function":"main0","line":42,"site":1}]}
+#include <metal_stdlib>
+using namespace metal;
+
+struct dm_loop_state
+{
+    device atomic_uint* abort;
+    atomic_uint hit;
+};
+static inline __attribute__((always_inline)) bool dm_lg_cap(thread uint& n, device dm_loop_state& s, uint site)
+{
+    if (++n < 262144u) return true;
+    if (n == 262144u)
+    {
+        atomic_fetch_min_explicit(&s.hit, site, memory_order_relaxed);
+        atomic_store_explicit(s.abort, 1u, memory_order_relaxed);
+    }
+    return false;
+}
+static inline __attribute__((always_inline)) bool dm_lg_go(thread uint& n, device dm_loop_state& s, uint site)
+{
+    if (!dm_lg_cap(n, s, site)) return false;
+    return (n & 1023u) != 0u || atomic_load_explicit(s.abort, memory_order_relaxed) == 0u;
+}
+struct Args { device uint* buf [[id(0)]]; };
+
+static inline __attribute__((always_inline))
+uint helper1(thread uint& x)
+{
+    x += 2u;
+    return helper2(x);
+}
+
+template<typename T>
+T spvMat(T a, uint b)
+{
+    for (uint k = 0u; k < b; k++) a += T(k);
+    return a;
+}
+
+static inline __attribute__((always_inline))
+void arrive()
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline __attribute__((always_inline))
+uint helper2(uint x)
+{
+    x += 2u;
+    return x;
+}
+
+static inline __attribute__((always_inline))
+uint helper0(uint x)
+{
+    x += 2u;
+    return x;
+}
+
+kernel void main0(device dm_loop_state& dm_loop [[buffer(28)]])
+{
+    uint dm_lg = 0u;
+    uint x = 0u, y = 0u, n = 8u;
+    do { x++; } while((x < 3u) && dm_lg_go(dm_lg, dm_loop, 1u) /* dm_loop_site 1: main0 */);
+    a.buf[0] = x;
+}

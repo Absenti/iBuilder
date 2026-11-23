@@ -1,0 +1,2900 @@
+[
+{
+"fn": "fixups",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"vert"
+],
+"out": [
+"ok",
+"void main() { gl_FragColor = texture(tex, uv) + texture(cube, d) + textureLod(t, uv, 0.0); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvoid main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvoid main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"vert"
+],
+"out": [
+"ok",
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"frag"
+],
+"out": [
+"ok",
+"void main() { gl_FragColor = texture(tex, uv) + texture(cube, d) + textureLod(t, uv, 0.0); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nout vec4 gm_FragColor;\nvoid main() { gm_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nout vec4 gm_FragColor;\nvoid main() { gm_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"frag"
+],
+"out": [
+"ok",
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"out": [
+"ok",
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"void main() { gl_FragColor = texture2D(tex, uv) + textureCube (cube, d) + texture2DLod(t, uv, 0.0); }"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"vert"
+],
+"out": [
+"ok",
+"\n\n\n\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nout vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nout vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"vert"
+],
+"out": [
+"ok",
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"frag"
+],
+"out": [
+"ok",
+"\n\n\n\nout vec4 dm_FragColor;\nvoid main(){dm_FragColor=vec4(1);}\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nout vec4 gm_FragColor;\nout vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gm_FragColor;\nvoid main(){gm_FragColor=vec4(1);}\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nout vec4 gm_FragColor;\nout vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gm_FragColor;\nvoid main(){gm_FragColor=vec4(1);}\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"frag"
+],
+"out": [
+"ok",
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+],
+"out": [
+"ok",
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"out vec4 gl_Position;\nin vec4 gl_FragCoord;\n  invariant out highp vec4 gl_Position ;\nout float gl_FragDepth;\nout vec4 gl_FragColor;\nvoid main(){gl_FragColor=vec4(1);}\n"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"vert"
+],
+"out": [
+"ok",
+"out vec4 dm_Color;\nvoid main(){ dm_Color = vec4(0); }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nout vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nout vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"vert"
+],
+"out": [
+"ok",
+"out vec4 dm_LegacyColor;\nout vec4 dm_LegacyColor;\nvoid main(){ dm_LegacyColor = vec4(0); }\n"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"frag"
+],
+"out": [
+"ok",
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nout vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nout vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"frag"
+],
+"out": [
+"ok",
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"out": [
+"ok",
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"out vec4 gl_FrontColor;\nvoid main(){ gl_FrontColor = vec4(0); }\n"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"vert"
+],
+"out": [
+"ok",
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nin vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nin vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"vert"
+],
+"out": [
+"ok",
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"frag"
+],
+"out": [
+"ok",
+"in vec4 dm_Color;\nvoid main(){ vec4 c = dm_Color; }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nin vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nin vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"frag"
+],
+"out": [
+"ok",
+"in vec4 dm_LegacyColor;\nin vec4 dm_LegacyColor;\nvoid main(){ vec4 c = dm_LegacyColor; }\n"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"out": [
+"ok",
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"in vec4 gl_Color;\nvoid main(){ vec4 c = gl_Color; }\n"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"vert"
+],
+"out": [
+"ok",
+"vec4 f(sampler2D dm_sampler_1, vec2 uv) { return texture(dm_sampler_1, uv); }\nint dm_sampler;\n"
+],
+"renamed": [
+[
+"dm_sampler_1",
+"sampler"
+]
+]
+},
+{
+"fn": "promote_legacy",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"vert"
+],
+"out": [
+"ok",
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"frag"
+],
+"out": [
+"ok",
+"vec4 f(sampler2D dm_sampler_1, vec2 uv) { return texture(dm_sampler_1, uv); }\nint dm_sampler;\n"
+],
+"renamed": [
+[
+"dm_sampler_1",
+"sampler"
+]
+]
+},
+{
+"fn": "promote_legacy",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"frag"
+],
+"out": [
+"ok",
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+],
+"out": [
+"ok",
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+],
+"out": [
+"ok",
+false
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"vec4 f(sampler2D dm_sampler_1, vec2 uv) { return texture(dm_sampler_1, uv); }\nint dm_sampler;\n"
+],
+"renamed": [
+[
+"dm_sampler_1",
+"sampler"
+]
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"vec4 f(sampler2D sampler, vec2 uv) { return texture(sampler, uv); }\nint dm_sampler;\n"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"vert"
+],
+"out": [
+"ok",
+"void main() { x = 1; }\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } }\nvoid h() {}\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvoid main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvoid main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"vert"
+],
+"out": [
+"ok",
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"frag"
+],
+"out": [
+"ok",
+"void main() { x = 1; }\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } }\nvoid h() {}\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvoid main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvoid main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"frag"
+],
+"out": [
+"ok",
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"out": [
+"ok",
+"void main() { x = 1; }\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } }\nvoid h() {}\n"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"out": [
+"ok",
+false
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"void main() { x = 1; };\nstruct S { int a; };\nuniform B { int b; };\nvoid g() { if (a) { } } ;\nvoid h() {}\u001c;\n"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"vert"
+],
+"out": [
+"ok",
+"void main(){ c = texture(s, (uv) + vec2(ivec2(o.x, 1)) / vec2(textureSize(s, 0))) + textureOffset(s, uv, ivec2(1, 0)) + texture(s, (f(uv)) + vec2(off) / vec2(textureSize(s, 0))); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvoid main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvoid main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"vert"
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"frag"
+],
+"out": [
+"ok",
+"void main(){ c = texture(s, (uv) + vec2(ivec2(o.x, 1)) / vec2(textureSize(s, 0))) + textureOffset(s, uv, ivec2(1, 0)) + texture(s, (f(uv)) + vec2(off) / vec2(textureSize(s, 0))); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvoid main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvoid main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"frag"
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, ivec2(o.x, 1)) + textureOffset(s, uv, ivec2(1, 0)) + textureOffset( s , f(uv) , off ); }"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"vert"
+],
+"out": [
+"ValueError",
+"unbalanced parentheses"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvoid main(){ c = textureOffset(s, uv, o(1); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvoid main(){ c = textureOffset(s, uv, o(1); }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"vert"
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, o(1); }"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"frag"
+],
+"out": [
+"ValueError",
+"unbalanced parentheses"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvoid main(){ c = textureOffset(s, uv, o(1); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvoid main(){ c = textureOffset(s, uv, o(1); }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"frag"
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, o(1); }"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }"
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, o(1); }"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, o(1); }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, o(1); }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main(){ c = textureOffset(s, uv, o(1); }",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(s, uv, o(1); }"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"vert"
+],
+"out": [
+"ok",
+"void main(){ c = texture(textureOffset(s, a, b), (uv) + vec2(k) / vec2(textureSize(textureOffset(s, a, b), 0))); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvoid main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvoid main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"vert"
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"frag"
+],
+"out": [
+"ok",
+"void main(){ c = texture(textureOffset(s, a, b), (uv) + vec2(k) / vec2(textureSize(textureOffset(s, a, b), 0))); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nvoid main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nvoid main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"frag"
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"void main(){ c = textureOffset(textureOffset(s, a, b), uv, k); }"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"vert"
+],
+"out": [
+"ok",
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture(texture, v); gl_FragColor = texture (texture, v) * sample; }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nin vec4 p;\nout vec2 v;\nuniform sampler2D dm_texture;\nvoid main(){ vec4 gm_sample = texture2D(dm_texture, v); gl_FragColor = texture (dm_texture, v) * gm_sample; }\n"
+],
+"renamed": [
+[
+"dm_texture",
+"texture"
+],
+[
+"gm_sample",
+"sample"
+]
+]
+},
+{
+"fn": "promote_legacy",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nin vec4 p;\nout vec2 v;\nuniform sampler2D dm_texture;\nvoid main(){ vec4 gm_sample = texture2D(dm_texture, v); gl_FragColor = texture (dm_texture, v) * gm_sample; }\n"
+],
+"renamed": [
+[
+"dm_texture",
+"texture"
+],
+[
+"gm_sample",
+"sample"
+]
+]
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"vert"
+],
+"out": [
+"ok",
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"frag"
+],
+"out": [
+"ok",
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture(texture, v); gl_FragColor = texture (texture, v) * sample; }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nout vec4 gm_FragColor;\nin vec4 p;\nin vec2 v;\nuniform sampler2D dm_texture;\nvoid main(){ vec4 gm_sample = texture2D(dm_texture, v); gm_FragColor = texture (dm_texture, v) * gm_sample; }\n"
+],
+"renamed": [
+[
+"dm_texture",
+"texture"
+],
+[
+"gm_sample",
+"sample"
+]
+]
+},
+{
+"fn": "promote_legacy",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nout vec4 gm_FragColor;\nin vec4 p;\nin vec2 v;\nuniform sampler2D dm_texture;\nvoid main(){ vec4 gm_sample = texture2D(dm_texture, v); gm_FragColor = texture (dm_texture, v) * gm_sample; }\n"
+],
+"renamed": [
+[
+"dm_texture",
+"texture"
+],
+[
+"gm_sample",
+"sample"
+]
+]
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"frag"
+],
+"out": [
+"ok",
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n"
+],
+"out": [
+"ok",
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D dm_texture;\nvoid main(){ vec4 sample = texture2D(dm_texture, v); gl_FragColor = texture (dm_texture, v) * sample; }\n"
+],
+"renamed": [
+[
+"dm_texture",
+"texture"
+]
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * sample; }\n",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"precision mediump float;\r\nprecision highp int;\nattribute vec4 p;\nvarying lowp vec2 v;\nuniform sampler2D texture;\nvoid main(){ vec4 gm_sample = texture2D(texture, v); gl_FragColor = texture (texture, v) * gm_sample; }\n"
+],
+"renamed": [
+[
+"gm_sample",
+"sample"
+]
+]
+},
+{
+"fn": "fixups",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"vert"
+],
+"out": [
+"ok",
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nin vec3 gm_sample;\nvoid main(){ float gm_sample_2 = 1.0; float gm_sample_1; }"
+],
+"renamed": [
+[
+"gm_sample_2",
+"sample"
+]
+]
+},
+{
+"fn": "promote_legacy",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nin vec3 gm_sample;\nvoid main(){ float gm_sample_2 = 1.0; float gm_sample_1; }"
+],
+"renamed": [
+[
+"gm_sample_2",
+"sample"
+]
+]
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"vert"
+],
+"out": [
+"ok",
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"frag"
+],
+"out": [
+"ok",
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nin vec3 gm_sample;\nvoid main(){ float gm_sample_2 = 1.0; float gm_sample_1; }"
+],
+"renamed": [
+[
+"gm_sample_2",
+"sample"
+]
+]
+},
+{
+"fn": "promote_legacy",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nin vec3 gm_sample;\nvoid main(){ float gm_sample_2 = 1.0; float gm_sample_1; }"
+],
+"renamed": [
+[
+"gm_sample_2",
+"sample"
+]
+]
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"frag"
+],
+"out": [
+"ok",
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+],
+"out": [
+"ok",
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"attribute vec3 gm_sample;\nvoid main(){ float sample = 1.0; float gm_sample_1; }",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"attribute vec3 gm_sample;\nvoid main(){ float gm_sample_2 = 1.0; float gm_sample_1; }"
+],
+"renamed": [
+[
+"gm_sample_2",
+"sample"
+]
+]
+},
+{
+"fn": "fixups",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"vert"
+],
+"out": [
+"ok",
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\n#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\n#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"vert"
+],
+"out": [
+"ok",
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nout vec4 dm_LegacyColor;\nout float dm_LegacyFog;\nout vec4 dm_LegacyTexCoord0;\nout vec4 dm_LegacyTexCoord10;\nvoid main(){ dm_LegacyTexCoord0 = dm_LegacyTexCoord10; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; dm_LegacyColor = vec4(dm_LegacyFog); }\n"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"frag"
+],
+"out": [
+"ok",
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\n#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\n#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"frag"
+],
+"out": [
+"ok",
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nin vec4 dm_LegacyColor;\nin vec4 dm_LegacySecondaryColor;\nin float dm_LegacyFog;\nin vec4 dm_LegacyTexCoord0;\nin vec4 dm_LegacyTexCoord10;\nlayout(location = 0) out vec4 dm_LegacyFragData0;\nlayout(location = 2) out vec4 dm_LegacyFragData2;\nvoid main(){ dm_LegacyTexCoord0 = dm_LegacyTexCoord10; dm_LegacyFragData2 = dm_LegacyFragData0 + dm_LegacyColor + dm_LegacySecondaryColor; gl_FrontColor = vec4(dm_LegacyFog); }\n"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"out": [
+"ok",
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"#version 120\n#extension GL_ARB_x : enable\n\n#line 3\nvoid main(){ gl_TexCoord[0] = gl_TexCoord [ 10 ]; gl_FragData[2] = gl_FragData[0] + gl_Color + gl_SecondaryColor; gl_FrontColor = vec4(gl_FogFragCoord); }\n"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"#version 120\nvoid main(){ }",
+"vert"
+],
+"out": [
+"ok",
+"#version 120\nvoid main(){ }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"#version 120\nvoid main(){ }",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\n#version 120\nvoid main(){ }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"#version 120\nvoid main(){ }",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\n#version 120\nvoid main(){ }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"#version 120\nvoid main(){ }",
+"vert"
+],
+"out": [
+"ok",
+"#version 120\nvoid main(){ }"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"#version 120\nvoid main(){ }",
+"frag"
+],
+"out": [
+"ok",
+"#version 120\nvoid main(){ }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"#version 120\nvoid main(){ }",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\n#version 120\nvoid main(){ }"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"#version 120\nvoid main(){ }",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\n#version 120\nvoid main(){ }"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"#version 120\nvoid main(){ }",
+"frag"
+],
+"out": [
+"ok",
+"#version 120\nvoid main(){ }"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"#version 120\nvoid main(){ }"
+],
+"out": [
+"ok",
+"#version 120\nvoid main(){ }"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"#version 120\nvoid main(){ }"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"#version 120\nvoid main(){ }"
+],
+"out": [
+"ok",
+true
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"#version 120\nvoid main(){ }",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"#version 120\nvoid main(){ }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"#version 120\nvoid main(){ }",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"#version 120\nvoid main(){ }"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"#version 120\nvoid main(){ }",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"#version 120\nvoid main(){ }"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"vert"
+],
+"out": [
+"ok",
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nlayout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nlayout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"vert"
+],
+"out": [
+"ok",
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"frag"
+],
+"out": [
+"ok",
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nlayout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nlayout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"frag"
+],
+"out": [
+"ok",
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"out": [
+"ok",
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"out": [
+"ok",
+[
+[
+"a",
+2
+],
+[
+"b",
+2
+],
+[
+"c",
+31
+],
+[
+"z",
+0
+]
+]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"out": [
+"ok",
+false
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"layout(binding = 2) uniform sampler2D a, b;\nuniform layout(std140, binding=0x1F) highp isampler3D c;\nlayout(location=1) uniform usamplerCube d;\nlayout() uniform sampler2D e;\nlayout(binding = 00) uniform sampler2D z;\n"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"vert"
+],
+"out": [
+"ok",
+"layout(binding = 010) uniform sampler2D a;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nlayout(binding = 010) uniform sampler2D a;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nlayout(binding = 010) uniform sampler2D a;\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"vert"
+],
+"out": [
+"ok",
+"layout(binding = 010) uniform sampler2D a;\n"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"frag"
+],
+"out": [
+"ok",
+"layout(binding = 010) uniform sampler2D a;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\nlayout(binding = 010) uniform sampler2D a;\n"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\nlayout(binding = 010) uniform sampler2D a;\n"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"frag"
+],
+"out": [
+"ok",
+"layout(binding = 010) uniform sampler2D a;\n"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n"
+],
+"out": [
+"ok",
+"layout(binding = 010) uniform sampler2D a;\n"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n"
+],
+"out": [
+"ValueError",
+"invalid literal for int() with base 0: '010'"
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n"
+],
+"out": [
+"ok",
+false
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"layout(binding = 010) uniform sampler2D a;\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"layout(binding = 010) uniform sampler2D a;\n"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"layout(binding = 010) uniform sampler2D a;\n",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"layout(binding = 010) uniform sampler2D a;\n"
+],
+"renamed": []
+},
+{
+"fn": "fixups",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"vert"
+],
+"out": [
+"ok",
+"caf\u00e9 \u00b2x main(){}"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"vert",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\ncaf\u00e9 \u00b2x main(){}"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"vert",
+true
+],
+"out": [
+"ok",
+"#version 450 core\ncaf\u00e9 \u00b2x main(){}"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"vert"
+],
+"out": [
+"ok",
+"caf\u00e9 \u00b2x main(){}"
+]
+},
+{
+"fn": "fixups",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"frag"
+],
+"out": [
+"ok",
+"caf\u00e9 \u00b2x main(){}"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"frag",
+false
+],
+"out": [
+"ok",
+"#version 310 es\nprecision highp float;\nprecision highp int;\ncaf\u00e9 \u00b2x main(){}"
+],
+"renamed": []
+},
+{
+"fn": "promote_legacy",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"frag",
+true
+],
+"out": [
+"ok",
+"#version 450 core\ncaf\u00e9 \u00b2x main(){}"
+],
+"renamed": []
+},
+{
+"fn": "legacy_desktop_io",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"frag"
+],
+"out": [
+"ok",
+"caf\u00e9 \u00b2x main(){}"
+]
+},
+{
+"fn": "function_semicolons",
+"in": [
+"caf\u00e9 \u00b2x main(){}"
+],
+"out": [
+"ok",
+"caf\u00e9 \u00b2x main(){}"
+]
+},
+{
+"fn": "explicit_sampler_bindings",
+"in": [
+"caf\u00e9 \u00b2x main(){}"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "is_standalone_glsl",
+"in": [
+"caf\u00e9 \u00b2x main(){}"
+],
+"out": [
+"ok",
+false
+]
+},
+{
+"fn": "rename_identifier",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"sampler",
+"dm_sampler",
+false
+],
+"out": [
+"ok",
+"caf\u00e9 \u00b2x main(){}"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"texture",
+"dm_texture",
+true
+],
+"out": [
+"ok",
+"caf\u00e9 \u00b2x main(){}"
+],
+"renamed": []
+},
+{
+"fn": "rename_identifier",
+"in": [
+"caf\u00e9 \u00b2x main(){}",
+"sample",
+"gm_sample",
+false
+],
+"out": [
+"ok",
+"caf\u00e9 \u00b2x main(){}"
+],
+"renamed": []
+},
+{
+"fn": "active_default_uniforms",
+"in": [
+"f.vert\nUniform reflection:\nu_a: offset 0, type 8b52, size 1, index 0, binding -1, stages 1\nu_s.m: offset 16, type 1406, size 1, index 0, binding -1, stages 1\nsamp: offset -1, type 8b5e, size 1, index -1, binding 0, stages 1\nother: offset 0, type 1406, size 1, index 1, binding -1, stages 1\n\nUniform block reflection:\ngl_DefaultUniformBlock: offset -1, type ffffffff, size 32, index 0, binding 0, stages 1\nB: offset -1, type ffffffff, size 4, index 1, binding 1, stages 1\n\nBuffer variable reflection:\n"
+],
+"out": [
+"ok",
+[
+"u_a",
+"u_s.m"
+]
+]
+},
+{
+"fn": "active_default_uniforms",
+"in": [
+"Uniform reflection:\nx: offset 0, type 1406, size 1, index 1, binding -1, stages 1\n\nUniform block reflection:\nB: offset -1, type ffffffff, size 4, index 1, binding 1, stages 1\n"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "active_default_uniforms",
+"in": [
+"no reflection here\n"
+],
+"out": [
+"ok",
+null
+]
+},
+{
+"fn": "active_default_uniforms",
+"in": [
+"Uniform reflection:\n\nUniform block reflection:\n"
+],
+"out": [
+"ok",
+[]
+]
+},
+{
+"fn": "game_names",
+"in": [
+[
+"a:dm_texture=0:vec2",
+"u:gm_sample.x=4:float:0:0",
+"t:dm_texture=1:-1:sampler2D",
+"r:0:2",
+"o:gm_FragColor=0"
+],
+[
+[
+"dm_texture",
+"texture"
+],
+[
+"gm_sample",
+"sample"
+]
+]
+],
+"out": [
+"ok",
+[
+"a:texture=0:vec2",
+"u:sample.x=4:float:0:0",
+"t:texture=1:-1:sampler2D",
+"r:0:2",
+"o:gm_FragColor=0"
+]
+]
+}
+]

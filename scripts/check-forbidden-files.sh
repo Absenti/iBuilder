@@ -28,7 +28,7 @@ set -u
 # ==================================================================================================================================================================
 # ALLOWLIST: the ONLY exceptions. Every entry is a path pattern (shell glob, `*` also matches `/`, relative to <root>) plus a size cap, and says why. Add nothing without a reason.
 # ==================================================================================================================================================================
-# Used for the files the NSO0 magic or the *.nso name flags. Return 0 = allowed. $1 = path relative to <root>, $2 = size in bytes.
+# Used for the files the NSO0 magic, the NRO0 magic or the *.nso name flags. Return 0 = allowed. $1 = path relative to <root>, $2 = size in bytes.
 nso_fixture_allowed() {
   case "$1" in
     # 1. The small synthetic Switch modules of the crates' tests (crates/<crate>/tests/data/**, crates/<crate>/tests/fixtures/**): for example the 14 `main` files of the shader splitter's
@@ -41,6 +41,12 @@ nso_fixture_allowed() {
     #    "Verification of the ports"). The biggest is 244,616 bytes, hence the larger cap (256 KB) for this one folder.
     crates/ibuilder-rewrite/tests/fixtures/stubs/*.nso)
       [ "$2" -le 262144 ] && return 0 ;;
+  esac
+  case "$1" in
+    # 3. The relayout fixtures, built by crates/ibuilder-rewrite/tools/layoutcases.py: the synthetic images of upstream's dm/tools/tests/test_mod_layout.py (an NRO of the Math.nro shape, an
+    #    uncompressed NSO with MOD0 in text and DT_RELR, the .eh_frame / LSDA variant, a module that already fits; "no game code"). The NSO is 78,080 bytes, hence 128 KB.
+    crates/ibuilder-rewrite/tests/fixtures/layout/base.*.bin)
+      [ "$2" -le 131072 ] && return 0 ;;
   esac
   return 1
 }
@@ -148,7 +154,9 @@ while IFS= read -r -d '' f; do
   if [ "$size" -ge 4 ]; then
     hex="$(head_hex "$f")"
     case "$hex" in 4e534f30*) nso=1 ;; esac                                  # "NSO0" at 0
-    [ "${hex:32:8}" = 4e524f30 ] && hit game-data "$f" "an NRO module (NRO0 at 0x10)"
+    if [ "${hex:32:8}" = 4e524f30 ]; then
+      if nso_fixture_allowed "$PREFIX$f" "$size"; then NALLOWED=$((NALLOWED + 1)); else hit game-data "$f" "an NRO module (NRO0 at 0x10)"; fi
+    fi
     case "$hex" in 50465330*) hit game-data "$f" "a PFS0 partition (an NSP)" ;; 48465330*) hit game-data "$f" "an HFS0 partition (an XCI)" ;; esac
     [ "${hex:512:8}" = 48454144 ] && hit game-data "$f" "an XCI header (HEAD at 0x100)"
     case "${hex:1024:8}" in 4e434133|4e434132) hit game-data "$f" "an NCA (NCA2/NCA3 at 0x200)" ;; esac

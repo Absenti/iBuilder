@@ -42,10 +42,12 @@ fn local(args: &Value) -> Option<Vec<i64>> {
 // the steps are kept grouped by round as written (rustfmt would put one per line)
 #[rustfmt::skip]
 pub const STEPS: &[&str] = &[
-    "check_msl", "precise", "membar_fence", "bit0_mask", "select_guards", "tg_fence", "border_emu", "uniform_tests", "blend_zero", "max_threads",
+    "check_msl", "precise", "bit0_mask", "select_guards", "tg_fence", "border_emu", "uniform_tests", "blend_zero", "max_threads",
     "vs_init", "vs_layer", "vs_depth", "vs_discard", "vs_layer_entry", "capture", "fs_uint", "fs_dual", "shared_body",
     "vs_base_instance", "drop_point_size", "first_store", "tg_spill", "vs_tf", "tf_layout",
     "chain", "hmma_msl", "frag_z_snap", "pool_arrays", "wide_loads", "mul_extended", "float_add_msl", "gather_offsets", "shared_store_msl", "per_vertex", "wide_atomics",
+    // the steps of upstream 033793f0's chain that the 2026-11-16 engine did not have, and `rewrites` (its finish() order over the steps of this crate)
+    "constant_reads", "compute_loops", "raw_noinline", "mesh_subgroup_noinline", "rewrites",
     // round 3 (tessellation, task / mesh shaders, passthrough geometry): `tools/tessmesh/`
     "tess_hull", "tess_domain", "tess_mode", "mesh_info", "mesh_to_stage", "mesh_pixel_reads", "mesh_compose", "geo_lean", "mesh_out_bytes", "mesh_prims_for",
 ];
@@ -73,6 +75,98 @@ pub fn crc32(data: &[u8]) -> u32 {
         c = t[((c ^ b as u32) & 0xff) as usize] ^ (c >> 8);
     }
     !c
+}
+
+/// `{"read_only": [s numbers]}` (constant_reads' read-only storage buffers)
+fn read_only(args: &Value) -> std::collections::HashSet<u32> {
+    args.get("read_only")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_u64().map(|n| n as u32))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `{"mode": ...}`: dmsh_chain.storage_constant_mode() (DMSH_SCONST), default `fp`
+fn mode(args: &Value) -> &str {
+    args.get("mode").and_then(|v| v.as_str()).unwrap_or("fp")
+}
+
+/// The MSL rewrites of upstream 033793f0's `finish()` in its order, from check_msl to the stage tails this crate owns (dmsh_build.py l.880-937): the order post.rs takes.
+/// args `{stage, local, read_only, mode, mesh_kind}`: `mesh_kind` (`ts` / `ms`) for a task / mesh shader, whose `dmsh_meshstage.to_stage` (between the chain and raw_noinline)
+/// is not part of this step; meta `{blend0, first, spill, loop_sites}`.
+fn rewrites(msl: &str, args: &Value) -> Option<Outcome> {
+    use crate::*;
+    use std::borrow::Cow;
+    let stage = args["stage"].as_str().unwrap_or("?");
+    let mesh_kind = args.get("mesh_kind").and_then(|v| v.as_str());
+    let ps = stage == "ps";
+    let lc = local(args);
+    let run = || -> Result<(String, Value), PostError> {
+        let mut cur: Cow<str> = Cow::Borrowed(msl);
+        macro_rules! step {
+            ($e:expr) => {{
+                if let Cow::Owned(o) = $e {
+                    cur = Cow::Owned(o);
+                }
+            }};
+        }
+        step!(steps::check_msl(&cur)?);
+        if ps {
+            step!(pervertex::per_vertex(&cur)?);
+        }
+        step!(steps::precise(&cur));
+        step!(bit0::bit0_mask(&cur));
+        step!(guards::select_guards(&cur)?);
+        step!(ampere::mul_extended(&cur));
+        step!(ampere::float_add_msl(&cur));
+        step!(ampere::gather_offsets(&cur)?);
+        step!(hmma::hmma_msl(&cur)?);
+        step!(ampere::shared_store_msl(&cur)?);
+        step!(pool::pool_arrays(&cur)?);
+        step!(wide::wide_loads(&cur));
+        step!(wide::constant_reads(&cur, &read_only(args), mode(args)));
+        step!(steps::tg_fence(&cur)?);
+        step!(border::border_emu(&cur)?);
+        if ps {
+            step!(zsnap::frag_z_snap(&cur).0);
+        }
+        step!(utest::uniform_tests(&cur)?);
+        let mut blend0 = 0;
+        if ps {
+            let (n, k) = blend::blend_zero(&cur)?;
+            blend0 = k;
+            step!(n);
+        }
+        let mut text = cur.into_owned();
+        let (mut first, mut spill, mut sites) = (Vec::new(), 0, Vec::new());
+        if mesh_kind.is_none() && stage == "cs" {
+            let (s, f) = cs::first_store(&text, lc.as_deref());
+            first = f;
+            let (s, n) = cs::tg_spill(&s)?;
+            spill = n;
+            let (s, l) = cs::compute_loops(&s)?;
+            sites = l;
+            text = steps::max_threads(&s, lc.as_deref()).into_owned();
+        }
+        if text.contains("dmsh_raw_find") {
+            text = steps::raw_noinline(&text, mesh_kind.unwrap_or(stage)).into_owned();
+        }
+        if mesh_kind == Some("ms") {
+            text = steps::mesh_subgroup_noinline(&text).into_owned();
+        }
+        Ok((
+            text,
+            json!({"blend0": blend0, "first": first.iter().map(|(n, w, v)| json!([n, w, v])).collect::<Vec<_>>(), "spill": spill,
+                   "loop_sites": sites.iter().map(|s| s.to_json()).collect::<Vec<_>>()}),
+        ))
+    };
+    match run() {
+        Ok((t, m)) => ok(t, m),
+        Err(e) => err(e),
+    }
 }
 
 /// the whole chain (`post_rewrites`) as one step: args `{stage, local, tf, dual_want, partner: [locations] | null, res: path of the answer json}`
@@ -115,7 +209,8 @@ fn chain(msl: &str, args: &Value) -> Option<Outcome> {
         Ok(o) => {
             let meta = json!({"blend0": o.blend_zero, "fu": o.fs_uint, "fd": o.fs_dual, "shared": o.shared_body, "pad": o.vs_pad, "discard": o.entry_discard,
                 "lay": o.layer_from.map(|(l, c)| json!({"loc": l, "comp": c.to_string()})), "first": o.first_store.iter().map(|(n, w, v)| json!([n, w, v])).collect::<Vec<_>>(), "spill": o.tg_spill,
-                "analysis_crc": o.analysis.as_ref().map(|a| crc32(a.as_bytes())), "plain_len": o.plain_len});
+                "analysis_crc": o.analysis.as_ref().map(|a| crc32(a.as_bytes())), "plain_len": o.plain_len,
+                "loop_sites": o.loop_sites.iter().map(|s| s.to_json()).collect::<Vec<_>>(), "viewport_mask": o.viewport_mask});
             ok(o.out, meta)
         }
         Err(e) => err(e),
@@ -248,7 +343,9 @@ fn tessmesh(step: &str, msl: &str, args: &Value) -> Option<Outcome> {
 pub fn run(step: &str, msl: &str, args: &Value) -> Option<Outcome> {
     use crate::*;
     match step {
-        s if s.starts_with("tess_") || s.starts_with("mesh_") || s == "geo_lean" => {
+        s if (s.starts_with("tess_") || s.starts_with("mesh_") || s == "geo_lean")
+            && s != "mesh_subgroup_noinline" =>
+        {
             tessmesh(s, msl, args)
         }
         "chain" => chain(msl, args),
@@ -257,7 +354,6 @@ pub fn run(step: &str, msl: &str, args: &Value) -> Option<Outcome> {
             Err(e) => err(e),
         },
         "precise" => ok(steps::precise(msl).into_owned(), json!({})),
-        "membar_fence" => ok(steps::membar_fence(msl).into_owned(), json!({})),
         "bit0_mask" => ok(bit0::bit0_mask(msl).into_owned(), json!({})),
         "select_guards" => match guards::select_guards(msl) {
             Ok(t) => ok(t.into_owned(), json!({})),
@@ -382,6 +478,27 @@ pub fn run(step: &str, msl: &str, args: &Value) -> Option<Outcome> {
             Ok(t) => ok(t.into_owned(), json!({})),
             Err(e) => err(e),
         },
+        "constant_reads" => ok(
+            wide::constant_reads(msl, &read_only(args), mode(args)).into_owned(),
+            json!({}),
+        ),
+        "compute_loops" => match cs::compute_loops(msl) {
+            Ok((t, sites)) => ok(
+                t,
+                json!({"sites": sites.iter().map(|s| s.to_json()).collect::<Vec<_>>()}),
+            ),
+            Err(e) => err(e),
+        },
+        "raw_noinline" => ok(
+            steps::raw_noinline(
+                msl,
+                args.get("stage").and_then(|v| v.as_str()).unwrap_or("cs"),
+            )
+            .into_owned(),
+            json!({}),
+        ),
+        "mesh_subgroup_noinline" => ok(steps::mesh_subgroup_noinline(msl).into_owned(), json!({})),
+        "rewrites" => rewrites(msl, args),
         "wide_atomics" => match atomic::wide_atomics(msl) {
             Ok(t) => ok(t.into_owned(), json!({})),
             Err(e) => err(e),

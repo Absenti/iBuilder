@@ -126,11 +126,14 @@ pub struct ToolOutput {
 }
 pub type ToolFn = Arc<dyn Fn(&[String]) -> ToolOutput + Send + Sync>;
 
-/// The two tools the shader chain calls (both third-party and staying so: the engine's `dmsh_xlate` over Ryujinx.Graphics.Shader, C#, and SPIRV-Cross, C).
+/// The tools the shader chain calls (all third-party and staying so: the engine's `dmsh_xlate` over Ryujinx.Graphics.Shader, C#, SPIRV-Cross, C, and for OpenGL games
+/// glslang, C++: `glslangValidator`'s command line, in the app `gameapp_glslang` of `app/c/glslang_cli.cpp`). `glslang: None`: an OpenGL game's GLSL cannot be compiled
+/// (`ibuilder_glvk::tools::NO_GLSLANG` per shader), every other game is unaffected.
 #[derive(Clone)]
 pub struct ShaderTools {
     pub xlate: ToolFn,
     pub spirv_cross: ToolFn,
+    pub glslang: Option<ToolFn>,
 }
 
 impl ShaderTools {
@@ -144,8 +147,31 @@ impl ShaderTools {
         ShaderTools {
             xlate: wrap(&self.xlate),
             spirv_cross: wrap(&self.spirv_cross),
+            glslang: self.glslang.as_ref().map(wrap),
         }
     }
+}
+
+/// Where a backend that knows which readers its split used leaves that record (`ibuilder_shadersplit::record`: `revs`, `uses` and `unknown` rows, tab-separated): beside the split's
+/// `tables/` folder, `<work>/split.record`. Stage 3 copies its rows into the library's `pack.txt` (`split-revs`, `split-uses`, `split-unknown`) for a targeted re-split.
+pub fn split_record_path(tables_dir: &Path) -> PathBuf {
+    tables_dir.with_file_name("split.record")
+}
+
+/// One reader family of the split and its revision now (`ibuilder_shadersplit::record::READERS`): a library whose record names another revision of a reader it used is split again
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SplitReader {
+    pub name: String,
+    pub rev: u32,
+    /// the unknown kinds the reader would read: `.ext`, or `#<hex prefix of the first bytes>`
+    pub claims: Vec<String>,
+}
+
+/// What `stale` compares a library's record with: this build's reader revisions, and the revisions a library without a record is taken to have
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SplitRevisions {
+    pub readers: Vec<SplitReader>,
+    pub legacy: BTreeMap<String, u32>,
 }
 
 pub struct SplitRequest<'a> {
@@ -219,6 +245,20 @@ pub trait ShaderBackend: Send + Sync {
     /// The shader split this build runs, as a short digest ("-" when unknown): a split that finds more shaders is not a chain change, so the
     /// library's chain alone cannot say it is out of date (`split_version`).
     fn split_version(&self) -> String;
+    /// The split's per-reader revisions (None: only `split_version` says whether a library is current). With them, a library is split again only when a reader its game needs changed.
+    fn split_revisions(&self) -> Option<SplitRevisions> {
+        None
+    }
+    /// For a library split before records existed: which readers its game's files need (the record's text: `uses` and `unknown` rows), from the RomFS, the DLC and the library's shader
+    /// map; None when the backend cannot tell (the library is then split again when any reader changed)
+    fn split_probe(
+        &self,
+        _romfs: &Path,
+        _dlc: &[PathBuf],
+        _shader_map: Option<&Path>,
+    ) -> Option<String> {
+        None
+    }
     fn split(&self, req: &SplitRequest<'_>, log: &dyn Log) -> Result<SplitResult>;
     /// Translate and write the library image; returns its path (`b-<chain>.img`).
     fn build(&self, req: &BuildRequest<'_>, progress: &mut dyn FnMut(&str)) -> Result<PathBuf>;
@@ -230,6 +270,39 @@ pub trait ShaderBackend: Send + Sync {
             "shader post-rewrites are not available in this build",
         ))
     }
+    // ---- games without NVN shaders: the host's GL / Vulkan layers (ibuilder-glvk; crate::layers) ----
+    /// The version of the layer libraries this backend writes (`ibuilder_glvk::layer_version`); `-`: it writes none.
+    fn layer_version(&self) -> String {
+        "-".to_string()
+    }
+    /// A game whose NVN split found no shader: `Ok(None)` when it draws with NVN (or this backend has no layer support), `Ok(Some)` when its GL / Vulkan layer
+    /// library was written into `req.out_dir` (`vk/` or `gl/`), `Err` when it is a GL / Vulkan game whose library could not be made.
+    fn build_layer(&self, _req: &LayerRequest<'_>, _log: &dyn Log) -> Result<Option<LayerResult>> {
+        Ok(None)
+    }
+}
+
+/// [`ShaderBackend::build_layer`]'s inputs: the roots the engine's NSP script gives `vk_shaders.py` / `gl_shaders.py`
+pub struct LayerRequest<'a> {
+    pub romfs: &'a Path,
+    pub main_nso: &'a Path,
+    pub dlc: &'a [PathBuf],
+    /// the pack folder being made: the library goes to `<out_dir>/vk/` or `<out_dir>/gl/`
+    pub out_dir: &'a Path,
+    /// scratch files of the tools
+    pub work: &'a Path,
+    pub jobs: usize,
+    /// SPIRV-Cross (gated); the GL layer's glslang is the backend's own
+    pub tools: &'a ShaderTools,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LayerResult {
+    /// `vk` or `gl`
+    pub api: String,
+    pub shaders: usize,
+    /// what the tools printed (failed shaders, skipped stages)
+    pub lines: Vec<String>,
 }
 
 // ---- stage 4: assemble and sign ----------------------------------------------------------------------------------------------

@@ -1,0 +1,29 @@
+{
+ "dlc": [
+  "1"
+ ],
+ "files": {
+  "pkg/cs_data.bin": "db59ef99cd313f502fbe7f97504b0382563d4c8a24587812c78b3d912d7e2def",
+  "pkg/cs_main.bin": "5d4b010aa9e6bdefd87981d21b384a9761b67b76f33ac69cf2d0365b9fe3339b",
+  "pkg/ps_data.bin": "46801a3505ca2282547c8e8d6ab494d4d98d40df082b3d02aed74be5d794c36a",
+  "pkg/ps_dlc.bin": "e09befc139b618005c9a5dff804e7ef37ec93881fa8ca20bbda72091795f05b9",
+  "pkg/vs_data.bin": "2479a625b93170c31ed12a4f6ee9addff0accae006cebe51e3fa365ecc55ca5c",
+  "pkg/vs_main.bin": "561e7a05afc8009dd3cca58bf615166b2708407f3edaa63615b41d4f2a2ee7b4",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "d017bad12e83dc161dc5c9a517c28597c430da84bf1bc6250c8f92b97c001f54",
+  "tables/shader_map.tsv": "42fc30c763385da7e96b953c1dab32cf861830f7addf85400c0333d31a91c9f0",
+  "tables/shader_pairs.tsv": "d68622c02733461e33e31a0e7d5abf2b30b833789886fbd3f065c7354bd45dbb"
+ },
+ "log": [
+  "[RED] Pack/BROKEN.DAT: @ROMFS@/Pack/BROKEN.DAT: unsupported CC4 version 3, layout -13 (its shaders are left out)",
+  "[RED] Pack/cut.dat: CC4 index: truncated header (its shaders are left out)",
+  "[RED] Pack/dup.dat: @ROMFS@/Pack/dup.dat: duplicate CC4 file hash (its shaders are left out)",
+  "[RED] /Pack/amb.dat/shaders/amb.nnx_shaders control section @0x0: no unique code area in its program (its shaders are left out)",
+  "[RED] aoc/1/DLC.DAT: ValueError: shaders/h.nnx_shaders: DFLT stream disagrees with its chunk length (its shaders are left out)",
+  "[RED] 5 file(s) could not be read, their shaders are left out (first: Pack/BROKEN.DAT: @ROMFS@/Pack/BROKEN.DAT: unsupported CC4 version 3, layout -13)",
+  "single-stage programs: 5 vertex shaders are paired with a cover of 1 pixel shader(s) (5226c23407a5ae8a)",
+  "shaders: 13 (compute 3, pixel 4, vertex 6); sources data 10, main 2, dlc 1; compute shader answers 3 rows; variation pairs 6"
+ ],
+ "shaders": 13,
+ "updates": []
+}

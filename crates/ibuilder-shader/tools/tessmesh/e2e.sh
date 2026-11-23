@@ -23,8 +23,8 @@ EOS
 chmod +x $D/eng/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate
 TM_JOBLOG=$D/jobs-py PYTHONDONTWRITEBYTECODE=1 $PY -I $T/run_py_build.py --driver $S2/sh3/bin --engine $S2/sh3/engine --pkg $D/game/pkg --profile $D/game/profile --out $D/py > $D/py.log 2>&1 || { tail -20 $D/py.log; exit 3; }
 mkdir -p $D/rs
-TM_JOBLOG=$D/jobs-rs $TARGET/release/shaderbuild build --pkg $D/game/pkg --profile $D/game/profile --game 0100DFA027504000 --out $D/rs --chain b24b25240cad --engine $D/eng --finisher rust --jobs 2 --tables 0 --pulling 0 --cas $D/rs/cas > $D/rs.log 2>&1 || { tail -20 $D/rs.log; exit 4; }
+TM_JOBLOG=$D/jobs-rs $TARGET/release/shaderbuild build --pkg $D/game/pkg --profile $D/game/profile --game 0100DFA027504000 --out $D/rs --chain 6c53446391cc --engine $D/eng --finisher rust --jobs 2 --tables 0 --pulling 0 --cas $D/rs/cas > $D/rs.log 2>&1 || { tail -20 $D/rs.log; exit 4; }
 grep -E "^shaders|mesh libraries" $D/py.log $D/rs.log
-$TARGET/release/libdiff $D/py/b-b24b25240cad.img $D/rs/b-b24b25240cad.img
+$TARGET/release/libdiff $D/py/b-6c53446391cc.img $D/rs/b-6c53446391cc.img
 # the translator's job files, as each build wrote them (job_for): the same jobs and the same code bytes
 diff -rq $D/jobs-py $D/jobs-rs && echo "translator jobs: $(ls $D/jobs-py | wc -l) job files, identical in both builds (job text and code sha256)"

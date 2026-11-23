@@ -79,7 +79,7 @@ fn manifest_53_jobs_identical_to_the_engines_own_output() {
 fn grizzy_sample_identical_to_the_python_build() {
     let (cap, img) = (
         format!("{}/cap-s1800", scratch()),
-        format!("{}/runs/s1800-cap/b-b24b25240cad.img", scratch()),
+        format!("{}/runs/s1800-cap/b-6c53446391cc.img", scratch()),
     );
     if !have(&cap) || !have(&img) {
         return;
@@ -102,7 +102,7 @@ fn grizzy_sample_identical_to_the_python_build() {
 fn full_grizzy_chain_identical_to_the_python_build() {
     let cap = std::env::var("SHADER_FULL_CAPTURE")
         .unwrap_or_else(|_| format!("{}/f1/cap-full", ibuilder_testkit::SCRATCH));
-    let img = format!("{}/runs/full-gil-j6/b-b24b25240cad.img", scratch());
+    let img = format!("{}/runs/full-gil-j6/b-6c53446391cc.img", scratch());
     if !have(&cap) || !have(&img) {
         return;
     }
@@ -121,7 +121,7 @@ fn full_grizzy_chain_identical_to_the_python_build() {
 /// c1_guard.py / cb_extent.py over the whole Grizzy library, against the tables of an independent full Mac build of the game (iOSBuilder worktree out-shaders)
 #[test]
 fn tables_identical_to_the_python_tables_of_a_full_mac_build() {
-    let img = format!("{}/runs/full-gil-j6/b-b24b25240cad.img", scratch());
+    let img = format!("{}/runs/full-gil-j6/b-6c53446391cc.img", scratch());
     let want = format!(
         "{}/out-shaders/0100DFA027504000/profile/0100DFA027504000",
         ibuilder_testkit::iosbuilder_worktree()
@@ -152,7 +152,7 @@ fn tables_identical_to_the_python_tables_of_a_full_mac_build() {
 /// the image writer reproduces shader_lib.write byte for byte (the sample library the Python wrote)
 #[test]
 fn image_writer_reproduces_the_pythons_image() {
-    let img = format!("{}/runs/s1800-cap/b-b24b25240cad.img", scratch());
+    let img = format!("{}/runs/s1800-cap/b-6c53446391cc.img", scratch());
     if !have(&img) {
         return;
     }

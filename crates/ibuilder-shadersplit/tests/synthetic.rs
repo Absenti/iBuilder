@@ -391,13 +391,17 @@ fn threads_and_a_resumed_memo_give_the_same_bytes() {
 #[test]
 fn a_container_this_port_does_not_read_is_an_explicit_error() {
     let g = game("c");
-    let mut cpk = b"CPK ".to_vec();
-    cpk.extend_from_slice(&lcg(1, 60));
-    std::fs::write(g.romfs.join("Data/root_000.cpk"), cpk).unwrap();
+    // (CRI CPK archives and Smash's data.arc, the examples before, are read now: cpk.rs, smash_arc.rs) a Next Level Games archive index
+    let mut dict = vec![0x58, 0x24, 0xf3, 0xa9];
+    dict.extend_from_slice(&lcg(1, 60));
+    std::fs::write(g.romfs.join("Data/stage.dict"), dict).unwrap();
     let (r, _, _) = run(&g, "o", 2, None);
     match r {
         Err(SplitError::Unsupported(m)) => {
-            assert!(m.contains("CRI CPK") && m.contains("root_000.cpk"), "{m}");
+            assert!(
+                m.contains("Next Level Games") && m.contains("stage.dict"),
+                "{m}"
+            );
             assert!(
                 SplitError::Unsupported(m)
                     .to_string()

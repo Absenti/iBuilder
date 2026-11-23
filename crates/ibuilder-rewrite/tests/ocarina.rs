@@ -2,7 +2,10 @@
 //! file `patch_nso.py` wrote for them (a copy of the engine's tools, `DM_GAME` the game's profile, `DM_REWRITE_J=6`) and of what it printed. `main` is a ZBIC module (flags
 //! 0xff, system 22.0.0+): loading it needs `ibuilder_nso::zbic`; its build ID is registered in `FRAME_STEP` (the frame ratio, the dynamic resolution and the screen shape stubs of
 //! `stubs_games::ocarina`, with the `ANAMORPHIC_ASPECT` capability) and its profile has the four movie `MATCH_CUTS`, whose output this checks end to end. The oracle is the shipped engine's
-//! `patch_nso.py` (nxnative a3663659 + the NX2Apple patches + engine-patches/0409, the stack-free conditional select: 44 / 10 / 71 `select` sites in sdk / subsdk0 / main) run on the three real modules with `DM_GAME=0400486024DEC000` and no `game.tsv` for the profile (the Rust side gets no games folder). Skipped with a message when the extracted game is not there (set `IBUILDER_OCARINA_EXEFS`).
+//! `patch_nso.py` (nxnative a3663659 + the NX2Apple patches + engine-patches/0409, the stack-free conditional select: 44 / 10 / 71 `select` sites in sdk / subsdk0 / main) run on the three real modules with `DM_GAME=0400486024DEC000` and no `game.tsv` for the profile (the Rust side gets no games folder).
+//! `main`'s rows (2026-11-23) are that run with the profile's patch file of `tools/overlay/` (the pinned one plus nxnative c12000da, the dynamic-resolution threshold
+//! x 60 / target, and b3d287fe, the render scale stubs: `RENDER_SCALE 1` in fixups.tsv, 204 more bytes of patch area); the same run on the pinned patch file gave the
+//! earlier rows exactly. sdk and subsdk0 do not change. Skipped with a message when the extracted game is not there (set `IBUILDER_OCARINA_EXEFS`).
 
 use ibuilder_rewrite::{Options, rewrite};
 use sha2::{Digest, Sha256};
@@ -13,15 +16,15 @@ use std::path::PathBuf;
 // table rows are kept one per line as written (rustfmt would put every field of every row on its own line)
 #[rustfmt::skip]
 const ORACLE: &[(&str, &str, &str, usize)] = &[
-    ("main", "patched.bin", "de498b73a84c641dcf0d2c86c9aeb2dd784531b10b94120de94a73d2019cfc51", 84941420),
-    ("main", "fixups.tsv", "2eeaffc1ad4bfbf40f09b6917b00b00678b54305c2ead3b720f42ff10e52a5ec", 314),
+    ("main", "patched.bin", "1fe1e73ee650c53ec9f9b5e02389740d1ce451e90adf1ea1fe0792ea2e9e5e96", 84941624),
+    ("main", "fixups.tsv", "c7ee190dc01e3d807d9ece6380088d4a069c7ab8559c6312dbdf3ac862059777", 331),
     ("main", "sites.tsv", "10d0ef0a259b683afa0443defd0ece56518478aad043dd3772bd940114f5beaf", 718201),
-    ("main", "gates.tsv", "eccb3edb696af6ace1d7c2046bc55dd21c76bffe9e956ad49f4f16d70ab916de", 1767),
-    ("main", "cuts.tsv", "32426ca1335df73da1559e301059eb61577153be03ee7d4e57b030a04b372c5f", 2181),
+    ("main", "gates.tsv", "e04e867ee48f12aedb3297950e17631e98e38d1f9abf0171bad78a5a118c9eef", 1767),
+    ("main", "cuts.tsv", "5abce5d9527eab9570b96a3931ee5a5ff692540facccb01b83efc3054439221a", 2448),
     ("main", "obs.tsv", "99e7b4f486617cb5eab3b745c7b921ccd92051e1ebd2f3d21db5e94a0fb08916", 44),
-    ("main", "changed.tsv", "3b64dcabd9a5c5506b96e4038d5cc569fa11e10c2fe2729ca24f4c940d31c395", 528291),
+    ("main", "changed.tsv", "058cb9780e6020e2aea095d9dbc5969f4200561eabd1beeb98cf05aa9b9e77e0", 528319),
     ("main", "match.tsv", "c2fb661b22a084295c32999e8573bc2eb5bf1dbc97d15988ed664e5a8f7ce32c", 1030),
-    ("main", "log", "681c6bc4dbc19bfb536cf5cc33921b4c71e91a57478545c2d728bee3c569db0a", 1051),
+    ("main", "log", "33459279f912b58b0b7daa09de012542e57fc5362a8bed35848886f62d6b8bbc", 1051),
     ("subsdk0", "patched.bin", "a4cd3eb0d8417ccedde3d8fd016ba5117b62668a0a611b59aefd705e609e57fd", 1117992),
     ("subsdk0", "fixups.tsv", "c3ee00c129b52140b4f0c7cac94ea31aff7af6a72c51bf7d8227cb96dd246cfd", 233),
     ("subsdk0", "sites.tsv", "eb60534677e761fd2253328a5b2f92fedb72e41746eb2359d10c098586332c09", 40462),

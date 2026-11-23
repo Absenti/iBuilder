@@ -1,0 +1,71 @@
+name: PR title
+
+# The pull request title rule (CONTRIBUTING.md, "Pull requests"). Main takes squash merges only, so a PR's title becomes the commit's subject on main: it must follow the Conventional
+# Commits form and stay short.
+#   <type>(<optional scope>)!?: <summary>     type: feat fix chore docs refactor perf test build ci style revert     72 characters at most
+#   e.g.  feat(shaders): read EA EASF archives      fix: keep the cover after deleting a game      chore(release): list v0.1.8 in apps.json
+# The job name `pr-title` is the status check the "main: pull requests only" ruleset requires; keep it stable.
+#
+# A pull request event checks its own title (re-run when the title is edited). A workflow_dispatch run (the apps.json PR that release.yml opens with GITHUB_TOKEN, whose events start no
+# workflow) looks up the open PR of the branch it runs on and checks that title, so the check is reported on the PR's head commit as CI's dispatch run is.
+# The title is read from the event or the API into an environment variable, never spliced into the script (no injection).
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  workflow_dispatch:
+
+concurrency:
+  group: pr-title-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-title:
+    name: pr-title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Find the title
+        id: title
+        env:
+          EVENT_TITLE: ${{ github.event.pull_request.title }}
+          EVENT_NAME: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            title="$EVENT_TITLE"
+          else
+            title="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json title --jq '.[0].title // ""')"
+            [ -n "$title" ] || { echo "::error::no open pull request has the branch $BRANCH as its head: nothing to check"; exit 1; }
+          fi
+          {
+            echo "value<<__TITLE_END__"
+            printf '%s\n' "$title"
+            echo "__TITLE_END__"
+          } >> "$GITHUB_OUTPUT"
+      - name: Check the title
+        env:
+          TITLE: ${{ steps.title.outputs.value }}
+        run: |
+          set -euo pipefail
+          printf 'title: %s\n' "$TITLE"
+          types='feat|fix|chore|docs|refactor|perf|test|build|ci|style|revert'
+          bad=0
+          if ! printf '%s' "$TITLE" | grep -Eq "^(${types})(\([a-z0-9._/-]+\))?!?: [^ ].*[^ .]\$"; then
+            echo "::error::the title must read '<type>(<optional scope>): <summary>' with a type among ${types//|/, }, a lowercase scope, one space after the colon and no final period (for example 'feat(shaders): read EA EASF archives')"
+            bad=1
+          fi
+          n=${#TITLE}
+          if [ "$n" -gt 72 ]; then
+            echo "::error::the title is $n characters long; 72 at most (say the rest in the description)"
+            bad=1
+          fi
+          [ "$bad" = 0 ] && echo "ok: a Conventional Commits title of $n characters"
+          exit "$bad"

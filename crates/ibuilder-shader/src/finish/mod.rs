@@ -21,6 +21,7 @@ mod tess_text;
 pub mod texts;
 pub mod unit;
 pub mod vin;
+pub mod vsunit;
 
 use crate::tools::ShaderTools;
 use crate::{Job, PostError, Stage, post_rewrites};
@@ -386,7 +387,7 @@ fn chain_err(e: PostError) -> Finished {
             "exception" => Finished::fail("fatal", format!("{step}: {msg}")),
             st => Finished::fail(
                 st,
-                if *step == "check_msl" {
+                if *step == "check_msl" || *step == "vs_viewport_mask" {
                     msg.clone()
                 } else {
                     t160(msg)
@@ -577,6 +578,28 @@ fn finish_inner(
         }
         mesh = Some(mi);
     }
+    // the raw lookup's search out of line, in a mesh stage inline (raw_noinline: ps / vs / cs get it in the chain, after their own tail); a mesh shader's subgroup helpers out of line
+    if stage == "hs" || stage == "ds" || mesh.is_some() {
+        let rstage = mesh
+            .as_ref()
+            .map(|m| m.kind.as_str())
+            .unwrap_or(stage.as_str());
+        let mut changed = false;
+        if let std::borrow::Cow::Owned(t) = crate::steps::raw_noinline(&msl_text, rstage) {
+            msl_text = t;
+            changed = true;
+        }
+        if rstage == "ms"
+            && let std::borrow::Cow::Owned(t) = crate::steps::mesh_subgroup_noinline(&msl_text)
+        {
+            msl_text = t;
+            changed = true;
+        }
+        if changed {
+            analysis = msl_text.clone();
+            write(&msl_path, msl_text.as_bytes())?;
+        }
+    }
     if ds && matches!(&tess, Some(t) if !t.has("unsupported")) {
         // the domain is the last stage before the rasterizer: the two depth-convention entry points, and its capture entry for a geometry shader after it
         let capture = crate::vs::capture(&msl_text).map_err(chain_err)?;
@@ -606,9 +629,13 @@ fn finish_inner(
     let mut outputs: Vec<(String, Vec<u8>)> = Vec::new();
     let mut side = J::obj();
     if stage == "ps" {
-        side = ps_libraries(ctx, key, &msl_text, &binds, &mut outputs);
+        let (files, s) = unit::ps_libraries(key, &msl_text, &binds, ctx.bf_want.contains(key));
+        outputs.extend(files);
+        side = s;
     }
-    outputs.push((format!("{key}_b.metal"), msl_text.clone().into_bytes()));
+    if !vs {
+        outputs.push((format!("{key}_b.metal"), msl_text.clone().into_bytes()));
+    }
     let entry = RE_ENTRY_KIND.captures(&analysis);
     let dr = reflect::drv_reads(&analysis);
     let omap = if stage == "ps" {
@@ -670,6 +697,9 @@ fn finish_inner(
         refl.set("entry_z", "main0_z");
         refl.set("entry_geometry_capture", "main0_gs");
     }
+    if post.viewport_mask {
+        refl.set("viewport_mask", true);
+    }
     if vs && crate::vs::layer_out(&analysis) {
         refl.set("layer_out", true);
     }
@@ -704,6 +734,12 @@ fn finish_inner(
     }
     if post.fs_uint {
         refl.set("entry_u", "main0_u");
+        if post.typed_alpha {
+            refl.set("entry_u_alpha", true);
+        }
+        if post.typed_logic {
+            refl.set("entry_u_logic", true);
+        }
     }
     if post.fs_dual {
         refl.set("entry_d", "main0_d");
@@ -731,6 +767,23 @@ fn finish_inner(
     if post.tg_spill > 0 {
         // the json's integers are i64: a total past it (saturated by tg_scan) is written as i64::MAX, never as a negative number
         refl.set("tg_spill", i64::try_from(post.tg_spill).unwrap_or(i64::MAX));
+    }
+    if stage == "cs" && !post.loop_sites.is_empty() {
+        refl.set(
+            "loop_sites",
+            J::Arr(
+                post.loop_sites
+                    .iter()
+                    .map(|l| {
+                        J::obj()
+                            .with("site", l.site as i64)
+                            .with("function", l.function.as_str())
+                            .with("line", l.line as i64)
+                            .with("barrier", l.barrier)
+                    })
+                    .collect(),
+            ),
+        );
     }
     refl.set(
         "threadgroup_size",
@@ -786,9 +839,19 @@ fn finish_inner(
     if let Some(t) = &tess {
         refl.set("tess", t.clone());
     }
+    let mut cut = false;
     if vs {
-        vin_finish(&msl_text, &mut refl, &mut outputs, key, log);
-        pull_finish(ctx, &msl_text, &mut refl, &mut outputs, key, log);
+        // the pulling and shadow-input libraries, cut from one unit with the base when they can be (dmsh_build.vs_libraries, source mode)
+        let libs = vsunit::vs_libraries(key, &msl_text, ctx.opts.pulling);
+        outputs.extend(libs.outputs);
+        log.extend(libs.log);
+        if let Some(p) = libs.pull {
+            side.set("pull", p);
+        }
+        if let Some(v) = libs.vin {
+            side.set("vin", v);
+        }
+        cut = libs.cut;
     }
     refl.extend(&side);
     let ps_locs = if stage == "ps" {
@@ -796,7 +859,7 @@ fn finish_inner(
     } else {
         BTreeSet::new()
     };
-    Ok(finalize(ctx, key, refl, outputs, ps_locs))
+    Ok(finalize(ctx, key, refl, outputs, ps_locs, cut))
 }
 
 /// `partner_reads(key)`: {location: component mask} the pixel shaders paired with a mesh shader read (`dmsh_meshstage.to_stage`'s reads), from their SPH input maps; None without pairs.
@@ -844,10 +907,14 @@ fn finalize(
     refl: J,
     mut outputs: Vec<(String, Vec<u8>)>,
     ps_locs: BTreeSet<u32>,
+    cut: bool,
 ) -> Finished {
     let mut w = refl.clone();
     w.set("chain_metal", ctx.opts.chain_metal.as_str());
     w.set("chain_compiler", ctx.opts.chain_compiler.as_str());
+    if cut {
+        w.set("chain_metal_cut", true);
+    }
     outputs.push((format!("{key}_b.json"), w.dump().into_bytes()));
     Finished {
         status: "ok".into(),
@@ -884,119 +951,4 @@ fn single_lane(p: &Path) -> R<()> {
         write(p, &n)?;
     }
     Ok(())
-}
-
-/// `ps_libraries` in source mode: the unit's text goes under every cut name (`_bx`, `_bf`); `_b` is the plain source (the caller adds it)
-fn ps_libraries(
-    ctx: &Ctx,
-    key: &str,
-    full: &str,
-    binds: &[J],
-    outputs: &mut Vec<(String, Vec<u8>)>,
-) -> J {
-    let (src, info) = unit::unit(full);
-    let side = src.is_some() && (!info.alpha.is_empty() || !info.logic.is_empty());
-    let folded = fetch::fold(
-        src.as_deref().unwrap_or(full),
-        binds,
-        ctx.bf_want.contains(key),
-    );
-    let candidates: Vec<(String, Option<J>)> = match (&folded, &src) {
-        (Ok((f, m)), _) => vec![(f.clone(), Some(m.clone()))],
-        (Err(_), Some(u)) => vec![(u.clone(), None)],
-        _ => vec![],
-    };
-    if let Some((unit_text, fetch_meta)) = candidates.into_iter().next() {
-        if side {
-            outputs.push((format!("{key}_bx.metal"), unit_text.clone().into_bytes()));
-        }
-        if fetch_meta.is_some() {
-            outputs.push((format!("{key}_bf.metal"), unit_text.into_bytes()));
-        }
-        let mut r = J::obj();
-        if side {
-            if !info.alpha.is_empty() {
-                r.set(
-                    "alpha",
-                    J::obj().with(
-                        "entries",
-                        J::Arr(info.alpha.iter().map(|s| J::from(s.as_str())).collect()),
-                    ),
-                );
-            }
-            if !info.logic.is_empty() {
-                r.set(
-                    "logic",
-                    J::obj().with(
-                        "entries",
-                        J::Arr(info.logic.iter().map(|s| J::from(s.as_str())).collect()),
-                    ),
-                );
-            }
-        }
-        if let Some(m) = fetch_meta {
-            r.set("fetch", m);
-        }
-        return r;
-    }
-    J::obj()
-}
-
-fn vin_finish(
-    full: &str,
-    refl: &mut J,
-    outputs: &mut Vec<(String, Vec<u8>)>,
-    key: &str,
-    log: &mut Vec<String>,
-) {
-    refl.remove("vin");
-    match vin::vin_variant(full) {
-        Ok((v, shadows)) => {
-            outputs.push((format!("{key}_bv.metal"), v.into_bytes()));
-            refl.set(
-                "vin",
-                J::obj()
-                    .with("entry", "main0")
-                    .with("entry_z", "main0_z")
-                    .with("shadow", J::Arr(shadows)),
-            );
-        }
-        Err(why) => {
-            if why != "no integer input" {
-                log.push(format!("[RED] {key}: no shadow-input library ({why}): its integer inputs keep the CPU conversion"));
-            }
-        }
-    }
-}
-
-fn pull_finish(
-    ctx: &Ctx,
-    full: &str,
-    refl: &mut J,
-    outputs: &mut Vec<(String, Vec<u8>)>,
-    key: &str,
-    log: &mut Vec<String>,
-) {
-    refl.remove("pull");
-    match vin::pull_variant(full) {
-        Ok((v, info)) => {
-            if ctx.opts.pulling {
-                outputs.push((format!("{key}_bp.metal"), v.into_bytes()));
-            }
-            let mut p = J::obj();
-            if let J::Obj(m) = &info {
-                for (k, v) in m {
-                    if *v != J::Null {
-                        p.set(k, v.clone());
-                    }
-                }
-            }
-            refl.set("pull", p);
-        }
-        Err(why) => {
-            if why != "no stage input" {
-                log.push(format!("[RED] {key}: no pulling library ({why}): its pipelines are always built for the draw's vertex layout"));
-            }
-        }
-    }
 }

@@ -164,17 +164,22 @@ pub fn raster_facts(stage: &str, src: &str) -> J {
             .captures_iter(&mem)
             .filter_map(|m| m[1].parse().ok())
             .collect();
-        let float_colors: i64 = RE_COLOR_DECL
-            .captures_iter(&mem)
-            .filter(|m| m[1].starts_with("float") || m[1].starts_with("half"))
-            .map(|m| 1i64 << m[2].parse::<i64>().unwrap_or(0))
-            .sum();
+        // the colour outputs main0 declares float, unsigned and signed (bitmaps)
+        let bits = |prefixes: &[&str]| -> i64 {
+            RE_COLOR_DECL
+                .captures_iter(&mem)
+                .filter(|m| prefixes.iter().any(|p| m[1].starts_with(p)))
+                .map(|m| 1i64 << m[2].parse::<i64>().unwrap_or(0))
+                .sum()
+        };
         return J::obj()
             .with("discard", src.contains("discard_fragment") as i64)
             .with("sample_mask", mem.contains("sample_mask") as i64)
             .with("primitive_id", src.contains("[[primitive_id]]") as i64)
             .with("colors", J::Arr(colors.into_iter().map(J::Int).collect()))
-            .with("float_colors", float_colors);
+            .with("float_colors", bits(&["float", "half"]))
+            .with("uint_colors", bits(&["uint"]))
+            .with("sint_colors", bits(&["int"]));
     }
     if stage != "vs" {
         return J::obj();
@@ -505,6 +510,30 @@ fn jint(v: &Value, k: &str) -> Option<i64> {
     v.get(k).and_then(|x| x.as_i64())
 }
 
+/// `v == x` for a json value and an int, as Python compares them (`True == 1`, `3.0 == 3`)
+fn json_eq_int(v: &Value, x: i64) -> bool {
+    match v {
+        Value::Bool(b) => i64::from(*b) == x,
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => i == x,
+            None => n.as_f64().is_some_and(|f| f == x as f64),
+        },
+        _ => false,
+    }
+}
+
+/// Python's truth value of a json value (`None` for a missing key)
+fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+    }
+}
+
 pub fn buffer_image_bias(name: &str, res: &Value) -> Option<i64> {
     let m = RE_IMG_BIAS.captures(name)?;
     let slots = m.get(2).map(|g| dec(g.as_str()));
@@ -536,7 +565,9 @@ pub fn buffer_bias_entries(res: &Value) -> i64 {
     for k in ["textures", "images"] {
         for i in res.get(k).and_then(|v| v.as_array()).into_iter().flatten() {
             if let Some(tbx) = jint(i, "tbx") {
-                n = n.max(tbx + jint(i, "array").unwrap_or(1).max(1));
+                // a wrapped 1D fetch (row_bias) takes a second entry per element: its logical width
+                let rows = if truthy(i.get("row_bias")) { 2 } else { 1 };
+                n = n.max(tbx + jint(i, "array").unwrap_or(1).max(1) * rows);
             }
         }
     }
@@ -631,7 +662,7 @@ pub fn reflect(key: &str, stage: &str, msl: &str, res: &Value) -> Result<Vec<J>,
             super::rx::lit_then(
                 msl,
                 &format!("struct spvPool_{nm}"),
-                r"\s*\{\s*uint n;\s*ulong seen;\s*array<(.+), \d+> e;",
+                r"\s*\{\s*uint n;\s*(?:uint bias;\s*)?ulong seen;\s*array<(.+), \d+> e;",
             )
             .map(|c| c[1].to_string())
         } else {
@@ -759,6 +790,10 @@ pub fn reflect(key: &str, stage: &str, msl: &str, res: &Value) -> Result<Vec<J>,
                 e.set("kind", abi::KIND_TBUF_UBO);
                 e.set("reg", ut.0);
                 e.set("off", ut.1);
+                if other && let UboS::At(a, b) = us {
+                    e.set("soff", b);
+                    e.set("sreg", a);
+                }
                 if !ty.starts_with("array<")
                     && let Some(x) = buffer_image_bias(&nm, res)
                 {
@@ -858,6 +893,25 @@ pub fn reflect(key: &str, stage: &str, msl: &str, res: &Value) -> Result<Vec<J>,
                 }
             }
         }
+        // a texture whose offset table entry is a wrapped 1D fetch's (row_bias): bound as rows, its logical width in the table's second group
+        let texture = matches!(
+            e.get("kind").and_then(|k| k.as_str()),
+            Some(abi::KIND_TEX | abi::KIND_TEX_UBO | abi::KIND_TEX_C2A)
+        );
+        if texture
+            && let Some(x) = buffer_image_bias(&nm, res)
+            && res
+                .get("textures")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .any(|t| {
+                    truthy(t.get("row_bias")) && t.get("tbx").is_some_and(|v| json_eq_int(v, x))
+                })
+        {
+            e.set("tbx", x);
+            e.set("fetch1d", true);
+        }
         binds.push(e);
     }
     // storage buffers: SPIR-V binding number -> c0 offset -> NVN storage buffer slot
@@ -900,6 +954,7 @@ pub fn reflect(key: &str, stage: &str, msl: &str, res: &Value) -> Result<Vec<J>,
             let rw = notes.iter().any(|n| RE_STORE_NOTE.is_match(n));
             e.set("kind", abi::KIND_GMEM_MAP);
             e.set("rw", rw);
+            e.set("pointers", gptr_sites(stage, res)?);
             continue;
         }
         if stage == "cs"
@@ -958,6 +1013,77 @@ pub fn reflect(key: &str, stage: &str, msl: &str, res: &Value) -> Result<Vec<J>,
         ));
     }
     Ok(binds)
+}
+
+// ------------------------------------------------------------------------------------------ gptr_sites
+re!(
+    RE_GPTR_SITE,
+    r"\Atranslator: gptr site ([0-9]+): c([0-9]+)\[([0-9]+)\] \+([0-9]+)\n?\z"
+);
+
+/// A decimal digit string as Python's `int` reads it, for ordering and printing: no leading zeros
+fn int_text(d: &str) -> String {
+    let t = d.trim_start_matches('0');
+    if t.is_empty() { "0" } else { t }.to_string()
+}
+
+/// `gptr_sites(stage, res)`: the fixed pointer words in NVN storage slots the translator found (its notes `translator: gptr site k: c<slot>[<word>] +<byte>`),
+/// `[slot, byte]` in site order, the sites in no storage slot of the stage left out; Err (the `ValueError` message) when the sites are not 0..n-1 within `GPTR_MAX`
+pub fn gptr_sites(stage: &str, res: &Value) -> Result<J, String> {
+    // site number (as int text) -> [reg, byte]; ordered as Python orders the ints: by length, then by text
+    let mut sites: Vec<(String, i64, i64)> = Vec::new();
+    let base = ssbo_base(stage);
+    for note in res
+        .get("notes")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.as_str())
+    {
+        let Some(m) = RE_GPTR_SITE.captures(note) else {
+            continue;
+        };
+        let k = int_text(&m[1]);
+        let num = |i: usize| m[i].parse::<i64>().ok();
+        let (cb_slot, cb_word, byte) = (num(2), num(3), num(4));
+        // a word past i64 is past every storage slot
+        let off = cb_word.and_then(|w| w.checked_mul(4));
+        let reg = match (cb_slot, off, base) {
+            (Some(0), Some(o), Some(b))
+                if 0 <= o - b
+                    && o - b < abi::C0_ROW * abi::C0_SSBO_SLOTS
+                    && (o - b) % abi::C0_ROW == 0 =>
+            {
+                (o - b) / abi::C0_ROW
+            }
+            _ => -1,
+        };
+        let byte = byte.unwrap_or(i64::MAX);
+        match sites.iter_mut().find(|s| s.0 == k) {
+            Some(s) => {
+                s.1 = reg;
+                s.2 = byte;
+            }
+            None => sites.push((k, reg, byte)),
+        }
+    }
+    sites.sort_by(|a, b| (a.0.len(), &a.0).cmp(&(b.0.len(), &b.0)));
+    let in_order = sites.iter().enumerate().all(|(i, s)| s.0 == i.to_string());
+    if !in_order || sites.len() as i64 > abi::GPTR_MAX {
+        let keys: Vec<&str> = sites.iter().map(|s| s.0.as_str()).collect();
+        return Err(format!(
+            "gptr sites [{}] are not 0..n-1 within {}",
+            keys.join(", "),
+            abi::GPTR_MAX
+        ));
+    }
+    Ok(J::Arr(
+        sites
+            .into_iter()
+            .filter(|s| s.1 >= 0)
+            .map(|s| J::Arr(vec![J::Int(s.1), J::Int(s.2)]))
+            .collect(),
+    ))
 }
 
 // ------------------------------------------------------------------------------------------ drv_reads / unfillable

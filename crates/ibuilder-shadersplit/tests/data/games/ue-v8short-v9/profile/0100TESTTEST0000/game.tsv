@@ -1,0 +1,3 @@
+title_id	0100TESTTEST0000
+shader_groups	/AT/=at /Game/=game /Proj/=proj /ue_shaders/=ue
+shader_note	synthetic Unreal game

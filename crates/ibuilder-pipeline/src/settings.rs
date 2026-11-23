@@ -420,6 +420,35 @@ pub fn apply_game_settings(ctx: &Ctx) -> BTreeMap<String, String> {
     out
 }
 
+/// The language row's default in the game's launcher.json (`DM_LANG`'s `default`): what the settings sheet shows when the player chose none. Not always the host's own
+/// default (`en-US`, hle_oe.c GetDesiredLanguage): a game whose control data does not list American English shows its first language there (ibuilder-ffi launcher.rs).
+pub fn launcher_default_language(ctx: &Ctx, tid: &str) -> Option<String> {
+    let text = read_text(&launcher_json_path(ctx, tid)).ok()?;
+    let doc = serde_json::from_str::<Value>(&text).ok()?;
+    doc.get("settings")?
+        .as_array()?
+        .iter()
+        .find(|r| r.get("env").and_then(|e| e.as_str()) == Some("DM_LANG"))?
+        .get("default")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty() && !s.contains('\n'))
+}
+
+/// `apply_default_language`: a game whose language nobody chose (no settings.tsv row, no env.txt line, no harness) starts in the language its settings sheet SHOWS (the launcher row's
+/// default), not in whatever the host falls back to (`en-US`): the sheet and the game agree. Runs after `apply_game_settings` and `apply_env_files` (prepare_boot), so any of those wins.
+/// Returns the language it set.
+pub fn apply_default_language(ctx: &Ctx) -> Option<String> {
+    let tid = ctx.title_id()?;
+    if ctx.env.get("DM_LANG").is_some() {
+        return None;
+    }
+    let lang = launcher_default_language(ctx, &tid)?;
+    ctx.env.set("DM_LANG", &lang);
+    ctx.log(&format!("game settings: DM_LANG={lang} (no language chosen: the one the game's settings show, from its launcher.json)"));
+    Some(lang)
+}
+
 /// `apply_env_files`: free-form engine switches for experiments without a new .ipa: `Documents/env.txt` (every game) and `Documents/games/<id>/env.txt` (this game,
 /// read last, so it wins over the global file), one `NAME=value` per line, `#` comments. Only DM_* and MTL_* names are taken; a switch the environment already names
 /// (the settings sheet's, a harness's) is left alone. Returns {name: value}.

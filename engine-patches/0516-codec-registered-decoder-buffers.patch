@@ -1,0 +1,194 @@
+# (after 0515) host/codec: registered video decoder buffers are queued until a picture fills them (Switch 2 SDK 19-22 movies no longer abort with 3604)
+#
+# Upstream:  https://github.com/seedds/nxnative/commit/a41f027064fc630d145415566b53640a06b7091b  ("host/codec: queue registered video decoder buffers until filled")
+#            author seedds, 2026-11-22 19:54 +0800; Co-authored-by: Flying Saucer Studios
+# Licence:   MIT, Copyright (c) 2026 seedds (nxnative LICENSE); ported from seedds/nxnative, MIT. The attribution above is kept as the licence asks.
+#
+# Why: in the Switch 2 SDK, Register*DecoderBuffer hands the buffer to VideoDecService and returns a sync handle that signals once a picture is written. The host pre-signalled
+#   generation-0 handles and left registered buffers out of pend[], so Start racing the worker's start-up recycle made Get*DecoderOutputBufferProperties return 3604 and the SDK abort
+#   (Mario Kart World 1.0.0 after a race, upstream PR #3173).
+# WHAT IT CHANGES (dm/host/hle_codec_video.c; test t_codec_video): registered buffers go into pend[] with a generation from 1, fill/ready run on register, a release drops a pending entry,
+#   the generation-0 shortcut in sync_reached is gone.
+# Games: Mario Kart World (0400C3F00006E000) and other NintendoSDK_movie 19-22 titles. Switches: none. Applies as is (the review's candidate 0516).
+# Tests (M1 Pro): t_codec_video (host-unit run of HOST_TESTS). NOT run on a device.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0515, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+diff --git a/dm/host/hle_codec_video.c b/dm/host/hle_codec_video.c
+index b47757db199a299133a67dfe73a12c19bfad8f1b..021d78ef9427f4ceda671c210480bbcafa0a1e98 100644
+--- a/dm/host/hle_codec_video.c
++++ b/dm/host/hle_codec_video.c
+@@ -2,9 +2,10 @@
+ // does not serve: nn::codec::video::Initialize crashed in it (Donkey Kong Bananza, sdk+0x2de99c, after its first punch, when the guide movie starts). The SDK's protocol, read from
+ // its implementation (sdk 20.5.19 Ounce):
+ //   - the client makes one image pool per output picture (MakeDecodeImagePreference → CalculateDecoderImagePoolBuffer → InitializeDecoderImagePool) and registers each with the
+-//     decoder under an index (RegisterVp9DecoderBuffer). Registering puts the index in the decoder's queue of acquirable buffers (8 deep), with a sync handle already signalled.
+-//   - Acquire takes the oldest index and its sync handle (description 3604 when the queue is empty); ReleaseVp9DecoderOutputBuffer gives the buffer to the decoder to fill and puts
+-//     it back in the queue at once, with a new sync handle that signals when the decoder has written a picture into it. The client polls nn::gs::TryWaitNativeSync on that handle,
++//     decoder under an index (RegisterVp9DecoderBuffer). Registering gives the buffer to the decoder to fill and puts the index in the decoder's queue of acquirable buffers
++//     (8 deep), with a sync handle that signals when the decoder has written a picture into it.
++//   - Acquire takes the oldest index and its sync handle (description 3604 when the queue is empty); ReleaseVp9DecoderOutputBuffer gives the buffer back to the decoder to fill
++//     and puts it back in the queue at once, with a new sync handle that signals when the next picture is written into it. The client polls nn::gs::TryWaitNativeSync on that handle,
+ //     then reads the picture's properties (description 3604 until it is filled) and the picture (ReadDecoderOutputImageRgba / Nv12, the CPU route; Bananza's player takes that one)
+ //   - SubmitVp9DecoderInputBuffer takes one packet with its time and an end-of-stream flag; description 3603 when the decoder cannot take more (the client retries after the
+ //     submission-ready event).
+@@ -53,7 +54,7 @@ typedef struct {
+     movie_vt_control vt;
+     struct { cv_pool *pool; uint32_t pidx; int reg, filled; uint32_t gen, filled_gen; uint16_t w, h; int64_t ts; uint8_t eos; } buf[CV_BUFS];
+     uint32_t fifo[8], fhead, fcount;          // acquirable indices
+-    uint32_t pend[CV_BUFS], phead, pcount;    // released, waiting for a picture
++    uint32_t pend[CV_BUFS], phead, pcount;    // registered or released, waiting for a picture
+     vpx_image_t *held[CV_HOLD]; int64_t held_ts[CV_HOLD]; uint8_t held_eos[CV_HOLD]; int nheld;
+     int eos_pending;
+     // The decoder's thread (cv_worker). The codec state above (vpx, avc, av1) is its own from Initialize to Finalize: it decodes outside mu
+@@ -331,20 +332,25 @@ static Result cv_dec_fin(void *t) {
+     pthread_cond_destroy(&d->work); pthread_mutex_destroy(&d->mu); free(d); *(cv_dec **)t = NULL;
+     return 0;
+ }
++static void cv_drop_index(uint32_t *q, uint32_t *head, uint32_t *count, uint32_t cap, uint32_t i) {   // removes i from a ring of indices, keeping the others' order
++    uint32_t n = 0, tmp[CV_BUFS];
++    for (uint32_t k = 0; k < *count; k++) { uint32_t v = q[(*head + k) % cap]; if (v != i) tmp[n++] = v; }
++    for (uint32_t k = 0; k < n; k++) q[k] = tmp[k];
++    *head = 0; *count = n;
++}
+ static Result cv_dec_reg(void *t, uint32_t i, void *pool, uint32_t pidx) {
+     cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS) { LOG("[RED] nn::codec::Register…DecoderBuffer index %u", i); return CV_R(2004); }
+     dm_host_mutex_lock(&d->mu);
+-    d->buf[i].pool = pool_of(pool); d->buf[i].pidx = pidx; d->buf[i].reg = 1; d->buf[i].filled = 0; d->buf[i].gen = 0; d->buf[i].filled_gen = 0;
++    d->buf[i].pool = pool_of(pool); d->buf[i].pidx = pidx; d->buf[i].reg = 1; d->buf[i].filled = 0; d->buf[i].gen++;
++    cv_drop_index(d->pend, &d->phead, &d->pcount, CV_BUFS, i);
++    if (d->pcount < CV_BUFS) { d->pend[(d->phead + d->pcount) % CV_BUFS] = i; d->pcount++; }
++    cv_drop_index(d->fifo, &d->fhead, &d->fcount, 8, i);
+     if (d->fcount < 8) { d->fifo[(d->fhead + d->fcount) % 8] = i; d->fcount++; } else LOG("[RED] nn::codec: acquirable queue full at register %u", i);
++    int before = cv_pending(d);
++    fill(d, 0); ready(d, before, 0);
+     pthread_mutex_unlock(&d->mu);
+     return 0;
+ }
+-static void cv_drop_index(uint32_t *q, uint32_t *head, uint32_t *count, uint32_t cap, uint32_t i) {   // removes i from a ring of indices, keeping the others' order
+-    uint32_t n = 0, tmp[CV_BUFS];
+-    for (uint32_t k = 0; k < *count; k++) { uint32_t v = q[(*head + k) % cap]; if (v != i) tmp[n++] = v; }
+-    for (uint32_t k = 0; k < n; k++) q[k] = tmp[k];
+-    *head = 0; *count = n;
+-}
+ static Result cv_dec_unreg(void *t, uint32_t i) {   // the buffer leaves the decoder: no longer acquirable, filled or waited for
+     cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS) return CV_R(2004);
+     dm_host_mutex_lock(&d->mu);
+@@ -523,6 +529,7 @@ static void cv_dec_rel(void *t, uint32_t i, cv_sync sync) {
+     (void)sync; cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS || !d->buf[i].reg) { LOG("[RED] nn::codec::Release…DecoderOutputBuffer index %u", i); return; }
+     dm_host_mutex_lock(&d->mu);
+     d->buf[i].gen++; d->buf[i].filled = 0;
++    cv_drop_index(d->pend, &d->phead, &d->pcount, CV_BUFS, i);   // an unfilled buffer may still sit in pend[]
+     if (d->pcount < CV_BUFS) { d->pend[(d->phead + d->pcount) % CV_BUFS] = i; d->pcount++; }
+     if (d->fcount < 8) { d->fifo[(d->fhead + d->fcount) % 8] = i; d->fcount++; } else LOG("[RED] nn::codec: acquirable queue full at release %u", i);
+     int before = cv_pending(d);
+@@ -661,10 +668,9 @@ HLE_FORCE("_ZN2nn5codec3sdk34MakeDecodeImagePreferenceForCompatEttNS0_24VideoDec
+           cv_pref, h_cv_pref19, uint64_t w, uint64_t h, uint32_t fmt, uint32_t mode) {
+     return (cv_pref){(uint16_t)w, (uint16_t)h, fmt, mode, CV_MAGIC, {0, 0}};
+ }
+-// The host's sync handles signal when their buffer holds the picture of that release; a handle the host did not make (another nn::gs user) reads as signalled
++// The host's sync handles signal when their buffer holds the picture of that registration or release; a handle the host did not make (another nn::gs user) reads as signalled
+ static bool sync_reached(const cv_sync *s) {
+     if (s->magic != CV_SYNC) { static int once; if (!once++ && (s->magic || s->dec)) LOG("[RED] nn::codec: a sync handle the host did not make (%#x): signalled", s->magic); return true; }
+-    if (!s->gen) return true;
+     dm_host_mutex_lock(&g_cv_mu);   // held until the decoder's lock is: FinalizeVp9Decoder cannot free it in between
+     cv_dec *d = s->dec && s->dec <= 16 ? g_cv[s->dec - 1] : NULL;
+     bool r = true;
+diff --git a/dm/host/tests/t_codec_video.c b/dm/host/tests/t_codec_video.c
+index 1285cd977e8924a39369946898dce240374cc3b6..ca8e26cd7d54688d672ccdf46654f397c60c5c9e 100644
+--- a/dm/host/tests/t_codec_video.c
++++ b/dm/host/tests/t_codec_video.c
+@@ -231,18 +231,17 @@ int main(void) {
+     cv_dec *d = cv_of(dec); assert(d && d->vpx_ok);
+     void *ev = NULL; assert(!h_cv_vp9event(&ev, dec) && ev == dec + CV_EVENT_OFF && g_ev[ev_slot(ev)].bound && ev_set(ev));
+ 
+-    // Registering makes a buffer acquirable at once, its sync handle signalled; an empty queue answers 3604
++    // Registering gives each buffer to the decoder and makes it acquirable at once, its sync handle unsignalled until a picture lands; an empty queue answers 3604
+     for (uint32_t i = 0; i < 2; i++) assert(!h_cv_vp9reg(dec, i, pool[i], 0));
+-    for (uint32_t i = 0; i < 2; i++) { assert(!h_cv_vp9acq(&idx, &sync, dec) && idx == i && sync.magic == CV_SYNC && sync.gen == 0 && h_gs_trywait(&sync)); }
++    cv_sync sync0, sync1;
++    assert(!h_cv_vp9acq(&idx, &sync0, dec) && idx == 0 && sync0.magic == CV_SYNC && sync0.gen == 1 && !h_gs_trywait(&sync0));
++    assert(!h_cv_vp9acq(&idx, &sync1, dec) && idx == 1 && sync1.magic == CV_SYNC && sync1.gen == 1 && !h_gs_trywait(&sync1));
+     assert(h_cv_vp9acq(&idx, &sync, dec) == CV_NONE);
+     assert(h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dec, 0) == CV_NONE);
+ 
+-    // Released: acquirable again with a new handle that signals once a picture is in the buffer; the picture's properties and its NV12 / RGBA readback
+-    h_cv_vp9rel(dec, 0, sync);
+-    assert(!h_cv_vp9acq(&idx, &sync, dec) && idx == 0 && sync.gen == 1 && !h_gs_trywait(&sync));
+-    assert(h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dec, 0) == CV_NONE);
++    // First picture lands directly in registered buffer 0 without a Release; its properties and NV12 / RGBA readback
+     assert(!h_cv_vp9submit(&id, dec, vp9, sizeof vp9, 1000, false) && id == 1);
+-    settle(dec); assert(h_gs_trywait(&sync));
++    settle(dec); assert(h_gs_trywait(&sync0) && !h_gs_trywait(&sync1));
+     assert(!h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dec, 0) && w == 16 && h == 16 && cw == 16 && ch == 16 && ts == 1000 && !eos);
+     uint32_t cs = 7; w = h = 0;   // SDK 19's form: the same properties, and colour space 0
+     assert(!h_cv_vp9props19(&w, &h, &cw, &ch, &cs, &ts, &eos, dec, 0) && w == 16 && h == 16 && ts == 1000 && !eos && cs == 0);
+@@ -254,6 +253,15 @@ int main(void) {
+     assert(!h_cv_nv12(pool[0], 0, 0, 0, 16, 16, y, 16, 256, uv, 16, 128) && !memcmp(y, nv12, 256) && !memcmp(uv, nv12 + 256, 128));
+     assert(!h_cv_rgba(pool[0], 0, 0, 0, 16, 16, rgba, 64, sizeof rgba));
+     for (int i = 0; i < 1024; i += 4) assert(rgba[i] >= 250 && rgba[i + 1] <= 5 && rgba[i + 2] <= 5 && rgba[i + 3] == 255);
++    // Second picture fills registered buffer 1; then Release returns buffer 0 with a new handle (gen 2) that signals on the next picture
++    assert(!h_cv_vp9submit(&id, dec, vp9, sizeof vp9, 1001, false) && id == 2);
++    settle(dec); assert(h_gs_trywait(&sync1) && !d->pcount);
++    h_cv_vp9rel(dec, 0, sync0);
++    assert(!h_cv_vp9acq(&idx, &sync, dec) && idx == 0 && sync.gen == 2 && !h_gs_trywait(&sync));
++    assert(h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dec, 0) == CV_NONE);
++    assert(!h_cv_vp9submit(&id, dec, vp9, sizeof vp9, 1002, false) && id == 3);
++    settle(dec); assert(h_gs_trywait(&sync) && !d->pcount);
++    assert(!h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dec, 0) && ts == 1002);
+ 
+     // No released buffer: pictures wait; the event goes down at CV_READY, with room left for a client's signal in flight, and packets are refused (3603) at CV_HOLD.
+     // A packet not yet decoded counts as the picture it will give: the event and the refusal are the same whether the decoder's thread has got to it or not
+@@ -280,14 +288,14 @@ int main(void) {
+     settle(dec); assert(d->nheld == CV_READY - 1 && ev_set(ev));
+     assert(!h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dec, 1) && ts == 2000 + CV_HOLD - CV_READY + 1);
+ 
+-    // Sync point event: armed on an unfilled buffer, signalled when the picture lands; one armed on a filled buffer is signalled at once
++    // Sync point event: armed on an unfilled buffer, signalled when the picture lands; one armed on a filled buffer (including a buffer registered while pictures wait) is signalled at once
+     assert(!h_spt_create(spt) && g_ev[ev_slot(spt)].bound);
+     h_cv_vp9rel(dec, 0, sync);   // buffer 0 takes the next waiting picture at once
+     assert(!h_cv_vp9acq(&idx, &sync, dec) && idx == 0);
+     assert(!h_spt_request(spt, &sync) && ev_set(spt) && !SPT(spt)->armed);
+-    assert(!h_cv_vp9reg(dec, 2, pool[2], 0) && !h_cv_vp9acq(&idx, &sync, dec) && idx == 2);
+-    for (int i = 0; i < 2; i++) { h_cv_vp9rel(dec, (uint32_t)i, sync); assert(!h_cv_vp9acq(&idx, &sync, dec)); }   // the last two waiting pictures go out
+-    h_cv_vp9rel(dec, 2, sync); assert(!h_cv_vp9acq(&idx, &sync, dec) && idx == 2 && !h_gs_trywait(&sync));
++    assert(!h_cv_vp9reg(dec, 2, pool[2], 0) && !h_cv_vp9acq(&idx, &sync, dec) && idx == 2 && sync.gen == 1 && h_gs_trywait(&sync));   // takes a waiting picture at register
++    h_cv_vp9rel(dec, 0, sync); assert(!h_cv_vp9acq(&idx, &sync, dec) && idx == 0 && !d->nheld);   // the last waiting picture goes out
++    h_cv_vp9rel(dec, 2, sync); assert(!h_cv_vp9acq(&idx, &sync, dec) && idx == 2 && sync.gen == 2 && !h_gs_trywait(&sync));
+     assert(!h_spt_request(spt, &sync) && !ev_set(spt) && SPT(spt)->armed);
+     assert(!h_cv_vp9submit(&id, dec, vp9, sizeof vp9, 3000, false));
+     settle(dec); assert(ev_set(spt) && !SPT(spt)->armed && h_gs_trywait(&sync));
+@@ -336,6 +344,33 @@ int main(void) {
+     for (int i = 0; i < 6; i++) assert(!h_cv_vp9submit(&id, dec, vp9, sizeof vp9, 7000 + i, false));
+     assert(!h_cv_vp9fin(dec) && !cv_of(dec) && !g_ev[ev_slot(ev)].bound);
+     for (int i = 0; i < 3; i += 2) { h_cv_poolfin(pool[i]); assert(!pool_of(pool[i])); }
++    // NintendoSDK_movie's startup sequence (SDK 19-22): RegisterVideoFrame calls Register -> Acquire -> RequestSyncPointEvent and returns; Start runs immediately without a Release.
++    // The event must stay armed until a real picture lands (never fire early and race Start), and releasing an unfilled buffer must not duplicate its pending entry
++    {   _Alignas(16) static uint8_t dk[0x400], pk[0x40], mk[16 * 16 * 4], ek[0x80];
++        assert(!h_cv_poolsize(&size, &align, &pref, 1) && !h_cv_pool(pk, mk, size, &pref, 1, 0));
++        assert(!h_cv_vp9init2(dk, 0x10000, 16, 16, 1, 1, 3, NULL, 0)); cv_dec *k = cv_of(dk);
++        assert(!h_spt_create(ek));
++        assert(!h_cv_vp9reg(dk, 0, pk, 0) && k->pcount == 1 && !h_cv_vp9acq(&idx, &sync, dk) && idx == 0 && sync.gen == 1 && !h_gs_trywait(&sync));
++        assert(!h_spt_request(ek, &sync) && !ev_set(ek) && SPT(ek)->armed);
++        assert(h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dk, 0) == CV_NONE);
++        assert(!h_cv_vp9start(dk) && !ev_set(ek) && SPT(ek)->armed);
++        assert(!h_cv_vp9submit(&id, dk, vp9, sizeof vp9, 5000, false));
++        settle(dk); assert(ev_set(ek) && !SPT(ek)->armed && !ev_by_me(ek) && h_gs_trywait(&sync));
++        assert(!h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dk, 0) && w == 16 && h == 16 && ts == 5000 && !eos && !k->pcount);
++        // Release -> Acquire -> RequestSyncPointEvent -> Submit for the next picture
++        h_cv_vp9rel(dk, 0, sync); assert(k->pcount == 1 && !h_cv_vp9acq(&idx, &sync, dk) && idx == 0 && sync.gen == 2 && !h_gs_trywait(&sync));
++        assert(!h_spt_request(ek, &sync) && !ev_set(ek) && SPT(ek)->armed);
++        // Releasing an unfilled buffer advances its generation without duplicating it in pend[], and Unregister -> Register keeps generation monotonic
++        h_cv_vp9rel(dk, 0, sync); assert(k->pcount == 1 && !h_cv_vp9acq(&idx, &sync, dk) && idx == 0 && sync.gen == 3 && !h_gs_trywait(&sync));
++        assert(!h_spt_request(ek, &sync) && !ev_set(ek) && SPT(ek)->armed);
++        assert(!h_cv_vp9submit(&id, dk, vp9, sizeof vp9, 6000, false));
++        settle(dk); assert(ev_set(ek) && !SPT(ek)->armed && h_gs_trywait(&sync));
++        assert(!h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dk, 0) && ts == 6000);
++        assert(!h_cv_vp9unreg(dk, 0) && !h_cv_vp9reg(dk, 0, pk, 0) && !h_cv_vp9acq(&idx, &sync, dk) && idx == 0 && sync.gen == 5 && !h_gs_trywait(&sync));
++        h_spt_destroy(ek);
++        assert(!h_cv_vp9fin(dk));
++        h_cv_poolfin(pk);
++    }
+     // VP8 (libvpx) and H.264 (VideoToolbox) take the same protocol: one released buffer, one key frame, its picture read back red
+     {   _Alignas(16) static uint8_t d8[0x400], p8[0x40], m8[16 * 16 * 4];
+         assert(!h_cv_poolsize(&size, &align, &pref, 1) && !h_cv_pool(p8, m8, size, &pref, 1, 0));

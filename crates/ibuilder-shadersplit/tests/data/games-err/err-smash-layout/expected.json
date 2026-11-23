@@ -1,0 +1,3 @@
+{
+ "error": "[RED] @ROMFS@/data.arc: version 0xd0005: the file system table does not have the layout this reader knows (it would end at 0x264 of 0x80)"
+}

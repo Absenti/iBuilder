@@ -28,6 +28,7 @@ pub mod diag;
 pub mod env;
 pub mod error;
 pub mod gate;
+pub mod layers;
 pub mod layout;
 pub mod live;
 pub mod log;
