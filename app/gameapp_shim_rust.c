@@ -6,7 +6,7 @@
  *
  *   * the signing identity (Keychain item / protected file) and the zsign call, offered to the chain as the ibuilder_sign_fn callback;
  *   * gameapp_nsz (nsz_decompress.c), the touch-pad and TV entries (dlsym on the loaded host, through ibuilder_host_symbol);
- *   * the managed shader translator's entry (gameapp_set_xlate) and SPIRV-Cross (spvc_cli.c), as the two ibuilder_tool_fn callbacks;
+ *   * the managed shader translator's entry (gameapp_set_xlate), SPIRV-Cross (spvc_cli.c) and glslang (glslang_cli.cpp), as the ibuilder_tool_fn callbacks;
  *   * the "GameAppLiveShader" notification (ibuilder_live_notify_fn).
  *
  * What is gone with the interpreter: Py_BytesMain, the inittab modules (_dmgameapp, _capstone, lz4, zbic), choose_gil, the signal logger, the
@@ -567,7 +567,7 @@ void *gameapp_game_menu(void)
     return fn ? fn() : NULL;
 }
 
-/* ---- the shader chain's native tools, in process: the two ibuilder_tool_fn callbacks ------------------------------------------------------------
+/* ---- the shader chain's native tools, in process: the ibuilder_tool_fn callbacks ------------------------------------------------------------
  * The translator is C# (the engine's dmsh_xlate over Ryujinx.Graphics.Shader, compiled into this app; the managed side registers its entry here at
  * launch). Its entry takes only the arguments (dmsh_xlate <job.json> <outdir>), and the Rust library passes the full command line, program name
  * first, as gameapp_tool_fn always did: the trampoline drops argv[0]. SPIRV-Cross (gameapp/spvc_cli.c over the C API) takes argv[0] as main() does. */
@@ -575,6 +575,7 @@ typedef int (*gameapp_tool_fn)(int argc, const char **argv, char **out, char **e
 static _Atomic(gameapp_tool_fn) g_xlate_fn;
 void gameapp_set_xlate(gameapp_tool_fn fn) { atomic_store(&g_xlate_fn, fn); }
 int gameapp_spirv_cross(int argc, const char **argv, char **out_stdout, char **out_stderr);   /* gameapp/spvc_cli.c */
+int gameapp_glslang(int argc, const char **argv, char **out_stdout, char **out_stderr);       /* app/c/glslang_cli.cpp: glslangValidator's subset, for OpenGL games */
 
 static int xlate_tool(int argc, const char **argv, char **out_stdout, char **out_stderr)
 {
@@ -582,7 +583,27 @@ static int xlate_tool(int argc, const char **argv, char **out_stdout, char **out
     *out_stdout = NULL; *out_stderr = NULL;
     if (fn == NULL) { *out_stderr = strdup("the translator is not registered (the managed side did not start it)"); return 127; }
     if (argc < 1) { *out_stderr = strdup("no program name"); return 2; }
+    ibuilder_qos_follow();   /* the build screen's Mode, changed during the build: this worker follows it (patch 0103) */
     return fn(argc - 1, argv + 1, out_stdout, out_stderr);
+}
+
+static int spirv_cross_tool(int argc, const char **argv, char **out_stdout, char **out_stderr)
+{
+    ibuilder_qos_follow();   /* as the translator's (patch 0103) */
+    return gameapp_spirv_cross(argc, argv, out_stdout, out_stderr);
+}
+
+static int glslang_tool(int argc, const char **argv, char **out_stdout, char **out_stderr)
+{
+    ibuilder_qos_follow();   /* as the translator's (patch 0103) */
+    return gameapp_glslang(argc, argv, out_stdout, out_stderr);   /* argv[0] is the program name, as main() takes it */
+}
+
+/* The build screen's Mode (patch 0103): 1 Fast, 0 Cool, for the build that runs now (the app saves fast_build in gameapp.settings.tsv for the next ones). */
+void gameapp_set_fast_build(int on)
+{
+    ibuilder_set_fast_build(on);
+    logln("[gameapp] chain: build mode %s (from the build screen)", on ? "Fast" : "Cool");
 }
 
 /* ---- the live-shader view hook: a "GameAppLiveShader" notification (busy 1 while the first game thread waits for a translation, then 0) ---- */
@@ -689,7 +710,8 @@ int gameapp_run_chain(void)
     o.bundle_dir = bundle;
     o.sign = sign_cb;
     o.xlate = xlate_tool;
-    o.spirv_cross = gameapp_spirv_cross;
+    o.spirv_cross = spirv_cross_tool;
+    o.glslang = glslang_tool;                  /* OpenGL games' GLSL (ibuilder_options' appended field) */
     o.live_notify = live_notify_cb;
     o.flags = IBUILDER_FLAG_BOOT_IN_PROCESS;   /* PIPELINE_BOOT=1: stage 5 runs in this process */
     o.sign_adhoc = sign_adhoc_cb;              /* no .p12 here: the framework is signed ad hoc, for export only */

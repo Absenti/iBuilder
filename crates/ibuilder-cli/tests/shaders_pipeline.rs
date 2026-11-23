@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const GAME: &str = "0100DFA027504000";
-const CHAIN: &str = "b24b25240cad";
+const CHAIN: &str = "6c53446391cc";
 
 fn read(p: &Path) -> Vec<u8> {
     std::fs::read(p).unwrap()
@@ -44,7 +44,7 @@ fn image_files(data: &[u8]) -> Vec<(String, Vec<u8>)> {
 #[test]
 fn the_pipelines_build_request_gives_the_pythons_files() {
     let (old, s2) = (ibuilder_testkit::scratch_old(), ibuilder_testkit::scratch());
-    let py_img = old.join("shader/runs/s300-j1/b-b24b25240cad.img");
+    let py_img = old.join("shader/runs/s300-j1/b-6c53446391cc.img");
     let (pkg, prof, engine) = (
         old.join("shader/split-out/pkg"),
         old.join("shader/profile").join(GAME),

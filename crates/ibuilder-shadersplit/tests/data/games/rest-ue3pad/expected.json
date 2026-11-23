@@ -1,0 +1,20 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "03e1cce00711fae818aa230e56d3d53c11604ddf48fadbdefdd6f9e6a4895f86",
+  "pkg/ps_data.bin": "2a4eb7a96421a861c035147571867a021acb65732b79741afaceec280d168f8a",
+  "pkg/vs_data.bin": "0056e8408015ef3d39bad48d51405487126b0ea01d10a7a38f37174a825ca175",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "88d6f7d83285aa5bfbdedf8e1e83f6349d95d89bd33473e128dd03e3458a4385",
+  "tables/shader_map.tsv": "64e3731dd08d69bd991c5eb0137b52e1236a06493528a79bdf133d33d50499d9",
+  "tables/shader_pairs.tsv": "56eb623acf1af53cf2fc43d3dea9db3967dc00e07f6b4606ecd82ff735a6afa7"
+ },
+ "log": [
+  "[RED] /Data/tail.xxx: no compressed chunk at 0x1366 (the chunks do not run to the end of the package) (its shaders are left out)",
+  "[RED] 1 file(s) could not be read, their shaders are left out (first: /Data/tail.xxx: no compressed chunk at 0x1366 (the chunks do not run to the end of the package))",
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (d57bd5806ca0a93b)",
+  "shaders: 3 (compute 1, pixel 1, vertex 1); sources data 3; compute shader answers 1 rows; variation pairs 1"
+ ],
+ "shaders": 3,
+ "updates": []
+}

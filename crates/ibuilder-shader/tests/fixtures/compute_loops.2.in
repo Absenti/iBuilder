@@ -1,0 +1,22 @@
+#include <metal_stdlib>
+using namespace metal;
+struct Args { device uint* buf [[id(0)]]; };
+
+static inline void arrive()
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+kernel void main0(constant Args& a [[buffer(0)]], uint tid [[thread_index_in_threadgroup]])
+{
+    uint count = 0u;
+    for (uint i = 0u; i < 300u + tid; i++)
+    {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    }
+    for (uint i = 0u; (arrive(), i < 2048u); i++)
+    {
+
+        count++;
+    }
+    a.buf[8u + tid] = count;
+}

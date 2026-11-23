@@ -603,7 +603,8 @@ pub fn scan_blob(
         return Ok(());
     }
     if starts(d, b"NARC") {
-        unsupported!("Camelot NARC container (cra.py: {label})");
+        // Camelot's containers (cra.rs): each member packed by its first byte, so its size says nothing about the budget above
+        return crate::cra::narc_scan(cx, d, label, out, depth);
     }
     if starts(d, b"BAHS") {
         out.extend(bahs_shaders(cx, d, label)?);
@@ -628,6 +629,10 @@ pub fn scan_blob(
     }
     if starts(d, TFXO) {
         out.extend(tfxo_shaders(d, label)?);
+        return Ok(());
+    }
+    if starts(d, crate::sharc::MAGIC) {
+        out.extend(crate::sharc::sharc_shaders(d, label)?);
         return Ok(());
     }
     if starts(d, SHAD) {
@@ -838,6 +843,14 @@ fn scan_file_in(cx: &Ctx<'_>, f: &FileRef) -> Res<FileResult> {
     if h4 == [0x58, 0x24, 0xf3, 0xa9] {
         unsupported!("Next Level Games archive index (.dict beside .data: {rel})");
     }
+    if h4 == crate::telltale::TTCZ || h4 == crate::telltale::TTCN {
+        // a Telltale .ttarch2 (ttarch2_shaders): only its effect pack holds shaders; an archive whose entry table names none is not read whole
+        if crate::telltale::ttarch2_named(&src)? {
+            let d = src.read_all().map_err(ioerr)?;
+            found.extend(crate::telltale::ttarch2_shaders(&d, &label)?);
+        }
+        return finish(cx, rel, found, [], trees);
+    }
     if rel.ends_with(".pkdswitch") {
         let idx_rel = format!("{}.pkiswitch", &rel[..rel.len() - ".pkdswitch".len()]);
         if let Some(il) = cx.files.get(f.root, &idx_rel) {
@@ -862,9 +875,20 @@ fn scan_file_in(cx: &Ctx<'_>, f: &FileRef) -> Res<FileResult> {
         idrk_shaders(&src, &label, &mut found)?;
         return finish(cx, rel, found, [], trees);
     }
+    if h4 == crate::rage_wad::MAGIC && rel.rsplit('/').next() == Some(crate::rage_wad::NAME) {
+        // RAGE WAD variant with split GLSLC arrays (noire_wad_shaders)
+        found = crate::rage_wad::noire_wad_shaders(&src, &label)?;
+        return finish(cx, rel, found, [], trees);
+    }
     if starts(&head, b"bnd2") {
         let d = src.read_all().map_err(ioerr)?;
         found.extend(bnd2_shaders(&d, &label)?);
+        return finish(cx, rel, found, [], trees);
+    }
+    if h4 == crate::sharc::MAGIC {
+        // GIANTS Engine shader archive
+        let d = src.read_all().map_err(ioerr)?;
+        found = crate::sharc::sharc_shaders(&d, &label)?;
         return finish(cx, rel, found, [], trees);
     }
     if starts(&head, b"PAK")
@@ -930,7 +954,30 @@ fn scan_file_in(cx: &Ctx<'_>, f: &FileRef) -> Res<FileResult> {
         return finish(cx, rel, found, [], trees);
     }
     if h4 == b"SRYK" {
-        unsupported!("Phyre VBF archive (vbf.py: {rel})");
+        // a Virtuos VBF archive (vbf.py): its compiled effects and loose GPU programs, read one member at a time
+        let es = crate::vbf::entries(&src).map_err(Failure::Red)?;
+        for e in &es {
+            if crate::vbf::wanted(&e.0) {
+                let d = crate::vbf::read(&src, e).map_err(Failure::Red)?;
+                found.extend(phyre_shaders(&d, &format!("/{rel}/{}", e.0))?);
+            }
+        }
+        return finish(cx, rel, found, [], trees);
+    }
+    if h4 == crate::redengine::FZLC {
+        // REDengine 3's static shader cache (fzlc_shaders)
+        found.extend(crate::redengine::fzlc_shaders(cx, &src, &label)?);
+        return finish(cx, rel, found, [], trees);
+    }
+    // REDengine 3's material cache: the footer is required even under the engine's file name, which also lets a damaged first flag be named
+    if crate::redengine::is_rdhs(&src, &head, rel)? {
+        found.extend(crate::redengine::rdhs_shaders(cx, &src, &label)?);
+        return finish(cx, rel, found, [], trees);
+    }
+    if crate::nxcx::is_nxcx(&head)
+        && let Some(archive) = crate::nxcx::nxcx_shaders(&src, &label)?
+    {
+        return finish(cx, rel, archive, [], trees);
     }
     if h4 == crate::falcom::PKA_MAGIC {
         // a Falcom .pka no job took (falcom_pka_jobs plans every one): its blobs, read one at a time

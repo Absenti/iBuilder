@@ -1,0 +1,17 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct spvDescriptorSetBuffer0
+{
+    array<texture_buffer<uint>, 2048> fp_tb_cb7_2A [[id(0)]];
+    const device _12* fp_s0 [[id(1)]];
+};
+
+kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])
+{
+    auto u0 = spvDescriptorSet0.fp_tb_cb7_2A[uint(_6)].sample(s, 0.5);
+}

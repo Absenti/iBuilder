@@ -87,7 +87,7 @@ fn the_300_shader_sample_is_the_pythons_library() {
         return;
     };
     assert_eq!((r.shaders, r.ok), (401, 401), "{:?}", r.failed);
-    let want = std::fs::read(old("shader/runs/s300-j1/b-b24b25240cad.img")).unwrap();
+    let want = std::fs::read(old("shader/runs/s300-j1/b-6c53446391cc.img")).unwrap();
     assert_eq!(std::fs::read(&r.image).unwrap(), want, "the library image");
     eprintln!(
         "401 shaders: image byte-identical to the Python's ({} bytes, {:.1} s)",
@@ -106,7 +106,7 @@ fn the_1800_shader_sample_is_the_pythons_library() {
         return;
     };
     assert_eq!((r.shaders, r.ok), (2459, 2459), "{:?}", r.failed);
-    let want = std::fs::read(old("shader/runs/s1800-cap/b-b24b25240cad.img")).unwrap();
+    let want = std::fs::read(old("shader/runs/s1800-cap/b-6c53446391cc.img")).unwrap();
     assert_eq!(std::fs::read(&r.image).unwrap(), want, "the library image");
     eprintln!(
         "2459 shaders: image byte-identical to the Python's ({} bytes, {:.1} s wall, {} translator calls {:.0} s, {} spirv-cross calls {:.0} s)",
@@ -133,7 +133,7 @@ fn the_whole_grizzy_library_is_the_pythons() {
     };
     let (a, b) = (
         map(&r.image),
-        map(&old("shader/runs/full-gil-j6/b-b24b25240cad.img")),
+        map(&old("shader/runs/full-gil-j6/b-6c53446391cc.img")),
     );
     let (same, stamp) = same_files(&a[..], &b[..], &["c1_full.tsv", "cb_extent.tsv"]);
     eprintln!(

@@ -1,4 +1,5 @@
-//! The small steps of `finish()`: precise, membar_fence, tg_fence, max_threads, check_msl.
+//! The small steps of `finish()`: precise, tg_fence, max_threads, check_msl, raw_noinline, mesh_subgroup_noinline (and membar_fence, which the engine's chain no longer runs:
+//! SPIRV-Cross writes MEMBAR's fences itself at MSL 3.2).
 use crate::templates as t;
 use crate::text::*;
 use crate::{PostError, failed};
@@ -90,7 +91,7 @@ pub fn precise(src: &str) -> Cow<'_, str> {
     }
 }
 
-/// dmsh_rewrite.membar_fence
+/// the 2026-11-16 engine's dmsh_rewrite.membar_fence (no longer a step of `finish()`)
 pub fn membar_fence(src: &str) -> Cow<'_, str> {
     if !contains(src, t::MEMBAR) {
         return Cow::Borrowed(src);
@@ -187,4 +188,51 @@ pub fn max_threads<'a>(src: &'a str, local: Option<&[i64]>) -> Cow<'a, str> {
         from = p + 1;
     }
     Cow::Borrowed(src)
+}
+
+/// dmsh_rewrite.raw_noinline: the raw global memory lookup's search (`dmsh_raw_find*`) written `noinline`, one copy the misses branch to; a mesh stage (`ms`) keeps it
+/// (or makes it again) always_inline, as Apple's M1 / M2 mesh compiler crashes on some mesh programs that call it. `stage` is the stage HEAD's finish() passes: the mesh kind
+/// for a task / mesh shader, else the job's stage.
+pub fn raw_noinline<'a>(src: &'a str, stage: &str) -> Cow<'a, str> {
+    static RAW_FIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\nstatic (?:inline __attribute__\(\(always_inline\)\)|__attribute__\(\(noinline\)\))\n(\w+ dmsh_raw_find\w*\()",
+        )
+        .expect("static regex")
+    });
+    if !contains(src, "dmsh_raw_find") {
+        return Cow::Borrowed(src);
+    }
+    let attr = if stage == "ms" {
+        "inline __attribute__((always_inline))"
+    } else {
+        "__attribute__((noinline))"
+    };
+    RAW_FIND.replace_all(src, |c: &regex::Captures| {
+        format!("\nstatic {attr}\n{}", &c[1])
+    })
+}
+
+/// dmsh_rewrite.mesh_subgroup_noinline: SPIRV-Cross's helpers that take a subgroup input (`gl_Subgroup*`) out of line in a mesh shader (Apple's mesh backend crashes inlining them),
+/// and every `thread T& gl_Subgroup*` parameter passed by value (out of line, the backend reads the lane ID through the reference as one value for the whole SIMD group).
+pub fn mesh_subgroup_noinline(src: &str) -> Cow<'_, str> {
+    // MESH_SUBGROUP_HELPER `(?m)^static inline __attribute__\(\(always_inline\)\)(?=\n\w+ \w+\([^\n]*\bgl_Subgroup\w*\b)`: the look-ahead is the group after the prefix,
+    // kept as it is (its text holds no line start, so no other match can begin inside it)
+    static HELPER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?m)^static inline __attribute__\(\(always_inline\)\)(\n\w+ \w+\([^\n]*\bgl_Subgroup)",
+        )
+        .expect("static regex")
+    });
+    static REF: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\bthread (\w+)& (gl_Subgroup\w+)\b").expect("static regex")
+    });
+    let a = HELPER.replace_all(src, "static __attribute__((noinline))$1");
+    match REF.replace_all(&a, "$1 $2") {
+        Cow::Owned(o) => Cow::Owned(o),
+        Cow::Borrowed(_) => match a {
+            Cow::Owned(o) => Cow::Owned(o),
+            Cow::Borrowed(_) => Cow::Borrowed(src),
+        },
+    }
 }

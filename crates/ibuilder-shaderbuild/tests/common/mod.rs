@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 use std::path::{Path, PathBuf};
 
-pub const CHAIN: &str = "b24b25240cad";
+pub const CHAIN: &str = "6c53446391cc";
 pub const GAME: &str = "0100DFA027504000";
 
 pub fn old(p: &str) -> PathBuf {

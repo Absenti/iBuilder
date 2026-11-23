@@ -39,6 +39,16 @@ use std::time::Instant;
 /// "<pause|cancel> <time>", says a person stopped it. The next run then does not take the folder for one an earlier run DIED under (the memory kill that makes a run read and translate on one
 /// thread, below), and goes on at full speed.
 pub const STOPPED_BY_USER: &str = "stopped.by.user";
+/// In the work folder: how many runs in a row ended under it without a person stopping them (a kill: memory, a crash, the background time running out). Removed with the folder,
+/// and when a person stops the build.
+pub const KILLED_RUNS: &str = "killed.runs";
+/// Speed-up B6 (2026-11-23): in the work folder, the game's previous library of this chain (`b-<chain>.img` and its digests table `b-<chain>.img.digests`), kept aside when a stale pack
+/// is rebuilt (a game update, a DLC change, a re-split) until the new library is in place. The build (`ibuilder_shaderbuild::cache::Store`) finds it as `<out_dir>/prev/` (hard links made
+/// before the build) and takes every shader whose digest did not change from it instead of translating it again: the new image is byte for byte the one a build without it makes. It goes
+/// with the work folder (a finished build, a failed one, or a game the app deletes) and stays with it when a person stops the build (the resumed build takes it again).
+pub const PREV_LIBRARY: &str = "prev";
+/// What the build leaves in `<out_dir>/prev/` about the previous library (`ibuilder_shaderbuild::cache::REUSE_FILE`): `state`, `entries`, `looked`, `hits` rows
+pub const PREV_REUSE: &str = "reuse.tsv";
 
 pub const SHADER_TABLES: [&str; 4] = [
     "shader_map.tsv",
@@ -188,7 +198,12 @@ impl ShaderResume {
                 }
             }
         } else {
-            rmtree(&self.work);
+            // everything goes but the previous library (B6: a game update changes the inputs, and its unchanged shaders are what that library is kept for)
+            for name in list_names(&self.work) {
+                if name != PREV_LIBRARY {
+                    remove_path(&self.work.join(name));
+                }
+            }
             let _ = fs::create_dir_all(&self.work);
             let _ = self.write(
                 Self::FILE,
@@ -241,6 +256,15 @@ fn pack_rows(text: &str) -> BTreeMap<String, String> {
         .filter_map(|l| l.split_once('\t'))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+}
+
+/// GL / Vulkan (crate::layers): the backend's layer library version, `-` without one
+fn layer_version(ctx: &Ctx) -> String {
+    ctx.adapters
+        .shaders
+        .as_ref()
+        .map(|b| b.layer_version())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn split_version(ctx: &Ctx) -> String {
@@ -462,9 +486,17 @@ pub fn shaders_will_build(ctx: &Ctx) -> bool {
         let t = read_text(&none_marker).unwrap_or_default();
         if !matches!(marker_verdict(ctx, &tid, &t), SplitVerdict::Stale(_))
             && (dlc_sig == "-" || t.contains(&format!("dlc {dlc_sig}\n")))
+            && !crate::layers::none_marker_misses_layers(&t, &layer_version(ctx))
+        // GL / Vulkan (crate::layers)
         {
             return false;
         }
+    }
+    if crate::layers::current(&pack, &layer_version(ctx)).is_some()
+        && !matches!(pack_verdict(ctx, &tid, &pack), Some(SplitVerdict::Stale(_)))
+        && stale_dlc(&pack, &dlc_sig).is_none()
+    {
+        return false; // GL / Vulkan (crate::layers)
     }
     let have = list_names(&pack)
         .iter()
@@ -500,6 +532,18 @@ pub fn app_setting(ctx: &Ctx, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The app's "Fast build" setting (`fast_build`, default off): when on, the build's worker threads keep the QoS of the thread that runs the chain instead of utility (`sys::qos`),
+/// so the build is faster and hotter and the UI may lag. Timing only, never a result.
+pub fn fast_build_setting(ctx: &Ctx) -> bool {
+    matches!(
+        app_setting(ctx, "fast_build")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str(),
+        "1" | "on" | "yes" | "true"
+    )
 }
 
 /// `shader_parallelism`: whether stage 3 finishes its shaders on several cores at once: on unless the player turned "Parallel shader preparation" off (`parallel_shaders 0`).
@@ -576,6 +620,167 @@ pub fn parse_progress(line: &str) -> Option<(u64, u64)> {
 /// `build_shaders_on_device`: stage 3 on the phone: the game's shaders become a library THIS host takes, with no Mac (docs/GAME-APP.md §8.7). The result is installed as a shader pack,
 /// `Documents/shaders/<id>/`, exactly where an imported pack goes. Skipped when this game already has a pack of the host's chain. Returns the pack folder, or `None` (nothing to build,
 /// a stop, or a failure the log says: `build_shaders` tells the failure apart).
+/// `b-<chain>.img`: the library of the host's chain
+fn library_file(chain: &str) -> String {
+    format!("b-{chain}.img")
+}
+
+/// `b-<chain>.img.digests`: the library's digests table (`ibuilder_shaderbuild::library::digests_path`), what lets a rebuild take its unchanged shaders from it (B6)
+fn digests_file(chain: &str) -> String {
+    format!("{}.digests", library_file(chain))
+}
+
+fn has_library_and_table(dir: &Path, chain: &str) -> bool {
+    is_file(&dir.join(library_file(chain))) && is_file(&dir.join(digests_file(chain)))
+}
+
+/// B6: a stale pack goes, but its library of this chain (with its digests table) is moved into `<work>/prev` first. Returns its size when it was kept.
+fn set_aside_library(pack: &Path, work: &Path, chain: &str) -> Option<u64> {
+    let mut kept = None;
+    if has_library_and_table(pack, chain) {
+        let prev = work.join(PREV_LIBRARY);
+        rmtree(&prev);
+        let moved = fs::create_dir_all(&prev).is_ok()
+            && [library_file(chain), digests_file(chain)]
+                .iter()
+                .all(|n| fs::rename(pack.join(n), prev.join(n)).is_ok());
+        if moved {
+            kept = fs::metadata(prev.join(library_file(chain)))
+                .ok()
+                .map(|m| m.len());
+        } else {
+            rmtree(&prev);
+        }
+    }
+    rmtree(pack);
+    kept
+}
+
+fn kept_aside(ctx: &Ctx, kept: Option<u64>) {
+    if let Some(bytes) = kept {
+        ctx.log(&format!("stage 3 shaders: its library ({}) is kept aside until the new one is built: the shaders that did not change are taken from it instead of translated", gib_text(bytes as f64)));
+    }
+}
+
+/// B6: the previous library goes (the build is over, or will not run); the work folder too when nothing else is in it
+fn drop_previous_library(work: &Path) {
+    let prev = work.join(PREV_LIBRARY);
+    if is_dir(&prev) {
+        rmtree(&prev);
+        if list_names(work).is_empty() {
+            let _ = fs::remove_dir(work);
+        }
+    }
+}
+
+/// A work folder an earlier run left: anything in it but the previous library (B6), which a stale pack's removal puts there before any build starts
+fn work_left_behind(work: &Path) -> bool {
+    is_dir(work) && list_names(work).iter().any(|n| n != PREV_LIBRARY)
+}
+
+/// B6: hard links of the previous library (`src`: `<work>/prev`, or the pack in place when it is rebuilt) in `<out>/prev/`, where the build looks for it; a symlink where a hard link
+/// cannot be made. Returns the library's size.
+fn link_previous_library(src: &Path, out: &Path, chain: &str) -> Option<u64> {
+    let dst = out.join(PREV_LIBRARY);
+    rmtree(&dst);
+    fs::create_dir_all(&dst).ok()?;
+    for n in [library_file(chain), digests_file(chain)] {
+        let (a, b) = (src.join(&n), dst.join(&n));
+        if fs::hard_link(&a, &b).is_err() && std::os::unix::fs::symlink(&a, &b).is_err() {
+            rmtree(&dst);
+            return None;
+        }
+    }
+    fs::metadata(src.join(library_file(chain)))
+        .ok()
+        .map(|m| m.len())
+}
+
+/// B6: the line about the previous library, from what the build left beside it (`PREV_REUSE`); `None` when the build did not get that far
+fn previous_library_line(out: &Path) -> Option<String> {
+    let text = read_text(&out.join(PREV_LIBRARY).join(PREV_REUSE)).ok()?;
+    let rows: BTreeMap<&str, &str> = text.lines().filter_map(|l| l.split_once('\t')).collect();
+    let state = rows.get("state").copied().unwrap_or("");
+    if state != "used" {
+        return Some(format!(
+            "stage 3 shaders: the previous library was {state}: every shader is translated or restored from the shader cache"
+        ));
+    }
+    Some(format!(
+        "stage 3 shaders: {} of {} shaders taken from the previous library (unchanged since it was built; it held {})",
+        rows.get("hits").copied().unwrap_or("0"),
+        rows.get("looked").copied().unwrap_or("0"),
+        rows.get("entries").copied().unwrap_or("0")
+    ))
+}
+
+/// B2: the translator's and SPIRV-Cross's calls and the time spent in them, summed over the build's threads (inside the memory/thermal gate: a wait there is not counted)
+#[derive(Default)]
+struct ToolClock {
+    xlate_calls: std::sync::atomic::AtomicU64,
+    xlate_ns: std::sync::atomic::AtomicU64,
+    cross_calls: std::sync::atomic::AtomicU64,
+    cross_ns: std::sync::atomic::AtomicU64,
+}
+
+impl ToolClock {
+    fn wrap(self: &Arc<Self>, tools: &ShaderTools) -> ShaderTools {
+        let timed = |f: &crate::adapters::ToolFn, xlate: bool| -> crate::adapters::ToolFn {
+            let (f, clock) = (f.clone(), self.clone());
+            Arc::new(move |argv: &[String]| {
+                let t = Instant::now();
+                let r = f(argv);
+                let ns = t.elapsed().as_nanos() as u64;
+                let (calls, total) = if xlate {
+                    (&clock.xlate_calls, &clock.xlate_ns)
+                } else {
+                    (&clock.cross_calls, &clock.cross_ns)
+                };
+                calls.fetch_add(1, Ordering::Relaxed);
+                total.fetch_add(ns, Ordering::Relaxed);
+                r
+            })
+        };
+        ShaderTools {
+            xlate: timed(&tools.xlate, true),
+            spirv_cross: timed(&tools.spirv_cross, false),
+            glslang: tools.glslang.clone(), // GL games only: not counted in B2's two tool clocks
+        }
+    }
+}
+
+/// B2: the process's user and system CPU seconds (`getrusage(RUSAGE_SELF)`: every thread, the in-process translator's too)
+#[allow(unsafe_code)]
+fn cpu_seconds() -> Option<(f64, f64)> {
+    // SAFETY: `ru` is a zeroed rusage that getrusage fills; nothing else is read or written
+    let ru = unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+            return None;
+        }
+        ru
+    };
+    let s = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    Some((s(ru.ru_utime), s(ru.ru_stime)))
+}
+
+/// B6, the free-space gate: whether the previous library (`prev` bytes, 0 = none) stays, and the free space the gate counts (`have`, -1 = unknown). It stays when the build's `need` fits
+/// beside it; else it goes, and its room counts as free, as it did when a stale pack was removed before the gate. Unknown free space keeps it (the gate is skipped then too).
+fn previous_library_fits(have: i64, need: u64, prev: u64) -> (bool, i64) {
+    if prev == 0 || have < 0 || (have as u64) >= need.saturating_add(prev) {
+        (true, have)
+    } else {
+        (false, have.saturating_add(prev as i64))
+    }
+}
+
+/// `"shader cache: hit 12, rebuilt 300"` (the build's summary line) -> (12, 300)
+fn parse_cache_line(line: &str) -> Option<(u64, u64)> {
+    let rest = line.strip_prefix("shader cache: hit ")?;
+    let (h, r) = rest.split_once(", rebuilt ")?;
+    Some((h.trim().parse().ok()?, r.trim().parse().ok()?))
+}
+
 pub fn build_shaders_on_device(ctx: &mut Ctx) -> Option<PathBuf> {
     build_shaders(ctx).ok().flatten()
 }
@@ -591,6 +796,7 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     let pack = ctx.shader_packs.join(&tid);
+    let work = with_ext_dir(&ctx.shader_packs, &format!("{tid}.work"));
     if let Some(what) = recover_pack(&pack) {
         ctx.log(&format!("stage 3 shaders: {what}"));
     }
@@ -621,11 +827,20 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         }
     }
     if is_file(&none_marker) {
+        // GL / Vulkan (crate::layers): a marker written before this app could read the game's GLSL / SPIR-V
+        let t = read_text(&none_marker).unwrap_or_default();
+        if crate::layers::none_marker_misses_layers(&t, &layer_version(ctx)) {
+            ctx.log(&format!("stage 3 shaders: {tid} held no NVN shader; this app also reads GL / Vulkan shaders -- split again"));
+            let _ = fs::remove_file(&none_marker);
+        }
+    }
+    if is_file(&none_marker) {
         let t = read_text(&none_marker).unwrap_or_default();
         ctx.log(&format!(
             "stage 3 shaders: {tid} holds no shader this split reads ({}) -- not tried again",
             t.trim()
         ));
+        drop_previous_library(&work);
         return Ok(None);
     }
     match pack_verdict(ctx, &tid, &pack) {
@@ -645,12 +860,17 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
             ctx.log(&format!(
                 "stage 3 shaders: Documents/shaders/{tid} was {why}: it may miss shaders this version finds -- built again"
             ));
-            rmtree(&pack);
+            kept_aside(ctx, set_aside_library(&pack, &work, &chain));
         }
     }
     if let Some((had, want)) = stale_dlc(&pack, &dlc_sig) {
         ctx.log(&format!("stage 3 shaders: Documents/shaders/{tid} was split with DLC {had}, installed now {want}: split again so the DLC's own shaders are translated too"));
-        rmtree(&pack);
+        kept_aside(ctx, set_aside_library(&pack, &work, &chain));
+    }
+    if let Some(api) = crate::layers::current(&pack, &layer_version(ctx)) {
+        // GL / Vulkan (crate::layers)
+        ctx.log(&format!("stage 3 shaders: Documents/shaders/{tid} already holds its {api} layer library -- nothing to build"));
+        return Ok(Some(pack));
     }
     let lib_names = [format!("b-{chain}.img"), format!("b-{chain}")];
     if list_names(&pack).iter().any(|n| lib_names.contains(n))
@@ -665,16 +885,19 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
             Some(&*ctx.log),
         );
         top_up_pack(ctx, &tid, &pack); // a pack built before the app carried the game's small input tables (pso_manifest.tsv, ...) gets them now
+        drop_previous_library(&work);
         return Ok(Some(pack));
     }
     if ctx.cfg.get_or("shader_build", "1") == "0" {
         ctx.log("stage 3 shaders: shader_build=0 -- not built on this device");
+        drop_previous_library(&work);
         return Ok(None);
     }
     // A library of another chain (an app update moved the chain: paches/engine) is one this host refuses; it goes before the build, which needs the space (a Grizzy library is ~2 GB).
     if is_dir(&pack) {
         for name in list_names(&pack) {
-            if name.starts_with("b-") && !lib_names.contains(&name) {
+            if name.starts_with("b-") && !lib_names.contains(&name) && name != digests_file(&chain)
+            {
                 let path = pack.join(&name);
                 let r = if is_dir(&path) {
                     fs::remove_dir_all(&path)
@@ -710,6 +933,7 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
             missing.join(", ")
         );
         ctx.log(&format!("stage 3 shaders: [RED] {why}"));
+        drop_previous_library(&work);
         return Err(PipelineError::failed(why));
     }
     let derived = derived.unwrap();
@@ -727,6 +951,18 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
             gb(crate::sys::free_bytes_strict(ctx.docs.root()).max(0))
         ));
     }
+    // B6: the previous library kept aside is room the build would have had without it (the stale pack went before this gate until B6): it stays only when the build fits beside it
+    let prev_bytes = fs::metadata(work.join(PREV_LIBRARY).join(library_file(&chain)))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let (keep_prev, have) = previous_library_fits(have, need, prev_bytes);
+    if !keep_prev {
+        drop_previous_library(&work);
+        ctx.log(&format!(
+            "stage 3 shaders: the previous library ({}) is removed to make room: every shader is translated or restored from the shader cache",
+            gib_text(prev_bytes as f64)
+        ));
+    }
     if have >= 0 && (have as u64) < need {
         let why = format!(
             "{:.1} GB free, the translation needs about {} GB",
@@ -742,6 +978,7 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         ctx.log(&format!(
             "stage 3 shaders: [RED] {why} -- not built on this device"
         ));
+        drop_previous_library(&work);
         return Err(PipelineError::failed(why));
     };
     ctx.thermal.set_log(ctx.log.clone());
@@ -751,7 +988,8 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         Some(ctx.thermal.clone()),
         ctx.clock.clone(),
     ));
-    let gated = tools.gated(&gate);
+    let clock = Arc::new(ToolClock::default());
+    let gated = clock.wrap(&tools).gated(&gate); // timed inside the gate: what the tools took, not what the gate held them back
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -766,16 +1004,36 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
     if parallel && shader_jobs == 0 {
         build_jobs = std::cmp::min(6, cpus); // an explicit shader_jobs in the config still wins
     }
-    let work = with_ext_dir(&ctx.shader_packs, &format!("{tid}.work"));
     // A work folder left behind is a translation that never finished: the process ended under it (iOS ended the app at 938 of 21,990 shaders on 2026-11-18, a memory kill: no signal in the
     // chain log). This one takes no chance. What that run finished is kept (ShaderResume): the same inputs resume, anything partial is done again.
     let stopped_marker = work.join(STOPPED_BY_USER);
     let user_stopped = is_file(&stopped_marker);
-    let left_behind = is_dir(&work) && !user_stopped; // a build a person stopped is not one the OS ended
-    if left_behind && shader_jobs == 0 {
-        build_jobs = 1;
-        jobs = 1;
-        ctx.log(&format!("stage 3 shaders: [ORANGE] the previous shader build of {tid} never finished (its work folder was still there): this one reads and translates on 1 thread, slower but within memory"));
+    let left_behind = work_left_behind(&work) && !user_stopped; // a build a person stopped is not one the OS ended
+    // Speed-up B1 (2026-11-22): a resume after ONE kill keeps half its threads (at least 2), not 1: the kill is as often the background time or a crash as memory, the Rust build peaks
+    // near 1.1 GB on 6 threads where 6.4 GB are free, and the memory gate below (shader_jobs_for_memory, ShaderMemoryGate) still lowers the count when memory is short. Killed twice in a
+    // row it is 1 thread, as before. A person's stop resets the count.
+    let killed_path = work.join(KILLED_RUNS);
+    if user_stopped {
+        let _ = fs::remove_file(&killed_path);
+    }
+    if left_behind {
+        let killed = fs::read_to_string(&killed_path)
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            + 1;
+        let _ = write_atomic(&killed_path, killed.to_string().as_bytes());
+        if shader_jobs == 0 {
+            if killed >= 2 {
+                build_jobs = 1;
+                jobs = 1;
+                ctx.log(&format!("stage 3 shaders: [ORANGE] the shader build of {tid} was ended {killed} times in a row before it finished (its work folder was still there): this one reads and translates on 1 thread, slower but within memory"));
+            } else {
+                build_jobs = (build_jobs / 2).max(2);
+                jobs = jobs.min(2);
+                ctx.log(&format!("stage 3 shaders: [ORANGE] the previous shader build of {tid} never finished (its work folder was still there): this one reads on {jobs} and translates on {build_jobs} threads, half the usual (ended again, the next one uses 1)"));
+            }
+        }
     }
     if ctx.thermal.read().1 && shader_jobs == 0 {
         // Low performance mode: at most 2 at once
@@ -934,8 +1192,16 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
     ));
     let record = work_record_rows(&work); // which readers the game needed (the split's record): kept with the library or the marker
     if n == 0 {
+        // GL / Vulkan (crate::layers): a game that draws through the host's GL or Vulkan layer compiles GLSL / SPIR-V at run time; its layer library is made instead
+        if let Some(p) = crate::layers::try_layers(
+            ctx, &backend, &gated, &tid, &chain, &romfs, &main_nso, &dlc, &dlc_sig, &split_ver,
+            &record, &work, build_jobs, &pack,
+        ) {
+            rmtree(&work);
+            return Ok(Some(p));
+        }
         ctx.log("stage 3 shaders: the game ships no shader this split reads (it may compile them at run time: a Mac capture is needed for such a game) -- nothing built");
-        rmtree(&work);
+        rmtree(&work); // the previous library with it
         let mut marker = format!(
             "the split found 0 shaders in RomFS.img and main\ndlc {dlc_sig}\nsplit {}\n",
             split_version(ctx)
@@ -943,6 +1209,7 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         for (k, v) in &record {
             marker.push_str(&format!("{k} {v}\n"));
         }
+        marker.push_str(&crate::layers::none_line(&layer_version(ctx))); // GL / Vulkan (crate::layers): which layer version tried too
         if let Err(e) = write_atomic(&none_marker, marker.as_bytes()) {
             ctx.log(&format!(
                 "stage 3 shaders: could not write {}: {e} (the next run splits again)",
@@ -996,12 +1263,25 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         if pulling { "built (the profile turns pso_mtl4 on)" } else { "skipped (pso_mtl4 off and the app has no Metal 4 switch: about a quarter of the image and of the build)" }
     ));
     let t_build = Instant::now();
+    // B6: the previous library where the build looks for it: the one kept aside, or the pack in place that this build replaces
+    let prev_src = [work.join(PREV_LIBRARY), pack.clone()]
+        .into_iter()
+        .find(|d| has_library_and_table(d, &chain));
+    if let Some(bytes) = prev_src
+        .as_ref()
+        .and_then(|src| link_previous_library(src, &out, &chain))
+    {
+        ctx.log(&format!("stage 3 shaders: the previous library of chain {chain} ({}) stays until the new one is in place: the shaders that did not change are taken from it", gib_text(bytes as f64)));
+    }
     let cas = shader_cache_folder(ctx, &chain, resumed).unwrap_or_else(|| {
         // no shared cache: the build's own, kept in the work folder, which is what a resumed run restores from
         let c = work.join("cas");
         let _ = fs::create_dir_all(&c);
         c
     });
+    let cache_line: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    let cpu0 = cpu_seconds();
+    let t_wall = Instant::now();
     let img = {
         let last_mem = Mutex::new(Instant::now() - std::time::Duration::from_secs(60));
         let docs = ctx.docs.clone();
@@ -1010,6 +1290,9 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         let mut stage = crate::stage::StageThrottle::new(std::time::Duration::from_secs(1));
         let mut progress = |line: &str| {
             log.line(line);
+            if let Some(c) = parse_cache_line(line) {
+                *cache_line.lock().unwrap() = Some(c);
+            }
             if let Some((done, total)) = parse_progress(line) {
                 stage.offer(
                     &docs,
@@ -1043,6 +1326,33 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         stage.flush(&docs); // a count held back by the throttle: the last one lands, whatever the build's end
         built
     };
+    // B2: where the build's time went, on the phone (the build's own report stays in the backend: the adapter hands back the image only)
+    let wall = t_wall.elapsed().as_secs_f64();
+    let ns = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed) as f64 / 1e9;
+    let n_of = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    let cache_text = match *cache_line.lock().unwrap() {
+        Some((h, r)) => format!("; shader cache hit {h}, rebuilt {r}"),
+        None => String::new(),
+    };
+    ctx.log(&format!(
+        "stage 3 shaders: build {wall:.0} s: translator {:.0} s in {} calls, SPIRV-Cross {:.0} s in {} calls (summed over threads){cache_text}",
+        ns(&clock.xlate_ns),
+        n_of(&clock.xlate_calls),
+        ns(&clock.cross_ns),
+        n_of(&clock.cross_calls)
+    ));
+    if let (Some((u0, s0)), Some((u1, s1))) = (cpu0, cpu_seconds()) {
+        let (u, s) = (u1 - u0, s1 - s0);
+        ctx.log(&format!(
+            "stage 3 shaders: CPU {u:.0} s user + {s:.0} s system in {wall:.0} s: {:.1} cores busy on average ({build_jobs} build threads)",
+            if wall > 0.0 { (u + s) / wall } else { 0.0 }
+        ));
+    }
+    if prev_src.is_some()
+        && let Some(l) = previous_library_line(&out)
+    {
+        ctx.log(&l);
+    }
     // this chain's cache folder inside the cache, and its size: measured once with the whole cache's for the line below, and said again when it is removed after the build (nothing
     // writes into the cache in between: it walked the 22,000-43,000 files twice; review r4 §6.3)
     let chain_cache = cas.join(crate::shaderpack::shader_cache_name(&chain));
@@ -1091,6 +1401,14 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
     let assemble = || -> std::io::Result<()> {
         fs::create_dir_all(&tmp)?;
         fs::rename(&img, tmp.join(img.file_name().unwrap_or_default()))?;
+        // B6: the library's digests table goes with it (a library without one is still whole: its rebuild translates every shader)
+        let table = img.with_file_name(format!(
+            "{}.digests",
+            img.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        if is_file(&table) {
+            let _ = fs::rename(&table, tmp.join(table.file_name().unwrap_or_default()));
+        }
         for name in list_names(&prof) {
             if name.ends_with(".tsv") {
                 fs::copy(prof.join(&name), tmp.join(&name))?;
@@ -1109,11 +1427,17 @@ pub fn build_shaders(ctx: &mut Ctx) -> Result<Option<PathBuf>> {
         for (k, v) in &record {
             txt.push_str(&format!("{k}\t{v}\n"));
         }
+        // speed-up B9: the translator option the library was made with, so the live translations of a play match it whatever the setting says by then (`learn_shaders`)
+        txt.push_str(&format!(
+            "xlate_optimized\t{}\n",
+            crate::sys::qos::xlate_optimized() as u8
+        ));
         fs::write(tmp.join("pack.txt"), txt)?;
         install_pack(&tmp, &pack)
     };
     if let Err(e) = assemble() {
         rmtree(&tmp); // the half-made pack (a whole library: ~2.2 GB for Grizzy) is of no use; the old one, if any, is still in its place (install_pack)
+        drop_previous_library(&work);
         ctx.log(&format!(
             "stage 3 shaders: [RED] the pack could not be installed: {e}"
         ));
@@ -1369,6 +1693,13 @@ pub fn learn_shaders(
                 .collect(),
         ));
     };
+    // speed-up B9: a live translation uses the translator option of the library it joins (pack.txt `xlate_optimized`; a library made before the row existed was made with DebugMode)
+    let optimized = read_text(&pack.join("pack.txt"))
+        .ok()
+        .map(|t| pack_rows(&t))
+        .and_then(|rows| rows.get("xlate_optimized").cloned())
+        .is_some_and(|v| v.trim() == "1");
+    crate::sys::qos::set_xlate_optimized(optimized);
     let work = lc.docs.game_dir(tid).join(LEARNED).join("work");
     let cache = lc.docs.shader_cache();
     let cas = if is_dir(&cache) {
@@ -1637,6 +1968,106 @@ mod tests {
     use crate::log::MemLog;
     use crate::memory::FakeMem;
     use std::time::Duration;
+
+    #[test]
+    fn the_previous_library_stays_only_when_the_build_fits_beside_it() {
+        const G: u64 = 1 << 30;
+        assert_eq!(
+            previous_library_fits(20 * G as i64, 8 * G, 2 * G),
+            (true, 20 * G as i64)
+        );
+        assert_eq!(
+            previous_library_fits(9 * G as i64, 8 * G, 2 * G),
+            (false, 11 * G as i64),
+            "it goes, and its room counts"
+        );
+        assert_eq!(
+            previous_library_fits(5 * G as i64, 8 * G, 2 * G),
+            (false, 7 * G as i64),
+            "the gate then refuses with the room it would have had"
+        );
+        assert_eq!(
+            previous_library_fits(-1, 8 * G, 2 * G),
+            (true, -1),
+            "free space unknown: the gate is skipped, the library stays"
+        );
+        assert_eq!(
+            previous_library_fits(1, 8 * G, 0),
+            (true, 1),
+            "none: nothing changes"
+        );
+    }
+
+    #[test]
+    fn the_build_summary_lines_read() {
+        assert_eq!(
+            parse_cache_line("shader cache: hit 12, rebuilt 300"),
+            Some((12, 300))
+        );
+        assert_eq!(
+            parse_cache_line("shader cache: /x/y, 1.0 GB after this build"),
+            None
+        );
+        let d = crate::testutil::TempDir::new("prev-line");
+        let out = d.join("out");
+        assert_eq!(previous_library_line(&out), None);
+        crate::testutil::write(
+            out.join(PREV_LIBRARY).join(PREV_REUSE),
+            "state\tused\nentries\t50\nlooked\t51\nhits\t49\n",
+        );
+        assert_eq!(
+            previous_library_line(&out).unwrap(),
+            "stage 3 shaders: 49 of 51 shaders taken from the previous library (unchanged since it was built; it held 50)"
+        );
+        crate::testutil::write(
+            out.join(PREV_LIBRARY).join(PREV_REUSE),
+            "state\tnot used: no digests table\n",
+        );
+        assert!(
+            previous_library_line(&out)
+                .unwrap()
+                .contains("was not used: no digests table: every shader is translated")
+        );
+    }
+
+    /// B6: a stale pack's library is kept aside in the work folder, survives the work folder being started again for other inputs, does not make the folder look like a killed run's,
+    /// and goes with `drop_previous_library` (the folder too when nothing else is in it)
+    #[test]
+    fn a_stale_pack_keeps_its_library_aside_in_the_work_folder() {
+        let d = crate::testutil::TempDir::new("prev-aside");
+        let (pack, work) = (d.join("T"), d.join("T.work"));
+        crate::testutil::write(pack.join("b-x.img"), "OLD");
+        crate::testutil::write(pack.join("b-x.img.digests"), "TABLE");
+        crate::testutil::write(pack.join("shader_map.tsv"), "map");
+        assert_eq!(set_aside_library(&pack, &work, "x"), Some(3));
+        assert!(!pack.exists());
+        assert_eq!(
+            fs::read_to_string(work.join("prev/b-x.img")).unwrap(),
+            "OLD"
+        );
+        assert!(
+            !work_left_behind(&work),
+            "a folder with only the previous library is no killed run's"
+        );
+        let mut r = ShaderResume::new(&work, "sig");
+        assert!(!r.open());
+        assert!(
+            is_file(&work.join("prev/b-x.img.digests")),
+            "starting the folder again keeps the previous library"
+        );
+        assert!(work_left_behind(&work));
+        drop_previous_library(&work);
+        assert!(!work.join(PREV_LIBRARY).exists() && work.exists());
+        // a pack without a digests table (built before B6, or imported): it goes whole, nothing is kept
+        let (pack2, work2) = (d.join("U"), d.join("U.work"));
+        crate::testutil::write(pack2.join("b-x.img"), "OLD");
+        assert_eq!(set_aside_library(&pack2, &work2, "x"), None);
+        assert!(!pack2.exists() && !work2.exists());
+        // only the previous library in the folder: dropping it removes the folder
+        crate::testutil::write(work2.join("prev/b-x.img"), "OLD");
+        drop_previous_library(&work2);
+        assert!(!work2.exists());
+    }
 
     fn lib(pack: &std::path::Path) -> Option<String> {
         fs::read_to_string(pack.join("b-x.img")).ok()

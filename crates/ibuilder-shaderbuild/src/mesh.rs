@@ -145,7 +145,13 @@ fn mesh_one(stored: &HashMap<String, Arc<Stored>>, vk: &str, gk: &str) -> One {
         return One::Crash("KeyError: 'capture_reads'".into());
     };
     match compose(&vs, &gs, &reads) {
-        Ok(msl) => One::Built(format!("{vk}_{gk}_m3.metal"), msl.into_bytes()),
+        // the final mesh code: the raw lookup's search inline again, as a mesh stage keeps it (`dmsh_rewrite.raw_noinline(msl, 'ms')`)
+        Ok(msl) => One::Built(
+            format!("{vk}_{gk}_m3.metal"),
+            ibuilder_shader::steps::raw_noinline(&msl, "ms")
+                .into_owned()
+                .into_bytes(),
+        ),
         Err(MeshErr::Value(e)) => One::NotComposed(e),
         Err(MeshErr::Crash(e)) => One::Crash(e),
     }

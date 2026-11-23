@@ -119,6 +119,8 @@ pub struct SplitOptions<'a> {
     pub nro_dir: Option<&'a Path>,
     /// `DM_SPLIT_REGISTERED_MAP`: a registered `shader_map.tsv` whose sources are kept when the same shader is found in several places (registered packing; None: the first copy)
     pub registered: Option<&'a Path>,
+    /// `sys.argv[9]` (ae5d8f51): a JSON list of GLSLC outputs the Mac host captured during play (`glslc_play`); their shaders take no key a game file, a boot capture or an add-on has
+    pub glslc_play: Option<&'a Path>,
     /// where the reader record of this split is written (`record.rs`: which readers the game's files needed, for a targeted re-split); None: not written
     pub record: Option<&'a Path>,
 }
@@ -144,6 +146,7 @@ impl<'a> SplitOptions<'a> {
             glslc_capture: None,
             nro_dir: None,
             registered: None,
+            glslc_play: None,
             record: None,
         }
     }
@@ -193,95 +196,6 @@ fn parent_name(p: &Path) -> String {
         .and_then(|d| d.file_name())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-/// What `uepak.unreal_paks`, `ue_legacy_jobs` and the other `*_jobs` of the Python look for in the file list. A container this port does not read is an explicit error:
-/// leaving it out would give the game fewer shaders than it has.
-fn detect_unsupported(files: &[FileRef], index: &FileIndex) -> Result<(), SplitError> {
-    let head_of = |f: &FileRef, n: usize| -> Vec<u8> {
-        f.loc
-            .open()
-            .ok()
-            .and_then(|s| s.read(0, n).ok())
-            .unwrap_or_default()
-    };
-    let tail_of = |f: &FileRef, n: usize| -> Vec<u8> {
-        f.loc
-            .open()
-            .ok()
-            .and_then(|s| {
-                let len = s.len();
-                s.read(len.saturating_sub(n as u64), n).ok()
-            })
-            .unwrap_or_default()
-    };
-    let unsup = |what: &str, f: &FileRef| -> Result<(), SplitError> {
-        Err(SplitError::Unsupported(format!("{what} (/{})", f.rel)))
-    };
-    for f in files {
-        let base = f.rel.rsplit('/').next().unwrap_or(&f.rel);
-        let lower = f.rel.to_ascii_lowercase();
-        if f.rel.ends_with(".pak") {
-            if head_of(f, 4) == b"KPKA" {
-                continue; // read by jobs::plan
-            }
-            let t = tail_of(f, 8);
-            if t.len() == 8 && &t[4..8] == b"LSPK" {
-                return unsup("Larian LSPK package", f);
-            }
-            // an Unreal pak is read (uepak.rs), unless its index is encrypted: the AES key in main is not searched for
-            if let Ok(src) = f.loc.open()
-                && crate::uepak::encrypted_index(&src)
-            {
-                return unsup(
-                    "Unreal Engine pak with an encrypted index (the AES key in main is needed)",
-                    f,
-                );
-            }
-        }
-        if f.rel.ends_with(".utoc") {
-            return unsup("Unreal Engine IoStore container", f);
-        }
-        if f.rel.ends_with(".trpfs")
-            && index.exists(f.root, &format!("{}d", &f.rel[..f.rel.len() - 1]))
-            && head_of(f, 8) == b"ONEPACK\0"
-        {
-            return unsup("Game Freak Trinity pack (data.trpfs)", f);
-        }
-        if f.rel.ends_with(".arc") && head_of(f, 8) == 0xABCDEF9876543210u64.to_le_bytes() {
-            return unsup("Super Smash Bros. Ultimate data.arc", f);
-        }
-        if lower.ends_with(".cpk") {
-            let h = head_of(f, 8);
-            if h.starts_with(b"CPK ") {
-                return unsup("CRI CPK archive", f);
-            }
-            // d3cpk.is_d3cpk: the magic 0xa1b2c3d4 and version 6 or 7
-            if h.len() >= 8
-                && h[..4] == [0xd4, 0xc3, 0xb2, 0xa1]
-                && matches!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 6 | 7)
-            {
-                return unsup("Diablo III package (d3cpk.py)", f);
-            }
-        }
-        if base == "build_key.txt" {
-            return unsup("Blizzard CASC archive set", f);
-        }
-        let h = head_of(f, 8);
-        if h.starts_with(b"CRA.") {
-            return unsup("Camelot CRA archive", f);
-        }
-        if h.starts_with(b"PDAT") {
-            return unsup("phx PDAT archive (Kirby Air Riders)", f);
-        }
-        if f.rel.ends_with("Data/layout.toc") {
-            return unsup("Frostbite bundle set (Data/layout.toc)", f);
-        }
-        if h.len() >= 16 && h.starts_with(b"RPF6") {
-            return unsup("Rockstar RPF6 archive", f);
-        }
-    }
-    Ok(())
 }
 
 fn nro_files(dir: &Path) -> Vec<PathBuf> {
@@ -365,7 +279,10 @@ impl Merged<'_> {
                         v.label, old_label
                     )));
                 }
-                if old_label.starts_with("/aoc/") && !v.label.starts_with("/aoc/") {
+                if old_label.starts_with("/aoc/")
+                    && !v.label.starts_with("/aoc/")
+                    && !v.label.starts_with("/glslc_play/")
+                {
                     let at = self.spill.append(&v.ctl, &v.code).map_err(io)?;
                     self.keys.insert(
                         key,
@@ -469,6 +386,12 @@ enum Work {
     Mvgl(crate::mvgl::MvglJob),
     /// a shard of one Falcom .pka archive's blobs (Trails into Reverie)
     Pka(crate::falcom::PkaJob),
+    /// an EA container, or a range of a BIG4 archive's members (FIFA 18)
+    Ea(crate::easf::EaJob),
+    /// a range of one Frostbite cas file's CompiledBytecode resources (EA SPORTS FC 27)
+    Frostbite(crate::frostbite::FbJob),
+    /// a range of one TT Games DAT's .nnx_shaders members, or its index's error (LEGO Star Wars: The Skywalker Saga)
+    Ttdat(crate::ttdat::TtJob),
 }
 
 type Results = Vec<FileResult>;
@@ -769,7 +692,15 @@ pub fn split(
                         format!("{r}/{below}")
                     }
                 };
-                for (nm, sh) in crate::uepak::archives(&mine, &tag_of, zstd)? {
+                let top = |f: &FileRef| -> Option<String> {
+                    let below = if tag.is_empty() {
+                        f.rel.as_str()
+                    } else {
+                        f.rel.strip_prefix(&format!("{tag}/"))?
+                    };
+                    (!below.contains('/')).then(|| below.to_string())
+                };
+                for (nm, sh) in crate::uepak::archives(&mine, &tag_of, zstd, mainnso, &top)? {
                     found.extend(
                         crate::uepak::ue_shaders(&sh, &format!("/ue_shaders/{nm}"))
                             .map_err(rerr)?,
@@ -900,7 +831,7 @@ pub fn split(
             zdicts.extend(m);
         }
     }
-    detect_unsupported(&files, &findex)?;
+    // (the containers the Python's `*_jobs` plan are all read now: what a reader cannot decode ends the split there, `error::Failure::Unsupported`)
 
     // ---- first pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way -------------------
     // the archives the Python plans as jobs of their own come first (`big + files`), their files are not scanned as loose files
@@ -919,11 +850,25 @@ pub fn split(
             format!("{root}/{below}")
         }
     };
-    let plan = crate::jobs::plan_with(&files, log, &path_of)?;
+    let mains: Vec<PathBuf> = opts.versions.iter().map(|(_, m)| m.to_path_buf()).collect();
+    let env = crate::jobs::PlanEnv {
+        mains: &mains,
+        nro_dir: opts.nro_dir,
+        zstd,
+    };
+    let plan = crate::jobs::plan_env(&files, log, &path_of, &env)?;
     let (kit_jobs, kit_taken) = crate::kit::plan(&files, &path_of)?;
-    // Media.Vision's MVGL archives (`mvgl_jobs`, after the PKZ jobs and before the zip jobs) and Falcom's .pka archives (`falcom_pka_jobs`, the Python's last planner)
+    // Media.Vision's MVGL archives (`mvgl_jobs`, after the CPK jobs and before the Diablo III jobs: `Plan::mvgl_at`) and Falcom's .pka archives (`falcom_pka_jobs`, the Python's last planner)
     let (mvgl_jobs, mvgl_taken) = crate::mvgl::plan(&files, &path_of);
     let (pka_jobs, pka_taken) = crate::falcom::plan(&files);
+    // Frostbite's bundles (`fb_jobs`, after the ARH jobs: `Plan::fb_at`) and TT Games' DATs (`tt_jobs`, after the KIT jobs, before Falcom's)
+    let (fb_jobs, fb_taken) = crate::frostbite::plan(&files, &path_of)?;
+    let (tt_jobs, tt_taken) = crate::ttdat::plan(&files, &path_of)?;
+    // EA's BIG4 / EASF / chunk / NXSHADER files (`ea_jobs`, after the LINKDATA jobs and before the others); their keys come from their own version's main
+    let (ea_jobs, ea_taken) = crate::easf::plan(&files, opts.versions.len())?;
+    let ea = crate::easf::EaShared::new(crate::easf::Keyring::new(
+        opts.versions.iter().map(|(_, m)| m.to_path_buf()).collect(),
+    ));
     let plain: Vec<FileRef> = files
         .iter()
         .filter(|f| {
@@ -932,22 +877,25 @@ pub fn split(
                 && !kit_taken.contains(&k)
                 && !mvgl_taken.contains(&k)
                 && !pka_taken.contains(&k)
+                && !ea_taken.contains(&k)
+                && !fb_taken.contains(&k)
+                && !tt_taken.contains(&k)
         })
         .cloned()
         .collect();
     let mut batches: Vec<Work> = plan.jobs.iter().cloned().map(Work::Special).collect();
-    let mvgl_at = plan
+    // the planners split.rs runs go to their place in the Python's order, the latest position first so that the earlier ones stay valid (ea_at <= mvgl_at <= fb_at)
+    let (mvgl_at, fb_at) = (plan.mvgl_at, plan.fb_at);
+    batches.splice(fb_at..fb_at, fb_jobs.into_iter().map(Work::Frostbite));
+    batches.splice(mvgl_at..mvgl_at, mvgl_jobs.into_iter().map(Work::Mvgl));
+    let ea_at = plan
         .jobs
         .iter()
-        .position(|j| {
-            matches!(
-                j,
-                crate::jobs::Special::Zip(..) | crate::jobs::Special::Arh(..)
-            )
-        })
+        .position(|j| !matches!(j, crate::jobs::Special::Linkdata(..)))
         .unwrap_or(plan.jobs.len());
-    batches.splice(mvgl_at..mvgl_at, mvgl_jobs.into_iter().map(Work::Mvgl));
+    batches.splice(ea_at..ea_at, ea_jobs.into_iter().map(Work::Ea));
     batches.extend(kit_jobs.into_iter().map(Work::Kit));
+    batches.extend(tt_jobs.into_iter().map(Work::Ttdat));
     batches.extend(pka_jobs.into_iter().map(Work::Pka));
     batches.extend(
         plain
@@ -999,6 +947,9 @@ pub fn split(
                 Work::Kit(k) => Ok(vec![crate::kit::scan(&cx, k, &files)?]),
                 Work::Mvgl(m) => Ok(vec![crate::mvgl::scan(&cx, m)?]),
                 Work::Pka(p) => Ok(vec![crate::falcom::scan(&cx, p)?]),
+                Work::Ea(e) => Ok(vec![crate::easf::scan(&cx, e, &ea)?]),
+                Work::Frostbite(j) => Ok(vec![crate::frostbite::scan(&cx, j)?]),
+                Work::Ttdat(j) => Ok(vec![crate::ttdat::scan(&cx, j)?]),
             }
         };
     let job_key = |kind: &str, fs_: &[FileRef]| -> String {
@@ -1035,6 +986,24 @@ pub fn split(
                 Work::Pka(p) => {
                     let mut parts: Vec<String> = vec!["special".to_string(), memo_version()];
                     parts.extend(p.identity());
+                    let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+                    JobMemo::key(&refs)
+                }
+                Work::Ea(e) => {
+                    let mut parts: Vec<String> = vec!["special".to_string(), memo_version()];
+                    parts.extend(e.identity());
+                    let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+                    JobMemo::key(&refs)
+                }
+                Work::Frostbite(j) => {
+                    let mut parts: Vec<String> = vec!["special".to_string(), memo_version()];
+                    parts.extend(j.identity());
+                    let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+                    JobMemo::key(&refs)
+                }
+                Work::Ttdat(j) => {
+                    let mut parts: Vec<String> = vec!["special".to_string(), memo_version()];
+                    parts.extend(j.identity());
                     let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
                     JobMemo::key(&refs)
                 }
@@ -1086,6 +1055,9 @@ pub fn split(
             Ok(())
         };
         run_pool(nj, batches.len(), &work, &mut sink, log, true)?;
+    }
+    for n in ea.notes() {
+        log(&n);
     }
     // ---- second pass: Unity serialized files without type trees are scanned again with the borrowed trees -------------------------
     if !defer.is_empty() {
@@ -1147,15 +1119,28 @@ pub fn split(
         ));
     }
     let n_unreadable = unreadable.iter().map(|u| u.1).sum::<usize>();
+    // play captures (ae5d8f51): game files, boot captures and add-ons keep any key they share with them
+    let mut play_pairs: Vec<Pair> = Vec::new();
+    if let Some(m) = opts.glslc_play {
+        let (played, pp) = glslc_play(&mcx, m, log)?;
+        merged.add(&mcx, played, vec![])?;
+        play_pairs = pp;
+    }
 
     // ---- pairs --------------------------------------------------------------------------------------------------------------------
     let per_src = merged.finish_preferred(&prof);
     let Merged {
         keys,
-        pairs: all_pairs,
+        pairs: mut all_pairs,
         mut spill,
         ..
     } = merged;
+    all_pairs.extend(play_pairs.into_iter().filter(|p| {
+        [&p.a, &p.b].iter().any(|k| {
+            keys.get(*k)
+                .is_some_and(|h| h.label.starts_with("/glslc_play/"))
+        })
+    }));
     let mut prog: BTreeSet<(String, String)> = all_pairs
         .iter()
         .filter(|p| p.prog)
@@ -1318,6 +1303,7 @@ pub fn split(
             "Unreal Engine shader code archives",
             any(&|w| w.contains("#UE")),
         ),
+        ("Telltale effect packs", any(&|w| w.contains("#TTFX@"))),
     ]
     .iter()
     .filter(|(_, hit)| *hit)
@@ -1431,4 +1417,60 @@ pub fn split(
             .map(|(s, n)| (St::from_short(s).unwrap().name().to_string(), *n))
             .collect(),
     })
+}
+
+/// the play captures' shaders (one per key) and their pairs
+type Played = (Vec<(String, Shader)>, Vec<Pair>);
+
+/// `glslc_play(manifest)`: the whole GLSLC outputs of the host's play capture, each file's pairs kept even when only one of their stages needs a new row; a file that cannot be read or holds
+/// no whole output is named and passed over
+fn glslc_play(
+    cx: &Ctx<'_>,
+    manifest: &Path,
+    log: &(dyn Fn(&str) + Sync),
+) -> Result<Played, SplitError> {
+    let text = fs::read_to_string(manifest)
+        .map_err(|e| SplitError::Input(format!("{}: {e}", manifest.display())))?;
+    let paths: Vec<String> = serde_json::from_str(&text)
+        .map_err(|e| SplitError::Input(format!("{}: {e}", manifest.display())))?;
+    let (mut played, mut pairs) = (Vec::new(), Vec::new());
+    for path in paths {
+        let base = path.rsplit('/').next().unwrap_or(&path);
+        let label = format!("/glslc_play/{base}");
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                // `OSError` as Python words it: [Errno n] strerror: 'path'
+                let msg = e.to_string();
+                let strerror = msg.split(" (os error").next().unwrap_or(&msg);
+                let why = match e.raw_os_error() {
+                    Some(n) => format!("[Errno {n}] {strerror}: {}", crate::casc::py_repr(&path)),
+                    None => msg.clone(),
+                };
+                log(&format!(
+                    "[RED] {path}: could not read GLSLC capture: {why}"
+                ));
+                continue;
+            }
+        };
+        let whole = crate::bytes::starts(&data, &GLSLC_MAGIC)
+            && crate::glslc::glslc_layout(&data, 0)
+                .map_err(|e| red(e.to_string()))?
+                .0
+                == data.len();
+        let found = if whole {
+            crate::glslc::glslc_shaders_at(&data, &label, false, &[0])
+                .map_err(|e| red(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+        if found.is_empty() {
+            log(&format!("[RED] {path}: no complete GLSLC shader output"));
+            continue;
+        }
+        pairs.extend(crate::scan::var_pairs_of(cx, &found).map_err(|e| red(e.to_string()))?);
+        played.extend(found);
+    }
+    let uniq = crate::scan_types::uniq_keys(cx, played).map_err(|e| red(e.to_string()))?;
+    Ok((uniq, pairs))
 }

@@ -1,0 +1,200 @@
+# 0103-build-screen-mode-cool-fast.patch -- the owner: the shader build is slower than before (but the phone is much cooler), and "Close" on the build screen does nothing the chevron does not;
+# put a build speed option there instead: "Pause - Mode / Notify me - Cancel". Applies after 0102.
+#
+# WHY SLOWER: since the field report on the Zelda lag, the build's worker threads lower themselves to utility QoS (crates/ibuilder-pipeline/src/sys/qos.rs): iOS then runs them mostly on the
+#   efficiency cores and the UI keeps its priority. Results are the same; only the pace changes.
+# FIX:
+#   * Build screen (GameBuildViewController, GameAppLibrary.cs): while a build runs the bottom bar is "Pause | Mode" over "Notify me | Cancel"; the primary button ("Close" while running) is
+#     hidden while it runs (the chevron at the top still goes back to the library). Paused or ended, the bar is as before (Cancel above Resume, or the game's action alone).
+#     "Mode: Cool" (leaf) / "Mode: Fast" (hare) opens a menu "Build mode": Cool "Slower and cooler; the app stays smooth" (default), Fast "Faster and hotter; the app may lag", the one in
+#     effect ticked (BuildMode, GameAppField.cs).
+#   * The choice is saved as fast_build 0/1 in Documents/gameapp.settings.tsv (GameAppUi.FastBuildOn) and told to a running build (gameapp_set_fast_build -> ibuilder_set_fast_build).
+#     Log: "build mode: Fast (...); the shader translation follows now, the other steps from the next build" (or ", from the next build" when no build runs).
+#   * Rust (not in this patch: sys/qos.rs, ibuilder-ffi, the shim): every run starts from fast_build; Fast leaves the workers at the chain thread's class (at least QOS_CLASS_DEFAULT), Cool
+#     lowers them to utility as before; the translator and SPIRV-Cross callbacks of the shim call ibuilder_qos_follow() before each call, so a worker of a running build moves to the new
+#     mode within a shader; other threads (boot, game, live translation) are never touched. The stage log says "worker threads at utility QoS (build mode Cool ...)" or "... (build mode Fast ...)".
+#     sys/qos.rs is excluded from the framework id and the shim/FFI are not inputs of it: no game needs a rebuild for this change; no shader output changes.
+# VERIFIED (2026-11-22, M1 Pro): every patch 0010-0103 applies in order; compile only (dotnet build -c Release -r ios-arm64 -t:Compile on the last device build's generated project):
+#   0 errors, the same warnings per file and code as without 0103. cargo clippy -D warnings (ibuilder-pipeline, ibuilder-ffi): clean; qos tests (a worker follows the mode, other threads are
+#   left alone) pass.
+# NOT VERIFIED: anything on an iPhone (the menu, the bar's layout on a phone and an iPad, the speed and heat of each mode).
+# NEW STRINGS: "Mode: ", "Build mode", "Slower and cooler; the app stays smooth", "Faster and hotter; the app may lag", "build mode: ", "the shader translation follows now",
+#   "could not save the build mode: ".
+diff -ruN t102/GameAppField.cs u/GameAppField.cs
+--- t102/GameAppField.cs	2026-11-22 23:19:47
++++ u/GameAppField.cs	2026-11-22 23:24:17
+@@ -241,6 +241,16 @@
+ }
+ 
+ /// The build screen's Pause / Cancel row (patch 0085): while a build runs both are shown (off when they cannot act), paused only Cancel (Resume is the main button), else none.
++/// Patch 0103: the build screen's Mode. Cool (the default): the build's workers run at utility QoS, so the UI keeps its priority, the phone stays cooler and the build is slower.
++/// Fast: they keep their priority, as before the workers were lowered: faster and hotter, and the app may lag while it builds. Timing only: the built game is the same.
++public static class BuildMode
++{
++    public static string Name(bool fast) => fast ? "Fast" : "Cool";
++    public static string Title(bool fast) => "Mode: " + Name(fast);
++    public static string Symbol(bool fast) => fast ? "hare.fill" : "leaf.fill";
++    public static string Note(bool fast) => fast ? "Faster and hotter; the app may lag" : "Slower and cooler; the app stays smooth";
++}
++
+ public static class BuildScreenButtons
+ {
+     public static (bool Row, bool Pause, bool Cancel) Shown(bool running, bool canPause, bool canCancel) =>
+diff -ruN t102/GameAppLibrary.cs u/GameAppLibrary.cs
+--- t102/GameAppLibrary.cs	2026-11-22 23:19:47
++++ u/GameAppLibrary.cs	2026-11-22 23:24:08
+@@ -1346,6 +1346,7 @@
+                 buildScreen?.DismissViewController(true, () => { if (!running) PrimaryTapped(); });
+             },
+             OnNotify = ToggleNotify,
++            OnMode = SetBuildMode,   // patch 0103
+         };
+         buildScreen.ModalPresentationStyle = UIModalPresentationStyle.FullScreen;
+         RefreshBuildScreen(force: true);   // not presented yet: the first model goes in now
+@@ -1428,9 +1429,26 @@
+             !running ? (stop.State == StopState.Paused ? "paused" : stop.State == StopState.Cancelled || stop.State == StopState.Cancelling ? "cancelled" : null) : null,
+             running && stop.Stoppable && stop.State == StopState.Running,
+             (running && stop.Stoppable && stop.State == StopState.Running) || stop.State == StopState.Paused,
+-            ExportOnly: game != null && GameAppUi.IsExportOnlyBuild(game, facts)));   // patch 0095: "Ready to export"
++            ExportOnly: game != null && GameAppUi.IsExportOnlyBuild(game, facts),   // patch 0095: "Ready to export"
++            Fast: BuildModeFast));   // patch 0103
+     }
+ 
++    // ---- patch 0103: the build mode (Mode on the build screen: Cool / Fast), saved as fast_build in gameapp.settings.tsv ----
++    private bool? buildModeFast;
++    private bool BuildModeFast => buildModeFast ??= GameAppUi.FastBuildOn(ReadAppSettings());
++
++    private void SetBuildMode(bool fast)
++    {
++        if (fast == BuildModeFast) return;
++        buildModeFast = fast;
++        try { File.WriteAllText(AppSettingsPath, GameAppUi.WithAppSetting(ReadAppSettings(), "fast_build", fast ? "1" : "0")); }
++        catch (Exception error) { Write($"could not save the build mode: {error.Message}"); }
++        try { GameAppMain.gameapp_set_fast_build(fast ? 1 : 0); }
++        catch (Exception error) { Write($"build mode: [ORANGE] the running build could not be told ({error.GetType().Name}): it applies from the next build"); }
++        Write($"build mode: {BuildMode.Name(fast)} ({BuildMode.Note(fast)}){(running ? "; the shader translation follows now, the other steps from the next build" : ", from the next build")}");
++        RefreshBuildScreen(force: true);
++    }
++
+     // ---- "Notify me": a notification when the build ends (the app may be in the background meanwhile) ------------
+ 
+     private bool notifyWhenDone;
+@@ -2249,9 +2267,11 @@
+     public sealed record Model(string Name, UIImage Icon, string Meta, List<GameAppUi.BuildStep> Steps, int Current, double Fraction,
+                                bool Running, bool Failed, string TimeLeft, string Clock, bool RamUnlocked, bool Extended, string MemoryLine,
+                                List<(string Text, GameAppUi.LogKind Kind)> Live, bool Notify, string PrimaryTitle, bool PrimaryEnabled, UIColor Tint,
+-                               string StopLine = null, string Stopped = null, bool CanPause = false, bool CanCancel = false, bool ExportOnly = false);
++                               string StopLine = null, string Stopped = null, bool CanPause = false, bool CanCancel = false, bool ExportOnly = false,
++                               bool Fast = false);   // patch 0103: the build mode (Mode: Cool / Fast)
+ 
+     public Action OnLog, OnPrimary, OnNotify, OnPause, OnCancel;
++    public Action<bool> OnMode;   // patch 0103: true = Fast, false = Cool
+     private readonly AmbientView ambient = new AmbientView();
+     private readonly UIImageView icon = new UIImageView { ContentMode = UIViewContentMode.ScaleAspectFill, ClipsToBounds = true };
+     private readonly UILabel iconInitials = new UILabel { TextAlignment = UITextAlignment.Center, TextColor = Theme.Text, Font = Theme.Font(15, UIFontWeight.Bold) };   // patch 0085
+@@ -2262,7 +2282,9 @@
+     private readonly UIStackView chips = new UIStackView { Axis = UILayoutConstraintAxis.Horizontal, Spacing = 8, Alignment = UIStackViewAlignment.Center };
+     private readonly UILabel leftValue = new UILabel(), leftNote = new UILabel(), ramLine = new UILabel(), extLine = new UILabel(), memNote = new UILabel();
+     private readonly UIStackView liveLines = new UIStackView { Axis = UILayoutConstraintAxis.Vertical, Spacing = 4 };
+-    private UIButton primary, notify, pauseButton, cancelButton;
++    private UIButton primary, notify, pauseButton, cancelButton, modeButton;
++    private UIStackView buttonsRow;
++    private bool cancelBeside = true;   // patch 0103: Cancel sits beside Notify me while a build runs, beside Resume above it otherwise
+     private UIStackView stopRow;
+     private Model last;
+ 
+@@ -2366,6 +2388,7 @@
+         primary.AccessibilityIdentifier = "build-primary";
+         primary.TouchUpInside += (_, __) => OnPrimary?.Invoke();
+         var buttons = new UIStackView(new UIView[] { notify, primary }) { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = 10 };
++        buttonsRow = buttons;
+         var buttonsWidth = buttons.WidthAnchor.ConstraintEqualTo(View.SafeAreaLayoutGuide.WidthAnchor, 1, -36);   // 18 pt each side; an iPad's are 560 wide at most
+         buttonsWidth.Priority = 999;
+ 
+@@ -2379,7 +2402,16 @@
+         cancelButton = Theme.Pill("Cancel", "xmark", false, 52);
+         cancelButton.AccessibilityIdentifier = "build-screen-cancel";
+         cancelButton.TouchUpInside += (_, __) => OnCancel?.Invoke();
+-        stopRow = new UIStackView(new UIView[] { pauseButton, cancelButton }) { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = 10, Hidden = true };
++        // patch 0103 (the owner: "Close" did nothing the chevron does not; the build mode belongs on this screen): while a build runs the bar is
++        //   Pause      Mode
++        //   Notify me  Cancel
++        // "Mode" opens Cool / Fast (BuildMode); paused or ended it is Cancel above Resume / Play as before
++        modeButton = Theme.Pill(BuildMode.Title(false), BuildMode.Symbol(false), false, 52);
++        modeButton.AccessibilityIdentifier = "build-screen-mode";
++        modeButton.ShowsMenuAsPrimaryAction = true;
++        modeButton.Menu = ModeMenu(false);
++        stopRow = new UIStackView(new UIView[] { pauseButton, modeButton }) { Axis = UILayoutConstraintAxis.Horizontal, Distribution = UIStackViewDistribution.FillEqually, Spacing = 10, Hidden = true };
++        buttons.InsertArrangedSubview(cancelButton, 1);
+         // patch 0085 (the owner: Pause and Cancel were half under the bottom row, in another style, and sometimes gone): the four actions are ONE fixed bar at the bottom, two rows of the
+         // same 52 pt pills (#25252b with a hairline; the accent for the primary only), never inside the scroll, so never under or over each other
+         var infoStack = Theme.Column(18, cards, liveButton);
+@@ -2522,14 +2554,42 @@
+         // Pause (while it runs), Cancel (while it runs or is paused)
+         // patch 0085: while a build runs Pause and Cancel are ALWAYS there (off, not gone, while they cannot act: a stop being honoured, the boot of a Play); paused: Cancel beside Resume
+         var stopShown = BuildScreenButtons.Shown(m.Running, m.CanPause, m.CanCancel);
++        if (m.Running != cancelBeside)   // patch 0103: Cancel beside Notify me while it runs, in the upper row (beside nothing, over Resume) otherwise
++        {
++            cancelBeside = m.Running;
++            (cancelBeside ? stopRow : buttonsRow).RemoveArrangedSubview(cancelButton);
++            cancelButton.RemoveFromSuperview();
++            if (cancelBeside) buttonsRow.InsertArrangedSubview(cancelButton, 1); else stopRow.AddArrangedSubview(cancelButton);
++        }
+         stopRow.Hidden = !stopShown.Row;
+         pauseButton.Hidden = !stopShown.Pause;
+         cancelButton.Hidden = !stopShown.Cancel;
++        modeButton.Hidden = !m.Running;
++        primary.Hidden = m.Running;   // patch 0103: "Close" is gone while it runs (the chevron at the top goes back to the library)
++        var mc = modeButton.Configuration;
++        mc.AttributedTitle = new NSAttributedString(BuildMode.Title(m.Fast), new UIStringAttributes { Font = Theme.Font(16, UIFontWeight.Semibold) });
++        mc.Image = UIImage.GetSystemImage(BuildMode.Symbol(m.Fast));
++        modeButton.Configuration = mc;
++        if (m.Fast != (last?.Fast ?? false) || modeButton.Menu == null) modeButton.Menu = ModeMenu(m.Fast);
++        modeButton.AccessibilityValue = m.Fast ? "Fast" : "Cool";
+         pauseButton.Enabled = m.CanPause;
+         cancelButton.Enabled = m.CanCancel;
+         pc = primary.Configuration;
+         pc.Image = m.Running || m.Failed || m.Stopped != null && m.Stopped != "paused" ? null : UIImage.GetSystemImage("play.fill");
+         primary.Configuration = pc;
++    }
++
++    /// Patch 0103: the Mode menu, the mode in effect ticked
++    private UIMenu ModeMenu(bool fast)
++    {
++        UIAction Item(bool f)
++        {
++            var a = UIAction.Create(BuildMode.Name(f), UIImage.GetSystemImage(BuildMode.Symbol(f)), (NSString) (f ? "build-mode-fast" : "build-mode-cool"), _ => OnMode?.Invoke(f));
++            a.Subtitle = BuildMode.Note(f);
++            a.State = f == fast ? UIMenuElementState.On : UIMenuElementState.Off;
++            return a;
++        }
++        return UIMenu.Create("Build mode", null, UIMenuIdentifier.None, UIMenuOptions.DisplayInline, new UIMenuElement[] { Item(false), Item(true) });
+     }
+ 
+     private static NSAttributedString Check(bool ok, string yes, string no)
+diff -ruN t102/GameAppMain.cs u/GameAppMain.cs
+--- t102/GameAppMain.cs	2026-11-22 23:19:47
++++ u/GameAppMain.cs	2026-11-22 23:24:08
+@@ -40,6 +40,7 @@
+ {
+     // gameapp/gameapp_shim.c, linked into this executable (NativeReference Kind=Static).
+     [DllImport("__Internal")] internal static extern int gameapp_run_chain();
++    [DllImport("__Internal")] internal static extern void gameapp_set_fast_build(int on);   // patch 0103: the build screen's Mode for the build that runs now
+     [DllImport("__Internal")] private static extern int gameapp_memline(byte[] buffer, int length);
+     [DllImport("__Internal")] private static extern long gameapp_available();
+     [DllImport("__Internal")] private static extern int gameapp_extended_va();
+diff -ruN t102/GameAppUi.cs u/GameAppUi.cs
+--- t102/GameAppUi.cs	2026-11-22 23:19:47
++++ u/GameAppUi.cs	2026-11-22 23:24:08
+@@ -587,6 +587,11 @@
+     public static bool LowPerformanceOn(string settingsText) =>
+         AppSetting(settingsText, "low_performance", "0").ToLowerInvariant() is "1" or "on" or "yes" or "true";
+ 
++    /// Patch 0103: the build screen's Mode, "Fast" when the settings file says fast_build 1 (the build's workers keep their priority: faster and hotter); "Cool" otherwise (the default:
++    /// the workers run at utility QoS, the UI keeps its priority). The chain reads the same key at the start of every build (ibuilder_run_chain).
++    public static bool FastBuildOn(string settingsText) =>
++        AppSetting(settingsText, "fast_build", "0").ToLowerInvariant() is "1" or "on" or "yes" or "true";
++
+     // ---- deleting a game ---------------------------------------------------------------------------------------------
+ 
+     /// What deleting a game removes, as paths relative to Documents: its dump and the update / add-on dumps of the same

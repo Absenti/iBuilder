@@ -491,3 +491,175 @@ impl Word {
         &self.index
     }
 }
+
+// ------------------------------------------------------------------------------------------------------------------------------ constant_reads
+
+/// `_RO_DECL` over the whole text (re.M): `^\s*(const device) ID\* (BUF) \[\[id\(\d+\)\]\];` -> (start of `const device`, the buffer), in text order
+fn ro_decls(src: &str) -> Vec<(usize, &str)> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(p) = find_b(b, b"const device _", from) {
+        from = p + 1;
+        let mut j = p;
+        while j > 0 && is_space(b[j - 1]) {
+            j -= 1;
+        }
+        if !(j == 0 || b[j - 1] == b'\n' || b[j..p].contains(&b'\n')) {
+            continue;
+        }
+        let mut c = Cur::at(src, p + 13);
+        if ident(&mut c).is_none() || !c.lit("* ") {
+            continue;
+        }
+        let Some(bf) = buf(&mut c) else { continue };
+        if !c.lit(" [[id(") || c.digits().is_none() || !c.lit(")]];") {
+            continue;
+        }
+        out.push((p, bf));
+    }
+    out
+}
+
+/// `_STORAGE_NAME` findall, counted: `\b[a-z]p_s\d+\b`
+fn storage_mentions(src: &str) -> HashMap<&str, usize> {
+    let b = src.as_bytes();
+    let mut out: HashMap<&str, usize> = HashMap::new();
+    let mut from = 0;
+    while let Some(q) = find_b(b, b"p_s", from) {
+        from = q + 1;
+        if q == 0 || !b[q - 1].is_ascii_lowercase() || in_word(b, q - 1) {
+            continue;
+        }
+        let e = digits_end(b, q + 3);
+        if e == q + 3 || (e < b.len() && is_word(b[e])) {
+            continue;
+        }
+        *out.entry(&src[q - 1..e]).or_default() += 1;
+    }
+    out
+}
+
+/// `_DEVICE_REFERENCE`: `\bdevice\s+[^;{}()]*&` anywhere
+fn device_reference(src: &str) -> bool {
+    let b = src.as_bytes();
+    let mut from = 0;
+    while let Some(p) = find_b(b, b"device", from) {
+        from = p + 1;
+        if in_word(b, p) {
+            continue;
+        }
+        let q = skip_space(b, p + 6);
+        if q == p + 6 {
+            continue;
+        }
+        let stop = b[q..]
+            .iter()
+            .position(|c| matches!(c, b';' | b'{' | b'}' | b'(' | b')' | b'&'));
+        if stop.is_some_and(|k| b[q + k] == b'&') {
+            return true;
+        }
+    }
+    false
+}
+
+/// one `_WORD_READ` match (the cast's text is `*(const device packed_uintN*)`): `(?:\*\((?P<cast>const device) packed_uint[234]\*\)(?=&\(\*))?(?P<address>&\s*(?:\(\s*)*)?\(\*spvDescriptorSet0\.(?P<buf>BUF)\)\._m0\[`
+struct WordRead<'a> {
+    buf: &'a str,
+    /// the start of the cast's `const device`
+    cast: Option<usize>,
+    address: bool,
+}
+
+/// `_WORD_READ` finditer. Every match holds `(*spvDescriptorSet0.BUF)._m0[` (the core) and starts at the leftmost of: the cast (exactly `*((const device) packed_uint[234]*)&`
+/// before the core), an `&` before a run of whitespace and `(` that ends at the core, the core. A match ends with `[`, which neither of the prefixes holds, so none reaches back
+/// into the match before it.
+fn word_reads(src: &str) -> Vec<WordRead<'_>> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(p) = find_b(b, b"(*spvDescriptorSet0.", from) {
+        from = p + 1;
+        let mut c = Cur::at(src, p + 20);
+        let Some(bf) = buf(&mut c) else { continue };
+        if !c.lit(")._m0[") {
+            continue;
+        }
+        from = c.i;
+        let mut j = p;
+        while j > 0 && (is_space(b[j - 1]) || b[j - 1] == b'(') {
+            j -= 1;
+        }
+        let address = j > 0 && b[j - 1] == b'&';
+        let mut cast = None;
+        if address && j == p && j > 29 {
+            // `*(const device packed_uintN*)` just before the `&` (the look-ahead `&(*`: the `&` is right before the core)
+            let a = j - 1 - 29;
+            if starts(b, a, "*(const device packed_uint")
+                && matches!(b[a + 26], b'2' | b'3' | b'4')
+                && starts(b, a + 27, "*)")
+            {
+                cast = Some(a + 2);
+            }
+        }
+        out.push(WordRead {
+            buf: bf,
+            cast,
+            address,
+        });
+    }
+    out
+}
+
+/// dmsh_wide.constant_reads: a storage buffer the translator found read-only (`read_only`: the MSL `s<n>` numbers of its storage buffers in binding order that it does not write,
+/// the raw pool table left out) moves to the constant address space, where Metal can keep reads at uniform addresses in constant registers, when every mention of it is a direct
+/// word read or one of wide_loads' packed loads (whose cast moves with it). `mode`: the stages it applies to (`fp`, a comma list, `all`; `0` / `off` / empty: none), as
+/// `dmsh_chain.storage_constant_mode()` (DMSH_SCONST, default `fp`).
+pub fn constant_reads<'a>(src: &'a str, read_only: &HashSet<u32>, mode: &str) -> Cow<'a, str> {
+    if matches!(mode, "0" | "off" | "") || read_only.is_empty() || ro_buffers(src).is_empty() {
+        return Cow::Borrowed(src);
+    }
+    if device_reference(src) {
+        return Cow::Borrowed(src);
+    }
+    // Python `strip()`: Unicode whitespace (the mode is an environment value, ASCII in practice)
+    let stages: HashSet<&str> = mode.split(',').map(|s| s.trim()).collect();
+    let mentions = storage_mentions(src);
+    let mut reads: HashMap<&str, Vec<&WordRead>> = HashMap::new();
+    let all = word_reads(src);
+    for r in &all {
+        reads.entry(r.buf).or_default().push(r);
+    }
+    let mut edits: Vec<(usize, usize)> = Vec::new();
+    for (at, bf) in ro_decls(src) {
+        // `int(buf[4:])`: the digits after `?p_s`
+        let n: Option<u32> = bf[4..].parse().ok();
+        if !n.is_some_and(|n| read_only.contains(&n))
+            || (mode != "all" && !stages.contains(&bf[..2]))
+        {
+            continue;
+        }
+        let acc = reads.get(bf).map(Vec::as_slice).unwrap_or(&[]);
+        if acc.is_empty() || acc.len() + 1 != mentions.get(bf).copied().unwrap_or(0) {
+            continue;
+        }
+        if acc.iter().any(|a| a.address && a.cast.is_none()) {
+            continue;
+        }
+        edits.push((at, at + 12));
+        edits.extend(acc.iter().filter_map(|a| a.cast.map(|c| (c, c + 12))));
+    }
+    if edits.is_empty() {
+        return Cow::Borrowed(src);
+    }
+    edits.sort_unstable();
+    let mut o = String::with_capacity(src.len());
+    let mut at = 0;
+    for (s, e) in edits {
+        o.push_str(&src[at..s]);
+        o.push_str("constant");
+        at = e;
+    }
+    o.push_str(&src[at..]);
+    Cow::Owned(o)
+}

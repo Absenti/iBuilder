@@ -166,7 +166,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pervertex::per_vertex(s).map(|c| ch(&c)).unwrap_or(false)
         });
         time("precise", &|s| ch(&steps::precise(s)));
-        time("membar_fence", &|s| ch(&steps::membar_fence(s)));
         time("bit0_mask", &|s| ch(&bit0::bit0_mask(s)));
         time("select_guards", &|s| {
             guards::select_guards(s).map(|c| ch(&c)).unwrap_or(false)

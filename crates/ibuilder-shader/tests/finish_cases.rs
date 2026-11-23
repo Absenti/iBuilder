@@ -3,6 +3,7 @@
 //! The cases are made by `tools/finish/gen_diff_cases.py` (hand-made MSL / SPIR-V, the Python's answers stored as the text `json.dumps` gives). The file is looked up at
 //! `$FINISH_CASES`, else `tests/data/finish_cases.json`; when it is absent the test says so and passes.
 use ibuilder_shader::finish::{entry, fetch, geometry, pyjson::J, reflect, spv, unit, vin};
+use ibuilder_shader::{fsuint, side};
 use serde_json::Value;
 
 fn cases() -> Option<Value> {
@@ -133,6 +134,26 @@ fn reflection_and_driver_reads() {
         }
     }
     bad += t.done();
+    // gptr_sites: the sites list, or the ValueError's message
+    let mut t = Tally::new("gptr_sites");
+    for (i, x) in c["gptr"].as_array().into_iter().flatten().enumerate() {
+        let (expect, got) = match (
+            x["expect"].get("ok"),
+            reflect::gptr_sites(&s(x, "stage"), &x["res"]),
+        ) {
+            (Some(e), Ok(g)) => (e.as_str().unwrap_or("").to_string(), g.dumps_compact()),
+            (_, Ok(g)) => (format!("error {}", x["expect"]["err"]), g.dumps_compact()),
+            (_, Err(m)) => (
+                x["expect"]
+                    .get("err")
+                    .map(|e| format!("error {e}"))
+                    .unwrap_or_else(|| x["expect"].to_string()),
+                format!("error {}", Value::String(m)),
+            ),
+        };
+        t.exact(i, &expect, got);
+    }
+    bad += t.done();
     assert_eq!(bad, 0);
 }
 
@@ -249,7 +270,94 @@ fn fragment_units_and_readable_tile_versions() {
         });
         te.check(i, &x["entries"], ej);
     }
-    let bad = tu.done() + tf.done() + ts.done() + te.done();
+    let mut bad = tu.done() + tf.done() + ts.done() + te.done();
+    // the typed-output entry point main0_u (fs_uint, typed_ops), the source the chain writes with it (shared body + main0_u + main0_d), its unit and readable-tile
+    // version, and ps_libraries as shader_device runs it (source mode)
+    let (mut tfu, mut tops, mut tfull, mut tu, mut tf, mut tp) = (
+        Tally::new("typed fs_uint"),
+        Tally::new("typed typed_ops"),
+        Tally::new("typed source"),
+        Tally::new("typed unit"),
+        Tally::new("typed fold"),
+        Tally::new("typed ps_libraries"),
+    );
+    for (i, x) in c["typed"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        let msl = s(x, "msl");
+        let fu = fsuint::fs_uint(&msl);
+        let fd = if x["dual"].as_bool().unwrap() {
+            fsuint::fs_dual(&msl)
+        } else {
+            None
+        };
+        tfu.exact(
+            i,
+            &s(x, "fu"),
+            fu.clone().map(J::Str).unwrap_or(J::Null).dumps_compact(),
+        );
+        tops.exact(
+            i,
+            &s(x, "ops"),
+            fu.as_deref()
+                .map(|f| {
+                    let (a, l) = fsuint::typed_ops(f);
+                    J::obj().with("alpha", a).with("logic", l)
+                })
+                .unwrap_or(J::Null)
+                .dumps_compact(),
+        );
+        let shared = if fu.is_some() || fd.is_some() {
+            side::shared_body(&msl)
+        } else {
+            None
+        };
+        let full = match shared {
+            Some(sh) => sh + fu.as_deref().unwrap_or("") + fd.as_deref().unwrap_or(""),
+            None => msl.clone(),
+        };
+        tfull.exact(i, &s(x, "full"), J::Str(full.clone()).dumps_compact());
+        let (u, info) = unit::unit(&full);
+        let info_j = match &info.why {
+            Some(w) => J::obj().with("why", w.as_str()),
+            None => J::obj()
+                .with("alpha", jstrs(info.alpha.clone()))
+                .with("logic", jstrs(info.logic.clone())),
+        };
+        tu.exact(
+            i,
+            &s(x, "unit"),
+            J::Arr(vec![u.clone().map(J::Str).unwrap_or(J::Null), info_j]).dumps_compact(),
+        );
+        let binds: Vec<J> = x["binds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(J::from_value)
+            .collect();
+        let om = x["om_only_ok"].as_bool().unwrap();
+        let fj = match fetch::fold(u.as_deref().unwrap_or(&full), &binds, om) {
+            Ok((t, m)) => J::Arr(vec![J::Str(t), m]),
+            Err(r) => J::Arr(vec![J::Null, J::Str(r)]),
+        };
+        tf.check(i, &x["fold"], Some(fj.dumps_compact()));
+        let (mut files, side_j) = unit::ps_libraries("k0", &full, &binds, om);
+        files.sort();
+        let mut fo = J::obj();
+        for (n, b) in files {
+            fo.set(&n, String::from_utf8(b).unwrap());
+        }
+        tp.check(
+            i,
+            &x["pslib"],
+            Some(J::Arr(vec![fo, side_j]).dumps_compact()),
+        );
+    }
+    bad += tfu.done() + tops.done() + tfull.done() + tu.done() + tf.done() + tp.done();
     assert_eq!(bad, 0);
 }
 
@@ -293,11 +401,7 @@ fn vertex_libraries() {
 #[test]
 fn spirv_rewriting() {
     let Some(c) = cases() else { return };
-    let (mut ts, mut ta, mut tf) = (
-        Tally::new("spv_single_lane"),
-        Tally::new("uses_image_atomics"),
-        Tally::new("flatten_sets"),
-    );
+    let (mut ts, mut tf) = (Tally::new("spv_single_lane"), Tally::new("flatten_sets"));
     for (i, x) in c["spv"].as_array().unwrap().iter().enumerate() {
         let d = unhex(x["spv"].as_str().unwrap());
         let got = spv::spv_single_lane(&d).ok().map(|r| match r {
@@ -305,11 +409,6 @@ fn spirv_rewriting() {
             None => format!("[false, {:?}]", hex(&d)),
         });
         ts.check(i, &x["expect"], got);
-        ta.check(
-            i,
-            &x["atomics"],
-            spv::uses_image_atomics(&d, "x").ok().map(|b| b.to_string()),
-        );
     }
     for (i, x) in c["flatten"].as_array().unwrap().iter().enumerate() {
         let d = unhex(x["spv"].as_str().unwrap());
@@ -319,7 +418,7 @@ fn spirv_rewriting() {
             spv::flatten_sets(&d).ok().map(|n| format!("{:?}", hex(&n))),
         );
     }
-    let bad = ts.done() + ta.done() + tf.done();
+    let bad = ts.done() + tf.done();
     assert_eq!(bad, 0);
 }
 

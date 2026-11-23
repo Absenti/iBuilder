@@ -4,8 +4,8 @@
 //! for a shader that defines the HMMA helper (see `hmma.rs`).
 use crate::fsuint::{fs_dual, fs_uint};
 use crate::{
-    PostError, ampere, bit0, blend, border, cs, guards, hmma, pervertex, pool, side, steps, tf,
-    utest, vs, wide, zsnap,
+    PostError, ampere, bit0, blend, border, cs, guards, hmma, pervertex, pool, side, steps, utest,
+    vs, wide, zsnap,
 };
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -70,10 +70,17 @@ pub struct PostOut {
     pub layer_entry: bool,
     /// vs_layer_entry's `{'loc', 'comp'}` (the reflection's `layer_from`)
     pub layer_from: Option<(u32, char)>,
+    /// vertex shader: `vs_viewport_mask` lowered a draw-uniform viewport mask (the reflection's `viewport_mask`)
+    pub viewport_mask: bool,
+    /// pixel shader: the typed-output entry point holds the alpha test / the logic operation (`dmsh_entry.typed_ops`: the reflection's `entry_u_alpha` / `entry_u_logic`)
+    pub typed_alpha: bool,
+    pub typed_logic: bool,
     /// compute: first_store's `[(storage binding's MSL name, word, value)]` (the reflection's `first_store`, with the binding's `reg` looked up there)
     pub first_store: Vec<(String, i64, i64)>,
     /// compute: tg_spill's bytes per workgroup (0: unchanged)
     pub tg_spill: u64,
+    /// compute: compute_loops' contained loops (the reflection's `loop_sites`)
+    pub loop_sites: Vec<cs::LoopSite>,
 }
 
 impl PostError {
@@ -84,6 +91,7 @@ impl PostError {
             PostError::Unported(_) => "unported",
             PostError::Failed { step, .. } => match *step {
                 "check_msl" => "image atomic MSL failed",
+                "vs_viewport_mask" => "vertex viewport mask failed",
                 "per_vertex" => "per-vertex input rewrite failed",
                 "select_guards" => "uniform bounds rewrite failed",
                 "gather_offsets" => "gather offsets rewrite failed",
@@ -92,6 +100,7 @@ impl PostError {
                 "pool_arrays" => "pool rewrite failed",
                 "uniform_tests" => "uniform tests rewrite failed",
                 "tg_spill" => "shared memory rewrite failed",
+                "compute_loops" => "compute loop containment failed",
                 _ => "exception",
             },
         }
@@ -110,6 +119,9 @@ macro_rules! step {
     }};
 }
 
+/// `dmsh_chain.storage_constant_mode()`: DMSH_SCONST, default `fp`; another value gives another chain id, which the host does not load
+pub const STORAGE_CONSTANT_MODE: &str = "fp";
+
 pub fn post_rewrites(src: &str, job: &Job) -> Result<PostOut, PostError> {
     if let Stage::Other(_) = job.stage {
         return Err(PostError::Unported("stage"));
@@ -121,7 +133,6 @@ pub fn post_rewrites(src: &str, job: &Job) -> Result<PostOut, PostError> {
         step!(cur, pervertex::per_vertex(&cur)?);
     }
     step!(cur, steps::precise(&cur));
-    step!(cur, steps::membar_fence(&cur));
     step!(cur, bit0::bit0_mask(&cur));
     step!(cur, guards::select_guards(&cur)?);
     step!(cur, ampere::mul_extended(&cur));
@@ -131,6 +142,29 @@ pub fn post_rewrites(src: &str, job: &Job) -> Result<PostOut, PostError> {
     step!(cur, ampere::shared_store_msl(&cur)?);
     step!(cur, pool::pool_arrays(&cur)?);
     step!(cur, wide::wide_loads(&cur));
+    if let Some(res) = job.res {
+        // the storage buffers the translator found read-only, by their MSL number (binding order), the raw pool table left out
+        let mut sb: Vec<&serde_json::Value> = res
+            .get("sbufs")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
+        sb.sort_by_key(|b| b.get("binding").and_then(|x| x.as_i64()).unwrap_or(0));
+        let read_only: std::collections::HashSet<u32> = sb
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                b.get("flags").and_then(|x| x.as_i64()).unwrap_or(0) & 1 == 0
+                    && b.get("cb_slot").and_then(|x| x.as_i64())
+                        != Some(crate::finish::abi::GMEM_MAP_CB_SLOT)
+            })
+            .map(|(i, _)| i as u32)
+            .collect();
+        step!(
+            cur,
+            wide::constant_reads(&cur, &read_only, STORAGE_CONSTANT_MODE)
+        );
+    }
     step!(cur, steps::tg_fence(&cur)?);
     step!(cur, border::border_emu(&cur)?);
     if ps {
@@ -157,13 +191,19 @@ pub fn post_rewrites(src: &str, job: &Job) -> Result<PostOut, PostError> {
             res.first_store = first;
             let (s, spill) = cs::tg_spill(&s)?;
             res.tg_spill = spill;
+            let (s, sites) = cs::compute_loops(&s)?;
+            res.loop_sites = sites;
             let mut text = s;
             if let Cow::Owned(o) = steps::max_threads(&text, local) {
+                text = o;
+            }
+            if let Cow::Owned(o) = steps::raw_noinline(&text, "cs") {
                 text = o;
             }
             res.out = text;
         }
         Stage::Vs => {
+            step!(cur, steps::raw_noinline(&cur, "vs"));
             let mut s = vs::vs_init(&cur);
             s = vs::vs_layer(s)?;
             s = vs::vs_base_instance(&s);
@@ -172,33 +212,22 @@ pub fn post_rewrites(src: &str, job: &Job) -> Result<PostOut, PostError> {
                 s = n;
                 res.vs_pad = pad;
             }
-            let capture = vs::capture(&s)?;
-            let (single, mut full) = vs::vs_depth(&s)?;
-            full.push_str(&capture);
             let Some(answer) = job.res else {
                 return Err(PostError::Unported(
                     "vs_writes without the translator's answer json",
                 ));
             };
-            let rw = vs::reflect_rw(&single, answer)?;
-            if vs::vs_writes(&single, rw) {
-                full.push_str(&vs::vs_discard(&single)?);
-                res.entry_discard = true;
-            }
-            if job.has_tf {
-                match job.tf {
-                    Some(tfv) => full.push_str(&tf::vs_tf(&single, tfv, false)?),
-                    None => return Err(PostError::Unported("vs_tf without the layout")),
-                }
-            }
-            res.plain_len = Some(full.len());
-            let (f2, lay) = vs::vs_layer_entry(&full)?;
-            res.layer_entry = lay.is_some();
-            res.layer_from = lay;
-            res.out = f2;
-            res.analysis = Some(single);
+            let e = vs::vertex_entries(&s, answer, job.has_tf, job.tf)?;
+            res.entry_discard = e.discard;
+            res.viewport_mask = e.viewport_mask;
+            res.plain_len = Some(e.plain_len);
+            res.layer_entry = e.layer_from.is_some();
+            res.layer_from = e.layer_from;
+            res.out = e.full;
+            res.analysis = Some(e.single);
         }
         Stage::Ps => {
+            step!(cur, steps::raw_noinline(&cur, "ps"));
             let fu = fs_uint(&cur);
             let fd = if job.dual_want { fs_dual(&cur) } else { None };
             let shared = if fu.is_some() || fd.is_some() {
@@ -207,6 +236,11 @@ pub fn post_rewrites(src: &str, job: &Job) -> Result<PostOut, PostError> {
                 None
             };
             res.fs_uint = fu.is_some() && shared.is_some();
+            if res.fs_uint
+                && let Some(u) = fu.as_deref()
+            {
+                (res.typed_alpha, res.typed_logic) = crate::fsuint::typed_ops(u);
+            }
             res.fs_dual = fd.is_some() && shared.is_some();
             match shared {
                 Some(mut sh) => {

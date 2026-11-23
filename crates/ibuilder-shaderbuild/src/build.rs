@@ -5,9 +5,9 @@
 //! 1. the profile folder is copied to `<out>/_work/profile/<game>` (the tables are written there; the pipeline reads them from that place) and read: `game.tsv`, the shader map, the answer
 //!    table, the pair tables, `bf_want` / `dual_want`;
 //! 2. every shader's digest (`key::shader_digest`; a vertex shader with pairs takes its pixel shaders') and a look into the cache (`cache::Store`): the **hits** need nothing more;
-//! 3. the **misses** in two phases (everything without pairs, then the vertex shaders with pixel-shader partners, which `vs_pad` reads), in batches of `4 * jobs`: a translator thread makes
-//!    the jobs of the next batch (`job_for`) and runs the translator over them in `jobs` threads while `jobs` worker threads finish the current batch (`Finisher`); a finished shader's
-//!    files go into one cache entry; the batch's working folder goes when its last shader is done;
+//! 3. the **misses** as one stream: `jobs` workers, each taking a few shaders at a time (`BuildOptions::xlate_group`), making their jobs (`job_for`), running the translator once over
+//!    them and finishing them one by one (`Finisher`) into the cache. A vertex shader with pixel-shader partners (`vs_pad` reads their MSL's locations) is taken as soon as its own
+//!    partners are finished (the Python's two phases, per shader instead of a barrier over all of phase 1); its partners are taken first. A group's working folder goes with the group;
 //! 4. the tables (`c1_full.tsv`, `cb_extent.tsv`: rows came with each shader), the stamp (`inputs.tsv`) and the library image, streamed from the entries in name order.
 //!
 //! A shader that fails (translator, spirv-cross, `finish`) has no files and is counted by its status, as in the Python; the build still returns its image.
@@ -33,7 +33,7 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 /// stack of a finishing worker thread
@@ -49,8 +49,12 @@ pub struct BuildOptions {
     pub out_dir: PathBuf,
     /// the host's chain id (`DMSH_CHAIN`)
     pub chain: String,
-    /// threads that translate and finish (the Python's `J`); a batch is `4 * jobs` shaders
+    /// threads that translate and finish (the Python's `J`)
     pub jobs: usize,
+    /// translator jobs per translator call: a worker takes up to this many shaders at once (fewer near the end, so that no worker sits on several while others are idle), translates
+    /// them in one call and finishes them. It changes no output (the translator makes every job on its own, `toolmemo` relies on it too); it trades the per-call cost (a process spawn
+    /// on the Mac) against the time a worker holds shaders others could take. Default [`DEFAULT_XLATE_GROUP`], or `IBUILDER_XLATE_GROUP` from the environment; 0 counts as 1
+    pub xlate_group: usize,
     /// write `c1_full.tsv` / `cb_extent.tsv` (a full build only)
     pub tables: bool,
     /// the pulling libraries (`_bp`) are built: part of every shader's digest, and what the finisher is told
@@ -70,6 +74,18 @@ pub struct BuildOptions {
     pub tool_memo: bool,
 }
 
+/// What a build's translator call holds by default: 4 jobs, what the old batches gave each call (a batch of `4 * jobs` in `jobs` calls)
+pub const DEFAULT_XLATE_GROUP: usize = 4;
+
+/// [`DEFAULT_XLATE_GROUP`], or `IBUILDER_XLATE_GROUP` (a number from 1 to 64) from the process environment: a measuring knob that needs no option on the callers
+pub fn default_xlate_group() -> usize {
+    std::env::var("IBUILDER_XLATE_GROUP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(DEFAULT_XLATE_GROUP)
+}
+
 impl BuildOptions {
     pub fn new(
         pkg_dir: &Path,
@@ -86,6 +102,7 @@ impl BuildOptions {
             out_dir: out_dir.to_path_buf(),
             chain: chain.to_string(),
             jobs: 4,
+            xlate_group: default_xlate_group(),
             tables: true,
             pulling: true,
             cas: cas.to_path_buf(),
@@ -151,39 +168,160 @@ pub struct BuildReport {
     pub memo_cross_misses: u64,
 }
 
-// ------------------------------------------------------------------------------------------------------------------------- queue
+// ------------------------------------------------------------------------------------------------------------------------- the stream
 
-struct Queue<T> {
-    m: Mutex<(VecDeque<T>, bool)>,
+/// Where the workers take the misses from (indices into the build's misses, in key order). Every shader without pairs is ready from the start, the pixel shaders that paired vertex
+/// shaders wait for first; a paired vertex shader is ready once the last of its partners this build finishes is done (finished or failed: what the old phase 2 saw after its barrier,
+/// per shader), and is then taken before any other.
+struct Sched {
+    m: Mutex<SchedState>,
     cv: Condvar,
+    /// miss -> the paired vertex shaders (misses) waiting for it
+    dependents: Vec<Vec<usize>>,
+    nj: usize,
+    group: usize,
 }
 
-impl<T> Queue<T> {
-    fn new() -> Self {
-        Queue {
-            m: Mutex::new((VecDeque::new(), false)),
+struct SchedState {
+    /// paired vertex shaders whose partners are done: taken first
+    released: VecDeque<usize>,
+    ready: VecDeque<usize>,
+    /// miss -> its partners not done yet (paired vertex shaders only)
+    left: Vec<usize>,
+    /// paired vertex shaders still waiting for a partner
+    waiting: usize,
+    /// a worker ended by a panic: nobody takes work any more (the scope then hands the panic on instead of the others waiting for its shaders)
+    broken: bool,
+}
+
+/// how often a worker with nothing to take looks at the stop request (a stop is one byte, nobody signals it)
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl Sched {
+    fn new(
+        misses: &[String],
+        pairs: &HashMap<String, BTreeSet<String>>,
+        nj: usize,
+        group: usize,
+    ) -> Sched {
+        let index: HashMap<&str, usize> = misses
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.as_str(), i))
+            .collect();
+        let mut dependents = vec![Vec::new(); misses.len()];
+        let mut left = vec![0usize; misses.len()];
+        let mut released = VecDeque::new();
+        let mut waiting = 0usize;
+        for (v, k) in misses.iter().enumerate() {
+            let Some(ps) = pairs.get(k) else {
+                continue;
+            };
+            for p in ps {
+                // a partner this build finishes now. A partner that has pairs itself is not waited for (the old phase 2 did not wait for its own shaders either; no profile seen has
+                // one): waiting for it could wait forever. A hit or a shader the map lacks is no wait (its locations are known, or never will be)
+                if let Some(&i) = index.get(p.as_str())
+                    && !pairs.contains_key(p)
+                {
+                    dependents[i].push(v);
+                    left[v] += 1;
+                }
+            }
+            if left[v] == 0 {
+                released.push_back(v);
+            } else {
+                waiting += 1;
+            }
+        }
+        let mut ready: VecDeque<usize> = VecDeque::with_capacity(misses.len());
+        let mut rest = Vec::new();
+        for (i, k) in misses.iter().enumerate() {
+            if pairs.contains_key(k) {
+                continue;
+            }
+            if dependents[i].is_empty() {
+                rest.push(i);
+            } else {
+                ready.push_back(i);
+            }
+        }
+        ready.extend(rest);
+        Sched {
+            m: Mutex::new(SchedState {
+                released,
+                ready,
+                left,
+                waiting,
+                broken: false,
+            }),
             cv: Condvar::new(),
+            dependents,
+            nj,
+            group: group.max(1),
         }
     }
-    fn push_all(&self, v: Vec<T>) {
-        self.m.lock().unwrap().0.extend(v);
-        self.cv.notify_all();
-    }
-    fn pop(&self) -> Option<T> {
+
+    /// The next shaders for one translator call: up to `group`, fewer when less than `group` per worker is ready (the end of the build, or vertex shaders released one by one).
+    /// `None`: nothing is left to take (every shader is taken, or a stop)
+    fn take(&self, sh: &Shared) -> Option<Vec<usize>> {
         let mut g = self.m.lock().unwrap();
         loop {
-            if let Some(x) = g.0.pop_front() {
-                return Some(x);
-            }
-            if g.1 {
+            if g.broken || sh.stopping() {
                 return None;
             }
-            g = self.cv.wait(g).unwrap();
+            let avail = g.released.len() + g.ready.len();
+            if avail > 0 {
+                let n = self.group.min(avail.div_ceil(self.nj));
+                let mut out = Vec::with_capacity(n);
+                while out.len() < n {
+                    match g.released.pop_front().or_else(|| g.ready.pop_front()) {
+                        Some(i) => out.push(i),
+                        None => break,
+                    }
+                }
+                return Some(out);
+            }
+            if g.waiting == 0 {
+                return None;
+            }
+            g = self.cv.wait_timeout(g, IDLE_POLL).unwrap().0;
         }
     }
-    fn close(&self) {
-        self.m.lock().unwrap().1 = true;
-        self.cv.notify_all();
+
+    /// shader `i` is done (finished, or failed): the vertex shaders that waited for it alone are ready
+    fn done(&self, i: usize) {
+        let deps = &self.dependents[i];
+        if deps.is_empty() {
+            return;
+        }
+        let mut g = self.m.lock().unwrap();
+        let mut any = false;
+        for &v in deps {
+            g.left[v] -= 1;
+            if g.left[v] == 0 {
+                g.released.push_back(v);
+                g.waiting -= 1;
+                any = true;
+            }
+        }
+        drop(g);
+        if any {
+            self.cv.notify_all();
+        }
+    }
+}
+
+/// Set on a worker's stack: a worker that ends by a panic tells the others to stop taking work (with `panic = "abort"` the process ends anyway)
+struct BreakOnPanic<'a>(&'a Sched);
+
+impl Drop for BreakOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            if let Ok(mut g) = self.0.m.lock() {
+                g.broken = true;
+            }
+            self.0.cv.notify_all();
+        }
     }
 }
 
@@ -215,20 +353,18 @@ impl<'a> Progress<'a> {
 /// A pending job: (the job, its c1).
 type PendingJob = (Map<String, Value>, Vec<u8>);
 
-struct Batch {
+/// The shaders one worker translates in one translator call and then finishes, one after the other; its working folder goes with it
+struct Group {
     dir: PathBuf,
-    paired: bool,
-    keys: Vec<String>,
-    /// key -> (the job, its c1), taken by the shader's task
-    jobs: Mutex<HashMap<String, PendingJob>>,
+    /// key -> (the job, its c1), taken by the shader's `fin`
+    jobs: HashMap<String, PendingJob>,
     /// key -> (status, detail) for shaders that never got a job
     pre_fail: HashMap<String, (String, String)>,
     /// the translator's `[RED] key: message` lines
     xerr: HashMap<String, String>,
-    remaining: AtomicUsize,
 }
 
-impl Drop for Batch {
+impl Drop for Group {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -239,7 +375,6 @@ struct Shared<'a> {
     /// the caller's tools, counted, behind the tool memo when it is on
     tools: &'a dyn ShaderTools,
     o: &'a BuildOptions,
-    nj: usize,
     map: &'a ShaderMap,
     facts: &'a HashMap<String, Value>,
     pairs: &'a HashMap<String, BTreeSet<String>>,
@@ -255,8 +390,6 @@ struct Shared<'a> {
     done: AtomicUsize,
     total: usize,
     progress: Progress<'a>,
-    inflight: Mutex<usize>,
-    inflight_cv: Condvar,
     /// a stop was seen: kept, so that a request withdrawn while the build winds down cannot turn it back into a complete one with shaders missing
     stopped: AtomicBool,
 }
@@ -331,16 +464,23 @@ pub(crate) fn parse_xlate_errors(stderr: &str, into: &mut HashMap<String, String
     }
 }
 
-/// `translate(batch)`: jobs for the batch's shaders and the translator run over them in `nj` chunks (`miss[i::nj]`)
-fn translate_batch(sh: &Shared, id: usize, paired: bool, keys: &[String]) -> Batch {
-    let dir = sh.tmp.join(format!("batch_{id}"));
+/// `translate(batch)` for one worker's group: the shaders' jobs, and one translator call over them (the Python's `miss[i::nj]` chunk of a batch, here the group). A stop seen while the jobs
+/// are made leaves the rest without one and calls no translator: the worker starts none of them
+fn translate_group(sh: &Shared, id: usize, keys: &[&str]) -> Group {
+    let dir = sh.tmp.join(format!("group_{id}"));
     let _ = std::fs::create_dir_all(&dir);
-    let mut jobs: HashMap<String, (Map<String, Value>, Vec<u8>)> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut jobs: HashMap<String, PendingJob> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
     let mut pre_fail: HashMap<String, (String, String)> = HashMap::new();
-    for k in keys {
+    let mut xerr: HashMap<String, String> = HashMap::new();
+    for &k in keys {
         if sh.stopping() {
-            break; // the rest of the batch is never finished (the workers skip it), so it needs no job
+            return Group {
+                dir,
+                jobs,
+                pre_fail,
+                xerr,
+            };
         }
         let (name, _) = &sh.map.loc[k];
         let code_path = dir.join(format!("{k}.bin"));
@@ -365,7 +505,7 @@ fn translate_batch(sh: &Shared, id: usize, paired: bool, keys: &[String]) -> Bat
                 }
                 if let Err(e) = std::fs::write(&code_path, &j.code) {
                     pre_fail.insert(
-                        k.clone(),
+                        k.to_string(),
                         (
                             "translation failed".into(),
                             format!("{}: {e}", code_path.display()),
@@ -373,65 +513,51 @@ fn translate_batch(sh: &Shared, id: usize, paired: bool, keys: &[String]) -> Bat
                     );
                     continue;
                 }
-                jobs.insert(k.clone(), (j.job, j.c1));
-                order.push(k.clone());
+                jobs.insert(k.to_string(), (j.job, j.c1));
+                order.push(k);
             }
             Err(JobError::Red(m)) => {
                 sh.log(&m);
                 pre_fail.insert(
-                    k.clone(),
+                    k.to_string(),
                     ("translation failed".into(), head_chars(&m, 160)),
                 );
             }
             Err(JobError::Unported(m)) => {
-                pre_fail.insert(k.clone(), (format!("unported: {m}"), String::new()));
+                pre_fail.insert(k.to_string(), (format!("unported: {m}"), String::new()));
             }
         }
     }
-    let nj = sh.nj;
-    let chunks: Vec<Vec<&String>> = (0..nj)
-        .map(|i| order.iter().skip(i).step_by(nj).collect::<Vec<_>>())
-        .filter(|c| !c.is_empty())
-        .collect();
-    let xerr: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
-    std::thread::scope(|s| {
-        for (n, ch) in chunks.iter().enumerate() {
-            let (dir, jobs, xerr) = (&dir, &jobs, &xerr);
-            s.spawn(move || {
-                ibuilder_pipeline::sys::qos::lower_worker_qos();
-                let text = format!(
-                    "[{}]",
-                    ch.iter()
-                        .map(|k| dumps(&Value::Object(jobs[*k].0.clone()), &Opts::DEFAULT))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                let jp = dir.join(format!("job_{n}.json"));
-                if let Err(e) = std::fs::write(&jp, text) {
-                    let mut g = xerr.lock().unwrap();
-                    for k in ch {
-                        g.insert((*k).clone(), format!("{}: {e}", jp.display()));
-                    }
-                    return;
+    if !order.is_empty() && !sh.stopping() {
+        let text = format!(
+            "[{}]",
+            order
+                .iter()
+                .map(|k| dumps(&Value::Object(jobs[*k].0.clone()), &Opts::DEFAULT))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let jp = dir.join("job.json");
+        match std::fs::write(&jp, text) {
+            Err(e) => {
+                for k in &order {
+                    xerr.insert(k.to_string(), format!("{}: {e}", jp.display()));
                 }
+            }
+            Ok(()) => {
                 let r = sh.tools.xlate(&[
                     jp.to_string_lossy().into_owned(),
                     dir.to_string_lossy().into_owned(),
                 ]);
-                let mut local = HashMap::new();
-                parse_xlate_errors(&r.stderr, &mut local);
-                xerr.lock().unwrap().extend(local);
-            });
+                parse_xlate_errors(&r.stderr, &mut xerr);
+            }
         }
-    });
-    Batch {
+    }
+    Group {
         dir,
-        paired,
-        keys: keys.to_vec(),
-        jobs: Mutex::new(jobs),
+        jobs,
         pre_fail,
-        xerr: xerr.into_inner().unwrap(),
-        remaining: AtomicUsize::new(keys.len()),
+        xerr,
     }
 }
 
@@ -449,7 +575,7 @@ fn remove_work_files(dir: &Path, key: &str) {
 }
 
 /// `fin(key, wb)` for a miss
-fn fin(sh: &Shared, b: &Batch, key: &str) {
+fn fin(sh: &Shared, b: &mut Group, key: &str) {
     let digest = &sh.digests[key];
     let outcome = (|| -> (String, String, Option<Arc<Stored>>) {
         if let Some((st, d)) = b.pre_fail.get(key) {
@@ -462,7 +588,7 @@ fn fin(sh: &Shared, b: &Batch, key: &str) {
         if !spv.exists() {
             return ("translation failed".into(), "no spv".into(), None);
         }
-        let Some((job, c1)) = b.jobs.lock().unwrap().remove(key) else {
+        let Some((job, c1)) = b.jobs.remove(key) else {
             return ("translation failed".into(), "no job".into(), None);
         };
         let mut job = Value::Object(job);
@@ -532,16 +658,6 @@ fn fin(sh: &Shared, b: &Batch, key: &str) {
     }
     sh.record_result(key, &outcome.0, &outcome.1);
     sh.finished_one();
-    batch_one_done(sh, b);
-}
-
-/// one shader of the batch is out of the way (finished, or left alone because of a stop); the last one frees the batch's place
-fn batch_one_done(sh: &Shared, b: &Batch) {
-    if b.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
-        let mut g = sh.inflight.lock().unwrap();
-        *g -= 1;
-        sh.inflight_cv.notify_all();
-    }
 }
 
 /// The build ends because of a stop. What it made for this run only (the stage folder of hard links, the batches' folders) goes; every shader that finished is in the translation cache, whole.
@@ -588,13 +704,6 @@ fn stopped_build(o: &BuildOptions, store: &Store, tmp: &Path) -> String {
         rmtree(tmp);
     }
     "cancelled".to_string()
-}
-
-fn wait_inflight(sh: &Shared, at_most: usize) {
-    let mut g = sh.inflight.lock().unwrap();
-    while *g > at_most {
-        g = sh.inflight_cv.wait(g).unwrap();
-    }
 }
 
 /// `dmsh_build.build_keys`: a partial build takes its paired pixel shaders along (vs_pad reads their MSL); a full build every shader of the map
@@ -846,7 +955,6 @@ pub fn build(o: &BuildOptions, env: &BuildEnv) -> Result<BuildReport, String> {
         env,
         tools,
         o,
-        nj,
         map: &map,
         facts: &facts,
         pairs: &pairs,
@@ -868,84 +976,44 @@ pub fn build(o: &BuildOptions, env: &BuildEnv) -> Result<BuildReport, String> {
         done: AtomicUsize::new(hits.len()),
         total: keys.len(),
         progress: Progress::new(log),
-        inflight: Mutex::new(0),
-        inflight_cv: Condvar::new(),
         stopped: AtomicBool::new(false),
     };
 
     // ---- translate and finish --------------------------------------------------------------------------------------------------------
-    // Two phases: paired vertex shaders read their pixel shaders' MSL (vs_pad), so they go last, in batches of their own, once every shader before them is finished.
-    let batch_size = 4 * nj;
-    let mut batches: Vec<(bool, Vec<String>)> = Vec::new();
-    for paired in [false, true] {
-        let ks: Vec<String> = misses
-            .iter()
-            .filter(|k| pairs.contains_key(*k) == paired)
-            .cloned()
-            .collect();
-        for c in ks.chunks(batch_size) {
-            batches.push((paired, c.to_vec()));
-        }
-    }
-    let queue: Queue<(Arc<Batch>, String)> = Queue::new();
-    let mut cancelled = false;
+    // One stream: every worker takes a few shaders, translates them in one call and finishes them, until none is left. The paired vertex shaders read their pixel shaders' MSL
+    // (vs_pad): each waits for its own partners only (`Sched`), not for every shader without pairs.
+    let sched = Sched::new(&misses, &pairs, nj, o.xlate_group);
+    let group_ids = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for i in 0..nj {
-            let (shared, queue) = (&shared, &queue);
+            let (shared, sched, misses, group_ids) = (&shared, &sched, &misses, &group_ids);
             // a worker runs the finisher's scanners over 20-45 KB texts with recursive descent in places: more than the default 2 MiB stack, as virtual address space only
             std::thread::Builder::new()
                 .name(format!("shaderbuild-{i}"))
                 .stack_size(WORKER_STACK)
                 .spawn_scoped(s, move || {
                     ibuilder_pipeline::sys::qos::lower_worker_qos();
-                    while let Some((b, key)) = queue.pop() {
-                        if shared.stopping() {
-                            batch_one_done(shared, &b); // a stop: no shader is started any more (the one in hand was finished above)
-                        } else {
-                            fin(shared, &b, &key);
+                    let _break = BreakOnPanic(sched);
+                    while let Some(taken) = sched.take(shared) {
+                        let keys: Vec<&str> = taken.iter().map(|&m| misses[m].as_str()).collect();
+                        let mut g = translate_group(
+                            shared,
+                            group_ids.fetch_add(1, Ordering::Relaxed),
+                            &keys,
+                        );
+                        for (&m, k) in taken.iter().zip(&keys) {
+                            if shared.stopping() {
+                                break; // a stop: no shader is started any more (the one in hand was finished above)
+                            }
+                            fin(shared, &mut g, k);
+                            sched.done(m);
                         }
                     }
                 })
                 .expect("spawn a shader build worker");
         }
-        let (tx, rx) = mpsc::sync_channel::<Batch>(0);
-        {
-            let (shared, batches) = (&shared, &batches);
-            s.spawn(move || {
-                ibuilder_pipeline::sys::qos::lower_worker_qos();
-                for (i, (paired, ks)) in batches.iter().enumerate() {
-                    if shared.stopping() {
-                        break;
-                    }
-                    let b = translate_batch(shared, i, *paired, ks);
-                    if tx.send(b).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        let mut seen_paired = false;
-        for b in rx {
-            if shared.stopping() {
-                cancelled = true;
-                break;
-            }
-            if b.paired && !seen_paired {
-                seen_paired = true;
-                wait_inflight(&shared, 0); // the first paired batch: everything before it is finished
-            }
-            wait_inflight(&shared, 1);
-            let b = Arc::new(b);
-            if b.keys.is_empty() {
-                continue;
-            }
-            *shared.inflight.lock().unwrap() += 1;
-            queue.push_all(b.keys.iter().map(|k| (b.clone(), k.clone())).collect());
-        }
-        wait_inflight(&shared, 0);
-        queue.close();
     });
-    if cancelled || shared.stopping() {
+    if shared.stopping() {
         // every shader that was finished is in the cache whole (an entry is written beside its name and renamed into place by the worker that made it, before that worker takes the next one)
         log(&format!(
             "[stop] shader build stopped: {} of {} shaders are finished and kept in the shader cache ({} of them from before this build); the next build restores them",

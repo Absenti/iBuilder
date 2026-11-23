@@ -17,7 +17,7 @@ The script needs `IOSBUILDER_WORKTREE` (or `IOSBUILDER`), see [BUILDING.md](BUIL
 
 1. APFS-clones the patched engine tree the app ships and applies `engine-patches/0[45]*.patch` in name order with
    `patch -p1 --forward`. The first patch that does not apply stops the build and is named.
-2. Stops if the shader chain id of the tree differs from `EXPECT_CHAIN` (default `b24b25240cad`). The chain id names
+2. Stops if the shader chain id of the tree differs from `EXPECT_CHAIN` (default `6c53446391cc` since 0536). The chain id names
    the shader library; if it moved, every game's library would have to be rebuilt (`CHAIN_ANY=1` only prints it).
 3. Runs the original project's own host build (`load/prebuild_loadable.sh`) from a mirror of its tools, in `HOST_WORK`
    (default `target/host-work`).
@@ -33,16 +33,18 @@ same file may need a re-diff after one is removed.
 ## The patches
 
 `04NN` are upstream nxnative fixes and our own changes; `05NN` are adapted from other MIT-licensed ports. Every patch
-header states what it changes, why, and how it was checked. They never change the shader chain id.
+header states what it changes, why, and how it was checked. Only 0536 changes the shader chain id (see [Shader chain 2026-11-23](#shader-chain-2026-11-23)).
 
 | area | patches |
 |---|---|
 | Audio | 0401 render pacing after bursts; 0453 real-time deadline for the audio render thread; 0454 short AudioOut tails (Bluetooth underruns) |
 | Memory | 0402 render-target recycle slack capped at 4 MiB; 0403 zero fills in bands that fit the shared buffer; 0404 / 0405 opt-in trimming of idle upload staging and bounded zero-copy sources; 0501 opt-in texture memory saver; 0500 opt-in skip of retired pools; 0512 a memory-pressure trim at the next submission (system pressure, app request, headroom watermark); 0519, 0521-0525 from the [2026-11-23 sync](#upstream-sync-2026-11-23) |
-| Pipelines and prewarm | 0406 look-ahead no longer resolves a future sparse attachment; 0412 prepare builds a head of the prewarm lists before the first frame and the tail in the background; 0413 this device's learned list first (`pso_user.tsv`); 0414 an MTLBinaryArchive of the MTLDevice path in the engine; 0415 the prewarm tail resumes where it stopped and waits while the device is hot; 0462 the archive's timed write never blocks compiles |
+| Pipelines and prewarm | 0406 look-ahead no longer resolves a future sparse attachment; 0412 prepare builds a head of the prewarm lists before the first frame and the tail in the background; 0413 this device's learned list first (`pso_user.tsv`); 0414 an MTLBinaryArchive of the MTLDevice path in the engine; 0415 the prewarm tail resumes where it stopped and waits while the device is hot; 0462 the archive's timed write never blocks compiles; 0535 libraries compiled from Metal source on the phone are compiled for size (`optimizationLevel` Size: faster pipeline setup per Apple, unmeasured here; the app's warm-up must use the same options) |
 | Graphics correctness | 0408 composed-mesh arguments checked live (Switch 2 mesh shaders); 0455 / 0456 empty-grid dispatches skipped, interrupted compute compile retried; 0457 sparse descriptor lifetime; 0458 present start-up link rescue; 0460 allocation checked before pages are write-protected; 0506 vertex streams bound to the bytes a draw reads, with a pool-end fallback; 0507 a presented texture keeps its contents when loaded and not written; 0509 the archive leaves out pipelines without a fragment stage, switch for render conditions |
 | Input | 0407 Npad style read under the bind lock; 0461 stick diagonals within the Switch circle |
 | Upstream sync 2026-11-23 | 0514-0534, see [the section below](#upstream-sync-2026-11-23) |
+| Shader chain | 0536 upstream's chain tools, translator sources and library ABI at 033793f0 (chain `6c53446391cc`); 0537 their host side. See [Shader chain 2026-11-23](#shader-chain-2026-11-23) |
+| GL and Vulkan games | 0538 shaders from Metal source: with no `<api>_shaders.metallib` and a `<DM_MSL_DIR>/<api>/msl/` folder (the files the phone's translation writes, `crates/ibuilder-glvk`), each function is compiled from its own `.metal` file at first use, with the options of the NVN source compiles (Relaxed math, invariance, `optimizationLevel` Size) |
 | Texture decode | 0410 / 0411 BC buffer-to-texture copies and BC decode on the CPU, only on a GPU without BC (A16 and older); 0510 that path on by itself, BC1-5 decoded on the GPU at upload; 0511 BC1-3 stored as ASTC 4x4. See [GPUs without BC textures](#gpus-without-bc-textures) |
 | Rewriter | 0409 a conditional select on x18 no longer spills over live stack. This changes the engine's Python rewriter only; the Rust rewriter has its own implementation |
 | Diagnostics | 0451 residency staging retired off the feedback queue; 0502 / 0503 tuning switches; 0504 a stall watchdog that logs every guest thread's wait after 5 s without a frame; 0505 a `[pools]` census line; 0508 draw drops counted by reason and the Metal HUD |
@@ -54,7 +56,7 @@ fail engine self-tests on this tree; 0459 (an 8 GiB alias for one game) is unver
 
 Patches 0514 to 0534 port the worthwhile engine changes of seedds/nxnative `e74c3fa7..184847c5` (89 commits, MIT;
 each patch header names its commits, authors, what was adapted and what was tested). Nothing of the shader chain was
-taken: the chain id stays `b24b25240cad`. Every patch was built and its tests run on a Mac (M1 Pro); none has run on a
+taken there: the chain id stayed `b24b25240cad` (it moved later, with 0536). Every patch was built and its tests run on a Mac (M1 Pro); none has run on a
 phone yet.
 
 | patch | upstream commits | games | switches |
@@ -88,8 +90,37 @@ and page-ins (the `system memory at frame` and `memory up to frame` lines, `mems
 and after.
 
 Not taken: ef393b7e's reserve message (paches/0006 already prints the size and errno there, and that hunk would stop
-0006 from applying); 194da5fb, 806fabe1, acbb26c3, 5b7dad03, the OpenGL commits and everything that moves the shader
-chain (a63ca651, 6dc27632, f41613f7, 131bd013, 930e9195, e3f2d21f, 8cc63cc9).
+0006 from applying); 194da5fb, 806fabe1, 5b7dad03 and the OpenGL commits. The chain-moving commits of that range
+(a63ca651, 6dc27632, f41613f7, 131bd013, 930e9195, e3f2d21f, acbb26c3, 8cc63cc9) came afterwards with 0536 / 0537.
+
+## Shader chain 2026-11-23
+
+0536 brings the translation chain to upstream nxnative 033793f0: every file `dmsh_chain.py` hashes (`FILES`) is upstream's,
+byte for byte, so the chain id is upstream's own, `6c53446391cc` (it was `b24b25240cad`: the files of a3663659 with the
+Snowdrop hunk of `shader_split.py`). That takes the 37 chain-moving commits since a3663659, the 27 the earlier reviews
+left out (a3663659..e74c3fa7: 736a2ecb, b989137a, c311523c, 02614c26, 32fe34ef, 3ec5b785, caccf926, 2e6f6fd0, 33b0cf51,
+ae5d8f51's chain part, 953c5a90 and the split readers) and the 10 since (a63ca651, 6dc27632, f41613f7, 131bd013, 930e9195,
+e3f2d21f, acbb26c3, 8cc63cc9, 1ed3e12a, 033793f0). 0537 is their host side: gmem map spans for raw loads, the pulling and
+shadow-input entry names when a vertex shader's three libraries are cut from one unit, vertex viewport masks off the lean
+geometry path, and task payloads past 16 KB through a buffer.
+
+**Every game's shader library is rebuilt once**: the host loads only `b-6c53446391cc`. The app's Rust stage 3
+(`ibuilder-shader`, `ibuilder-shaderbuild`) follows the same Python: on 5,348 shaders of Ocarina of Time (every task and
+mesh shader among them) its library is sha256-identical to the one upstream's Python makes through the phone's driver.
+The Rust ports had been written against an older engine copy (upstream of 2026-11-15); they are now at 033793f0 too.
+
+The app's translator is compiled from the engine's Ryujinx sources and `dmsh_xlate/Program.cs`: an app build must take
+them from the tree with 0536 applied (`NXPOCKET_ENGINE`), not from the unpatched `out-stage` engine.
+
+| patch | upstream commits | what |
+|---|---|---|
+| 0536 shader chain at 033793f0 | the 37 above | `dm/gfx/tools` chain files and the split readers they import, the translator's Ryujinx sources and `Program.cs`, `dmsh_abi.h`, `shader_lib.py`, `romfs.py` (shared descriptors), `dmsh_chain.h` |
+| 0537 host side of the chain | 736a2ecb, b989137a, 2e6f6fd0, acbb26c3 (nvn parts) | `nvn_mtl.m`, `nvn_geometry.inc` |
+
+Not taken: ae5d8f51's host part (the Mac host recovering shaders compiled during play: `nvn_live.inc`, `hle_glslc.c`;
+the app translates such shaders itself), `gl_shaders.py` / `vk_shaders.py` (the Mac's OpenGL and Vulkan paths), and the
+translator binary `dmsh_xlate_bin/dmsh_xlate` (a patch carries no binary; the Mac oracle used upstream's, which matches
+`dmsh_chain.lock`).
 
 ## Switches
 
@@ -104,6 +135,7 @@ The host reads `DM_*` environment variables. On the phone they go in a game's `D
 | `DM_PSO_BINARY_ARCHIVE=0` | on | turn the pipeline archive off (0414); `DM_PSO_ARCHIVE_MB` bounds its size |
 | `DM_PSO_TAIL_RESUME=0`, `DM_PSO_TAIL_HOT=1` | resume on, wait when hot | tail resume and heat behaviour (0415) |
 | `DM_PSO_NOWAIT=0` | set by the app | whether a draw that needs a pipeline waits for its compile |
+| `DM_MTL_OPT_SIZE=0` | on | compile libraries from source at the Default level, as before 0535 (also the GL / Vulkan layers' source mode, 0538; A/B only: the app's warm-up compiles for size, so its cache entries are then not used) |
 | `DM_PSO_MTL4=0` | per game | use the MTLDevice path instead of Metal 4 pipelines |
 | `DM_PROF_TEX_BC_CPU=1` | set by the chain on a GPU without BC textures | accepted, no longer needed since 0510: the no-BC path turns itself on on such a GPU |
 | `DM_NO_BC_ASTC=all\|bc1\|0` | `all` | without BC: BC1, BC2 and BC3 stored as ASTC 4x4; `bc1` BC1 only; `0` every BC format decompressed (0511) |

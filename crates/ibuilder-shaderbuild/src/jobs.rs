@@ -7,8 +7,8 @@
 //! The Switch 2 task / mesh stages (`dmsh_meshstage.py`: `info`, `memory`, `own_shared`) are ported (round 3); [`JobError::Unported`] stays for what a later round may meet.
 use serde_json::{Map, Value, json};
 
-/// A shader the build cannot give a job: the Python's `sys.exit('[RED] ...')` (the shader is malformed: a failed shader here, a stopped build there) or a
-/// case this port does not cover.
+/// A shader the build cannot give a job: the Python's `sys.exit('[RED] ...')` or `job_for`'s own `ValueError` (a ray tracing record on the ordinary path; its text has no `[RED]`):
+/// a failed shader here, a stopped build there; or a case this port does not cover.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobError {
     Red(String),
@@ -32,12 +32,25 @@ pub struct XlateOpts {
 }
 
 impl Default for XlateOpts {
+    /// `debug` is on unless the app's "Optimized translator (experimental)" setting is (`set_optimized`, speed-up B9): the translator's DebugMode skips its AST optimizer, so its output
+    /// is full of temporaries (dmsh_xlate Program.cs: "semantics unchanged"); without it the MSL is smaller and every later step is faster, but outputs change: a library built with it
+    /// differs from one built without it (the option is in every shader's digest, `key.rs`).
     fn default() -> Self {
         XlateOpts {
-            debug: true,
+            debug: !optimized(),
             reduced: true,
         }
     }
+}
+
+/// The app's "Optimized translator (experimental)" setting (`ibuilder_pipeline::sys::qos::set_xlate_optimized`, set by the FFI at every `ibuilder_run_chain`)
+pub fn set_optimized(on: bool) {
+    ibuilder_pipeline::sys::qos::set_xlate_optimized(on);
+}
+
+/// `true` while the translator runs without its DebugMode (`set_optimized`).
+pub fn optimized() -> bool {
+    ibuilder_pipeline::sys::qos::xlate_optimized()
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +141,8 @@ pub fn ps_omap(code: &[u8]) -> Option<u32> {
 /// The two byte vectors of a combined vertex shader: (code, c1).
 pub type VertexAb = (Vec<u8>, Vec<u8>);
 
-/// `dmsh_build.vertex_ab`: a vertex shader in two parts (VertexA + VertexB) as one program. `Ok(Some((code, c1)))` for such a shader (c1 is what follows part B), `Ok(None)` for any other.
+/// `dmsh_build.vertex_ab`: Maxwell's type-0 VertexA and type-1 VertexB merged into one program as Ryujinx does. `Ok(Some((code, c1)))` for such a shader (c1 follows part B when
+/// control +0x700 places B's header, else it lies between +0x700's offset and B), `Ok(None)` for a single program.
 pub fn vertex_ab(key: &str, code: &[u8], ctl: &[u8]) -> Result<Option<VertexAb>, JobError> {
     if code.len() < 0x80 || ctl.len() < 0x760 || code[..4] != GFX_MAGIC {
         return Ok(None);
@@ -149,20 +163,34 @@ pub fn vertex_ab(key: &str, code: &[u8], ctl: &[u8]) -> Result<Option<VertexAb>,
     } else {
         0
     };
-    let b_from_ctl = rd32(ctl, 0x700, "vertex_ab")? as u64 + 0x30;
-    let rem = |n: usize| (n as i64 - 0x50).rem_euclid(32);
+    let c1o = rd32(ctl, 0x700, "vertex_ab")? as usize;
+    let (a_end, b_end) = (a_sph + a_len, b_sph + b_len);
     if a_sph != 0x30
-        || b_sph as u64 != b_from_ctl
+        || !(a_end <= c1o && c1o <= b_sph)
+        || b_end > code.len()
         || bw0 & 0x1f != 1
         || (bw0 >> 10) & 0xf != 1
-        || rem(a_len) != 0
-        || rem(b_len) != 0
-        || b_sph + b_len > code.len()
+        || a_len < 0x50
+        || b_len < 0x50
+        || !(a_len - 0x50).is_multiple_of(32)
+        || !(b_len - 0x50).is_multiple_of(32)
     {
         return Err(JobError::Red(format!(
-            "[RED] {key}: vertex shader of shader type 0 without a VertexB part in the expected place (control +0x748 {a_sph:#x} {a_len:#x} {b_sph:#x} {b_len:#x})"
+            "[RED] {key}: vertex shader of shader type 0 without a VertexB part in the expected place (control +0x748 {a_sph:#x} {a_len:#x} {b_sph:#x} {b_len:#x}, +0x700 {c1o:#x})"
         )));
     }
+    // Catherine puts B's 0x30-byte header at +0x700's offset and c1 after B; Borderlands uses the offset for c1 before B
+    let trailing = &code[b_end..];
+    let c1 = if c1o + 0x30 == b_sph {
+        trailing.to_vec()
+    } else {
+        if trailing.iter().any(|b| *b != 0) {
+            return Err(JobError::Red(format!(
+                "[RED] {key}: two-part vertex shader whose part B carries constants of its own: a merged program has one c1"
+            )));
+        }
+        code[c1o..b_sph].to_vec()
+    };
     let word = |off: usize, i: usize| {
         u32::from_le_bytes(code[off + 4 * i..off + 4 * i + 4].try_into().unwrap())
     };
@@ -177,8 +205,8 @@ pub fn vertex_ab(key: &str, code: &[u8], ctl: &[u8]) -> Result<Option<VertexAb>,
     for i in 5..20 {
         sph.push(sa[i] | sb[i]);
     }
-    let mut a = slice(code, a_sph + 0x50, a_sph + a_len).to_vec();
-    let b = slice(code, b_sph + 0x50, b_sph + b_len);
+    let mut a = code[a_sph + 0x50..a_end].to_vec();
+    let b = &code[b_sph + 0x50..b_end];
     let alen = a.len();
     let mut o = 0usize;
     while o < alen {
@@ -200,7 +228,7 @@ pub fn vertex_ab(key: &str, code: &[u8], ctl: &[u8]) -> Result<Option<VertexAb>,
     }
     out.extend_from_slice(&a);
     out.extend_from_slice(b);
-    Ok(Some((out, slice(code, b_sph + b_len, usize::MAX).to_vec())))
+    Ok(Some((out, c1)))
 }
 
 /// `dmsh_build.tf_layout`: the four transform feedback streams of a vertex / geometry shader's control section (None: no strides, or a layout of unknown form: `notes` gets the Python's `[RED]` line)
@@ -306,6 +334,12 @@ pub fn job_for(
     let mut code: Vec<u8> = slice(rec, 0x38, ci).to_vec();
     let mut stage: String = name.chars().take(2).collect();
     let ctl = &rec[ci..];
+    // a ray tracing record (NVN2 stage byte 8) belongs to the RT build: the Python's `ValueError` (the build stops), its text as it is (no `[RED]`). Short NVN2 graphics control sections have no stage byte
+    if is_nvn2(ctl) && ctl.len() > 0x56 && ctl[0x56] == 8 {
+        return Err(JobError::Red(format!(
+            "{key}: stage8 RT record reached the ordinary shader path; correct its shader_map stage"
+        )));
+    }
     let mut extra: Vec<(String, Value)> = Vec::new();
     let mut mesh_job = false;
     let c1: Vec<u8>;
@@ -353,6 +387,16 @@ pub fn job_for(
             {
                 mesh.refused =
                     Some("shared memory of its own, or stage memory past Metal's limit".into());
+            }
+            // a task-fed mesh shader whose payload goes through the spill buffer reads it from a shared memory of its own (the translator's `dm_stage_in`)
+            if mesh.kind == "ms"
+                && mesh.task == Some(true)
+                && ibuilder_shader::finish::meshstage::payload_spill(&mesh)
+            {
+                extra.push((
+                    "stage_input_words".into(),
+                    json!(ibuilder_shader::finish::meshstage::payload_words(&mesh)),
+                ));
             }
             extra.push(("mesh_stage".into(), mesh.to_json()));
             extra.push(("stage_memory".into(), json!(lay)));
@@ -447,6 +491,15 @@ pub fn job_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_optimized_translator_setting_turns_debug_off() {
+        assert!(XlateOpts::default().debug);
+        set_optimized(true);
+        assert!(!XlateOpts::default().debug && XlateOpts::default().reduced);
+        set_optimized(false);
+        assert!(XlateOpts::default().debug);
+    }
 
     #[test]
     fn tf_and_domain_readers() {

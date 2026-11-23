@@ -6,9 +6,9 @@
 #
 # What it builds (docs/ARCHITECTURE.md has the design):
 #   1. libibuilder_ffi.a for the target: `cargo build --release -p ibuilder-ffi --features real-stages` (scripts/build-ios-ffi.sh). The features give the chain driver with the REAL stage
-#      workers: profile, rewrite, assemble, sign, mods and stage 3 (ibuilder-shadersplit, ibuilder-shaderbuild, ibuilder-shader's finisher); the translator and SPIRV-Cross are callbacks.
-#   2. libgameappshim-rust-<kind>.a: app/gameapp_shim_rust.c (the drop-in for gameapp_shim.c), zsign (+ OpenSSL, zlib, minizip) and its adapter, SPIRV-Cross's C wrapper, the NSZ converter
-#      and a standard zstd decoder. No Python.h anywhere.
+#      workers: profile, rewrite, assemble, sign, mods and stage 3 (ibuilder-shadersplit, ibuilder-shaderbuild, ibuilder-shader's finisher); the translator, SPIRV-Cross and glslang are callbacks.
+#   2. libgameappshim-rust-<kind>.a: app/gameapp_shim_rust.c (the drop-in for gameapp_shim.c), zsign (+ OpenSSL, zlib, minizip) and its adapter, SPIRV-Cross's C wrapper, glslang's C++
+#      wrapper (app/c/glslang_cli.cpp: glslangValidator's subset for OpenGL games), the NSZ converter and a standard zstd decoder. No Python.h anywhere.
 #   3. the .NET iOS app: the C# snapshot in app/gameapp/ (UNCHANGED; app/patches/*.patch are applied to a copy if there are any), the engine's extractor and shader translator sources,
 #      `dotnet publish -r ios-arm64` (device) / `dotnet build -r iossimulator-arm64` (simulator). NO CPython, Python.framework, .py or pyext in the project or the bundle.
 #   4. the bundle's data: the registered games' tables (dm/games/*/game.tsv), the host sources the profile reads, host-prebuilt.dylib. Nothing else.
@@ -22,6 +22,7 @@
 #   IOSBUILDER_WORKTREE  the iOSBuilder tree with the newest work (default $IOSBUILDER): its out-load-ui/ (prebuilt hosts), out-spvc/ (SPIRV-Cross archives) and out-stage/out-engine/ (the patched engine)
 #   NXPOCKET_ENGINE      the patched engine tree (default $IOSBUILDER_WORKTREE/out-stage/out-engine/engine)
 #   ZSIGN_SRC, OPENSSL_XC, ZSTD_SRC   zsign checkout, OpenSSL.xcframework, zstd sources (defaults: $IOSBUILDER/out-sign/ and $IOSBUILDER/out/src/zstd/lib)
+#   GLSLANG_OUT          glslang's archives and headers (default <repo>/target/glslang: scripts/build-glslang.sh, the pinned release 16.6.0, run here when the kind's archive is missing)
 #   GAMEAPP_HOST         the prebuilt loadable host (default dist/host/host-prebuilt-loadable-{ios,sim}.dylib, the host rebuilt with engine-patches/ and pinned in app/inputs.tsv;
 #                        else $IOSBUILDER_WORKTREE/out-load-ui/host-prebuilt-loadable-{ios,sim}.dylib)
 #   IBUILDER_TEAM_SUFFIX optional: the team suffix your sideloading service gives the bundle id; adds its exact background-task id to Info.plist (see step 3)
@@ -63,18 +64,21 @@ IOSBUILDER="${IOSBUILDER:-${IOSBUILDER_MAIN:-}}"
 [ -d "$IOSBUILDER" ] || { echo "FAIL: IOSBUILDER=$IOSBUILDER is not a folder" >&2; exit 2; }
 W="${IOSBUILDER_WORKTREE:-$IOSBUILDER}"
 MAIN_CHECKOUT="$IOSBUILDER"
-ENGINE="${NXPOCKET_ENGINE:-$W/out-stage/out-engine/engine}"
+# the engine tree with this repository's engine-patches applied (scripts/build-host.sh leaves it in its HOST_WORK): the app's translator sources, chain header and tables must be the host's
+# (shader chain 2026-11-23, 0536/0537); the unpatched out-stage engine is only the fallback before a host was built here
+ENGINE="${NXPOCKET_ENGINE:-$( [ -d "$ROOT/target/host-work/engine/dm/tools/nx_extract" ] && echo "$ROOT/target/host-work/engine" || echo "$W/out-stage/out-engine/engine")}"
 ZSIGN="${ZSIGN_SRC:-$MAIN_CHECKOUT/out-sign/signing/zsign}"
 OSSL_XC="${OPENSSL_XC:-$MAIN_CHECKOUT/out-sign/signing/OpenSSL/Frameworks/OpenSSL.xcframework}"
 ZSTD_SRC="${ZSTD_SRC:-$MAIN_CHECKOUT/out/src/zstd/lib}"
 SPVC="${IOSBUILDER_SPVC:-$W/out-spvc}"
+GLSLANG_OUT="${GLSLANG_OUT:-$ROOT/target/glslang}"
 APP_ID="dev.ibuilder.app"
 APPNAME=GameApp
 case "$KIND" in
   device)    SDKNAME=iphoneos;        RID=ios-arm64;          TRIPLE=arm64-apple-ios26.0;            RUST_TARGET=aarch64-apple-ios;     OSSL_PLAT=ios-arm64
-             HOST_DYLIB="${GAMEAPP_HOST:-$( [ -f "$ROOT/dist/host/host-prebuilt-loadable-ios.dylib" ] && echo "$ROOT/dist/host/host-prebuilt-loadable-ios.dylib" || echo "$W/out-load-ui/host-prebuilt-loadable-ios.dylib" )}"; SPVC_LIB_NAME=libspvc-ios.a; VERB=publish ;;
+             HOST_DYLIB="${GAMEAPP_HOST:-$( [ -f "$ROOT/dist/host/host-prebuilt-loadable-ios.dylib" ] && echo "$ROOT/dist/host/host-prebuilt-loadable-ios.dylib" || echo "$W/out-load-ui/host-prebuilt-loadable-ios.dylib" )}"; SPVC_LIB_NAME=libspvc-ios.a; GLSLANG_KIND=ios; VERB=publish ;;
   simulator) SDKNAME=iphonesimulator; RID=iossimulator-arm64; TRIPLE=arm64-apple-ios26.0-simulator; RUST_TARGET=aarch64-apple-ios-sim; OSSL_PLAT=ios-arm64_x86_64-simulator
-             HOST_DYLIB="${GAMEAPP_HOST:-$( [ -f "$ROOT/dist/host/host-prebuilt-loadable-sim.dylib" ] && echo "$ROOT/dist/host/host-prebuilt-loadable-sim.dylib" || echo "$W/out-load-ui/host-prebuilt-loadable-sim.dylib" )}"; SPVC_LIB_NAME=libspvc-sim.a; VERB=build ;;
+             HOST_DYLIB="${GAMEAPP_HOST:-$( [ -f "$ROOT/dist/host/host-prebuilt-loadable-sim.dylib" ] && echo "$ROOT/dist/host/host-prebuilt-loadable-sim.dylib" || echo "$W/out-load-ui/host-prebuilt-loadable-sim.dylib" )}"; SPVC_LIB_NAME=libspvc-sim.a; GLSLANG_KIND=sim; VERB=build ;;
   *) echo "usage: $0 [device|simulator]" >&2; exit 2 ;;
 esac
 if [ "$KIND" = simulator ]; then
@@ -137,6 +141,13 @@ if [ ! -f "$SPVC_LIB" ]; then
 fi
 note_input "spvc-$KIND" "$SPVC_LIB" "SPIRV-Cross (pin f11ba9f, tools/build_spvc_ios.sh) as a static library: the C wrapper app/c/spvc_cli.c drives its C API in process"
 note_input spvc-include "$SPVC/include" "spirv_cross_c.h and spirv.h of that build"
+GLSLANG_LIB="$GLSLANG_OUT/libglslang-$GLSLANG_KIND.a"
+if [ ! -f "$GLSLANG_LIB" ] || [ ! -f "$GLSLANG_OUT/include/glslang/build_info.h" ]; then
+  say "  no $GLSLANG_LIB: building glslang (the pinned release) under $GLSLANG_OUT with scripts/build-glslang.sh $GLSLANG_KIND (writes only there)"
+  GLSLANG_OUT="$GLSLANG_OUT" bash "$ROOT/scripts/build-glslang.sh" "$GLSLANG_KIND" > "$WD/glslang-build.log" 2>&1 || die "build-glslang.sh failed (see $WD/glslang-build.log)"
+fi
+note_input "glslang-$KIND" "$GLSLANG_LIB" "glslang (release 16.6.0, e1b562a, scripts/build-glslang.sh: ENABLE_OPT=OFF, no binaries, no HLSL) as a static library: the C++ wrapper app/c/glslang_cli.cpp drives its API in process (OpenGL games)"
+note_input glslang-include "$GLSLANG_OUT/include" "glslang's and SPIRV's headers of that build, DirStackFileIncluder.h, the generated build_info.h and glsl_intrinsic_header.h"
 SHADER_CHAIN="$(grep -o 'DMSH_CHAIN "[0-9a-f]*"' "$ENGINE/dm/gfx/nvn/dmsh_chain.h" | cut -d'"' -f2)"
 [ -n "$SHADER_CHAIN" ] || die "no DMSH_CHAIN in $ENGINE/dm/gfx/nvn/dmsh_chain.h"
 strings -a "$HOST_DYLIB" > "$WD/host-strings.txt"   # a file, not a pipe: grep -q leaves at its first match and pipefail would report the dying writer
@@ -180,7 +191,7 @@ RUSTLIB_SHA="$(shasum -a 256 < "$RUSTLIB" | cut -d' ' -f1)"
 echo "  $RUSTLIB  $(stat -f %z "$RUSTLIB") bytes  sha256 $RUSTLIB_SHA" >&2
 
 # ---------------------------------------------------------------- 2. zsign + the shim + the C helpers -> one archive
-say "2. zsign + libz/minizip + app/gameapp_shim_rust.c + spvc_cli.c + nsz/zstd -> libgameappshim-rust-$KIND.a"
+say "2. zsign + libz/minizip + app/gameapp_shim_rust.c + spvc_cli.c + glslang_cli.cpp + nsz/zstd -> libgameappshim-rust-$KIND.a"
 OBJ="$WD/obj"; rm -rf "$OBJ" "$WD/include"; mkdir -p "$OBJ" "$WD/include"
 ln -s "$OSSL_FW/Headers" "$WD/include/openssl"
 CXXFLAGS=(-target "$TRIPLE" -isysroot "$SDK" -std=c++11 -Oz -fPIC -I"$ZSIGN/src" -I"$ZSIGN/src/common" -I"$ZSIGN/src/third-party/zlib" -I"$ZSIGN/src/third-party/minizip" -I"$WD/include")
@@ -201,6 +212,9 @@ xcrun --sdk "$SDKNAME" clang++ "${CXXFLAGS[@]}" -DNXPOCKET_WITH_ZSIGN -I"$ROOT/a
 xcrun --sdk "$SDKNAME" clang -target "$TRIPLE" -isysroot "$SDK" -O1 -g0 -Wall -I"$ROOT/app/c" -I"$ROOT/crates/ibuilder-ffi/include" \
   -c "$ROOT/app/gameapp_shim_rust.c" -o "$OBJ/c_gameapp_shim_rust.o" || die "app/gameapp_shim_rust.c did not compile"
 xcrun --sdk "$SDKNAME" clang -target "$TRIPLE" -isysroot "$SDK" -O2 -g0 -I"$SPVC/include" -c "$ROOT/app/c/spvc_cli.c" -o "$OBJ/c_spvc_cli.o" || die "spvc_cli.c did not compile"
+# glslang's command line (OpenGL games): C++17 against the headers of the pinned build; libglslang-<kind>.a is linked as its own native reference below
+xcrun --sdk "$SDKNAME" clang++ -target "$TRIPLE" -isysroot "$SDK" -std=c++17 -O2 -g0 -fPIC -I"$GLSLANG_OUT/include" -I"$GLSLANG_OUT/include/glslang" \
+  -c "$ROOT/app/c/glslang_cli.cpp" -o "$OBJ/z_glslang_cli.o" || die "glslang_cli.cpp did not compile"
 # NSZ converter + a STANDARD zstd stream decoder as ONE relocatable object whose only external symbols are gameapp_nsz_to_nsp and gameapp_stdzstd_*: zstd's own symbols become local
 # (`ld -r` with an export list), so the standard decoder is the one the NSZ converter uses and nothing clashes. (The worktree's app linked the ZBIC-variant zstd of libpyext_static.a for NSZ.)
 ZOBJ="$WD/zstd-obj"; rm -rf "$ZOBJ"; mkdir -p "$ZOBJ"
@@ -319,6 +333,7 @@ $(for f in "$P"/GameApp*.cs; do echo "    <Compile Include=\"$f\" />"; done)
     <NativeReference Include="$LIBSHIM"><Kind>Static</Kind></NativeReference>
     <NativeReference Include="$RUSTLIB"><Kind>Static</Kind><ForceLoad>true</ForceLoad><SmartLink>false</SmartLink></NativeReference>
     <NativeReference Include="$SPVC_LIB"><Kind>Static</Kind><IsCxx>True</IsCxx></NativeReference>
+    <NativeReference Include="$GLSLANG_LIB"><Kind>Static</Kind><IsCxx>True</IsCxx></NativeReference>
     <NativeReference Include="$OSSL_FW"><Kind>Framework</Kind></NativeReference>
   </ItemGroup>
 </Project>

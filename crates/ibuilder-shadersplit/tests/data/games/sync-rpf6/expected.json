@@ -1,0 +1,19 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "630c9b1a38b37f4e3f4dfedbb3ad3a5fd0b6a2abe758e3aafe3134f13c06d4a5",
+  "pkg/ps_data.bin": "6f9b7a8ee188917f22b8c1de3a17523238816885fc93093d03fcf217edfb9ab1",
+  "pkg/vs_data.bin": "65b2b3abcb0d1960215dcbbfde1436f06284eaebdb0cc3c4cff5770491956399",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "55e20097f5b374031b3a3b4e24d25cb997393fb2b21cc6f9ab0e228860888aff",
+  "tables/shader_map.tsv": "0f0ec1abc0d27dae69e7b7eeb963f5572f78835fbc3fa88e7f668571b2ac268a",
+  "tables/shader_pairs.tsv": "5aa0373962553e0efbf27dc253b41c266a952c062b997b4f07f05d24b0e3e7a8"
+ },
+ "log": [
+  "[RED] Data/shaders.rpf: ValueError: @ROMFS@/Data/shaders.rpf/broken.nvn: compressed, but neither a zstd frame nor a zlib stream, also after decryption (its shaders are left out)",
+  "[RED] 1 file(s) could not be read, their shaders are left out (first: Data/shaders.rpf: ValueError: @ROMFS@/Data/shaders.rpf/broken.nvn: compressed, but neither a zstd frame nor a zlib stream, also after decryption)",
+  "shaders: 11 (compute 1, pixel 5, vertex 5); sources data 11; compute shader answers 1 rows; variation pairs 0"
+ ],
+ "shaders": 11,
+ "updates": []
+}

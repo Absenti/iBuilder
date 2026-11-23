@@ -43,26 +43,56 @@ impl Ruzstd {
         cap: usize,
     ) -> Result<Vec<u8>, String> {
         use ruzstd::decoding::{Dictionary, FrameDecoder, StreamingDecoder};
-        let mut fd = FrameDecoder::new();
-        if let Some(raw) = dict {
-            if raw.len() < 8 {
-                return Err("zstd dictionary is shorter than its header".into());
+        let decoder = || -> Result<FrameDecoder, String> {
+            let mut fd = FrameDecoder::new();
+            if let Some(raw) = dict {
+                if raw.len() < 8 {
+                    return Err("zstd dictionary is shorter than its header".into());
+                }
+                let d =
+                    Dictionary::decode_dict(raw).map_err(|e| format!("zstd dictionary: {e}"))?;
+                fd.add_dict(d)
+                    .map_err(|e| format!("zstd dictionary: {e}"))?;
             }
-            let d = Dictionary::decode_dict(raw).map_err(|e| format!("zstd dictionary: {e}"))?;
-            fd.add_dict(d)
-                .map_err(|e| format!("zstd dictionary: {e}"))?;
-        }
-        let mut sd =
-            StreamingDecoder::new_with_decoder(data, fd).map_err(|e| format!("zstd: {e}"))?;
-        let mut out = Vec::new();
-        let r = match max_length {
-            Some(n) => (&mut sd).take(n as u64).read_to_end(&mut out),
-            // one byte more than the cap is read, to tell "fits exactly" from "passes it"
-            None => (&mut sd).take(cap as u64 + 1).read_to_end(&mut out),
+            Ok(fd)
         };
-        r.map_err(|e| format!("zstd: {e}"))?;
-        if max_length.is_none() && out.len() > cap {
-            return Err(crate::inflate::cap_error(cap));
+        let mut out = Vec::new();
+        if let Some(n) = max_length {
+            // `ZstdDecompressor().decompress(data, max_length)`: one frame
+            let mut sd = StreamingDecoder::new_with_decoder(data, decoder()?)
+                .map_err(|e| format!("zstd: {e}"))?;
+            (&mut sd)
+                .take(n as u64)
+                .read_to_end(&mut out)
+                .map_err(|e| format!("zstd: {e}"))?;
+            return Ok(out);
+        }
+        // `zstd.decompress(data)`: every frame, one after the other (6aaf73ba: the files the zstd command decoded are decoded in process, concatenated frames included); a skippable frame
+        // gives nothing, anything else after a frame is an error
+        let mut rest: &[u8] = data;
+        loop {
+            if rest.len() >= 8 && rest[0] & 0xf0 == 0x50 && rest[1..4] == [0x2a, 0x4d, 0x18] {
+                let n = u32::from_le_bytes(rest[4..8].try_into().unwrap()) as usize;
+                if rest.len() - 8 < n {
+                    return Err("zstd: a skippable frame runs past the data".into());
+                }
+                rest = &rest[8 + n..];
+            } else {
+                let mut sd = StreamingDecoder::new_with_decoder(&mut rest, decoder()?)
+                    .map_err(|e| format!("zstd: {e}"))?;
+                // one byte more than the cap is read, to tell "fits exactly" from "passes it"
+                let room = (cap as u64 + 1).saturating_sub(out.len() as u64);
+                (&mut sd)
+                    .take(room)
+                    .read_to_end(&mut out)
+                    .map_err(|e| format!("zstd: {e}"))?;
+                if out.len() > cap {
+                    return Err(crate::inflate::cap_error(cap));
+                }
+            }
+            if rest.is_empty() {
+                break;
+            }
         }
         Ok(out)
     }

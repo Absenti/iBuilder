@@ -193,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|n| n.to_str())
         .and_then(|n| n.strip_prefix("b-"))
         .and_then(|n| n.strip_suffix(".img"))
-        .unwrap_or("b24b25240cad")
+        .unwrap_or("6c53446391cc")
         .to_string();
     let ctx = Ctx::load(
         &profile,

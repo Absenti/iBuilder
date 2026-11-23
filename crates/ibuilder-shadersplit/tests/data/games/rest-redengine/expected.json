@@ -1,0 +1,27 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_content.bin": "6d5fc1d19fa46eeee272e5a0410b880b625f9397079f521b16b8e798f266c808",
+  "pkg/ds_content.bin": "d53e067baad1400b4b550fc20d5138971abaec86ac029c809f597bd1c675c249",
+  "pkg/hs_content.bin": "1960b302321aa4163d1e96a3e4c7667bc175ef36aff100f5c4a871e091e22933",
+  "pkg/ps_content.bin": "23a464210f978cf40aa3a44c7480d2d5a64129193125f5588492cccadb7e607e",
+  "pkg/vs_content.bin": "ce4656de4a88c17f76d674d085981a3e5eec7c3bdd4e9ce34c8e047c76890292",
+  "pkg/vs_data.bin": "d7cbcddb769240666c7202df9be09cc569d4363590c3c3e2870ad477c4937e57",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "9261ec374bb8e2e818b770b0b1ab0b542c426a8777d3f7eb8237ffcb53c4214c",
+  "tables/shader_map.tsv": "33fc4dde46845277a54850adc840e8c6cded1f65a8ee83e9163261ed87fdfadb",
+  "tables/shader_pairs.tsv": "704214bbf17d6e022327b1e6d312b42e9e19602cba392a69b4e73a791ca3cd59"
+ },
+ "log": [
+  "[RED] /content/patch0/shadernx.cache: record 0 at 0x0 decompresses to 2656 bytes, its header says 2660 (its shaders are left out)",
+  "[RED] /content/patch1/shadernx.cache: record 0 at 0x0: flag 2, stored 2406, not a zstd frame inside the records (its shaders are left out)",
+  "[RED] /content/patch2/shadernx.cache: footer b'RDHS' version 2, index 0x977: not a version 3 RDHS shader cache (its shaders are left out)",
+  "[RED] /content/patch3/staticshadernx.cache: chunk 1 at 0xa90: 2656 decoded bytes but no stored data (its shaders are left out)",
+  "[RED] /content/patch4/staticshadernx.cache: 0x8 bytes at 0x4 lie outside the 0x8 bytes there are (its shaders are left out)",
+  "[RED] 5 file(s) could not be read, their shaders are left out (first: /content/patch0/shadernx.cache: record 0 at 0x0 decompresses to 2656 bytes, its header says 2660)",
+  "single-stage programs: 2 vertex shaders are paired with a cover of 1 pixel shader(s) (c72a24f5c7892235)",
+  "shaders: 9 (compute 1, domain 1, hull 1, pixel 2, vertex 4); sources content 8, data 1; compute shader answers 1 rows; variation pairs 4"
+ ],
+ "shaders": 9,
+ "updates": []
+}

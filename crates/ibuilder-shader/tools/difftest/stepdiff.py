@@ -3,7 +3,7 @@
 
     PYTHONDONTWRITEBYTECODE=1 python -I stepdiff.py <engine copy (the dir holding dm/)> <cases.tsv> <out.tsv> [--jobs N] [--only STEP] [--dump DIR ID...]
 
-cases.tsv: `id<TAB>step<TAB>path of the input MSL<TAB>args json`. Every case applies ONE step function of the engine (dmsh_rewrite / dmsh_fetch / dmsh_entry / dmsh_wide /
+cases.tsv: `id<TAB>step<TAB>path of the input MSL<TAB>args json`. Every case applies ONE step function of the engine (dmsh_rewrite / dmsh_entry / dmsh_wide /
 dmsh_atomic / dmsh_reflect / dmsh_side / dmsh_geometry / dmsh_build.vs_tf, the functions themselves, not a re-statement) to the text and writes
 `id status same len crc32 meta msg` (status OK or ERR: a ValueError or a SystemExit; same: text unchanged; meta: JSON of what else the function returns, sorted keys).
 `step_diff` (Rust) writes the same format; compare.py compares the two."""
@@ -11,7 +11,7 @@ import ast, json, os, re, signal, sys, zlib
 
 eng = os.path.abspath(sys.argv[1])
 sys.path.insert(0, os.path.join(eng, 'dm/gfx/tools')); sys.path.insert(0, os.path.join(eng, 'dm/tools'))
-import dmsh_rewrite as rw, dmsh_fetch, dmsh_entry as en, dmsh_wide, dmsh_atomic, dmsh_reflect, dmsh_side, dmsh_geometry  # noqa: E402
+import dmsh_rewrite as rw, dmsh_entry as en, dmsh_wide, dmsh_atomic, dmsh_reflect, dmsh_side, dmsh_geometry  # noqa: E402
 import dmsh_tess, dmsh_meshstage as dms, dmsh_mesh  # noqa: E402  (round 3: tools/tessmesh/)
 import zlib as _z
 
@@ -44,16 +44,17 @@ def vs_pad_py(src, partner):   # dmsh_build.vs_pad with the partner locations gi
 
 def crc(t): return None if t is None else _z.crc32(t.encode())
 
-def chain(msl, a):
-    """dmsh_build.finish() from check_msl to the file it writes, for ps / vs / cs (lines 762-868), on the engine's own functions"""
-    stage = a['stage']; local = a.get('local'); tf = a.get('tf'); partner = a.get('partner')
-    res = json.load(open(a['res'])) if a.get('res') else {'notes': [], 'sbufs': []}
+def read_only_of(res):   # dmsh_build.finish(): the MSL s<n> numbers (binding order) of the storage buffers the translator does not write, the raw pool table left out
+    import dmsh_abi as abi
+    return {i for i, b in enumerate(sorted(res['sbufs'], key=lambda b: b['binding'])) if not b['flags'] & 1 and b['cb_slot'] != abi.GMEM_MAP_CB_SLOT}
+
+def head_rewrites(msl, stage, read_only, mode, local, mesh_kind):
+    """dmsh_build.finish() from check_msl to the raw / mesh helpers' rewrites (upstream 033793f0, dmsh_build.py l.880-937), without a mesh stage's to_stage (dmsh_meshstage)"""
     src = dmsh_atomic.check_msl(msl)
     if stage == 'ps': src = rw.per_vertex(src)
     src = rw.precise(src)
-    src = rw.membar_fence(src)
     src = rw.bit0_mask(src)
-    src = dmsh_fetch.select_guards(src)
+    src = rw.select_guards(src)
     src = rw.mul_extended(src)
     src = rw.float_add_msl(src)
     src = rw.gather_offsets(src)
@@ -61,30 +62,49 @@ def chain(msl, a):
     src = rw.shared_store_msl(src)
     src = dmsh_reflect.pool_arrays(src)
     src = dmsh_wide.wide_loads(src)
+    src = dmsh_wide.constant_reads(src, read_only, mode)
     src = rw.tg_fence(src)
     src = rw.border_emu(src)
     if stage == 'ps': src = rw.frag_z_snap(src)[0]
     src = rw.uniform_tests(src)
     blend0 = 0
     if stage == 'ps': src, blend0 = rw.blend_zero(src)
-    first, spill = [], 0
-    pad = []; lay = None; discard = False; fu = fd = None; shared = None; analysis = None; plain_len = None
-    if stage == 'cs':
+    first, spill, loop_sites = [], 0, []
+    if not mesh_kind and stage == 'cs':
         src, first = rw.first_store(src, local)
         src, spill = rw.tg_spill(src)
+        src, loop_sites = rw.compute_loops(src)
         src = rw.max_threads(src, local)
+    if 'dmsh_raw_find' in src: src = rw.raw_noinline(src, mesh_kind or stage)
+    if mesh_kind == 'ms': src = rw.mesh_subgroup_noinline(src)
+    return src, blend0, first, spill, loop_sites
+
+def rewrites(msl, a):   # the `rewrites` step: args {stage, local, read_only, mode, mesh_kind}
+    src, blend0, first, spill, sites = head_rewrites(msl, a['stage'], set(a.get('read_only') or ()), a.get('mode', 'fp'), a.get('local'), a.get('mesh_kind'))
+    return src, {'blend0': blend0, 'first': [list(f) for f in first], 'spill': spill, 'loop_sites': sites}
+
+def chain(msl, a):
+    """dmsh_build.finish() from check_msl to the file it writes, for ps / vs / cs (upstream 033793f0, dmsh_build.py l.880-970), on the engine's own functions"""
+    stage = a['stage']; local = a.get('local'); tf = a.get('tf'); partner = a.get('partner')
+    res = json.load(open(a['res'])) if a.get('res') else {'notes': [], 'sbufs': []}
+    src, blend0, first, spill, loop_sites = head_rewrites(msl, stage, read_only_of(res), a.get('mode', 'fp'), local, None)
+    pad = []; lay = None; discard = False; fu = fd = None; shared = None; analysis = None; plain_len = None; viewport_mask = False
+    if stage == 'cs':
         out = src
     elif stage == 'vs':
         src = en.vs_base_instance(en.vs_layer(en.vs_init(src)))
         if partner is not None: src, pad = vs_pad_py(src, set(partner))
-        capture = dmsh_geometry.capture(src)
+        src, unculled = en.vs_viewport_mask(src)
+        viewport_mask = src != unculled
+        capture = dmsh_geometry.capture(unculled)
         src, full = en.vs_depth(src)
+        layer_source = en.vs_depth(unculled)[1] if viewport_mask else full
         full += capture
         discard = en.vs_writes(src, dmsh_reflect.reflect('k', 'vs', src, res))
-        if discard: full += en.vs_discard(src)
-        if tf: full += BUILD['vs_tf'](src, tf)
+        if discard: full += en.vs_discard(unculled)
+        if tf: full += BUILD['vs_tf'](unculled, tf)
         plain_len = len(full)
-        full, lay = en.vs_layer_entry(full)
+        full, lay = en.vs_layer_entry(full, layer_source)
         out = full; analysis = src
     else:
         fu = en.fs_uint(src)
@@ -93,7 +113,7 @@ def chain(msl, a):
         if shared: out = shared + (fu or '') + (fd or ''); analysis = src
         else: out = src; fu = fd = None
     meta = {'blend0': blend0, 'fu': bool(fu), 'fd': bool(fd), 'shared': bool(shared), 'pad': pad, 'discard': discard, 'lay': lay, 'first': [list(f) for f in first], 'spill': spill,
-            'analysis_crc': crc(analysis), 'plain_len': plain_len}
+            'analysis_crc': crc(analysis), 'plain_len': plain_len, 'loop_sites': loop_sites, 'viewport_mask': viewport_mask}
     return out, meta
 
 def tf_layout_step(m, a):   # the control section as hex text; the layout as json, the `[RED]` line the function prints in the meta
@@ -109,9 +129,8 @@ STEPS = {
     'wide_atomics': lambda m, a: (dmsh_atomic.wide_atomics(m), {}),
     'per_vertex': lambda m, a: (rw.per_vertex(m), {}),
     'precise': lambda m, a: (rw.precise(m), {}),
-    'membar_fence': lambda m, a: (rw.membar_fence(m), {}),
     'bit0_mask': lambda m, a: (rw.bit0_mask(m), {}),
-    'select_guards': lambda m, a: (dmsh_fetch.select_guards(m), {}),
+    'select_guards': lambda m, a: (rw.select_guards(m), {}),
     'mul_extended': lambda m, a: (rw.mul_extended(m), {}),
     'float_add_msl': lambda m, a: (rw.float_add_msl(m), {}),
     'gather_offsets': gather,
@@ -139,6 +158,12 @@ STEPS = {
     'fs_dual': lambda m, a: none_or(en.fs_dual(m)),
     'shared_body': lambda m, a: none_or(dmsh_side.shared_body(m)),
     'vs_tf': lambda m, a: (BUILD['vs_tf'](m, a['tf']), {}),
+    # upstream 033793f0's new steps, and its finish() order over the rewrites (`rewrites`)
+    'constant_reads': lambda m, a: (dmsh_wide.constant_reads(m, set(a.get('read_only') or ()), a.get('mode', 'fp')), {}),
+    'compute_loops': lambda m, a: (lambda r: (r[0], {'sites': r[1]}))(rw.compute_loops(m)),
+    'raw_noinline': lambda m, a: (rw.raw_noinline(m, a.get('stage', 'cs')), {}),
+    'mesh_subgroup_noinline': lambda m, a: (rw.mesh_subgroup_noinline(m), {}),
+    'rewrites': rewrites,
 }
 
 # ---- round 3 (tools/tessmesh/): tessellation, task / mesh shaders, passthrough geometry -----------------------------------------------------------------------------
@@ -189,7 +214,7 @@ def one(row, text):
     fn = STEPS.get(step)
     if fn is None: return f'{cid}\tUNKNOWN\t0\t0\t0\t{{}}\t""', None
     try:
-        signal.setitimer(signal.ITIMER_REAL, 60 if step == 'chain' else float(os.environ.get('STEPDIFF_TIMEOUT', '1')))   # a few of the engine's functions loop without end on texts no real shader has (drop_point_size): that is an ERR here
+        signal.setitimer(signal.ITIMER_REAL, 60 if step in ('chain', 'rewrites') else float(os.environ.get('STEPDIFF_TIMEOUT', '1')))   # a few of the engine's functions loop without end on texts no real shader has (drop_point_size): that is an ERR here
         try: out, meta = fn(text, args)
         finally: signal.setitimer(signal.ITIMER_REAL, 0)
     except TimeoutError as e: return f'{cid}\tERR\t0\t0\t0\tnull\t"timeout"', None

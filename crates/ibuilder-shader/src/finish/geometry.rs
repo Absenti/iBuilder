@@ -338,7 +338,14 @@ pub fn finish_gs(
             .with("drv_reads", "")
             .with("drv_unfillable", J::Arr(vec![]))
             .with("bindings", J::Arr(vec![]));
-        return Ok(super::finalize(ctx, key, refl, vec![], Default::default()));
+        return Ok(super::finalize(
+            ctx,
+            key,
+            refl,
+            vec![],
+            Default::default(),
+            false,
+        ));
     }
     let code = match std::fs::read(work.join(format!("{key}.bin"))).or_else(|_| {
         job.get("code")

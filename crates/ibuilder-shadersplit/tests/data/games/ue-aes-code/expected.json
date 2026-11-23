@@ -1,0 +1,17 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/ps_game.bin": "67cd35ca21fe4334e8684b2b262af14db646dea98caca3a25a6f6ee554fe24ed",
+  "pkg/vs_game.bin": "68ecd77abad7240d485cbeec3b7053140c80d183d8d6df798d85ab1e9e16c699",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f2ba7b14c9b0912d59d94603955272d90ab8f1b5b538d5f541340e5c62f089cb",
+  "tables/shader_map.tsv": "9b468fea233e1f161d0d7e36b5507de0e115b08ad1b96da5d5f7049142fcef11",
+  "tables/shader_pairs.tsv": "07f49ce9744571e87cffe3cc4c17dd409db0a6150e1014d8cc866ae5e1b2d7b5"
+ },
+ "log": [
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (2e72bca1354b5352)",
+  "shaders: 2 (pixel 1, vertex 1); sources game 2; compute shader answers 0 rows; variation pairs 1"
+ ],
+ "shaders": 2,
+ "updates": []
+}

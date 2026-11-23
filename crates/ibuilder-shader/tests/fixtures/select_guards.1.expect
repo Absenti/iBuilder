@@ -1,0 +1,18 @@
+OK
+{}
+#include <metal_stdlib>
+using namespace metal;
+
+fragment main0_out main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])
+{
+    main0_out out = {};
+    int _3 = int(in.m_4.x);
+    bool _5 = uint(_3) < ((*spvDescriptorSet0.fp_c25)._m0[0].z >> 4u);
+    float _6 = select(0.0, (*spvDescriptorSet0.fp_c3)._m0[_5 ? _3 : 0].x, _5);
+    float _7 = select(0.0, (*spvDescriptorSet0.fp_c3)._m0[_5 ? _3 : 0].y, _5);
+    bool _8 = uint(_3 + 1) < ((*spvDescriptorSet0.fp_c25)._m0[1].w >> 2u);
+    float _9 = select(0.0, (*spvDescriptorSet0.fp_c4)._m0[_8 ? (_3 + 1) : 0].x, _8);
+    float _10 = select(0.0, (*spvDescriptorSet0.fp_c4)._m0[_8 ? (_3 + 1) : 0][1], _8);
+    out.out_var_SV_Target = float4(_7, as_type<float>(_9), _10, _6);
+    return out;
+}

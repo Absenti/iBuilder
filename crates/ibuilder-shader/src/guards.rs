@@ -1,4 +1,4 @@
-//! dmsh_fetch.select_guards: bounded uniform / storage reads written as `select(0, read, cond)` (the hottest rewrite of the chain: 2.4 ms a shader in Python).
+//! dmsh_rewrite.select_guards: bounded uniform / storage reads written as `select(0, read, cond)` (the hottest rewrite of the chain: 2.4 ms a shader in Python).
 use crate::templates as t;
 use crate::text::*;
 use crate::{PostError, failed};
@@ -18,10 +18,14 @@ fn set0_letters(s: &[u8], i: usize) -> Option<usize> {
     if e == a { None } else { Some(e) }
 }
 
-/// the start of the GSIZE that ends exactly at `e` (just after its last `)`): `((*spvDescriptorSet0.[a-z]+_c25)._m0[\d].[xyzw] >> 2u)`
+/// the start of the GSIZE that ends exactly at `e` (just after its last `)`): `((*spvDescriptorSet0.[a-z]+_c25)._m0[\d].[xyzw] >> (?:2|4)u)` (a size in words or in vec4 rows)
 fn gsize_start(s: &[u8], e: usize) -> Option<usize> {
     let tail = b" >> 2u)";
-    if e < tail.len() || &s[e - tail.len()..e] != tail {
+    if e < tail.len()
+        || &s[e - tail.len()..e - 3] != b" >> "
+        || !matches!(s[e - 3], b'2' | b'4')
+        || &s[e - 2..e] != b"u)"
+    {
         return None;
     }
     let mut k = e - tail.len();
@@ -331,13 +335,13 @@ fn grow_sub(src: &str, conds: &HashSet<&str>, kind: Kind) -> Option<String> {
     })
 }
 
-/// `GSIZE\) \?` anywhere
+/// `GSIZE\) \?` anywhere: the leftmost (the position of its ` >> `)
 fn gleft(s: &[u8]) -> Option<usize> {
     let mut from = 0;
-    while let Some(p) = find_b(s, b" >> 2u)) ?", from) {
-        from = p + 1;
-        if gsize_start(s, p + 7).is_some() {
-            return Some(p);
+    while let Some(q) = find_b(s, b"u)) ?", from) {
+        from = q + 1;
+        if q >= 5 && gsize_start(s, q + 2).is_some() {
+            return Some(q - 5);
         }
     }
     None

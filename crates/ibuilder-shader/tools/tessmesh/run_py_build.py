@@ -3,7 +3,7 @@ usage: TM_FAKE=<dir> TM_REAL_XLATE=<dmsh_xlate> run_py_build.py --driver <dir wi
 import argparse, os, subprocess, sys
 ap = argparse.ArgumentParser()
 for a in ('--driver', '--engine', '--pkg', '--profile', '--out'): ap.add_argument(a, required=True)
-ap.add_argument('--game', default='0100DFA027504000'); ap.add_argument('--chain', default='b24b25240cad'); ap.add_argument('--jobs', type=int, default=2); ap.add_argument('--pulling', default='0')
+ap.add_argument('--game', default='0100DFA027504000'); ap.add_argument('--chain', default='6c53446391cc'); ap.add_argument('--jobs', type=int, default=2); ap.add_argument('--pulling', default='0')
 a = ap.parse_args()
 sys.path.insert(0, a.driver)
 import shader_device as sd

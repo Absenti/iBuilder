@@ -1,0 +1,24 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_other.bin": "4068a2c032615d686d615595a3d3fce3beb097784edda0c8c4785f40f009f9d7",
+  "pkg/ps_data.bin": "a86c54d0019c4a00a495172110be3347b87f2aabd6515038f000cc63c2886494",
+  "pkg/ps_other.bin": "961c471d8c3804bac677d8821f528e3628b1e76f4cad009e48b555f325e53103",
+  "pkg/vs_data.bin": "e75bd48d4257c1494cff6bd4d966ac1121c09c2d38fa2ad372d24c8a5730a6e9",
+  "pkg/vs_other.bin": "290fb555052d64651d75468a004ab08d27213badce2aa3840fe3f3feb3e25b6f",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "0a67a4e9bbff9567a87e2a95be9937a560d5d6aacba365f8e0c29c54679ef610",
+  "tables/shader_map.tsv": "a3f891f89a2ce88a9be90efe8de68bdd61da118d05e33c04f22fc6cde6a51f54",
+  "tables/shader_pairs.tsv": "2e8e0a354eed1ca3b2a3fce853cca684dd0ee29d56156177d73cad0939cbe6e6"
+ },
+ "log": [
+  "[RED] /42/shader/bad.narc/0: 1 control sections, 0 shader records read; the rest are left out",
+  "[RED] 42: Error: shader/sum.narc: the checksum differs (its shaders are left out)",
+  "[RED] 1 file(s) could not be read, their shaders are left out (first: 42: Error: shader/sum.narc: the checksum differs)",
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (29e33e31dd7c255d)",
+  "shaders: 16 (compute 2, pixel 7, vertex 7); sources other 14, data 2; compute shader answers 2 rows; variation pairs 1"
+ ],
+ "nro_dir": "nro",
+ "shaders": 16,
+ "updates": []
+}

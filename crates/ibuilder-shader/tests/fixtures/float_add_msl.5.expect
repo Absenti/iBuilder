@@ -1,0 +1,4 @@
+OK
+{}
+    atomic_fetch_add_explicit((device atomic_float*)&b._m0[0], v, memory_order_relaxed);
+    bool _10 = false;

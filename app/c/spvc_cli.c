@@ -12,6 +12,8 @@
  * Supported:   <spv>  --output <path>  --msl  --msl-version <n>  --msl-argument-buffers  --msl-texture-buffer-native
  *              --msl-pad-fragment-output  --msl-decoration-binding  --msl-texture-1d-as-2d
  *              --rename-entry-point <old> <new> <stage>  --fixup-clipspace  --reflect [json]  --version <glsl n>
+ *              --msl-argument-buffer-tier <n>  --flip-vert-y  --msl-discrete-descriptor-set <set>  --msl-dynamic-buffer <set> <binding>
+ *              (the last four: vk_shaders.py and gl_shaders.py, ported in crates/ibuilder-glvk; at most MAX_SETS of each list)
  *              --revision  and a bare --version (which, as in the CLI, is a usage error: the help text, exit 1).
  * Without --msl and --reflect the target is plain GLSL, as upstream's default: combined image samplers built, the
  * dummy sampler, `--version 450` setting the #version.
@@ -179,6 +181,8 @@ static char *dup_or_empty(const sbuf *b)
 	return r;
 }
 
+enum { MAX_SETS = 64 };
+
 typedef struct {
 	const char *input, *output, *reflect;
 	int msl, fixup, set_version, set_msl_version;
@@ -186,6 +190,12 @@ typedef struct {
 	uint32_t version, msl_version;
 	const char *ren_old, *ren_new;
 	int ren_model, have_ren;
+	/* --msl-argument-buffer-tier (0 = Tier 1, upstream's default), --flip-vert-y, --msl-discrete-descriptor-set, --msl-dynamic-buffer (in command-line order: the
+	 * dynamic buffers take the indexes 0, 1, ... as main.cpp's `i++`) */
+	uint32_t msl_abtier;
+	int yflip;
+	uint32_t discrete[MAX_SETS]; size_t ndiscrete;
+	uint32_t dyn_set[MAX_SETS], dyn_binding[MAX_SETS]; size_t ndyn;
 } args_t;
 
 /* --output: the text, exactly as the CLI writes it (fopen "w", the text, no extra newline). Returns the exit code: 0 when the whole text reached the file, 1 otherwise (review r5 P2: upstream
@@ -228,6 +238,18 @@ int gameapp_spirv_cross(int argc, const char **argv, char **out_stdout, char **o
 		else if (!strcmp(f, "--msl-decoration-binding")) a.msl_decbind = 1;
 		else if (!strcmp(f, "--msl-texture-1d-as-2d")) a.msl_1d2d = 1;
 		else if (!strcmp(f, "--fixup-clipspace")) a.fixup = 1;
+		else if (!strcmp(f, "--flip-vert-y")) a.yflip = 1;
+		else if (!strcmp(f, "--msl-argument-buffer-tier")) {
+			if (i + 1 >= argc || !parse_uint(argv[++i], &a.msl_abtier)) goto usage;
+		}
+		else if (!strcmp(f, "--msl-discrete-descriptor-set")) {
+			if (i + 1 >= argc || a.ndiscrete >= MAX_SETS || !parse_uint(argv[++i], &a.discrete[a.ndiscrete])) goto usage;
+			a.ndiscrete++;
+		}
+		else if (!strcmp(f, "--msl-dynamic-buffer")) {
+			if (i + 2 >= argc || a.ndyn >= MAX_SETS || !parse_uint(argv[i + 1], &a.dyn_set[a.ndyn]) || !parse_uint(argv[i + 2], &a.dyn_binding[a.ndyn])) goto usage;
+			i += 2; a.ndyn++;
+		}
 		else if (!strcmp(f, "--output")) {
 			if (i + 1 >= argc) goto usage;
 			a.output = argv[++i];
@@ -323,7 +345,7 @@ parsed:
 			opt_u(o, SPVC_COMPILER_OPTION_MSL_PAD_FRAGMENT_OUTPUT_COMPONENTS, a.msl_pad);
 			opt_u(o, SPVC_COMPILER_OPTION_MSL_TESS_DOMAIN_ORIGIN_LOWER_LEFT, 0);
 			opt_u(o, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, a.msl_argbuf);
-			opt_u(o, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER, 0);
+			opt_u(o, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS_TIER, a.msl_abtier);
 			opt_u(o, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, a.msl_texbuf);
 			opt_u(o, SPVC_COMPILER_OPTION_MSL_MULTIVIEW, 0);
 			opt_u(o, SPVC_COMPILER_OPTION_MSL_MULTIVIEW_LAYERED_RENDERING, 1);
@@ -367,7 +389,7 @@ parsed:
 		opt_u(o, SPVC_COMPILER_OPTION_GLSL_ENABLE_420PACK_EXTENSION, 1);
 		opt_u(o, SPVC_COMPILER_OPTION_GLSL_VULKAN_SEMANTICS, 0);
 		opt_u(o, SPVC_COMPILER_OPTION_FIXUP_DEPTH_CONVENTION, a.fixup);
-		opt_u(o, SPVC_COMPILER_OPTION_FLIP_VERTEX_Y, 0);
+		opt_u(o, SPVC_COMPILER_OPTION_FLIP_VERTEX_Y, a.yflip);
 		opt_u(o, SPVC_COMPILER_OPTION_GLSL_SUPPORT_NONZERO_BASE_INSTANCE, 1);
 		opt_u(o, SPVC_COMPILER_OPTION_GLSL_EMIT_PUSH_CONSTANT_AS_UNIFORM_BUFFER, 0);
 		opt_u(o, SPVC_COMPILER_OPTION_GLSL_EMIT_UNIFORM_BUFFER_AS_PLAIN_UNIFORMS, 0);
@@ -379,6 +401,17 @@ parsed:
 		opt_u(o, SPVC_COMPILER_OPTION_RELAX_NAN_CHECKS, 0);
 		r = spvc_compiler_install_compiler_options(comp, o);
 		if (r != SPVC_SUCCESS) goto thrown;
+		if (a.msl) {
+			/* main.cpp, after set_msl_options: the discrete sets, then the dynamic buffers numbered in their order */
+			for (size_t k = 0; k < a.ndiscrete; k++) {
+				r = spvc_compiler_msl_add_discrete_descriptor_set(comp, a.discrete[k]);
+				if (r != SPVC_SUCCESS) goto thrown;
+			}
+			for (size_t k = 0; k < a.ndyn; k++) {
+				r = spvc_compiler_msl_add_dynamic_buffer(comp, a.dyn_set[k], a.dyn_binding[k], (unsigned)k);
+				if (r != SPVC_SUCCESS) goto thrown;
+			}
+		}
 	}
 
 	if (a.have_ren) {

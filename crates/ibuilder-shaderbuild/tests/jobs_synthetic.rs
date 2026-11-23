@@ -2,7 +2,8 @@
 //! against the Python functions extracted from the engine's `dmsh_build.py` and run on the same records by `tools/gen_synth_jobs.py` (output: `$S2/B/oracle/synth/<case>/`).
 //! Job text, code bytes, c1, the `sys.exit` message or the printed `[RED]` lines must be the Python's. Switch 2 task / mesh records (`dmsh_meshstage.info / memory / own_shared`, round 3) are compared
 //! like the others; the records the Python crashes on (a control section too short for the fields, a stage byte that is neither task nor mesh) are errors in the port too.
-//! The oracle is looked up in `$S2/sh3/synth` (`tools/gen_synth_jobs.py <engine tools> <dir>`: round 3, with the task / mesh records), else the earlier `$S2/B/oracle/synth`.
+//! The oracle is looked up in `$SYNTH_JOBS` when set (`tools/gen_synth_jobs.py <engine tools> <dir>`), else `$S2/sh3/synth` (round 3, with the task / mesh records), else the earlier
+//! `$S2/B/oracle/synth`. A `ValueError` of `job_for` itself (`valueerror.txt`: a ray tracing record on the ordinary path, the build stops) is an error with the Python's text.
 mod common;
 use common::*;
 use ibuilder_shaderbuild::jobs::{JobError, XlateOpts, job_for};
@@ -11,7 +12,9 @@ use serde_json::Value;
 
 #[test]
 fn synthetic_records_give_the_pythons_jobs() {
-    let dir = if s2("sh3/synth").exists() {
+    let dir = if let Some(d) = std::env::var_os("SYNTH_JOBS") {
+        std::path::PathBuf::from(d)
+    } else if s2("sh3/synth").exists() {
         s2("sh3/synth")
     } else {
         s2("B/oracle/synth")
@@ -52,7 +55,9 @@ fn synthetic_records_give_the_pythons_jobs() {
             unported += 1;
             continue;
         }
-        if let Ok(msg) = std::fs::read_to_string(d.join("exit.txt")) {
+        if let Ok(msg) = std::fs::read_to_string(d.join("exit.txt"))
+            .or_else(|_| std::fs::read_to_string(d.join("valueerror.txt")))
+        {
             let r = job_for(
                 &key,
                 &name,
@@ -111,6 +116,7 @@ fn synthetic_records_give_the_pythons_jobs() {
             "no_facts",
             "mesh_stage",
             "stage_memory",
+            "stage_input_words",
         ] {
             if py.get(k).is_some() {
                 features.insert(k);
@@ -121,6 +127,9 @@ fn synthetic_records_give_the_pythons_jobs() {
         }
         if c.contains("vab_ok") {
             features.insert("vertex A+B merge");
+        }
+        if c.contains("vab_split") {
+            features.insert("vertex A+B merge, c1 before B");
         }
     }
     eprintln!(

@@ -288,6 +288,7 @@ pub fn mock_tools() -> ShaderTools {
     ShaderTools {
         xlate: t.clone(),
         spirv_cross: t,
+        glslang: None,
     }
 }
 

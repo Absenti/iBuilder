@@ -1,0 +1,22 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "90d8470f05e5fe9d550e9aa353a3d44d3aab4a641844c4acfdcd455b89c03175",
+  "pkg/ps_data.bin": "facacf1d3d081ff2f0c00070aa1cfe3a42adc8a58caf437b4664fd4f2b2d0382",
+  "pkg/vs_data.bin": "82d07eb2248b1000bd859484026cb6df3df4de677452bbddad10bd19bd69e096",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "bb53c0cfb0257f26329881e70dec75c6e91f09695b5cb5a67aae626c7e6517f6",
+  "tables/shader_map.tsv": "07ff5f1c3bd02d3653acc38887147a25d44c7c79ae82fc944bc210b1f4769137",
+  "tables/shader_pairs.tsv": "f5d861048fac15dc5db5096746d548cb3b68806fe942806d59ce5c20b6999011"
+ },
+ "log": [
+  "[RED] Data/Lost.pak: [Errno 2] No such file or directory: '@ROMFS@/Data/Lost_1.pak' (its shaders are left out)",
+  "[RED] Data/Old.pak: @ROMFS@/Data/Old.pak: unsupported LSPK version 14 (its shaders are left out)",
+  "[RED] /Data/Main.pak/Shaders/NX/bad.bshd: BSHD stage 3 disagrees with its GLSLC program (its shaders are left out)",
+  "[RED] Data/Main.pak: ValueError: /Data/Main.pak/Shaders/NX/broken.bshd: decoded size 12 differs from 16 (its shaders are left out)",
+  "[RED] 4 file(s) could not be read, their shaders are left out (first: Data/Lost.pak: [Errno 2] No such file or directory: '@ROMFS@/Data/Lost_1.pak')",
+  "shaders: 5 (compute 1, pixel 2, vertex 2); sources data 5; compute shader answers 1 rows; variation pairs 2"
+ ],
+ "shaders": 5,
+ "updates": []
+}

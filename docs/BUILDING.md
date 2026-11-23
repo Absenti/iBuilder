@@ -11,6 +11,9 @@ A Mac with:
 * a checkout of the original iOSBuilder project, used only as a read-only input. The app build takes from it the
   prebuilt engine host, the SPIRV-Cross archives, the patched engine tree and the zsign, OpenSSL and zstd sources.
   Nothing in this repository writes there.
+* CMake and network access once, for glslang (OpenGL games): `scripts/build-glslang.sh` fetches the pinned release
+  (16.6.0, tarball sha256 checked) into `target/glslang/` and builds its static libraries; the app build runs it when
+  the archive is missing.
 
 Your dumps, keys and certificates are never needed by the build and must never be committed.
 
@@ -45,7 +48,7 @@ scripts/build-app.sh simulator     # an ad hoc signed GameApp.app for the iOS si
 The device IPA is ad hoc signed; SideStore or AltStore re-sign it with the user's Apple ID. The script:
 
 1. builds `libibuilder_ffi.a` (`--features real-stages`) for the target;
-2. builds the C shim, zsign + OpenSSL, the SPIRV-Cross wrapper, the NSZ converter and zstd;
+2. builds the C shim, zsign + OpenSSL, the SPIRV-Cross wrapper, the glslang wrapper (`app/c/glslang_cli.cpp`), the NSZ converter and zstd;
 3. builds the .NET app from `app/gameapp/` with `app/patches/*.patch` applied in order to a copy;
 4. adds the bundle data, signs, zips the IPA and runs `app/verify_ipa.sh` on the archive read back.
 

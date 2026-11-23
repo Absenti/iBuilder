@@ -16,7 +16,7 @@ path = "src/bin/ibuilder.rs"
 # Each stage worker is wired through a feature; a feature is on only because its crate exists and builds (they are other agents' crates: path dependencies, read-only).
 # With a feature off the stage fails with a message that names it (adapters::Unwired).
 [features]
-default = ["profile", "rewrite", "macho", "sign", "mods", "shaders", "shader-finish", "shadersplit", "nup"]
+default = ["profile", "rewrite", "macho", "sign", "mods", "shaders", "shader-finish", "shadersplit", "glvk", "nup"]
 # stage 1 for a Switch 2 `.nup` container (`ibuilder-nup`: the Rust port of pack_nup.py): `ibuilder --nup FILE --out DIR`, the pipeline's `nup` config key
 nup = ["dep:ibuilder-nup"]
 profile = ["dep:ibuilder-profile"]
@@ -31,7 +31,9 @@ mods = ["dep:ibuilder-mods"]
 shaders = ["dep:ibuilder-shaderbuild"]
 shader-finish = ["shaders", "ibuilder-shaderbuild/f2-finish"]
 shadersplit = ["shaders", "dep:ibuilder-shadersplit"]
-shader-host-tools = ["shaders", "ibuilder-shaderbuild/host-tools"]
+shader-host-tools = ["shaders", "ibuilder-shaderbuild/host-tools", "ibuilder-glvk?/host-tools"]
+#   glvk            games without NVN shaders that draw through the host's GL / Vulkan layer (ibuilder-glvk: the vk_shaders.py / gl_shaders.py ports)
+glvk = ["shaders", "dep:ibuilder-glvk"]
 mock-stages = ["ibuilder-pipeline/mock"]
 # measuring only (docs/chain/MEMORY-RUST.md): the allocation profiler replaces the global allocator and the binary prints where the live heap was at its peak
 memprofile = ["ibuilder-alloc/profile"]
@@ -50,6 +52,7 @@ ibuilder-mods = { path = "../ibuilder-mods", optional = true }
 ibuilder-nup = { path = "../ibuilder-nup", optional = true }
 ibuilder-shaderbuild = { path = "../ibuilder-shaderbuild", optional = true }
 ibuilder-shadersplit = { path = "../ibuilder-shadersplit", optional = true }
+ibuilder-glvk = { path = "../ibuilder-glvk", optional = true }
 # the build's global rayon pool (utility QoS workers, `build_pool`) and the rewrite's own pool
 rayon = { workspace = true }
 # the rewrite reads the module through a file mapping (clean pages are not footprint)

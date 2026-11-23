@@ -17,7 +17,7 @@ fn data() -> PathBuf {
 fn text(e: &UeErr) -> String {
     match e {
         UeErr::Value(s) => format!("ValueError: {s}"),
-        UeErr::Red(s) | UeErr::Unsupported(s) => s.clone(),
+        UeErr::Red(s) | UeErr::Unsupported(s) | UeErr::Other(s) => s.clone(),
     }
 }
 
@@ -44,12 +44,12 @@ fn outcome(b: &[u8]) -> Value {
     }
     out.insert(
         "sources".into(),
-        match uepak::pak_shader_sources("P", &src) {
+        match uepak::pak_shader_sources("P", &src, None, &|| false) {
             Ok((a, b)) => json!({"ok": [a, b]}),
             Err(e) => json!({"err": text(&e)}),
         },
     );
-    let pk = match uepak::Pak::open("P", &src) {
+    let pk = match uepak::Pak::open("P", &src, None) {
         Ok(p) => p,
         Err(e) => {
             out.insert("pak".into(), json!({"err": text(&e)}));
@@ -211,8 +211,9 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+/// An encrypted index whose key main does not hold: the pak is left out with the Python's red line (`ue_legacy_jobs`: "the pak cannot be read"), the split goes on
 #[test]
-fn an_encrypted_index_ends_the_split_with_its_reason() {
+fn an_encrypted_index_with_no_key_in_main_costs_its_pak() {
     let g = data().join("games/ue-v8-kakarot");
     let w = std::env::temp_dir().join(format!("ibuilder-uepak-enc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&w);
@@ -226,10 +227,19 @@ fn an_encrypted_index_ends_the_split_with_its_reason() {
     let (romfs, main, prof) = (w.join("RomFS"), w.join("main"), w.join("profile"));
     let (pkg, tables) = (w.join("out/pkg"), w.join("out/tables"));
     let o = SplitOptions::single(&romfs, &main, &pkg, &tables, &prof, "0100TESTTEST0000");
-    let e = split(&o, &Ruzstd, &NoGate, &|_| {}).expect_err("refused");
-    assert_eq!(
-        e.to_string(),
-        "unsupported container: Unreal Engine pak with an encrypted index (the AES key in main is needed) (/AT/Content/Paks/pakchunk1-Switch.pak)"
+    let lines = std::sync::Mutex::new(Vec::<String>::new());
+    split(&o, &Ruzstd, &NoGate, &|l| {
+        lines.lock().unwrap().push(l.to_string())
+    })
+    .expect("split");
+    let want = format!(
+        "[RED] /AT/Content/Paks/pakchunk1-Switch.pak: the pak cannot be read ({}/AT/Content/Paks/pakchunk1-Switch.pak: the index is encrypted and no key in main (a 32-byte window or two 16-byte literals its code stores together) decrypts it); its shaders are left out",
+        romfs.display()
+    );
+    assert!(
+        lines.lock().unwrap().contains(&want),
+        "{:?}",
+        lines.lock().unwrap()
     );
     let _ = std::fs::remove_dir_all(&w);
 }

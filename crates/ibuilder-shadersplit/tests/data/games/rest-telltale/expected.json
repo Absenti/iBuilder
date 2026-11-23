@@ -1,0 +1,20 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "2ab5af6f9f43cf70a0147f9c661e5ca1a10ad735a3c49bcdd941cc63e55ae336",
+  "pkg/ps_data.bin": "f36a460956984a3fafc95cbcdcbfa3c8ddbbbec4a4b5cfa45e9bb5114e6b65be",
+  "pkg/vs_data.bin": "e0a5f526f21a1a5547ed10e819d6d6baed77240a37ea8e43ef1622ca4ca5e574",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "63369f93fffa2b41284b3e99138d58771db80a11af3d29949df0a24006724ac4",
+  "tables/shader_map.tsv": "ad3fe43e62aa0a64c195cb908b35635da7ce57ebdaa6e9c3b80c91f2b9d0061f",
+  "tables/shader_pairs.tsv": "5aa0373962553e0efbf27dc253b41c266a952c062b997b4f07f05d24b0e3e7a8"
+ },
+ "log": [
+  "[RED] Data/Bad.ttarch2: error: Error -3 while decompressing data: invalid block type (its shaders are left out)",
+  "[RED] Data/Cut.ttarch2: error: Error -5 while decompressing data: incomplete or truncated stream (its shaders are left out)",
+  "[RED] 2 file(s) could not be read, their shaders are left out (first: Data/Bad.ttarch2: error: Error -3 while decompressing data: invalid block type)",
+  "shaders: 36 (compute 1, pixel 32, vertex 3); sources data 36; compute shader answers 1 rows; variation pairs 0"
+ ],
+ "shaders": 36,
+ "updates": []
+}

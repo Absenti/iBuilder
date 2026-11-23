@@ -131,7 +131,7 @@ fn grizzy_end_to_end_with_shaders() {
         host: Some(host),
         romfs: Some(romfs),
         shaders: true,
-        shader_chain: Some("b24b25240cad".into()),
+        shader_chain: Some("6c53446391cc".into()),
         engine: Some(engine),
         ..Default::default()
     };
@@ -169,7 +169,7 @@ fn grizzy_end_to_end_with_shaders() {
     assert_eq!(compared, 21);
     // the pack stage 3 installs, where the host looks for it
     let pack = out.join("shaders/0100DFA027504000");
-    let lib = pack.join("b-b24b25240cad.img");
+    let lib = pack.join("b-6c53446391cc.img");
     assert_eq!(
         std::fs::metadata(&lib).expect("the library").len(),
         1_706_277_556,
@@ -180,7 +180,7 @@ fn grizzy_end_to_end_with_shaders() {
     }
     let note = std::fs::read_to_string(pack.join("pack.txt")).unwrap();
     assert!(
-        note.contains("shaders\t21990\n") && note.contains("chain\tb24b25240cad\n"),
+        note.contains("shaders\t21990\n") && note.contains("chain\t6c53446391cc\n"),
         "{note}"
     );
     assert!(
@@ -191,7 +191,7 @@ fn grizzy_end_to_end_with_shaders() {
     let cache = out
         .join("shadercache")
         .join(ibuilder_pipeline::shaderpack::shader_cache_name(
-            "b24b25240cad",
+            "6c53446391cc",
         ));
     assert!(
         cache.is_dir() && ibuilder_pipeline::util::folder_bytes(&cache) > 1 << 30,

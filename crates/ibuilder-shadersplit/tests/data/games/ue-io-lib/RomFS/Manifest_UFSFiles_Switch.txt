@@ -1,0 +1,3 @@
+Game/Content/Paks/Game-Switch.pak	0
+Game/Content/ShaderArchive-Global-SF_GLSL_SWITCH.ushaderbytecode	1
+Game/Content/ShaderArchive-Game-SF_GLSL_SWITCH-SP_GLSL_SWITCH.ushaderbytecode	2

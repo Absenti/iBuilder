@@ -1,0 +1,139 @@
+# nvn/msl: the shader libraries compiled from Metal SOURCE on the device are compiled for size (MTLCompileOptions.optimizationLevel = MTLLibraryOptimizationLevelSize; DM_MTL_OPT_SIZE)
+#
+# Origin:  written in this repository (speed-up W4), from Apple's WWDC22 session 10102 ("Target and optimize GPU binaries with Metal 3"): a library compiled for size inlines and
+#          unrolls less, so the pipelines made from it are set up up to 1.4x faster, and the GPU may run them up to 4% slower. No upstream commit. Applies after 0534 (patch -p1).
+# Licence: the licence of the tree it patches (the engine's MIT licence, Copyright (c) 2026 seedds and contributors).
+#
+# Why: the iPhone has no `xcrun metal`, so a game whose shaders were translated on the phone ships Metal source, and iOSBuilder's paches/0007 (src_compile; also the compile of 0008's
+#   live shaders) compiles each library at its first use, then every pipeline from it. Pipeline compiles are most of the first session's waits (0414's header: 580 s of the 930 s of
+#   compiles in frames of Ocarina of Time's session 2 were pipelines).
+# WHAT IT CHANGES (dm/gfx/nvn/nvn_mtl.m, after lib_digest; test dm/gfx/tests/t_mtl_opt_size.m):
+#   * paches/0007 is applied by load/prebuild_loadable.sh to a COPY of nvn_mtl.m after every engine patch, so its src_compile cannot be edited from here. Its options are made with
+#     [MTLCompileOptions new] between lib_digest and the end of lib_from_file (0007's hunk 2 lands there): this patch defines MTLCompileOptions to DmMslCompileOptions over that span
+#     only (#define before the comment of lib_from_file, #undef after its end, outside every hunk of 0007, 0008 and 0009, which apply as before, no fuzz). DmMslCompileOptions +new
+#     returns a REAL MTLCompileOptions with optimizationLevel Size: MTLCompileOptions is a facade (+alloc gives MTLCompileOptionsInternal), and an instance of a true subclass has none
+#     of its properties ("-[Sub setOptimizationLevel:]: unrecognized selector", tried on the Mac); +allocWithZone: gives the real class too. scripts/build-host.sh checks, on the
+#     copy prebuild_loadable.sh compiled, that 0007's "MTLCompileOptions *o = [MTLCompileOptions new];" lies between the #define and the #undef.
+#   * The options of a library compiled from source are then, in full: optimizationLevel Size (this patch), mathMode Relaxed, preserveInvariance YES (0007), languageVersion 4.0 only
+#     for a source containing "vertex_value<", else the default (0007); every other value is the default of [MTLCompileOptions new] (the test checks it: no preprocessor macros, no
+#     install name, no libraries, libraryType executable, mathFloatingPointFunctions, maxTotalThreadsPerThreadgroup and enableLogging as a plain object; fastMathEnabled is
+#     deprecated and follows mathMode).
+#   * The app's warm-up (GameAppWarm.cs WarmCompile) compiles the same sources ahead of time so that Metal's compile cache serves these compiles. The cache key includes the options:
+#     measured on the Mac (M1 Pro, macOS 27.3), a source compiled with a plain MTLCompileOptions {Relaxed, invariance, Size} in one process is found in the cache by a NEW process using
+#     DmMslCompileOptions (3.9 ms against 47 ms cold, and the other way round 2.6 against 44 ms), and a Default-level compile of the same source misses it (45.8 ms). So the warm-up
+#     must set optimizationLevel = Size too, or every library is compiled again here.
+#   * DM_MTL_OPT_SIZE (dm_envflag.h, read once, at the first compile): on by default; 0 / off gives the Default level, as before this patch, for an A/B. The app cannot follow a run-time
+#     switch it is not given: with DM_MTL_OPT_SIZE=0 the warm-up's compiles do not match and the cache serves none of them.
+#   * Not changed: the host's own shaders (dm/gfx/msl, built when the host is built and loaded as metallibs; their run-time fallback in host_msl.m), dev_lib's diagnostic and embedded
+#     kernels (options:nil), libraries loaded from a .metallib (built off the phone with ios_metal.py's own flags), the Metal 4 path (pso_mtl4 makes pipelines from the same libraries,
+#     it compiles no library of its own), 0414's pipeline archive (pipelines only: entries recorded from Default-level libraries miss once and are compiled again and re-added).
+#   * Log, at the first compile: "shader libraries from source: optimizationLevel Size (engine-patches/0535; DM_MTL_OPT_SIZE=0: Default)".
+# Effect on games already built: none on their files. Libraries compiled from source on the phone are compiled again once (the cache key changed), and so are their pipelines.
+# Games: every game whose library ships .metal sources (translated on the phone); a Mac-built .metallib is not affected. Switches: DM_MTL_OPT_SIZE.
+# Tests (M1 Pro): t_mtl_opt_size (on, and off with DM_MTL_OPT_SIZE=0; 7 checks each). The speed-up on a phone (pipeline setup, frame time) is NOT measured: nothing ran on an iPhone.
+#   On the Mac, a toy kernel's pipeline set up as fast from either level (4-5 ms): no gain measured there either.
+# Shader chain: not touched (b24b25240cad; scripts/build-host.sh checks it).
+# Apply with: patch -p1, to the tree out-stage/out-engine/engine + engine-patches/0401..0534, in the order of the numbers of this folder (scripts/build-host.sh does).
+
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -8263,6 +8263,32 @@
+     char hex[33]; for (int i = 0; i < 16; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
+     return @(hex);
+ }
++// ---- engine-patches/0535: the libraries compiled from Metal SOURCE are optimized for size (MTLCompileOptions.optimizationLevel = MTLLibraryOptimizationLevelSize; DM_MTL_OPT_SIZE) ----
++// Apple, WWDC22 session 10102: a library compiled for size inlines and unrolls less, so the pipelines made from it compile up to 1.4x faster; the GPU may run them up to 4% slower.
++// The source compile is iOSBuilder's paches/0007 (src_compile, also the compile of 0008's live shaders), which load/prebuild_loadable.sh applies to a copy of this file AFTER every engine
++// patch, so it cannot be edited from here. It lands between the #define below and the #undef after lib_from_file and makes its options with [MTLCompileOptions new]: in that span the
++// name is DmMslCompileOptions, whose +new returns a real MTLCompileOptions (the class is a facade: a true subclass instance has none of its properties) with the level set, and 0007 then
++// sets mathMode = Relaxed, preserveInvariance = YES and, for a source using vertex_value, languageVersion 4.0. scripts/build-host.sh checks that 0007's line lands in the span.
++// The app's warm-up (GameAppWarm.cs WarmCompile) compiles the same sources ahead of time so that Metal's compile cache serves these compiles; the cache key includes the options (a Default-
++// level compile of a source compiled for size misses it), so the warm-up must set the same level. DM_MTL_OPT_SIZE=0 (dm_envflag.h, read once): the Default level, as before 0535, which
++// the warm-up's compiles then do not match (every library is compiled again here). On by default
++static int mtl_opt_size(void) {
++    static int v; static dispatch_once_t once;
++    dispatch_once(&once, ^{ int bad = 0; v = dm_env_flag("DM_MTL_OPT_SIZE", 1, &bad);
++        MLOG("shader libraries from source: optimizationLevel %s%s", v ? "Size (engine-patches/0535; DM_MTL_OPT_SIZE=0: Default)"
++             : "Default (DM_MTL_OPT_SIZE=0; the app's warm-up compiles for size, so Metal's compile cache has none of these)", bad ? "; [RED] DM_MTL_OPT_SIZE not understood: on" : ""); });
++    return v;
++}
++@interface DmMslCompileOptions : MTLCompileOptions @end
++@implementation DmMslCompileOptions
+++ (instancetype)allocWithZone:(struct _NSZone *)zone { return (DmMslCompileOptions *)[MTLCompileOptions allocWithZone:zone]; }   // never the empty subclass instance
+++ (instancetype)new {
++    MTLCompileOptions *o = [[MTLCompileOptions alloc] init];
++    if (mtl_opt_size()) o.optimizationLevel = MTLLibraryOptimizationLevelSize;
++    return (DmMslCompileOptions *)o;
++}
++@end
++#define MTLCompileOptions DmMslCompileOptions   // engine-patches/0535: up to the #undef after lib_from_file (paches/0007's src_compile)
+ // Build the library from a .metallib file without permanently occupying a file descriptor: newLibraryWithURL keeps that file open for as long as the library object lives (one per game shader - of the 258 descriptors the iOS app permanently holds in a run, 213 are these,
+ // while the default soft limit of an iOS process is 256; new shaders created in other acts raise it further). Here the file is mapped into memory and closed immediately, and the library is built from the in-memory data; the mapping is released when the library's data object is freed.
+ // The library is tagged with its digest (lib_tag), from the mapped bytes
+@@ -8289,6 +8315,7 @@
+     dispatch_data_t d = dispatch_data_create(m, len, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ munmap(m, len); });
+     return lib_tag([g_dev newLibraryWithData:d error:err], lib_digest(m, len));
+ }
++#undef MTLCompileOptions   // engine-patches/0535: the span paches/0007's src_compile lands in ends here
+ // NVN depth mode (nvnDeviceSetDepthMode): every vertex library has two entry points (dmsh_entry.py vs_depth): main0 rewrites z for the GL convention (near = -w, NVN's default),
+ // main0_z leaves z as is (near = 0, which Link's Awakening, 13 Sentinels and Engage set). Loading picks by the mode the game set, so no game needs a setting for it
+ static _Atomic int g_depth_zero, g_vs_loaded;
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -1019,6 +1019,12 @@
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_bc_astc.m $(MTL_T_SRC) $(FW)
+ check_t_bc_astc: RUN_ENV = MTL_DEBUG_LAYER=1
+ # engine-patches/0512: the memory-pressure response (watermark, test switches, the trim at the next submission), and DM_MEM_PRESSURE=0
++# engine-patches/0535: the options of the libraries compiled from Metal source (DmMslCompileOptions, DM_MTL_OPT_SIZE), on and off
++t_mtl_opt_size: t_mtl_opt_size.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_mtl_opt_size.m $(MTL_T_SRC) $(FW)
++.PHONY: check_t_mtl_opt_size
++check_t_mtl_opt_size: t_mtl_opt_size
++	MTL_DEBUG_LAYER=1 ./t_mtl_opt_size && MTL_DEBUG_LAYER=1 ./t_mtl_opt_size off
+ t_mem_trim: t_mem_trim.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_mem_trim.m $(MTL_T_SRC) $(FW)
+ check_t_mem_trim: t_mem_trim
+--- /dev/null
++++ b/dm/gfx/tests/t_mtl_opt_size.m
+@@ -0,0 +1,41 @@
++// The options of the libraries compiled from Metal source (engine-patches/0535, DM_MTL_OPT_SIZE): paches/0007's src_compile makes them with [MTLCompileOptions new], which in its span of
++// nvn_mtl.m is [DmMslCompileOptions new]. That span exists only in the copy load/prebuild_loadable.sh patches (scripts/build-host.sh checks 0007's line lands in it); here the class is
++// called by its name, after the #undef.
++//   t_mtl_opt_size        DM_MTL_OPT_SIZE unset: a real MTLCompileOptions (the class is a facade: an instance of a true subclass has none of its properties), optimizationLevel Size, every
++//                         other value the default of a plain [MTLCompileOptions new]; with 0007's values (mathMode Relaxed, preserveInvariance) a kernel compiles; read once
++//   t_mtl_opt_size off    DM_MTL_OPT_SIZE=0: the same object with the Default level, as before 0535
++// Usage: t_mtl_opt_size [off]
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(c, ...) do { checks++; if (!(c)) { failed++; printf("  FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
++int main(int argc, char **argv) { @autoreleasepool {
++    int off = argc > 1 && !strcmp(argv[1], "off");
++    if (off) setenv("DM_MTL_OPT_SIZE", "0", 1); else unsetenv("DM_MTL_OPT_SIZE");
++    MTLLibraryOptimizationLevel want = off ? MTLLibraryOptimizationLevelDefault : MTLLibraryOptimizationLevelSize;
++    MTLCompileOptions *o = [DmMslCompileOptions new], *plain = [MTLCompileOptions new];
++    CHECK(o && [o isKindOfClass:[MTLCompileOptions class]] && ![o isKindOfClass:[DmMslCompileOptions class]] && [o class] == [plain class],
++          "the options are a real MTLCompileOptions (%s; a plain one is %s)", object_getClassName(o), object_getClassName(plain));
++    CHECK(o.optimizationLevel == want, "optimizationLevel %ld, want %ld", (long)o.optimizationLevel, (long)want);
++    CHECK(plain.optimizationLevel == MTLLibraryOptimizationLevelDefault, "a plain MTLCompileOptions keeps the Default level (%ld)", (long)plain.optimizationLevel);
++    CHECK(o.mathMode == plain.mathMode && o.mathFloatingPointFunctions == plain.mathFloatingPointFunctions && o.languageVersion == plain.languageVersion
++          && o.preserveInvariance == plain.preserveInvariance && o.libraryType == plain.libraryType && !o.preprocessorMacros && !o.installName && !o.libraries
++          && o.maxTotalThreadsPerThreadgroup == plain.maxTotalThreadsPerThreadgroup && o.enableLogging == plain.enableLogging,
++          "nothing but the level differs from a plain [MTLCompileOptions new] (mathMode %ld/%ld, language %lu/%lu, invariance %d/%d)",
++          (long)o.mathMode, (long)plain.mathMode, (unsigned long)o.languageVersion, (unsigned long)plain.languageVersion, o.preserveInvariance, plain.preserveInvariance);
++    MTLCompileOptions *ai = [[DmMslCompileOptions alloc] init];
++    CHECK(ai && [ai class] == [plain class] && ai.optimizationLevel == MTLLibraryOptimizationLevelDefault, "alloc/init is a real MTLCompileOptions too, Default level (%s, %ld)", object_getClassName(ai), (long)ai.optimizationLevel);
++    setenv("DM_MTL_OPT_SIZE", off ? "1" : "0", 1);
++    CHECK([DmMslCompileOptions new].optimizationLevel == want && mtl_opt_size() == !off, "DM_MTL_OPT_SIZE is read once");
++    o.mathMode = MTLMathModeRelaxed; o.preserveInvariance = YES;   // paches/0007 src_compile's values
++    id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); NSError *e = nil;
++    id<MTLLibrary> lib = [dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
++        "kernel void k(device float4 *b [[buffer(0)]], uint i [[thread_position_in_grid]]) { float4 x = b[i]; for (int j = 0; j < 16; j++) x = sin(x) * 1.5f + cos(x.yzwx); b[i] = x; }\n" options:o error:&e];
++    id<MTLFunction> fn = [lib newFunctionWithName:@"k"];
++    CHECK(lib && fn && [dev newComputePipelineStateWithFunction:fn error:&e], "a kernel compiles with these options and makes a pipeline (%s)", e ? e.localizedDescription.UTF8String : "ok");
++    printf("t_mtl_opt_size%s: %d checks, %d failed\n", off ? " off" : "", checks, failed); return failed != 0;
++}}

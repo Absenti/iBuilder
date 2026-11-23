@@ -143,6 +143,15 @@ int main(int argc, char **argv)
     CHECK(ibuilder_create(&bad, &err) == NULL && err == IBUILDER_E_BAD_ARG, "a struct_size from an older header is refused");
     char msg[256];
     CHECK(ibuilder_last_error(msg, sizeof msg) > 0 && strstr(msg, "struct_size") != NULL, "ibuilder_last_error says why");
+    {   /* the struct of the header before glslang was appended (it ends with sign_adhoc): taken, the appended field reads as NULL */
+        ibuilder_options older; memset(&older, 0, sizeof older);
+        older.struct_size = (uint32_t) offsetof(ibuilder_options, glslang);
+        older.documents_dir = docs; older.bundle_dir = docs;
+        ibuilder_t *ho = ibuilder_create(&older, &err);
+        CHECK(ho != NULL, "a struct_size that ends at sign_adhoc (an older header) is taken");
+        ibuilder_destroy(ho);
+        CHECK(offsetof(ibuilder_options, glslang) == offsetof(ibuilder_options, sign_adhoc) + sizeof(ibuilder_sign_fn), "glslang is appended right after sign_adhoc");
+    }
     CHECK(ibuilder_run_chain(NULL, NULL) == IBUILDER_E_BAD_ARG, "ibuilder_run_chain(NULL) fails with E_BAD_ARG");
     ibuilder_destroy(NULL);     /* a no-op */
     ibuilder_cancel(NULL);      /* a no-op */

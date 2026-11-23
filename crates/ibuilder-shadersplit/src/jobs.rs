@@ -33,6 +33,24 @@ pub enum Special {
     Linkdata(FileRef, FileRef, usize, usize),
     /// files of an Unreal pak with inline shaders (`ue_legacy_jobs`, uepak.rs)
     Ue(crate::uepak::UeJob),
+    /// a range of Game Freak's Trinity packs (`trpfs_jobs`, trinity.rs)
+    Trinity(crate::trinity::TrinityJob),
+    /// a range of Super Smash Bros. Ultimate's data.arc files (`smash_arc_jobs`, smash_arc.rs)
+    SmashArc(crate::smash_arc::ArcJob),
+    /// a range of a CRI CPK's entries (`cpk_jobs`, cpk.rs)
+    Cpk(crate::cpk::CpkJob),
+    /// a byte range of a Diablo III package (`d3cpk_jobs`, cpk.rs)
+    D3(crate::cpk::D3Job),
+    /// a range of one CASC archive's files (Diablo II: Resurrected, casc.rs)
+    Casc(crate::casc::CascJob),
+    /// a range of Camelot's CRA archive's files (cra.rs)
+    Cra(crate::cra::CraJob),
+    /// a byte range of a phx PDAT archive (Kirby Air Riders, pdat.rs)
+    Pdat(crate::pdat::PdatJob),
+    /// a range of a Rockstar RPF6 archive's files (Red Dead Redemption, rpf6.rs)
+    Rpf(crate::rpf6::RpfJob),
+    /// a range of a Larian package's BSHD members (Divinity: Original Sin 2, lspk.rs)
+    Lspk(crate::lspk::LspkJob),
 }
 
 impl Special {
@@ -45,6 +63,15 @@ impl Special {
             | Special::Arh(f, _)
             | Special::Linkdata(f, _, _, _) => f,
             Special::Ue(j) => &j.file,
+            Special::Trinity(j) => &j.file,
+            Special::SmashArc(j) => &j.file,
+            Special::Cpk(j) => &j.file,
+            Special::D3(j) => &j.file,
+            Special::Casc(j) => &j.file,
+            Special::Cra(j) => &j.file,
+            Special::Pdat(j) => &j.file,
+            Special::Rpf(j) => &j.file,
+            Special::Lspk(j) => &j.file,
         }
     }
 
@@ -85,14 +112,48 @@ impl Special {
                 i.loc.len()
             )],
             Special::Ue(j) => j.identity(),
+            Special::Trinity(j) => j.identity(),
+            Special::SmashArc(j) => j.identity(),
+            Special::Cpk(j) => j.identity(),
+            Special::D3(j) => j.identity(),
+            Special::Casc(j) => j.identity(),
+            Special::Cra(j) => j.identity(),
+            Special::Pdat(j) => j.identity(),
+            Special::Rpf(j) => j.identity(),
+            Special::Lspk(j) => j.identity(),
         }
     }
 }
+
+/// `(root, rel)` of the files a planner's jobs read
+pub type Taken = HashSet<(usize, String)>;
 
 pub struct Plan {
     pub jobs: Vec<Special>,
     /// `(root, rel)` of the files the jobs read: they are not scanned as loose files
     pub taken: HashSet<(usize, String)>,
+    /// where split.rs puts the MVGL jobs among `jobs` (the Python's `mv_jobs`: after the CPK jobs, before the Diablo III, CASC and CRA jobs)
+    pub mvgl_at: usize,
+    /// where split.rs puts the Frostbite jobs among `jobs` (the Python's `fb_jobs`: after the ARH jobs, before the PDAT, RPF6 and LSPK jobs)
+    pub fb_at: usize,
+}
+
+/// What the planners need besides the files: the `main` of each version (`main_v`: the AES key of an encrypted Unreal pak, an RPF6 key), `DM_NRO_DIR` (the NRO that lists a CRA
+/// archive) and the zstd decoder of the tables a planner reads (Super Smash Bros. Ultimate's file system table)
+pub struct PlanEnv<'a> {
+    pub mains: &'a [std::path::PathBuf],
+    pub nro_dir: Option<&'a std::path::Path>,
+    pub zstd: &'a dyn crate::zstd::Zstd,
+}
+
+impl Default for PlanEnv<'_> {
+    fn default() -> Self {
+        PlanEnv {
+            mains: &[],
+            nro_dir: None,
+            zstd: &crate::zstd::Ruzstd,
+        }
+    }
 }
 
 fn io(e: std::io::Error) -> SplitError {
@@ -218,9 +279,7 @@ pub fn zip_member(src: &dyn Source, entries: &[ZipEntry], name: &str) -> Res<Vec
         None => red!("KeyError: \"There is no item named '{name}' in the archive\""),
     };
     if e.method == 0 && e.csize != e.size {
-        unsupported!(
-            "zip member stored with another size than its file size (Star Fox's LZ4-chunk members: {name})"
-        );
+        return viper_zip_member(src, e);
     }
     if e.flags & 1 != 0 {
         red!("RuntimeError: File '{name}' is encrypted, password required for extraction");
@@ -268,6 +327,75 @@ pub fn zip_member(src: &dyn Source, entries: &[ZipEntry], name: &str) -> Res<Vec
         red!("BadZipFile: Bad CRC-32 for file '{name}'");
     }
     Ok(data)
+}
+
+/// `viper_zip_member(z, info)`: a member of Star Fox's data.zip the central directory calls stored at another size than its file size: a chain of 64 KB chunks, each a u32 length and an
+/// LZ4 block compressed against the previous chunk's output as its dictionary (a chunk whose length equals what is left is stored raw); the CRC is the decoded data's
+fn viper_zip_member(src: &dyn Source, e: &ZipEntry) -> Res<Vec<u8>> {
+    const CHUNK: usize = 0x10000;
+    let io = |x: std::io::Error| Failure::Red(format!("OSError: {x}"));
+    let name = &e.name;
+    let h = src.read(e.header_offset, 30).map_err(io)?;
+    if h.len() < 4 || &h[..4] != b"PK\x03\x04" {
+        red!("zip/{name}: no local header at {:#x}", e.header_offset);
+    }
+    if h.len() < 30 {
+        red!(
+            "error: unpack_from requires a buffer of at least 30 bytes for unpacking 4 bytes at offset 26 (actual buffer size is {})",
+            h.len()
+        );
+    }
+    let (nl, xl) = (
+        u16::from_le_bytes([h[26], h[27]]) as u64,
+        u16::from_le_bytes([h[28], h[29]]) as u64,
+    );
+    let d = src
+        .read(e.header_offset + 30 + nl + xl, e.csize as usize)
+        .map_err(io)?;
+    let u = e.size as usize;
+    let (mut out, mut off) = (Vec::<u8>::new(), 0usize);
+    while off + 4 <= d.len() && out.len() < u {
+        let n = u32::from_le_bytes(d[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        let want = CHUNK.min(u - out.len());
+        if !(0 < n && n <= d.len() - off) {
+            red!(
+                "{name}: LZ4 chunk of {n} bytes at {:#x} runs past the member ({} bytes)",
+                off - 4,
+                d.len()
+            );
+        }
+        if n == want {
+            out.extend_from_slice(&d[off..off + n]);
+        } else {
+            let mut buf = vec![0u8; want];
+            let dict = &out[out.len().saturating_sub(CHUNK)..];
+            let r = if out.is_empty() {
+                lz4_flex::block::decompress_into(&d[off..off + n], &mut buf)
+            } else {
+                lz4_flex::block::decompress_into_with_dict(&d[off..off + n], &mut buf, dict)
+            };
+            match r {
+                Ok(k) => out.extend_from_slice(&buf[..k]),
+                Err(x) => red!(
+                    "{name}: LZ4 chunk at {:#x}: Decompression failed: corrupt input or insufficient space in destination buffer ({x})",
+                    off - 4
+                ),
+            }
+        }
+        off += n;
+    }
+    if off != d.len() || out.len() != u {
+        red!(
+            "{name}: the LZ4 chunks make {} of {u} bytes from {off} of {}",
+            out.len(),
+            d.len()
+        );
+    }
+    if crc32fast::hash(&out) != e.crc {
+        red!("{name}: CRC mismatch after the LZ4 chunks");
+    }
+    Ok(out)
 }
 
 // ---- RE Engine KPKA ---------------------------------------------------------------------------------------------------------------
@@ -756,16 +884,23 @@ pub fn arh_entries(d: &[u8]) -> Result<Vec<(String, u64, u64)>, String> {
 
 // ---- planning --------------------------------------------------------------------------------------------------------------------
 
-/// The jobs of the archives among `files`, in the Python's order (linkdata, kpka, trpfs, ue, bdt, smash_arc, pkz, cpk, d3cpk, casc, cra, zip, arh, frostbite, pdat, rpf, lspk)
+/// The jobs of the archives among `files`, in the Python's `plan_jobs` order (linkdata, [ea], kpka, trpfs, ue, bdt, smash_arc, pkz, cpk, [mvgl], d3cpk, casc, cra, zip, arh,
+/// [frostbite], pdat, rpf, lspk; then kit, ttdat, falcom_pka); the bracketed ones are planned in split.rs and put at their place there ([`Plan::mvgl_at`], [`Plan::fb_at`])
 pub fn plan(files: &[FileRef], log: &(dyn Fn(&str) + Sync)) -> Result<Plan, SplitError> {
-    plan_with(files, log, &|f: &FileRef| f.rel.clone())
+    plan_env(
+        files,
+        log,
+        &|f: &FileRef| f.rel.clone(),
+        &PlanEnv::default(),
+    )
 }
 
-/// [`plan`], `path_of` naming a file as the Python's messages do (the RomFS argument and the path below it: the Unreal pak reader's)
-pub fn plan_with(
+/// [`plan`], `path_of` naming a file as the Python's messages do (the RomFS argument and the path below it: the Unreal pak reader's), with what [`PlanEnv`] gives the planners
+pub fn plan_env(
     files: &[FileRef],
     log: &(dyn Fn(&str) + Sync),
     path_of: &dyn Fn(&FileRef) -> String,
+    env: &PlanEnv<'_>,
 ) -> Result<Plan, SplitError> {
     let mut jobs: Vec<Special> = Vec::new();
     let mut taken: HashSet<(usize, String)> = HashSet::new();
@@ -866,9 +1001,16 @@ pub fn plan_with(
         }
     }
 
+    // trpfs_jobs (after kpka_jobs): Game Freak's Trinity packs, data.trpfs read through data.trpfd
+    {
+        let (tr, tr_taken) = crate::trinity::plan(files)?;
+        jobs.extend(tr.into_iter().map(Special::Trinity));
+        taken.extend(tr_taken);
+    }
+
     // ue_legacy_jobs (after kpka_jobs and trpfs_jobs, before bdt_jobs, as the Python plans them): Unreal paks with inline shaders
     {
-        let (ue, ue_taken) = crate::uepak::legacy_jobs(files, path_of, log)?;
+        let (ue, ue_taken) = crate::uepak::legacy_jobs(files, path_of, log, env.mains)?;
         jobs.extend(ue.into_iter().map(Special::Ue));
         taken.extend(ue_taken);
     }
@@ -921,6 +1063,13 @@ pub fn plan_with(
         for c in chunk_by(&ents, |e| e.2, PARTS) {
             jobs.push(Special::Bdt(f.clone(), c));
         }
+    }
+
+    // smash_arc_jobs (after bdt_jobs, before pkz_jobs): Super Smash Bros. Ultimate's data.arc, its current files in ranges
+    {
+        let (arc, arc_taken) = crate::smash_arc::plan(files, env.zstd, path_of)?;
+        jobs.extend(arc.into_iter().map(Special::SmashArc));
+        taken.extend(arc_taken);
     }
 
     // pkz_jobs
@@ -979,6 +1128,24 @@ pub fn plan_with(
         if !cur.is_empty() {
             jobs.push(Special::Pkz(f.clone(), cur));
         }
+    }
+
+    // cpk_jobs; mvgl_jobs go here (split.rs); then d3cpk_jobs (cpk.rs), casc_jobs and cra_jobs
+    let mvgl_at;
+    {
+        let (cj, ct) = crate::cpk::cpk_jobs(files, path_of, log)?;
+        jobs.extend(cj.into_iter().map(Special::Cpk));
+        taken.extend(ct);
+        mvgl_at = jobs.len();
+        let (dj, dt) = crate::cpk::d3cpk_jobs(files)?;
+        jobs.extend(dj.into_iter().map(Special::D3));
+        taken.extend(dt);
+        let (cj, ct) = crate::casc::plan(files, log, path_of)?;
+        jobs.extend(cj.into_iter().map(Special::Casc));
+        taken.extend(ct);
+        let (rj, rt) = crate::cra::plan(files, env.nro_dir)?;
+        jobs.extend(rj.into_iter().map(Special::Cra));
+        taken.extend(rt);
     }
 
     // zip_jobs
@@ -1057,7 +1224,27 @@ pub fn plan_with(
         taken.insert(key(f));
         taken.insert(key(ard));
     }
-    Ok(Plan { jobs, taken })
+
+    // frostbite_jobs go here (split.rs); then pdat_jobs, rpf_jobs, lspk_jobs; kit_jobs, ttdat_jobs and falcom_pka_jobs follow in split.rs
+    let fb_at = jobs.len();
+    {
+        let (pj, pt) = crate::pdat::plan(files);
+        jobs.extend(pj.into_iter().map(Special::Pdat));
+        taken.extend(pt);
+        let mains: Vec<&std::path::Path> = env.mains.iter().map(|m| m.as_path()).collect();
+        let (rj, rt) = crate::rpf6::plan(files, &mains, path_of)?;
+        jobs.extend(rj.into_iter().map(Special::Rpf));
+        taken.extend(rt);
+        let (lj, lt) = crate::lspk::plan(files, path_of);
+        jobs.extend(lj.into_iter().map(Special::Lspk));
+        taken.extend(lt);
+    }
+    Ok(Plan {
+        jobs,
+        taken,
+        mvgl_at,
+        fb_at,
+    })
 }
 
 // ---- running a job -------------------------------------------------------------------------------------------------------------------
@@ -1100,6 +1287,14 @@ pub fn run(cx: &Ctx<'_>, job: &Special) -> Result<FileResult, Failure> {
             r.extra = crate::scan_types::Extra::Unreadable { why, count };
         }
         return Ok(r);
+    }
+    if let Special::Cpk(j) = job {
+        let out = crate::cpk::cpk_shaders(cx, j)?;
+        return finish(cx, &j.file.rel, out, std::iter::empty(), Trees::new());
+    }
+    if let Special::D3(j) = job {
+        let out = crate::cpk::d3cpk_shaders(cx, j)?;
+        return finish(cx, &j.file.rel, out, std::iter::empty(), Trees::new());
     }
     let (f, found) = match job {
         Special::Zip(f, names) => {
@@ -1241,7 +1436,16 @@ pub fn run(cx: &Ctx<'_>, job: &Special) -> Result<FileResult, Failure> {
             }
             (f, out)
         }
-        Special::Ue(_) => red!("an Unreal pak job reached the archive readers"), // handled above
+        Special::Trinity(j) => (&j.file, crate::trinity::shaders(cx, j)?),
+        Special::SmashArc(j) => (&j.file, crate::smash_arc::shaders(cx, j)?),
+        Special::Casc(j) => (&j.file, crate::casc::shaders(cx, j)?),
+        Special::Cra(j) => (&j.file, crate::cra::shaders(cx, j)?),
+        Special::Pdat(j) => (&j.file, crate::pdat::shaders(cx, j)?),
+        Special::Rpf(j) => (&j.file, crate::rpf6::shaders(cx, j)?),
+        Special::Lspk(j) => (&j.file, crate::lspk::shaders(cx, j)?),
+        Special::Ue(_) | Special::Cpk(_) | Special::D3(_) => {
+            red!("an Unreal pak or CPK job reached the archive readers") // handled above
+        }
     };
     // the arh job is named after its ARD: `rel[:-4] + '.ard'` is the file's own rel here
     finish(cx, &f.rel, found, std::iter::empty(), Trees::new())

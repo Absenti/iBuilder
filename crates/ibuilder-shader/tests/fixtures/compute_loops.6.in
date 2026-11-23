@@ -1,0 +1,45 @@
+uint helper0(uint x)
+using namespace metal; struct Args { device uint* buf [[id(0)]]; };
+
+static inline __attribute__((always_inline))
+#include <metal_stdlib>
+{
+    x += 2u;
+    return x;
+}
+
+static inline __attribute__((always_inline))
+void arrive()
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template<typename T>
+T spvMat(T a, uint b)
+{
+    for (uint k = 0u; k < b; k++) a += T(k);
+    return a;
+}
+
+static inline __attribute__((always_inline))
+uint helper1(uint x, device uint* q)
+{
+    x += 2u;
+}
+
+static inline __attribute__((always_inline))
+uint helper2(uint x)
+{
+    for (uint i = 0u; i < 4u; i++)
+    {
+        spvMat<uint>(x, i);
+    }
+    return x;
+}
+
+kernel void main0()
+{
+    uint x = 0u, y = 0u, n = 8u;
+    uint z = helper2(x);
+    a.buf[0] = x;
+}

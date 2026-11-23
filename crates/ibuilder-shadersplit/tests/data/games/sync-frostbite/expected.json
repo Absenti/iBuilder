@@ -1,0 +1,23 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "00f51445dda790fde03556ff4517ef1d7ee6a0f29ce1777130dc0902039ed4a4",
+  "pkg/ps_data.bin": "c7343cbbaac830359e8302d327c00b3f76aac3966a1c5a7a47736465fc5c16f6",
+  "pkg/ps_pack.bin": "7d5f3f92604ecbf8fa30aa9d0e5444b10b3b105dfc41cf2650802cb5010aeab5",
+  "pkg/ps_patch.bin": "42e7b9cc54e46c054ba8c57a6d189c03f0816b23cfb794b0e698a8055784ca6c",
+  "pkg/vs_data.bin": "d1d5056166059570e415c90d2a8d0613e70950be85f2ebd83b74b7474e7256e3",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "b2788791b11dd6ae5ee7ab2425d181fdbcf3950771ebb01b2ee719d36b6ed94c",
+  "tables/shader_map.tsv": "5e00c22573ae97d054d30c5f47a1ef3a8131b9dd82c5a34e1ee1a07d2eb10aa7",
+  "tables/shader_pairs.tsv": "5aa0373962553e0efbf27dc253b41c266a952c062b997b4f07f05d24b0e3e7a8"
+ },
+ "log": [
+  "[RED] /Data/NX/superbundlelayout/installpackage_00/cas_02.cas#shaders/bytecode/0004: a CompiledBytecode resource without a VNVN record; left out",
+  "[RED] /Data/NX/superbundlelayout/installpackage_00/cas_02.cas#shaders/bytecode/0005: control +0x704 does not match the code area length; left out",
+  "[RED] Data/NX/superbundlelayout/installpackage_12/cas_12.cas: ValueError: a damaged block at 0xa5d (000009b7006009b7) (its shaders are left out)",
+  "[RED] 1 file(s) could not be read, their shaders are left out (first: Data/NX/superbundlelayout/installpackage_12/cas_12.cas: ValueError: a damaged block at 0xa5d (000009b7006009b7))",
+  "shaders: 6 (compute 1, pixel 4, vertex 1); sources data 4, patch 1, pack 1; compute shader answers 1 rows; variation pairs 0"
+ ],
+ "shaders": 6,
+ "updates": []
+}

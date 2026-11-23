@@ -103,11 +103,11 @@ pub trait Finisher: Send + Sync {
     }
 }
 
-/// The spirv-cross flags of `dmsh_build.XC`
+/// The spirv-cross flags of `dmsh_build.XC` (`dmsh_chain.CROSS_MSL`: MSL 3.2 for every shader)
 pub const XC: [&str; 6] = [
     "--msl",
     "--msl-version",
-    "20300",
+    "30200",
     "--msl-argument-buffers",
     "--msl-texture-buffer-native",
     "--msl-pad-fragment-output",

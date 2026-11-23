@@ -575,6 +575,129 @@ def g_tflayout(args):
             if a1 + i < len(ctl): ctl[a1 + i] = sizes[i]
     return ctl.hex()
 
+# ----------------------------------------------------------------------------------------------------------------------------- pool_arrays: pools handed to functions, buffer texture pools
+POOLS = [('fp_t_cb0_40000000', 'texture2d<float>', 1048576), ('fp_s_cb0_40000000', 'sampler', 4096), ('fp_tb_cb0_40000000', 'texture_buffer<float>', 1048576),
+         ('fp_t2d_cb7_2A', 'texture2d<float>', 2048), ('fp_tb_cb7_2A', 'texture_buffer<uint>', 2048)]
+def g_pool_callable(args):
+    pools = rng.sample(POOLS, rng.randint(1, 3))
+    mem = [f'    array<{ty}, {n}> {nm} [[id({i})]];' for i, (nm, ty, n) in enumerate(pools)]
+    if maybe(0.5): mem.append(f'    const device _12* fp_s0 [[id({len(pools)})]];')
+    struct = 'struct spvDescriptorSetBuffer0\n{\n' + '\n'.join(mem) + '\n};\n\n'
+    def use(nm, ty, base, idx):
+        if 'texture_buffer' in ty:
+            return ch(f'{base}{nm}[{idx}].read(uint({idx}))', f'{base}{nm}[{idx}].get_width()', f'{base}{nm}[{idx}].read(uint({base}{nm}[_3].get_width()))',
+                      f'{base}{nm}[{idx}].sample(s, 0.5)' if maybe(0.1) else f'{base}{nm}[ {idx} ].read(uint(f(_1, (_2))))', f'{base}{nm}[{idx}].read(1u' if maybe(0.05) else f'{base}{nm}[{idx}].read(2u)')
+        if ty == 'sampler': return f'{base}{nm}[{idx}]'
+        return f'{base}{nm}[{idx}].sample(s, float2(0.5))'
+    helpers, calls = [], []
+    for k in range(rng.randint(0, 3)):
+        nm, ty, n = pick(pools)
+        pty = ch(f'constant array<{ty}, {n}>& {nm}', f'constant array<{ty}, {n}> & {nm}', f'constant array<{ty},{n}>&{nm}', f'constant array<{ty}, {n + 1}>& {nm}' if maybe(0.1) else f'constant array<{ty}, {n}>& {nm}',
+                 f'device array<{ty}, {n}>& {nm}' if maybe(0.05) else f'constant array<{ty}, {n}>& {nm}', f'constant array<float, {n}>& {nm}' if maybe(0.05) else f'constant array<{ty}, {n}>& {nm}')
+        params = [pty] + ([ch('uint i', 'thread float2& uv', 'sampler s')] if maybe(0.7) else [])
+        rng.shuffle(params)
+        body = [f'    auto x{j} = {use(nm, ty, "", ch("i", "0u", "(i + 1u)", "uint(x)"))};' for j in range(rng.randint(1, 3))]
+        if maybe(0.1): body.append(f'    auto p = &{nm}[0];')
+        if maybe(0.1): body.append(f'    auto q = {nm};')
+        if maybe(0.15): body.append(f'    // {nm} in a comment ("{nm}")')
+        if maybe(0.2) and helpers: body.append(f'    h{k - 1}({", ".join(nm if "array" in x else ("i" if "uint" in x else ("uv" if "uv" in x else "s")) for x in helpers[-1][1])});')
+        name = f'h{k}'
+        helpers.append((name, params, body))
+        cargs = [('spvDescriptorSet0.' if maybe(0.85) else 'x.') + nm if 'array' in x else ch('_5', '0u', 'uv', 's') for x in params]
+        if maybe(0.1): cargs = cargs[:-1]
+        calls.append(f'    auto r{k} = {name}({", ".join(cargs)});')
+    text = PRELUDE
+    pre = maybe(0.05)
+    for name, params, body in helpers:
+        h = f'static inline __attribute__((always_inline))\nfloat4 {name}({", ".join(params)})\n{{\n' + '\n'.join(body) + '\n    return float4(0.0);\n}\n\n'
+        if pre: text += h
+    text += struct
+    if not pre:
+        for name, params, body in helpers: text += f'static inline __attribute__((always_inline))\nfloat4 {name}({", ".join(params)})\n{{\n' + '\n'.join(body) + '\n    return float4(0.0);\n}\n\n'
+    main = [f'    auto u{j} = {use(nm, ty, "spvDescriptorSet0.", ch("_5", "uint(_6)", "_7[2]", "f(a[1], b[2])"))};' for j, (nm, ty, n) in enumerate(pools) if maybe(0.8)]
+    if maybe(0.05): main.append(f'    auto e = &spvDescriptorSet0.{pools[0][0]}[1];')
+    text += ch('fragment main0_out main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])', 'kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])') + '\n{\n' + '\n'.join(calls + main) + '\n}\n'
+    if maybe(0.05): text = text.replace('struct spvDescriptorSetBuffer0', '// struct spvDescriptorSetBuffer0', 1)
+    return text
+_g_pool_plain = GENS['pool_arrays']
+GENS['pool_arrays'] = lambda args: g_pool_callable(args) if maybe(0.5) else _g_pool_plain(args)
+
+# ----------------------------------------------------------------------------------------------------------------------------- constant_reads
+@gen('constant_reads')
+def g_constant_reads(args):
+    stage = ch('fp', 'fp', 'vp', 'cp')
+    bufs = [f'{stage if maybe(0.85) else ch("fp", "vp", "cp")}_s{i}' for i in range(rng.randint(1, 4))]
+    mem = []
+    for i, b in enumerate(bufs):
+        mem.append(ch(f'    const device _{20 + i}* {b} [[id({i})]];', f'    const device _{20 + i}* {b} [[id({i})]];', f'    device _{20 + i}* {b} [[id({i})]];', f'    const device _{20 + i}*  {b} [[id({i})]];'))
+    body = []
+    for b in bufs:
+        for _ in range(rng.randint(0, 4)):
+            k = rng.randint(0, 9)
+            if k <= 3: body.append(f'    uint _{rng.randint(1, 99)} = (*spvDescriptorSet0.{b})._m0[{ch("_5", "int(_6)", "0", "_7 ? _8 : 0")}];')
+            elif k == 4: body.append(f'    packed_uint{ch(2, 3, 4)} _{rng.randint(1, 99)} = *(const device packed_uint{ch(2, 3, 4)}*)&(*spvDescriptorSet0.{b})._m0[int(_9)];')
+            elif k == 5: body.append(f'    uint _{rng.randint(1, 99)} = as_type<uint>(select(0u, (*spvDescriptorSet0.{b})._m0[_10 ? _11 : 0], _10));')
+            elif k == 6: body.append(f'    device uint* p = &{ch("", " ", "(", " ( ")}(*spvDescriptorSet0.{b})._m0[1];')
+            elif k == 7: body.append(f'    x = spvDescriptorSet0.{b};')
+            elif k == 8: body.append(f'    (*spvDescriptorSet0.{b})._m0[2] = 1u;')
+            else: body.append(f'    // {b}')
+    if maybe(0.1): body.append(ch('    device uint& r = x;', '    f(device uint & r);', '    thread device uint &q;'))
+    args['read_only'] = sorted(rng.sample(range(5), rng.randint(0, 4)))
+    args['mode'] = ch('fp', 'fp', 'fp', 'all', 'vp,fp', ' cp , fp', '', '0', 'off', 'cp')
+    return PRELUDE + 'struct spvDescriptorSetBuffer0\n{\n' + '\n'.join(mem) + '\n};\n\n' + ch('fragment', 'vertex', 'kernel') + ' void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])\n{\n' + '\n'.join(body) + '\n}\n'
+
+# ----------------------------------------------------------------------------------------------------------------------------- compute_loops
+def loop_stmt(depth=0):
+    k = rng.randint(0, 9)
+    body = ['        x += 1u;'] + ([loop_stmt(depth + 1)] if depth < 2 and maybe(0.3) else []) + (['        threadgroup_barrier(mem_flags::mem_threadgroup);'] if maybe(0.15) else []) + \
+           (['        arrive();'] if maybe(0.1) else []) + ([f'        y = helper{rng.randint(0, 2)}(x);'] if maybe(0.3) else []) + (['        // while (1) in a comment'] if maybe(0.1) else [])
+    b = '\n'.join(body)
+    if k <= 2: return f'    for (uint i = 0u; i < {ch("n", "helper0(n)", "16u", "")}; i++)\n    {{\n{b}\n    }}'
+    if k == 3: return f'    for (;;) x++;'
+    if k == 4: return f'    while ({ch("x < n", "helper1(x) != 0u", "true", "f(x, (y))")})\n    {{\n{b}\n    }}'
+    if k == 5: return f'    do\n    {{\n{b}\n    }} while ({ch("x < n", "helper0(x) < 4u", "false")});'
+    if k == 6: return f'    while (x < n) x = x * 2u;'
+    if k == 7: return f'    for (int j = 0; j < 4; j++) {{ x += uint(j); }}'
+    if k == 8: return f'    do {{ x++; }} while(x < 3u);'
+    return f'    for (uint i = 0u; i < 4u; i++)\n    {{\n        spvMat<uint>(x, i);\n    }}'
+@gen('compute_loops')
+def g_compute_loops(args):
+    helpers = []
+    for h in range(3):
+        body = [loop_stmt(1) if maybe(0.4) else '    x += 2u;'] + ([f'    return helper{h + 1}(x);'] if h < 2 and maybe(0.3) else ['    return x;'])
+        helpers.append(f'static inline __attribute__((always_inline))\nuint helper{h}({ch("uint x", "uint x", "thread uint& x", "uint x, device uint* q")})\n{{\n' + '\n'.join(body) + '\n}\n')
+    helpers.append('static inline __attribute__((always_inline))\nvoid arrive()\n{\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n}\n')
+    helpers.append('template<typename T>\nT spvMat(T a, uint b)\n{\n    for (uint k = 0u; k < b; k++) a += T(k);\n    return a;\n}\n')
+    rng.shuffle(helpers)
+    main = [loop_stmt() for _ in range(rng.randint(0, 3))] + [f'    uint z = helper{rng.randint(0, 2)}(x);' for _ in range(rng.randint(0, 2))] + ['    uint s = "for (";' if maybe(0.05) else '    a.buf[0] = x;']
+    head = ch('kernel void main0(constant Args& a [[buffer(0)]], uint tid [[thread_index_in_threadgroup]])', 'kernel void main0()', 'kernel void main0(device uint* b [[buffer(28)]])' if maybe(0.1) else 'kernel void main0(constant Args& a [[buffer(0)]])',
+              'fragment void main0()' if maybe(0.1) else 'kernel  void  main0 (uint x)')
+    brace = '\n{\n' if maybe(0.93) else ' {\n'
+    ns = 'using namespace metal;\n' if maybe(0.95) else 'using namespace metal; '
+    return '#include <metal_stdlib>\n' + ns + 'struct Args { device uint* buf [[id(0)]]; };\n\n' + '\n'.join(helpers) + '\n' + head + brace + '    uint x = 0u, y = 0u, n = 8u;\n' + '\n'.join(main) + '\n}\n'
+
+# ----------------------------------------------------------------------------------------------------------------------------- raw_noinline / mesh_subgroup_noinline
+@gen('raw_noinline')
+def g_raw_noinline(args):
+    out = [PRELUDE]
+    for i in range(rng.randint(1, 4)):
+        attr = ch('static inline __attribute__((always_inline))', 'static __attribute__((noinline))', 'static inline', 'static  inline __attribute__((always_inline))')
+        name = ch('dmsh_raw_find', f'dmsh_raw_find_{i}', 'dmsh_raw_findx', 'dmsh_raw_lookup', 'dm_raw_find')
+        out.append(f'{attr}\n{ch("uint", "int2", "void", "spvUnsafeArray<uint, 2>")} {name}({ch("uint a", "")})\n{{\n    return 0u;\n}}\n')
+    args['stage'] = ch('cs', 'ms', 'ts', 'vs', 'ps')
+    return '\n'.join(out)
+
+@gen('mesh_subgroup_noinline')
+def g_mesh_subgroup(args):
+    out = [PRELUDE]
+    for i in range(rng.randint(1, 4)):
+        attr = ch('static inline __attribute__((always_inline))', 'static inline __attribute__((always_inline))', 'static __attribute__((noinline))', '  static inline __attribute__((always_inline))')
+        params = ch('thread uint& gl_SubgroupInvocationID, thread uint& gl_SubgroupSize', 'thread const uint& x, thread uint& gl_SubgroupInvocationID', 'uint gl_SubgroupID', 'thread uint4& gl_SubgroupEqMask',
+                    'thread uint& x', 'thread uint& gl_Subgroup', 'thread uint& my_gl_SubgroupSize')
+        out.append(f'{attr}\n{ch("uint", "void", "uint4")} helper{i}({params})\n{{\n    return {ch("gl_SubgroupInvocationID", "0u", "x")};\n}}\n')
+    out.append('kernel void main0(uint gl_SubgroupInvocationID [[thread_index_in_simdgroup]])\n{\n    helper0(gl_SubgroupInvocationID);\n}\n')
+    return '\n'.join(out)
+
 # ----------------------------------------------------------------------------------------------------------------------------- driver
 def main():
     out = sys.argv[1]

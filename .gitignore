@@ -234,5 +234,7 @@ shadercache/
 # anywhere else (for example next to the sources) stays ignored.
 !/crates/*/tests/fixtures/**/*.nso
 !/crates/*/tests/data/**/*.nso
+# the synthetic NROs of the shader splitter's CRA games (tests/data/games/sync-cra*/nro: the module a CRA archive's file table is in)
+!/crates/*/tests/data/**/*.nro
 # a future fixture that mimics a dump folder
 !/crates/*/tests/**/ExeFS/

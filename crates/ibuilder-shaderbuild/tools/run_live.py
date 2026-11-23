@@ -4,7 +4,7 @@ usage: S=$OLD python run_live.py --engine DIR --out DIR"""
 import argparse, json, os, struct, subprocess as real_subprocess, sys, tempfile, shutil
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 S = os.environ['S'] + '/shader'
-ap = argparse.ArgumentParser(); ap.add_argument('--engine', required=True); ap.add_argument('--out', required=True); ap.add_argument('--chain', default='b24b25240cad'); ap.add_argument('--n', type=int, default=4)
+ap = argparse.ArgumentParser(); ap.add_argument('--engine', required=True); ap.add_argument('--out', required=True); ap.add_argument('--chain', default='6c53446391cc'); ap.add_argument('--n', type=int, default=4)
 a = ap.parse_args()
 import shader_device as sd
 tl = os.path.join(a.engine, 'dm/gfx/tools')

@@ -1,0 +1,20 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "eb6e9f45ba84d30d3fd36627df8bf90af52a9b8adb21dfdba1e1d9859c46d923",
+  "pkg/gs_data.bin": "ed8c7f09d34c5b54a22974876c3fb1d9b4c0c8e11cf76305e3f546c171276173",
+  "pkg/ps_data.bin": "0ad6566986609365aebd9364344fb3424d8e2df1178df567cf8d0f9a2de44efd",
+  "pkg/vs_data.bin": "d7b6503f53457ec24ecd353c6e6f252153832195781ccaeee1db916de24fd21c",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "2b020b9358a617de4e88a422f320be8276951404075900fdd909bf9eede1f196",
+  "tables/shader_map.tsv": "2168a900e25c7cf5b8e0aaedb5b5c10051f49d31b251f865137577f37211aa62",
+  "tables/shader_pairs.tsv": "05cc57e49941a0fa55b066f3838e1438ba65be1ac42fb2dde8d5c3ba7ef53048"
+ },
+ "log": [
+  "[RED] /Data/b.dat#PMAP: the control section at 0x20 runs past its record (its shaders are left out)",
+  "[RED] 1 file(s) could not be read, their shaders are left out (first: /Data/b.dat#PMAP: the control section at 0x20 runs past its record)",
+  "shaders: 7 (compute 2, geometry 1, pixel 2, vertex 2); sources data 7; compute shader answers 2 rows; variation pairs 2"
+ ],
+ "shaders": 7,
+ "updates": []
+}

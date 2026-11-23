@@ -1,0 +1,24 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_other.bin": "912c10c04b0c1ba9eba70a3d6286393a7c738e3669685ccd39c1f5fdc76880c6",
+  "pkg/ps_data.bin": "a86c54d0019c4a00a495172110be3347b87f2aabd6515038f000cc63c2886494",
+  "pkg/ps_other.bin": "d69ff5759d6518f370dfe8be43d1d85ffd262b371a8cc90d1efd2000782dccfb",
+  "pkg/vs_data.bin": "e75bd48d4257c1494cff6bd4d966ac1121c09c2d38fa2ad372d24c8a5730a6e9",
+  "pkg/vs_other.bin": "01a5a433762cfa5b596450ee4a15bdc9d4ae3249d6e59d05d75b29e5d03ead23",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "b3b689c148a004d010db4212e8db2fbd440bc15d7178f76a20c98fad60493c39",
+  "tables/shader_map.tsv": "765b71da19f1b773ff1593b40b90f53da5cc955354c795f3d83be3dbfd081ca1",
+  "tables/shader_pairs.tsv": "8261f4df94ffdf3f2574fa9bdbae4f294991c199d7d427c8390d95c06abdc7c2"
+ },
+ "log": [
+  "[RED] 42: IndexError: index out of range (its shaders are left out)",
+  "[RED] 42: Error: shader/sum.narc: the checksum differs (its shaders are left out)",
+  "[RED] 2 file(s) could not be read, their shaders are left out (first: 42: IndexError: index out of range)",
+  "single-stage programs: 1 vertex shaders are paired with a cover of 1 pixel shader(s) (0596403cbf7cea0b)",
+  "shaders: 16 (compute 2, pixel 7, vertex 7); sources other 14, data 2; compute shader answers 2 rows; variation pairs 1"
+ ],
+ "nro_dir": "nro",
+ "shaders": 16,
+ "updates": []
+}

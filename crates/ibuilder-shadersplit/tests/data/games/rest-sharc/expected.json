@@ -1,0 +1,23 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "18bf518ec4c4f6ccc8c46cf3206ab7b5b97c9ce42c33feff4ab6d4cafefc333f",
+  "pkg/ps_data.bin": "9e5f77a93fb988a253ab67b01fab8845a96a300dbadd114bc17f40593688043a",
+  "pkg/vs_data.bin": "99a413e2263d0b5d3029bb5bd576f91656ba9123706295fa6ef03b86bc9d38ba",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "824dfb2d786eb1ee93a881e02bc7d1df98911c50fac94cad88652dcabbb14285",
+  "tables/shader_map.tsv": "a3975519c21796a3ccd83f902f4efefd0a73e0b9fa41bc3e6cee3bf022edf4b0",
+  "tables/shader_pairs.tsv": "ac9f3c94662c0553cf1ddd72a32ba41b6ff66418a362f6bff8b9b40a7edcd503"
+ },
+ "log": [
+  "[RED] /Data/corrupt.sharc#0: damaged SHARC LZMA stream (Corrupt input data) (its shaders are left out)",
+  "[RED] /Data/cut.sharc#0: incomplete SHARC GLSLC output (2542 bytes decoded, 2576 declared) (its shaders are left out)",
+  "[RED] /Data/props.sharc#0: damaged SHARC LZMA stream (Internal error) (its shaders are left out)",
+  "[RED] /Data/short.sharc#0: short SHARC LZMA member (its shaders are left out)",
+  "[RED] /Data/v10.sharc: SHARC version 10, header size 0x2c: layout this reader does not know (its shaders are left out)",
+  "[RED] 5 file(s) could not be read, their shaders are left out (first: /Data/corrupt.sharc#0: damaged SHARC LZMA stream (Corrupt input data))",
+  "shaders: 4 (compute 1, pixel 2, vertex 1); sources data 4; compute shader answers 1 rows; variation pairs 1"
+ ],
+ "shaders": 4,
+ "updates": []
+}

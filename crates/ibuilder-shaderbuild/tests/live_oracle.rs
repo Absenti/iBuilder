@@ -17,7 +17,7 @@ fn live_translation_equals_the_phones_python() {
     if !have(&dir) || !have(&pkg()) {
         return;
     }
-    let img_path = dir.join("work/out/b-b24b25240cad.img");
+    let img_path = dir.join("work/out/b-6c53446391cc.img");
     if !have(&img_path) {
         return;
     }
@@ -112,7 +112,7 @@ fn live_translation_equals_the_phones_python() {
         out.files.len()
     );
     // the live image of the run: the same bytes as the Python's (it is a partial build over the same packages)
-    let mine = std::fs::read(work.join("out/b-b24b25240cad.img")).unwrap();
+    let mine = std::fs::read(work.join("out/b-6c53446391cc.img")).unwrap();
     if mine != img {
         let keep = s2("B/run/live-rs-image.img");
         let _ = std::fs::create_dir_all(keep.parent().unwrap());

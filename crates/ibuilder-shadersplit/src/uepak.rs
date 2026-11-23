@@ -4,8 +4,11 @@
 //!
 //! Paks are read by their footer (magic `0x5A6F12E1` near the end), whatever their name ends with `.pak`. Versions 4, 8 (ordinary and short), 9 (serialized and frozen index), 11 and 12.
 //! Blocks: stored, Zlib, Zstd, LZ4. Every other method (Oodle, LZ5, ...) needs the game's own decoder, which the Mac host runs for the Python (`DM_OODLE_HOST`); there is none on the phone, so
-//! such a package is left out with the Python's own red line when it runs without a host. An encrypted index needs the AES key in main, which this port does not search for: the split ends with
-//! `unsupported container` (see `split::detect_unsupported`).
+//! such a package is left out with the Python's own red line when it runs without a host (an archive or IoStore shader library that needs Oodle ends the split: [`OODLE_WHY`]).
+//! An encrypted index (and encrypted entries) are read with the AES-256 key found in main as upstream finds it ([`Keys`]: two 16-byte literals main's code stores together, else a
+//! 32-byte window of its read-only or data segment that decrypts the index start to a mount point). The key stays in memory.
+//! IoStore containers (`uestore.rs`): the export bundles of the containers beside a pak with inline shaders are scanned like its packages; Unreal Engine 5 shader libraries are read
+//! into archives with the paks' ones.
 //!
 //! Two routes, as upstream decides per pak (`pak_shader_sources`):
 //! * inline shaders (version 4 and ordinary version 8 paks, DRAGON BALL Z: KAKAROT; version 11 paks with `.uexp` and no `.ushaderbytecode`; the inline half of short v8 / v9 paks): every file of
@@ -16,10 +19,12 @@
 use crate::bytes::*;
 use crate::ctl::*;
 use crate::error::{Failure, Res, SplitError};
+use crate::image::Loc;
 use crate::inflate::{self, Wrap};
 use crate::scan::FileRef;
 use crate::scan_types::{Ctx, Shader};
 use crate::source::Source;
+use crate::uestore::{IO_SHADER_LIBRARY, Toc, mount_order};
 use crate::zstd::Zstd;
 use crate::{red, unsupported};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -73,6 +78,8 @@ pub enum UeErr {
     Red(String),
     /// a container this port does not read: ends the split
     Unsupported(String),
+    /// another Python exception, already as `<type name>: <message>` (`zlib.error`, `IndexError`, `OSError`, ...)
+    Other(String),
 }
 
 impl From<Failure> for UeErr {
@@ -90,7 +97,7 @@ impl UeErr {
         let w = match self {
             UeErr::Red(s) => s.clone(),
             UeErr::Value(s) => format!("ValueError: {s}"),
-            UeErr::Unsupported(s) => s.clone(),
+            UeErr::Unsupported(s) | UeErr::Other(s) => s.clone(),
         };
         if w.trim_start_matches('/')
             .starts_with(name.trim_start_matches('/'))
@@ -102,7 +109,7 @@ impl UeErr {
     }
     pub fn text(&self) -> &str {
         match self {
-            UeErr::Value(s) | UeErr::Red(s) | UeErr::Unsupported(s) => s,
+            UeErr::Value(s) | UeErr::Red(s) | UeErr::Unsupported(s) | UeErr::Other(s) => s,
         }
     }
 }
@@ -115,21 +122,21 @@ fn val<T>(m: impl Into<String>) -> UeRes<T> {
 
 // ---- R: a table reader whose reads past the end are a ValueError ----------------------------------------------------------------
 
-struct R<'a> {
+pub struct R<'a> {
     b: &'a [u8],
     o: i128,
     what: String,
 }
 
 impl<'a> R<'a> {
-    fn new(b: &'a [u8], o: i128, what: impl Into<String>) -> R<'a> {
+    pub fn new(b: &'a [u8], o: i128, what: impl Into<String>) -> R<'a> {
         R {
             b,
             o,
             what: what.into(),
         }
     }
-    fn need(&self, n: i128) -> UeRes<()> {
+    pub fn need(&self, n: i128) -> UeRes<()> {
         if n < 0 || !(0 <= self.o && self.o <= self.b.len() as i128 - n) {
             return val(format!(
                 "{}: {} bytes at {} do not fit in its {}",
@@ -141,29 +148,29 @@ impl<'a> R<'a> {
         }
         Ok(())
     }
-    fn raw(&mut self, n: i128) -> UeRes<&'a [u8]> {
+    pub fn raw(&mut self, n: i128) -> UeRes<&'a [u8]> {
         self.need(n)?;
         let a = self.o as usize;
         self.o += n;
         Ok(&self.b[a..a + n as usize])
     }
-    fn u8(&mut self) -> UeRes<u8> {
+    pub fn u8(&mut self) -> UeRes<u8> {
         Ok(self.raw(1)?[0])
     }
-    fn u32(&mut self) -> UeRes<u32> {
+    pub fn u32(&mut self) -> UeRes<u32> {
         Ok(u32::from_le_bytes(self.raw(4)?.try_into().unwrap()))
     }
-    fn i32(&mut self) -> UeRes<i32> {
+    pub fn i32(&mut self) -> UeRes<i32> {
         Ok(i32::from_le_bytes(self.raw(4)?.try_into().unwrap()))
     }
-    fn u64(&mut self) -> UeRes<u64> {
+    pub fn u64(&mut self) -> UeRes<u64> {
         Ok(u64::from_le_bytes(self.raw(8)?.try_into().unwrap()))
     }
-    fn i64(&mut self) -> UeRes<i64> {
+    pub fn i64(&mut self) -> UeRes<i64> {
         Ok(i64::from_le_bytes(self.raw(8)?.try_into().unwrap()))
     }
     /// `fstr()`: i32 length with the NUL; UTF-8 (`'replace'`), or UTF-16 when negative
-    fn fstr(&mut self) -> UeRes<String> {
+    pub fn fstr(&mut self) -> UeRes<String> {
         let n = self.i32()? as i128;
         if n < 0 {
             let b = self.raw(-2 * n)?;
@@ -184,6 +191,41 @@ impl<'a> R<'a> {
         }
         let b = self.raw(n)?;
         Ok(String::from_utf8_lossy(&b[..b.len() - 1]).into_owned())
+    }
+    /// `count()`: a TArray's length (i32)
+    pub fn count(&mut self) -> UeRes<i32> {
+        self.i32()
+    }
+    /// `[r.take(<size bytes>) for _ in range(count)]`: fails where the Python's loop would, at the first item that does not fit
+    pub fn items(&mut self, count: i128, size: i128) -> UeRes<()> {
+        if count <= 0 {
+            return Ok(());
+        }
+        let room = (self.b.len() as i128 - self.o).max(0);
+        if count * size <= room {
+            self.o += count * size;
+            return Ok(());
+        }
+        self.o += room / size * size;
+        self.need(size)
+    }
+    pub fn pos(&self) -> i128 {
+        self.o
+    }
+    pub fn seek(&mut self, o: i128) {
+        self.o = o;
+    }
+    pub fn len(&self) -> i128 {
+        self.b.len() as i128
+    }
+    pub fn is_empty(&self) -> bool {
+        self.b.is_empty()
+    }
+    pub fn what(&self) -> &str {
+        &self.what
+    }
+    pub fn bytes(&self) -> &'a [u8] {
+        self.b
     }
 }
 
@@ -369,6 +411,22 @@ pub struct Pak<'s> {
     stored_header: i128,
     pub mount: String,
     files: Files,
+    /// the AES key of an encrypted index and its encrypted entries (kept in memory only)
+    key: Option<[u8; 32]>,
+}
+
+/// `aes_decrypt(key, b)[:n]` with the block-aligned length read before it
+fn decrypt_range(
+    src: &dyn Source,
+    key: &[u8; 32],
+    off: i128,
+    n: i128,
+    what: &str,
+) -> UeRes<Vec<u8>> {
+    let b = read_range(src, off, (n + 15) & !15, what)?;
+    let mut d = crate::aes::decrypt(key, &b).map_err(UeErr::Value)?;
+    d.truncate(n.max(0) as usize);
+    Ok(d)
 }
 
 /// `frozen_pak_index(data, methods, what)`: UE4's 64-bit frozen FPakFileData
@@ -522,20 +580,27 @@ fn frozen_pak_index(
 }
 
 impl<'s> Pak<'s> {
-    /// `Pak(path)`: no key (an encrypted index is refused before a pak is opened: `split::detect_unsupported`)
-    pub fn open(path: &str, src: &'s dyn Source) -> UeRes<Pak<'s>> {
+    /// `Pak(path, key)`: key = the AES key of an encrypted index and entries ([`Keys`]); None for a pak in the clear
+    pub fn open(path: &str, src: &'s dyn Source, key: Option<[u8; 32]>) -> UeRes<Pak<'s>> {
         let ft = footer(src)?;
         let short = ft.version == 8 && ft.methods.len() == 4;
         let stored_header = if short { 50 } else { 53 };
-        if ft.encrypted {
+        if ft.encrypted && key.is_none() {
             return val(format!(
                 "{path}: the index is encrypted and no key was given"
             ));
         }
-        let idx = read_range(src, ft.ioff as i128, ft.isz as i128, path)?;
+        let at = |off: i128, n: i128| -> UeRes<Vec<u8>> {
+            match (ft.encrypted, key.as_ref()) {
+                (true, Some(k)) => decrypt_range(src, k, off, n, path),
+                _ => read_range(src, off, n, path),
+            }
+        };
+        let idx = at(ft.ioff as i128, ft.isz as i128)?;
         let what = format!("{path}: the index");
         let mut pak = Pak {
             path: path.to_string(),
+            key,
             src,
             version: ft.version,
             methods: ft.methods.clone(),
@@ -635,7 +700,7 @@ impl<'s> Pak<'s> {
         if r.i32()? != 0 {
             return val(format!("{path}: unencoded entries are not read"));
         }
-        let dir = read_range(src, doff as i128, dsz as i128, path)?;
+        let dir = at(doff as i128, dsz as i128)?;
         let mut d = R::new(&dir, 0, format!("{path}: the directory index"));
         let mut files = BTreeMap::new();
         let nd = d.i32()?;
@@ -744,15 +809,18 @@ impl<'s> Pak<'s> {
     }
 
     fn read_at(&self, off: i128, n: i128, enc: bool) -> UeRes<Vec<u8>> {
-        if enc {
-            return val(format!(
+        if !enc {
+            return read_range(self.src, off, n, &self.path);
+        }
+        match &self.key {
+            Some(k) => decrypt_range(self.src, k, off, n, &self.path),
+            None => val(format!(
                 "{}: {} encrypted bytes at {} and no key was given",
                 self.path,
                 hx(n),
                 hx(off)
-            ));
+            )),
         }
-        read_range(self.src, off, n, &self.path)
     }
 
     /// `read(path, decode=oodle)` (`oodle` = true: a method this port has no decoder for is the Python's red text with no Mac host; false: `decode=None`, its ValueError)
@@ -912,15 +980,20 @@ pub fn lz4_block(b: &[u8], k: usize) -> Result<Vec<u8>, String> {
 
 // ---- which route a pak takes ----------------------------------------------------------------------------------------------------------
 
-/// `pak_shader_sources(path)` with no key: (scan inline packages, extract shader archives). The IoStore containers `inline_in_containers` looks for beside the pak are refused before
-/// (`split::detect_unsupported`), so they count as absent here.
-pub fn pak_shader_sources(path: &str, src: &dyn Source) -> UeRes<(bool, bool)> {
+/// `pak_shader_sources(path, key)`: (scan inline packages, extract shader archives). `beside()` = `inline_in_containers(path)`: the IoStore containers in the pak's folder hold
+/// export bundles and no shader library (asked only where the Python asks it). An encrypted pak with no key is sent for extraction, which reports the missing key.
+pub fn pak_shader_sources(
+    path: &str,
+    src: &dyn Source,
+    key: Option<[u8; 32]>,
+    beside: &dyn Fn() -> bool,
+) -> UeRes<(bool, bool)> {
     let ft = footer(src)?;
     if ft.version == 9 || (ft.version == 8 && ft.methods.len() == 4) {
-        if ft.encrypted {
+        if ft.encrypted && key.is_none() {
             return Ok((false, true));
         }
-        let pak = Pak::open(path, src)?;
+        let pak = Pak::open(path, src, key)?;
         let names = pak.names();
         let archives = names.iter().any(|n| n.ends_with(".ushaderbytecode"));
         let members = names.iter().any(|n| {
@@ -930,15 +1003,21 @@ pub fn pak_shader_sources(path: &str, src: &dyn Source) -> UeRes<(bool, bool)> {
                     .unwrap_or(n)
                     .starts_with("GlobalShaderCache-")
         });
-        return Ok((members, archives));
+        return Ok((members || beside(), archives));
     }
     if [4, 8, 9].contains(&ft.version) {
         return Ok((true, false));
     }
-    if ft.encrypted {
+    if ft.encrypted && key.is_none() {
         return Ok((false, true));
     }
-    let idx = read_range(src, ft.ioff as i128, ft.isz as i128, path)?;
+    let at = |off: i128, n: i128| -> UeRes<Vec<u8>> {
+        match (ft.encrypted, key.as_ref()) {
+            (true, Some(k)) => decrypt_range(src, k, off, n, path),
+            _ => read_range(src, off, n, path),
+        }
+    };
+    let idx = at(ft.ioff as i128, ft.isz as i128)?;
     let mut r = R::new(&idx, 0, format!("{path}: the index"));
     r.fstr()?;
     r.need(12)?; // `take('<iQ')`
@@ -958,9 +1037,221 @@ pub fn pak_shader_sources(path: &str, src: &dyn Source) -> UeRes<(bool, bool)> {
     }
     r.need(16)?;
     let (doff, dsz) = (r.u64()?, r.u64()?);
-    let d = read_range(src, doff as i128, dsz as i128, path)?;
-    let inline = !contains(&d, b".ushaderbytecode\0") && contains(&d, b".uexp\0");
+    let d = at(doff as i128, dsz as i128)?;
+    let inline = !contains(&d, b".ushaderbytecode\0")
+        && (contains(&d, b".uexp\0") || (contains(&d, b"GlobalShaderCache-") && beside()));
     Ok((inline, !inline))
+}
+
+// ---- the AES key in main ------------------------------------------------------------------------------------------------------------------
+
+/// `img[a:b]` with Python's slice rules (negative bounds count from the end)
+fn pyslice(img: &[u8], a: i64, b: i64) -> &[u8] {
+    let n = img.len() as i64;
+    let norm = |x: i64| if x < 0 { (n + x).max(0) } else { x.min(n) };
+    let (a, b) = (norm(a), norm(b));
+    if a < b {
+        &img[a as usize..b as usize]
+    } else {
+        &[]
+    }
+}
+
+/// `code_keys(img, lo)`: 32-byte keys that main's code stores from two 16-byte literals (`stp qA, qB, [x0]` after `ldr qA` / `ldr qB`, each from an `adrp` page plus its offset,
+/// within 8 instructions before it). A candidate may be shorter than 32 bytes, as the Python's slices are; trying it is the Python's ValueError
+fn code_keys(img: &[u8], lo: usize) -> Vec<Vec<u8>> {
+    let nw = (lo / 4).min(img.len() / 4);
+    let word = |i: usize| u32::from_le_bytes(img[4 * i..4 * i + 4].try_into().unwrap());
+    let mut out = Vec::new();
+    for i in 0..nw {
+        let x = word(i);
+        if x & 0xFFFF83E0 != 0xAD000000 {
+            continue;
+        }
+        let mut page: [Option<i64>; 32] = [None; 32];
+        let mut half: [Option<i64>; 32] = [None; 32];
+        for j in i.saturating_sub(8)..i {
+            let y = word(j);
+            let rd = (y & 31) as usize;
+            if y & 0x9F000000 == 0x90000000 {
+                let imm = ((y >> 29) & 3) as i64 | (((y >> 5) & 0x7FFFF) as i64) << 2;
+                let imm = if imm & (1 << 20) != 0 {
+                    imm - (1 << 21)
+                } else {
+                    imm
+                };
+                page[rd] = Some(((j * 4) as i64 & !0xFFF) + (imm << 12));
+            } else if y & 0xFFC00000 == 0x3DC00000 && page[((y >> 5) & 31) as usize].is_some() {
+                half[rd] =
+                    Some(page[((y >> 5) & 31) as usize].unwrap() + ((y >> 10) & 0xFFF) as i64 * 16);
+            } else {
+                page[rd] = None;
+                half[rd] = None;
+            }
+        }
+        let (a, b) = (half[(x & 31) as usize], half[((x >> 10) & 31) as usize]);
+        if let (Some(a), Some(b)) = (a, b)
+            && a + 16 <= img.len() as i64
+            && b + 16 <= img.len() as i64
+        {
+            let mut k = pyslice(img, a, a + 16).to_vec();
+            k.extend_from_slice(pyslice(img, b, b + 16));
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// `find_key(img, lo, hi, pak, first)`: the AES key that decrypts the index start to a short mount point: one of `first` (a key another pak opened with), one main's code stores from two
+/// 16-byte literals ([`code_keys`]), else one of main's 32-byte windows (read-only and data segments, 4-aligned, at least 20 distinct bytes)
+fn find_key(
+    img: &[u8],
+    lo: usize,
+    hi: usize,
+    path: &str,
+    src: &dyn Source,
+    first: &[[u8; 32]],
+) -> UeRes<Option<[u8; 32]>> {
+    let ft = footer(src)?;
+    let blk = src
+        .read(ft.ioff, 16)
+        .map_err(|e| UeErr::Other(format!("OSError: {e}")))?;
+    let opens = |k: &[u8]| -> UeRes<bool> {
+        let Ok(key) = <[u8; 32]>::try_from(k) else {
+            return val("invalid AES key, data or IV length");
+        };
+        let d = crate::aes::decrypt(&key, &blk).map_err(UeErr::Value)?;
+        if d.len() < 16 {
+            return Err(UeErr::Other(format!(
+                "error: unpack requires a buffer of 16 bytes (the index start has {})",
+                d.len()
+            )));
+        }
+        if ft.frozen {
+            let ptr = i64::from_le_bytes(d[..8].try_into().unwrap());
+            let n = i32::from_le_bytes(d[8..12].try_into().unwrap()) as i64;
+            let cap = i32::from_le_bytes(d[12..16].try_into().unwrap()) as i64;
+            let at = ptr >> 1;
+            if ptr & 1 == 0
+                || !(1 < n && n < 512)
+                || n != cap
+                || !(16 <= at && at <= ft.isz as i64 - n * 2)
+            {
+                return Ok(false);
+            }
+            let (begin, end) = (at & !15, (at + n * 2 + 15) & !15);
+            let b = read_range(
+                src,
+                ft.ioff as i128 + begin as i128,
+                (end - begin) as i128,
+                path,
+            )?;
+            let x = crate::aes::decrypt(&key, &b).map_err(UeErr::Value)?;
+            let raw = pyslice(&x, at - begin, at - begin + n * 2);
+            let u: Vec<u16> = raw
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
+                .collect();
+            if !raw.len().is_multiple_of(2) {
+                return Ok(false);
+            }
+            let Ok(s) = String::from_utf16(&u) else {
+                return Ok(false);
+            };
+            let body: Vec<char> = s.chars().collect();
+            return Ok((s.starts_with('.') || s.starts_with('/'))
+                && s.ends_with('\0')
+                && body[..body.len() - 1]
+                    .iter()
+                    .all(|&c| c >= ' ' && !('\x7f'..='\u{9f}').contains(&c)));
+        }
+        let n = i32::from_le_bytes(d[..4].try_into().unwrap()) as i64;
+        if !(1 < n && n < 512) || !matches!(d[4], b'.' | b'/') {
+            return Ok(false);
+        }
+        let s = &d[4..(4 + n).min(16) as usize];
+        let head = &s[..((n - 1) as usize).min(s.len())];
+        Ok(head.iter().all(|&c| (0x20..0x7F).contains(&c))
+            && ((s.len() as i64) < n || s[(n - 1) as usize] == 0))
+    };
+    for k in first {
+        if opens(k)? {
+            return Ok(Some(*k));
+        }
+    }
+    for k in code_keys(img, lo) {
+        if opens(&k)? {
+            return Ok(Some(k.try_into().unwrap()));
+        }
+    }
+    let mut a = lo;
+    while (a as i64) < hi as i64 - 32 {
+        let w = sl(img, a, a + 32);
+        let mut seen = [0u64; 4];
+        let mut distinct = 0;
+        for &c in w {
+            let (q, bit) = ((c >> 6) as usize, 1u64 << (c & 63));
+            if seen[q] & bit == 0 {
+                seen[q] |= bit;
+                distinct += 1;
+            }
+        }
+        if distinct >= 20 && opens(w)? {
+            return Ok(Some(w.try_into().unwrap()));
+        }
+        a += 4;
+    }
+    Ok(None)
+}
+
+/// `Keys(mains)`: the AES keys of a game's paks, from its mains (the ExeFS main of each version, base game first). Each main is loaded once, at the first encrypted pak; a key found is
+/// tried first on the next pak. The keys stay in memory: never printed, logged or written.
+pub struct Keys {
+    mains: Vec<std::path::PathBuf>,
+    imgs: HashMap<usize, (Vec<u8>, usize, usize)>,
+    /// the keys found so far, in order
+    pub found: Vec<[u8; 32]>,
+}
+
+impl Keys {
+    pub fn new(mains: Vec<std::path::PathBuf>) -> Keys {
+        Keys {
+            mains,
+            imgs: HashMap::new(),
+            found: Vec::new(),
+        }
+    }
+
+    /// `keys(pak)`: None for a pak whose index is not encrypted, else the key [`find_key`] finds, trying each main in turn; the Python's ValueError when none opens it
+    pub fn key(&mut self, path: &str, src: &dyn Source) -> UeRes<Option<[u8; 32]>> {
+        if !footer(src)?.encrypted {
+            return Ok(None);
+        }
+        for m in 0..self.mains.len() {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.imgs.entry(m) {
+                let module =
+                    ibuilder_nso::read(&self.mains[m]).map_err(|x| UeErr::Value(x.to_string()))?;
+                let lo = module.segments[1].0 as usize;
+                let hi = module.image.len();
+                e.insert((module.image, lo, hi));
+            }
+            let (img, lo, hi) = &self.imgs[&m];
+            if let Some(k) = find_key(img, *lo, *hi, path, src, &self.found)? {
+                if !self.found.contains(&k) {
+                    self.found.push(k);
+                }
+                return Ok(Some(k));
+            }
+        }
+        val(format!(
+            "{path}: the index is encrypted and no key in main (a 32-byte window or two 16-byte literals its code stores together) decrypts it"
+        ))
+    }
+
+    /// shader_split's `key(p)`: any error is no key
+    pub fn try_key(&mut self, path: &str, src: &dyn Source) -> Option<[u8; 32]> {
+        self.key(path, src).ok().flatten()
+    }
 }
 
 // ---- normpath ---------------------------------------------------------------------------------------------------------------------------
@@ -1005,32 +1296,58 @@ pub fn label_of(mount: &str, name: &str) -> String {
 
 // ---- jobs ---------------------------------------------------------------------------------------------------------------------------
 
-/// The planned jobs, and the `(root, rel)` of the paks they take out of the plain list
+/// The planned jobs, and the `(root, rel)` of the paks and containers they take out of the plain list
 pub type Planned = (Vec<UeJob>, HashSet<(usize, String)>);
 /// `(root, folder, normpath(mount + name))` -> `(pak, name, raw size)`: one file of the merged view
 type ViewItem = ((usize, String, String), (usize, String, i128));
 /// One decoded archive by file name: its shaders `(frequency, bytes)`
 pub type NamedArchive = (String, Vec<(u8, Vec<u8>)>);
+/// A container beside an inline pak: its `.utoc`, path, key and `.ucas` partitions
+type IoToc<'a> = (&'a FileRef, String, Option<[u8; 32]>, Vec<(String, Loc)>);
+/// `(root, folder, chunk ID)`: one export bundle of the merged view
+type ChunkAt = (usize, String, [u8; 12]);
+/// One package of a job: its bytes, decoded when asked
+type Package<'a> = Box<dyn Fn() -> UeRes<Vec<u8>> + 'a>;
 
-/// One job of `ue_legacy_jobs`: names of one pak's files
+/// What one job of `ue_legacy_jobs` reads
+#[derive(Clone)]
+pub enum UeWhat {
+    /// `UE_LEGACY`: names of one pak's files
+    Pak(Vec<String>),
+    /// `UE_IO`: export bundles (chunk indices) of one IoStore container, and its `.ucas` partitions by name below the RomFS
+    Io(Vec<usize>, Vec<(String, Loc)>),
+}
+
+/// One job of `ue_legacy_jobs`
 #[derive(Clone)]
 pub struct UeJob {
+    /// the pak, or the container's `.utoc`
     pub file: FileRef,
-    /// the path the Python names the pak by (its messages)
+    /// the path the Python names the pak or container by (its messages)
     pub path: String,
-    pub names: Vec<String>,
+    pub what: UeWhat,
+    /// the AES key of an encrypted pak or container (in memory only; the memo identity says only that there is one)
+    pub key: Option<[u8; 32]>,
 }
 
 impl UeJob {
     pub fn identity(&self) -> Vec<String> {
-        std::iter::once(format!(
-            "uepak:{}:{}:{}",
+        let tag = match self.what {
+            UeWhat::Pak(_) => "uepak",
+            UeWhat::Io(..) => "uestore",
+        };
+        let mut v = vec![format!(
+            "{tag}:{}:{}:{}{}",
             self.file.root,
             self.file.rel,
-            self.file.loc.len()
-        ))
-        .chain(self.names.iter().cloned())
-        .collect()
+            self.file.loc.len(),
+            if self.key.is_some() { ":aes" } else { "" }
+        )];
+        match &self.what {
+            UeWhat::Pak(names) => v.extend(names.iter().cloned()),
+            UeWhat::Io(chunks, _) => v.extend(chunks.iter().map(|c| c.to_string())),
+        }
+        v
     }
 }
 
@@ -1038,12 +1355,77 @@ fn dir_of(rel: &str) -> &str {
     rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
 }
 
-/// `ue_legacy_jobs(files)`: the jobs, and the paks they take out of the plain list
+/// A container's `.utoc` parsed without a key (TOC metadata is in the clear), `ucas` finding its partitions
+fn open_toc(
+    f: &FileRef,
+    path: &str,
+    key: Option<[u8; 32]>,
+    ucas: &dyn Fn(&str) -> Option<Loc>,
+) -> UeRes<Toc> {
+    let src = f
+        .loc
+        .open()
+        .map_err(|e| UeErr::Other(format!("OSError: {e}")))?;
+    let b = src
+        .read(0, src.len() as usize)
+        .map_err(|e| UeErr::Other(format!("OSError: {e}")))?;
+    Toc::parse(path, &f.rel, &b, key, ucas)
+}
+
+/// `inline_in_containers(path)`: the containers in the pak's folder hold export bundles and no shader library (containers that do not parse count as absent, as in `io_tocs`)
+fn inline_in_containers<'a>(
+    pak: &FileRef,
+    files: impl Iterator<Item = &'a FileRef>,
+    path_of: &dyn Fn(&FileRef) -> String,
+) -> bool {
+    let dir = dir_of(&pak.rel);
+    let (mut bundles, mut libs) = (false, false);
+    for f in files {
+        if f.root != pak.root || !f.rel.ends_with(".utoc") || dir_of(&f.rel) != dir {
+            continue;
+        }
+        if let Ok(t) = open_toc(f, &path_of(f), None, &|_| None) {
+            bundles |= !t.export_bundles().is_empty();
+            libs |= !t.of_type(IO_SHADER_LIBRARY).is_empty();
+        }
+    }
+    bundles && !libs
+}
+
+/// Splits `items` (`(owner, name, raw size)`, sorted) into jobs of about equal raw size, as `ue_legacy_jobs` does per tag
+fn parts<T: Clone>(items: Vec<(usize, T, i128)>) -> Vec<(usize, Vec<T>)> {
+    let step = items.iter().map(|x| x.2).sum::<i128>() as f64 / PARTS;
+    let mut jobs = Vec::new();
+    let mut cur: Vec<(usize, Vec<T>)> = Vec::new();
+    let mut size = 0i128;
+    for (pi, name, raw) in items {
+        match cur.iter_mut().find(|(p, _)| *p == pi) {
+            Some((_, v)) => v.push(name),
+            None => cur.push((pi, vec![name])),
+        }
+        size += raw;
+        if size as f64 >= step {
+            jobs.append(&mut cur);
+            size = 0;
+        }
+    }
+    jobs.append(&mut cur);
+    jobs
+}
+
+/// `ue_legacy_jobs(files, mains=main_v)`: the jobs (paks with inline shaders, then the export bundles of the containers beside them), and the paks and containers they take out of
+/// the plain list. `mains`: the ExeFS main of every version, whose AES key opens an encrypted pak ([`Keys`])
 pub fn legacy_jobs(
     files: &[FileRef],
     path_of: &dyn Fn(&FileRef) -> String,
     log: &(dyn Fn(&str) + Sync),
+    mains: &[std::path::PathBuf],
 ) -> Result<Planned, SplitError> {
+    let mut keys = Keys::new(mains.to_vec());
+    let by_rel: HashMap<(usize, &str), &FileRef> = files
+        .iter()
+        .map(|f| ((f.root, f.rel.as_str()), f))
+        .collect();
     let mut paks: Vec<(&FileRef, String, bool)> = Vec::new();
     for f in files {
         if !f.rel.ends_with(".pak") {
@@ -1051,7 +1433,9 @@ pub fn legacy_jobs(
         }
         let Ok(src) = f.loc.open() else { continue };
         let path = path_of(f);
-        match pak_shader_sources(&path, &src) {
+        let k = keys.try_key(&path, &src);
+        let beside = || inline_in_containers(f, files.iter(), path_of);
+        match pak_shader_sources(&path, &src, k, &beside) {
             Ok((true, archives)) => paks.push((f, path, archives)),
             Ok(_) => {}
             Err(UeErr::Unsupported(m)) => return Err(SplitError::Unsupported(m)),
@@ -1067,6 +1451,7 @@ pub fn legacy_jobs(
     });
     // (root, folder, normpath(mount + name)) -> (pak index, name, raw size)
     let mut view: HashMap<(usize, String, String), (usize, String, i128)> = HashMap::new();
+    let mut pak_keys: HashMap<usize, Option<[u8; 32]>> = HashMap::new();
     for (pi, (f, path, archives)) in paks.iter().enumerate() {
         let src = match f.loc.open() {
             Ok(s) => s,
@@ -1078,8 +1463,9 @@ pub fn legacy_jobs(
                 continue;
             }
         };
-        let got = (|| -> UeRes<Vec<ViewItem>> {
-            let pk = Pak::open(path, &src)?;
+        let got = (|| -> UeRes<(Option<[u8; 32]>, Vec<ViewItem>)> {
+            let k = keys.key(path, &src)?;
+            let pk = Pak::open(path, &src, k)?;
             let mut v = Vec::new();
             for name in pk.names() {
                 if *archives && name.ends_with(".ushaderbytecode") {
@@ -1095,10 +1481,13 @@ pub fn legacy_jobs(
                     (pi, name, raw),
                 ));
             }
-            Ok(v)
+            Ok((k, v))
         })();
         match got {
-            Ok(v) => view.extend(v),
+            Ok((k, v)) => {
+                pak_keys.insert(pi, k);
+                view.extend(v);
+            }
             Err(e) => log(&format!(
                 "[RED] /{}: the pak cannot be read ({}); its shaders are left out",
                 f.rel,
@@ -1109,37 +1498,104 @@ pub fn legacy_jobs(
     for (f, _, _) in &paks {
         taken.insert((f.root, f.rel.clone()));
     }
-    let mut items: Vec<(usize, String, i128)> = view.into_values().collect();
-    items.sort_by(|a, b| (&paks[a.0].0.rel, &a.1).cmp(&(&paks[b.0].0.rel, &b.1)));
-    let step = items.iter().map(|x| x.2).sum::<i128>() as f64 / PARTS;
-    let mut jobs = Vec::new();
-    let mut cur: Vec<(usize, Vec<String>)> = Vec::new();
-    let mut size = 0i128;
-    let flush = |cur: &mut Vec<(usize, Vec<String>)>, jobs: &mut Vec<UeJob>| {
-        for (pi, ns) in cur.drain(..) {
-            jobs.push(UeJob {
-                file: paks[pi].0.clone(),
-                path: paks[pi].1.clone(),
-                names: ns,
-            });
+    // the export bundles of the containers in the paks' folders, the newest copy of each chunk ID (mount order)
+    let folders: HashSet<(usize, &str)> = paks
+        .iter()
+        .map(|(f, _, _)| (f.root, dir_of(&f.rel)))
+        .collect();
+    let mut tocs: Vec<(&FileRef, String)> = files
+        .iter()
+        .filter(|f| f.rel.ends_with(".utoc") && folders.contains(&(f.root, dir_of(&f.rel))))
+        .map(|f| (f, path_of(f)))
+        .collect();
+    tocs.sort_by_cached_key(|(_, p)| mount_order(p));
+    let mut io: Vec<IoToc<'_>> = Vec::new();
+    let mut chunks: HashMap<ChunkAt, (usize, usize, i128)> = HashMap::new();
+    for (f, path) in tocs {
+        let t = match open_toc(f, &path, None, &|_| None) {
+            Ok(t) => t,
+            Err(e) => {
+                log(&format!(
+                    "[RED] /{}: the container cannot be read ({}); its shaders are left out",
+                    f.rel,
+                    e.text()
+                ));
+                continue;
+            }
+        };
+        let bundles = t.export_bundles();
+        if bundles.is_empty() {
+            continue;
         }
-    };
-    for (pi, name, raw) in items {
-        match cur.iter_mut().find(|(p, _)| *p == pi) {
-            Some((_, v)) => v.push(name),
-            None => cur.push((pi, vec![name])),
+        let mut key = None;
+        if t.encrypted {
+            let beside = format!("{}.pak", &f.rel[..f.rel.len() - 5]);
+            key = by_rel
+                .get(&(f.root, beside.as_str()))
+                .and_then(|p| {
+                    let src = p.loc.open().ok()?;
+                    keys.try_key(&path_of(p), &src)
+                })
+                .or_else(|| keys.found.first().copied());
+            if key.is_none() {
+                log(&format!(
+                    "[RED] /{}: the container is encrypted and no key of the game opens the pak beside it; its shaders are left out",
+                    f.rel
+                ));
+                continue;
+            }
         }
-        size += raw;
-        if size as f64 >= step {
-            flush(&mut cur, &mut jobs);
-            size = 0;
+        taken.insert((f.root, f.rel.clone()));
+        let mut parts_ = Vec::new();
+        for rel in t.ucas_rels(&f.rel) {
+            if let Some(u) = by_rel.get(&(f.root, rel.as_str())) {
+                parts_.push((rel.clone(), u.loc.clone()));
+            }
+            taken.insert((f.root, rel));
+        }
+        let ti = io.len();
+        io.push((f, path, key, parts_));
+        for i in bundles {
+            chunks.insert(
+                (f.root, dir_of(&f.rel).to_string(), t.ids[i]),
+                (ti, i, t.ranges[i].1 as i128),
+            );
         }
     }
-    flush(&mut cur, &mut jobs);
+    let mut items: Vec<(usize, String, i128)> = view.into_values().collect();
+    items.sort_by(|a, b| (&paks[a.0].0.rel, &a.1).cmp(&(&paks[b.0].0.rel, &b.1)));
+    let mut jobs = Vec::new();
+    for (pi, names) in parts(items) {
+        jobs.push(UeJob {
+            file: paks[pi].0.clone(),
+            path: paks[pi].1.clone(),
+            what: UeWhat::Pak(names),
+            key: pak_keys.get(&pi).copied().flatten(),
+        });
+    }
+    let mut items: Vec<(usize, usize, i128)> = chunks.into_values().collect();
+    items.sort_by(|a, b| (&io[a.0].0.rel, a.1).cmp(&(&io[b.0].0.rel, b.1)));
+    for (ti, ids) in parts(items) {
+        jobs.push(UeJob {
+            file: io[ti].0.clone(),
+            path: io[ti].1.clone(),
+            what: UeWhat::Io(ids, io[ti].3.clone()),
+            key: io[ti].2,
+        });
+    }
     Ok((jobs, taken))
 }
 
-/// `ue_legacy_shaders` + `ue_packages`: every package of the job decoded and scanned on its own; a package that fails costs only itself (at most 8 lines per job).
+/// `UeErr` as the failure of a whole job (`scan_file`'s unreadable result)
+fn job_failure(e: UeErr) -> Failure {
+    match e {
+        UeErr::Unsupported(m) => Failure::Unsupported(m),
+        UeErr::Red(m) | UeErr::Other(m) => Failure::Red(m),
+        UeErr::Value(m) => Failure::Red(format!("ValueError: {m}")),
+    }
+}
+
+/// `ue_legacy_shaders` / `ue_io_shaders` + `ue_packages`: every package of the job decoded and scanned on its own; a package that fails costs only itself (at most 8 lines per job).
 /// -> the shaders, and `(first reason, packages left out)` when any was
 pub fn legacy_shaders(
     cx: &Ctx<'_>,
@@ -1151,17 +1607,43 @@ pub fn legacy_shaders(
         .loc
         .open()
         .map_err(|e| Failure::Red(format!("OSError: {e}")))?;
-    let pk = match Pak::open(&job.path, &src) {
-        Ok(p) => p,
-        Err(UeErr::Unsupported(m)) => return Err(Failure::Unsupported(m)),
-        Err(UeErr::Red(m)) => return Err(Failure::Red(m)),
-        Err(UeErr::Value(m)) => return Err(Failure::Red(format!("ValueError: {m}"))),
-    };
+    // (label, read) of every package, in the job's order
+    let pk;
+    let toc;
+    let mut items: Vec<(String, Package<'_>)> = Vec::new();
+    match &job.what {
+        UeWhat::Pak(names) => {
+            pk = Pak::open(&job.path, &src, job.key).map_err(job_failure)?;
+            for name in names {
+                let pk = &pk;
+                items.push((
+                    format!("/{}#{}", job.file.rel, label_of(&pk.mount, name)),
+                    Box::new(move || pk.read(name, cx.zstd, true)),
+                ));
+            }
+        }
+        UeWhat::Io(ids, ucas) => {
+            let lookup = |n: &str| ucas.iter().find(|(r, _)| r == n).map(|(_, l)| l.clone());
+            toc = open_toc(&job.file, &job.path, job.key, &lookup).map_err(job_failure)?;
+            let names = toc.names().map_err(job_failure)?;
+            for &i in ids {
+                let toc = &toc;
+                let name = names
+                    .get(&i)
+                    .filter(|n| !n.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| crate::uestore::hex8(&toc.ids[i]));
+                items.push((
+                    format!("/{}#{name}", job.file.rel),
+                    Box::new(move || toc.read(i, &|| UeErr::Red(OODLE_RED.into()))),
+                ));
+            }
+        }
+    }
     let (mut first, mut lost) = (String::new(), 0usize);
-    for name in &job.names {
-        let label = format!("/{}#{}", job.file.rel, label_of(&pk.mount, name));
+    for (label, read) in items {
         let r = (|| -> UeRes<()> {
-            let d = pk.read(name, cx.zstd, true)?;
+            let d = read()?;
             let mut found = Vec::new();
             inline_shaders(&d, &label, &mut found)?;
             out.extend(found);
@@ -1573,7 +2055,7 @@ pub fn decoded_shaders(b: &[u8], what: &str) -> Result<Vec<(u8, Vec<u8>)>, Failu
             {
                 Some(d) if d.len() == raw as usize && starts(&d, b"LSLG") => d,
                 _ => unsupported!(
-                    "Unreal Engine shader code archive with Oodle-compressed shaders ({what}: shader {i}; the game's own decoder in the Mac host)"
+                    "Unreal Engine shader code archive with Oodle-compressed shaders ({what}: shader {i}). {OODLE_WHY}"
                 ),
             }
         };
@@ -1654,32 +2136,112 @@ pub fn ue_shaders_file(d: &[u8], label: &str) -> Res<Vec<Shader>> {
     ue_shaders(&v, label)
 }
 
-/// `uepak.job` + `finish` in process: the shader code archives of every pak of one version that `pak_shader_sources` routes to extraction, by file name (a later pak's archive
-/// of the same name replaces an earlier one, as they are written into one folder), each as its decoded shaders. Sorted by name, as main() lists `ue_shaders/`.
+/// Why Oodle data ends the split on the phone: upstream decodes it on the Mac with the game's own `OodleLZ_Decompress` (the host's tool mode, `DM_OODLE_SERVE`), which needs the game's
+/// rewritten modules loaded; the phone's split runs before they are built, signed or loaded, and no Oodle decoder under a licence this repository can take exists
+pub const OODLE_WHY: &str = "Oodle is decoded only by the game's own decoder (OodleLZ_Decompress in main), which upstream runs on the Mac; on the iPhone the split runs before the game's code is loaded, and there is no Oodle decoder under a licence iBuilder can use. Games with Oodle-compressed Unreal shaders: Octopath Traveler 0, FINAL FANTASY RESONANCE, Yoshi and the Mysterious Book, Mario & Luigi: Brothership";
+
+/// `uepak.job` + `finish` in process: the shader libraries of the version's IoStore containers (Unreal Engine 5: FINAL FANTASY RESONANCE), then the shader code archives of every pak of
+/// one version that `pak_shader_sources` routes to extraction, by file name (a later archive of the same name replaces an earlier one, as they are written into one folder), each as
+/// its decoded shaders. Sorted by name, as main() lists `ue_shaders/`. `main`: this version's ExeFS main (the AES key of an encrypted pak); `top(f)`: the name of a file at the top
+/// of the RomFS (the manifests that name the libraries), None for one below it.
 pub fn archives(
     files: &[&FileRef],
     path_of: &dyn Fn(&FileRef) -> String,
     zstd: &dyn Zstd,
+    main: &std::path::Path,
+    top: &dyn Fn(&FileRef) -> Option<String>,
 ) -> Result<Vec<NamedArchive>, SplitError> {
+    let mut by_name: BTreeMap<String, Vec<(u8, Vec<u8>)>> = BTreeMap::new();
+    let ue = |e: UeErr| match e {
+        UeErr::Unsupported(m) => SplitError::Unsupported(m),
+        e => SplitError::Red(e.text().to_string()),
+    };
+    // ---- IoStore shader libraries (`io_tocs(romfs)`, in mount order; a library or group the newest container has wins)
+    let by_rel: HashMap<&str, &FileRef> = files.iter().map(|f| (f.rel.as_str(), *f)).collect();
+    let lookup = |n: &str| by_rel.get(n).map(|f| f.loc.clone());
+    let mut found: Vec<(&FileRef, String)> = files
+        .iter()
+        .filter(|f| f.rel.ends_with(".utoc"))
+        .map(|f| (*f, path_of(f)))
+        .collect();
+    found.sort_by_cached_key(|(_, p)| mount_order(p));
+    let tocs: Vec<Toc> = found
+        .iter()
+        .filter_map(|(f, p)| open_toc(f, p, None, &lookup).ok())
+        .collect();
+    if tocs
+        .iter()
+        .any(|t| !t.of_type(IO_SHADER_LIBRARY).is_empty())
+    {
+        let manifests: Vec<Vec<u8>> = files
+            .iter()
+            .filter(|f| top(f).is_some_and(|n| n.starts_with("Manifest_") && n.ends_with(".txt")))
+            .filter_map(|f| {
+                f.loc
+                    .open()
+                    .ok()
+                    .and_then(|s| s.read(0, s.len() as usize).ok())
+            })
+            .collect();
+        let names = crate::uestore::archive_names(&manifests);
+        let mut chunk: HashMap<[u8; 12], (usize, usize)> = HashMap::new();
+        for (t, toc) in tocs.iter().enumerate().rev() {
+            for (k, c) in toc.ids.iter().enumerate() {
+                chunk.entry(*c).or_insert((t, k));
+            }
+        }
+        let oodle = |what: &str| {
+            UeErr::Unsupported(format!(
+                "Unreal Engine IoStore shader library with Oodle-compressed data ({what}). {OODLE_WHY}"
+            ))
+        };
+        let mut seen = HashSet::new();
+        for (t, toc) in tocs.iter().enumerate().rev() {
+            for i in toc.of_type(IO_SHADER_LIBRARY) {
+                if !seen.insert(toc.ids[i]) {
+                    continue;
+                }
+                let name = format!(
+                    "{}.ushaderbytecode",
+                    crate::uestore::io_library_name(&toc.ids[i], &names)
+                );
+                let sh = crate::uestore::io_archive(&tocs, t, i, &|c| chunk.get(c).copied(), &oodle)
+                    .map_err(|e| match e {
+                        UeErr::Value(m) if m.ends_with("the container is encrypted and no key was given") => {
+                            SplitError::Unsupported(format!(
+                                "Unreal Engine IoStore shader library in an encrypted container ({m}; upstream reads none either)"
+                            ))
+                        }
+                        e => ue(e),
+                    })?;
+                by_name.insert(name, sh);
+            }
+        }
+    }
+    // ---- the paks' shader code archives
     let mut paks: Vec<&FileRef> = files
         .iter()
         .copied()
         .filter(|f| f.rel.ends_with(".pak"))
         .collect();
     paks.sort_by(|a, b| a.rel.cmp(&b.rel));
-    let mut by_name: BTreeMap<String, Vec<(u8, Vec<u8>)>> = BTreeMap::new();
-    let ue = |e: UeErr| match e {
-        UeErr::Unsupported(m) => SplitError::Unsupported(m),
-        e => SplitError::Red(e.text().to_string()),
-    };
+    let mut keys = Keys::new(vec![main.to_path_buf()]);
     for f in paks {
         let Ok(src) = f.loc.open() else { continue };
         let path = path_of(f);
-        match pak_shader_sources(&path, &src) {
+        let k = keys.try_key(&path, &src);
+        let beside = || inline_in_containers(f, files.iter().copied(), path_of);
+        match pak_shader_sources(&path, &src, k, &beside) {
             Ok((_, true)) => {}
             _ => continue,
         }
-        let pk = Pak::open(&path, &src).map_err(ue)?;
+        let k = keys.key(&path, &src).map_err(|e| match e {
+            UeErr::Value(m) if m.ends_with("decrypts it") => SplitError::Unsupported(format!(
+                "Unreal Engine pak with an encrypted index whose AES key is not in main ({m})"
+            )),
+            e => ue(e),
+        })?;
+        let pk = Pak::open(&path, &src, k).map_err(ue)?;
         for name in pk
             .names()
             .into_iter()
@@ -1696,9 +2258,4 @@ pub fn archives(
         }
     }
     Ok(by_name.into_iter().collect())
-}
-
-/// For `split::detect_unsupported`: a pak whose footer reads and whose index is encrypted
-pub fn encrypted_index(src: &dyn Source) -> bool {
-    footer(src).map(|f| f.encrypted).unwrap_or(false)
 }

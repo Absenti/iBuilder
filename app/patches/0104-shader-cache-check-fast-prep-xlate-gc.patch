@@ -1,0 +1,802 @@
+# 0104-shader-cache-check-fast-prep-xlate-gc.patch -- speed-up items W2, W3, W4 (app side), B2 (app side) and B9 (app side) of the owner's list: the warm-up knows when iOS emptied its
+# Metal shader cache, may use the device's compiler concurrency, compiles for size like the host; the translator's GC cost is logged; an experimental translator switch. Applies after 0103.
+#
+# W2 -- "Check the shader cache" (Settings > Build, on by default; shader_cache_check 1/0 in Documents/gameapp.settings.tsv).
+#   WHY: iOS's Metal shader cache (about 255 MB) is emptied at a reboot, a reinstall and an iOS update (developer.apple.com/forums/thread/659856). The warm-up's markers (warmed.tsv,
+#     prepared.tsv: GameWarmLogic.Header) named only the app build and the chain, so after a reboot a game stayed "prepared" and its first Play compiled cold (1,061-1,708 s measured).
+#   FIX (GameAppWarm.cs ShaderCacheCheck, GameWarm.MarkerHeader / WrittenHeader / CheckCacheOnce):
+#     * the markers' first line now also names the boot and the OS build: "# warmed app_build <b> chain <c> boot <kern.boottime seconds> os <kern.osversion>", always WRITTEN with them.
+#       With the check on, ParseWarmed / PreparedMatches (ShaderCacheCheck.Holds) refuse a marker of another boot (more than 120 s apart: iOS moves kern.boottime when it steps the clock)
+#       or OS build, or one written before 0104; off, only the app build and the chain count, as before. FirstStartPending, the queue's counts and the game sheet's "Shaders prepared" use it.
+#     * the probe: once per process and game (the queue's sync at a launch or a return, while nothing else has the phone and no run goes; and a run's own start, also in an exported app),
+#       the first 3 libraries warmed.tsv says were COMPILED are compiled again with WarmCompile and timed; every one above 50 ms = cold: warmed.tsv goes back to its header, prepared.tsv is
+#       removed, the game is prepared again; games/<id>/cache_probe.tsv keeps the epoch of that reset, so a game found cold AGAIN in the same boot is not reset again (iOS may simply not keep
+#       its libraries). cache_probe.tsv is cache state: never exported (PlayerWarm.CacheState).
+#     * every decision is one log line "shader cache: <title>: ...": prepared before the phone restarted / iOS was updated (23A341 to 23B82) / before the check; probed warm (times);
+#       probed cold (times), markers reset; cold again, not reset; nothing decided.
+# W3 -- "Faster shader preparation" (Settings > Build, off by default; shader_prep_fast 1/0).
+#   FIX (GameAppWarm.cs FastWarm): on, with "Shader preparation" at Auto, in the foreground at thermal Nominal or Fair: as many workers as MTLDevice.MaximumConcurrentCompilationTaskCount
+#     (the .NET binding: IMTLDevice.MaximumConcurrentCompilationTaskCount, nuint, iOS 26.1+; 0 before: Auto's count), capped at the phone's cores; in the background on a charger: Utility
+#     QoS instead of Background (still one worker). Kept: none at thermal Serious or Critical (a charger does not lift it), one in the background, a core count chosen in "Shader
+#     preparation" wins. The automatic run starts threads for the device's limit (the extra ones wait while it is off), so a switch applies to the run that is going.
+#     The phone's charging state: UIDevice.BatteryState (its notification), on the main thread.
+# W4 -- WarmCompile compiles for size: MTLCompileOptions.OptimizationLevel = MTLLibraryOptimizationLevel.Size, always (engine-patches/0535 sets the same in the host's src_compile).
+#   WarmCompile's options are now, in full: OptimizationLevel Size, MathMode Relaxed (iOS 18+, always here), PreserveInvariance true, LanguageVersion 4.0 only for a source containing
+#   "vertex_value<" (iOS 26+), else the default; nothing else set (no macros, no install name, no libraries, the default library type).
+# B2 -- the translator's GC cost (GameAppField.cs TranslatorGc, GameAppMain.cs): at the end of each chain run of a build (not a Play), one line
+#   "translator GC: gen0 N, gen1 N, gen2 N (F forced, X s), paused Y s, T translations": the deltas of GC.CollectionCount(0/1/2) and GC.GetTotalPauseDuration() over the chain run
+#   (process-wide counts; the translator is what allocates then), the compacting collections XlateEntry forces itself and their own time (timed there: the runtime may report no pause,
+#   then "paused n/a"). No line when the run translated nothing.
+# B9 -- "Optimized translator (experimental)" (Settings > Build, off by default): saved as xlate_optimized 1/0 (GameAppUi.XlateOptimizedOn); the chain reads the key at each build (the
+#   Rust side, not in this patch). The change is said in the log ("build setting: optimized translator (experimental) on: ...; it applies to the next build ...").
+# The three switches sit in the Settings shelf's Build card after "Low performance" (GameAppShelf.cs), and in the older Build section (GameAppMain.cs BuildSection) after its own.
+# VERIFIED (2026-11-23, M1 Pro): every patch 0010-0104 applies in order (scripts/check-patches-apply.sh); compile only (dotnet build -c Release -r ios-arm64 -t:Compile on the last device
+#   build's generated project): 0 errors, the same warnings per file and code as without 0104. The pure parts (ShaderCacheCheck, FastWarm, GameWarmLogic's header checks) compiled on the
+#   Mac with WARM_LOGIC_ONLY: 51 checks pass (same boot, a 90 s clock step, a reboot, an iOS update, a pre-0104 marker, check off; the probe's rows and verdict, the reset guard; the worker
+#   counts and the QoS rule); the sysctl reads (kern.boottime as a 16-byte timeval, kern.osversion) and the GC line, on the Mac.
+# NOT VERIFIED: anything on an iPhone: the boot time and OS build read there, the probe's times (cache hit vs cold), the reset after a real reboot, MaximumConcurrentCompilationTaskCount's
+#   value, the speed and heat of the faster preparation, the GC line's numbers, the switches' layout. Whether Metal's cache really keys on optimizationLevel on iOS is measured on the Mac only
+#   (engine-patches/0535).
+# NEW STRINGS: "Check the shader cache", "iOS empties its shader cache when the phone restarts or iOS is updated. ...", "shader cache: ", "iOS emptied its shader cache since, so the game
+#   is prepared again", " prepared libraries compiled again in ", "the preparation stands", "Faster shader preparation", "Compiles as many shaders at once as the phone allows ...",
+#   "faster shader preparation on", "Optimized translator (experimental)", "Smaller and faster shaders, but experimental: ...", "build setting: optimized translator (experimental) ",
+#   "translator GC: gen0 ".
+diff -ruN t103/GameAppField.cs u/GameAppField.cs
+--- t103/GameAppField.cs	2026-11-22 23:54:25
++++ u/GameAppField.cs	2026-11-23 00:04:08
+@@ -240,6 +240,38 @@
+         buf == null || buf.Length < 32 ? -1 : (long) Math.Min((ulong) long.MaxValue, (ulong) BitConverter.ToUInt32(buf, 0) * BitConverter.ToUInt64(buf, 24));
+ }
+ 
++/// Patch 0104 (B9): "Optimized translator (experimental)" (Settings › Build, off by default), saved as xlate_optimized 1/0 in Documents/gameapp.settings.tsv; the chain reads it at the start of
++/// every build (the Rust side). Smaller and faster shaders, but a game built with it may show graphics errors.
++public static class XlateOptimized
++{
++    public const string SettingKey = "xlate_optimized";
++    public const string Title = "Optimized translator (experimental)";
++    public const string Note = "Smaller and faster shaders, but experimental: a game built with it may show graphics errors. Applies to the next build; turn it off and rebuild if a game looks wrong.";
++}
++
++/// Patch 0104 (B2): the translator's GC cost over one chain run, one line at its end. The counts are the process's (GC.CollectionCount), the translator being what allocates while a build
++/// translates (~2.7 MB a shader); `Forced` the compacting collections XlateEntry asks for itself (every 40 translations, and at each one below 1.5 GB left) and their own time, measured there,
++/// since GC.GetTotalPauseDuration may say 0 on this runtime.
++public static class TranslatorGc
++{
++    public readonly record struct Sample(int Gen0, int Gen1, int Gen2, TimeSpan Paused, long Translations, long Forced, TimeSpan ForcedTime);
++
++    public static Sample Now(long translations, long forced, TimeSpan forcedTime) =>
++        new Sample(GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2), GC.GetTotalPauseDuration(), translations, forced, forcedTime);
++
++    /// "translator GC: gen0 120, gen1 40, gen2 31 (30 forced, 12.4 s), paused 15.2 s, 1,200 translations"; null when the run translated nothing.
++    public static string Line(Sample a, Sample b)
++    {
++        long n = b.Translations - a.Translations;
++        if (n <= 0) return null;
++        string S(TimeSpan t) => t.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture) + " s";
++        var paused = b.Paused - a.Paused;
++        return $"translator GC: gen0 {b.Gen0 - a.Gen0}, gen1 {b.Gen1 - a.Gen1}, gen2 {b.Gen2 - a.Gen2} ({b.Forced - a.Forced} forced, {S(b.ForcedTime - a.ForcedTime)}), "
++             + (paused > TimeSpan.Zero ? $"paused {S(paused)}" : "paused n/a (the runtime reports none)")
++             + $", {n.ToString("N0", CultureInfo.InvariantCulture)} translations";
++    }
++}
++
+ /// The build screen's Pause / Cancel row (patch 0085): while a build runs both are shown (off when they cannot act), paused only Cancel (Resume is the main button), else none.
+ /// Patch 0103: the build screen's Mode. Cool (the default): the build's workers run at utility QoS, so the UI keeps its priority, the phone stays cooler and the build is slower.
+ /// Fast: they keep their priority, as before the workers were lowered: faster and hotter, and the app may lag while it builds. Timing only: the built game is the same.
+@@ -925,7 +957,7 @@
+ {
+     /// The files of games/<id>/ that describe what THIS app's Metal cache holds (the warm-up's rows, its "all done" marker, the host's prewarm-tail state): an exported app starts with an
+     /// empty cache, so they are not exported (they made the exported South Park skip all 710 libraries as "already warm": "0 compiled in 0 s"), and a copy an older export left is ignored.
+-    public static readonly IReadOnlyList<string> CacheState = new[] { "warmed.tsv", "prepared.tsv", "pso_tail.tsv" };
++    public static readonly IReadOnlyList<string> CacheState = new[] { "warmed.tsv", "prepared.tsv", "pso_tail.tsv", "cache_probe.tsv" };   // 0104: the cache probe's file too
+ 
+     public static bool IsCacheState(string relative) => relative != null && CacheState.Contains(System.IO.Path.GetFileName(relative), StringComparer.Ordinal);
+ 
+diff -ruN t103/GameAppMain.cs u/GameAppMain.cs
+--- t103/GameAppMain.cs	2026-11-22 23:54:25
++++ u/GameAppMain.cs	2026-11-23 00:04:08
+@@ -90,6 +90,11 @@
+     }
+ 
+     private static long xlateCount;
++    // patch 0104 (B2): the collections XlateEntry forces, and their time (GC.GetTotalPauseDuration may say 0 on this runtime: these are timed here)
++    internal static long XlateCount => Interlocked.Read(ref xlateCount);
++    private static long xlateForced, xlateForcedTicks;
++    internal static long XlateForced => Interlocked.Read(ref xlateForced);
++    internal static TimeSpan XlateForcedTime => TimeSpan.FromTicks(Interlocked.Read(ref xlateForcedTicks));
+ 
+     [System.Runtime.InteropServices.UnmanagedCallersOnly]
+     private static int XlateEntry(int argc, IntPtr argv, IntPtr stdoutOut, IntPtr stderrOut)
+@@ -111,7 +116,12 @@
+         // 1.5 GB is left, a compacting collection hands the freed pages back to the system.
+         var n = Interlocked.Increment(ref xlateCount);
+         if (n % 40 == 0 || AvailableMiBValue() is long left && left >= 0 && left < 1536)
++        {
++            var gc0 = System.Diagnostics.Stopwatch.GetTimestamp();
+             GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, true, true);
++            Interlocked.Increment(ref xlateForced);   // patch 0104 (B2)
++            Interlocked.Add(ref xlateForcedTicks, System.Diagnostics.Stopwatch.GetElapsedTime(gc0).Ticks);
++        }
+         // CoTaskMem is malloc on this platform: the shim frees these with free().
+         if (stdoutOut != IntPtr.Zero) Marshal.WriteIntPtr(stdoutOut, Marshal.StringToCoTaskMemUTF8(so ?? ""));
+         if (stderrOut != IntPtr.Zero) Marshal.WriteIntPtr(stderrOut, Marshal.StringToCoTaskMemUTF8(se ?? ""));
+@@ -1711,6 +1721,17 @@
+         lowPerfLabel.Text = "Low performance (cooler, slower)";
+         var lowPerfRow = new UIStackView(new UIView[] { lowPerfLabel, new UIView(), lowPerf }) { Axis = UILayoutConstraintAxis.Horizontal, Alignment = UIStackViewAlignment.Center };
+ 
++        // patch 0104: the same three switches as the Settings shelf's Build card (GameAppWarm.cs)
++        UIStackView SwitchRow(string title, UISwitch toggle)
++        {
++            var label = Label(UIFontTextStyle.Subheadline, UIColor.Label);
++            label.Text = title;
++            return new UIStackView(new UIView[] { label, new UIView(), toggle }) { Axis = UILayoutConstraintAxis.Horizontal, Alignment = UIStackViewAlignment.Center };
++        }
++        var xlateRow = SwitchRow(XlateOptimized.Title, XlateOptimizedSwitch());
++        var fastRow = SwitchRow(FastWarm.Title, WarmFastSwitch());
++        var checkRow = SwitchRow(ShaderCacheCheck.Title, WarmCheckSwitch());
++
+         cacheSizeLabel = Label(UIFontTextStyle.Subheadline, UIColor.Label);
+         RefreshCacheSize();
+         var clear = UIButton.FromType(UIButtonType.System);
+@@ -1727,7 +1748,7 @@
+         };
+         var cacheRow = new UIStackView(new UIView[] { cacheSizeLabel, new UIView(), clear }) { Axis = UILayoutConstraintAxis.Horizontal, Alignment = UIStackViewAlignment.Center };
+ 
+-        return new UIStackView(new UIView[] { parallelRow, lowPerfRow, cacheRow })
++        return new UIStackView(new UIView[] { parallelRow, lowPerfRow, xlateRow, fastRow, checkRow, cacheRow })
+         {
+             Axis = UILayoutConstraintAxis.Vertical,
+             Spacing = 8,
+@@ -2946,9 +2967,11 @@
+             int rc = -1;
+             string chainError = null;
+             pythonRanThisProcess = true;
++            var gcBefore = TranslatorGc.Now(GameAppMain.XlateCount, GameAppMain.XlateForced, GameAppMain.XlateForcedTime);   // patch 0104 (B2): the translator's GC over this chain run
+             try { rc = GameAppMain.gameapp_run_chain(); }
+             catch (Exception error) { chainError = $"{error.GetType().FullName}: {error.Message}"; }
+             var chainTook = DateTime.Now - chainStarted;
++            var gcLine = bootOnly ? null : TranslatorGc.Line(gcBefore, TranslatorGc.Now(GameAppMain.XlateCount, GameAppMain.XlateForced, GameAppMain.XlateForcedTime));
+             // 131 = paused, 130 = cancelled: not failures (no "stopped at" line, no notification, no gameapp.killed). The chain is not left on the stack, so a Resume may run it again in this process.
+             bool askedBefore = stop.State is StopState.Pausing or StopState.Cancelling;
+             var outcome = stop.ChainReturned(rc, chainError != null);
+@@ -2958,6 +2981,7 @@
+             {
+                 if (chainError != null) Write($"chain exception: {chainError}");
+                 Write($"chain returned {rc} after {Took(chainTook)}");
++                if (gcLine != null) Write(gcLine);   // patch 0104 (B2)
+                 if (askedBefore && outcome is StopOutcome.Finished or StopOutcome.Failed) Write("the stop came too late: the chain had already ended");
+                 failedRun = outcome == StopOutcome.Failed;
+                 lastChainRc = chainError != null ? -1 : rc;
+diff -ruN t103/GameAppShelf.cs u/GameAppShelf.cs
+--- t103/GameAppShelf.cs	2026-11-22 23:54:25
++++ u/GameAppShelf.cs	2026-11-23 00:04:08
+@@ -619,6 +619,9 @@
+         var buildCard = Look.Group(
+             SettingsSwitchRow("Parallel shader preparation", "Uses every core while a build translates the shaders. Applies from the next build.", parallel),
+             SettingsSwitchRow("Low performance", "Cooler and slower: at most two jobs at once, also in a build that is running.", lowPerf),
++            SettingsSwitchRow(XlateOptimized.Title, XlateOptimized.Note, XlateOptimizedSwitch()),   // patch 0104 (B9)
++            SettingsSwitchRow(FastWarm.Title, FastWarm.Note, WarmFastSwitch()),                     // patch 0104 (W3, GameAppWarm.cs)
++            SettingsSwitchRow(ShaderCacheCheck.Title, ShaderCacheCheck.Note, WarmCheckSwitch()),    // patch 0104 (W2, GameAppWarm.cs)
+             warmCoresBlock,
+             SettingsSwitchRow(StorageOptimizer.Title, StorageOptimizer.Note, optimize),   // GameAppSlot.cs (patch 0073)
+             cacheHolder);
+@@ -1035,7 +1038,7 @@
+             // patch 0086: a finished preparation says so ("Shaders prepared", "5,009 prepared"), with no Pause and no bar (prepared.tsv's "all" row of this app build and chain)
+             string preparedText = null;
+             try { var mk = Path.Combine(docs, "games", (tid ?? "").ToUpperInvariant(), "prepared.tsv"); if (tid != null && File.Exists(mk)) preparedText = File.ReadAllText(mk); } catch (Exception) { }
+-            bool prepared = !GameExport.IsPlayer && !thisOne && preparedText != null && GameWarmLogic.PreparedDone(preparedText, GameWarmLogic.Header(GameWarm.CacheBuild, GameAppBuild.ShaderChain), true);
++            bool prepared = !GameExport.IsPlayer && !thisOne && preparedText != null && GameWarmLogic.PreparedDone(preparedText, GameWarm.MarkerHeader, true);   // patch 0104: this boot and OS build too
+             var prepare = SettingsRow(GameExport.IsPlayer ? "Prepare the shaders…" : prepared ? "Shaders prepared" : thisOne ? "Pause the preparation" : "Prepare this one now", prepared ? null : () => Then(() => PrepareShadersFor(game)), !prepared, false);
+             var wt = (tid ?? "").ToUpperInvariant();
+             prepare.Value.Text = GameExport.IsPlayer ? (GameWarm.Active ? "Running" : "")
+diff -ruN t103/GameAppUi.cs u/GameAppUi.cs
+--- t103/GameAppUi.cs	2026-11-22 23:54:25
++++ u/GameAppUi.cs	2026-11-23 00:04:08
+@@ -592,6 +592,18 @@
+     public static bool FastBuildOn(string settingsText) =>
+         AppSetting(settingsText, "fast_build", "0").ToLowerInvariant() is "1" or "on" or "yes" or "true";
+ 
++    /// Patch 0104 (W2): "Check the shader cache", on unless the file says shader_cache_check 0 (ShaderCacheCheck, GameAppWarm.cs).
++    public static bool ShaderCacheCheckOn(string settingsText) =>
++        AppSetting(settingsText, ShaderCacheCheck.SettingKey, "1").ToLowerInvariant() is not ("0" or "off" or "no" or "false");
++
++    /// Patch 0104 (W3): "Faster shader preparation", off unless the file says shader_prep_fast 1 (FastWarm, GameAppWarm.cs).
++    public static bool FastShaderPrepOn(string settingsText) =>
++        AppSetting(settingsText, FastWarm.SettingKey, "0").ToLowerInvariant() is "1" or "on" or "yes" or "true";
++
++    /// Patch 0104 (B9): "Optimized translator (experimental)", off unless the file says xlate_optimized 1. The chain reads the same key at the start of every build (the Rust side).
++    public static bool XlateOptimizedOn(string settingsText) =>
++        AppSetting(settingsText, XlateOptimized.SettingKey, "0").ToLowerInvariant() is "1" or "on" or "yes" or "true";
++
+     // ---- deleting a game ---------------------------------------------------------------------------------------------
+ 
+     /// What deleting a game removes, as paths relative to Documents: its dump and the update / add-on dumps of the same
+diff -ruN t103/GameAppWarm.cs u/GameAppWarm.cs
+--- t103/GameAppWarm.cs	2026-11-22 23:54:25
++++ u/GameAppWarm.cs	2026-11-23 00:07:40
+@@ -3,7 +3,8 @@
+ //
+ // Why it works: the host (paches/0007, nvn_mtl.m src_compile) compiles each library of a source pack at its first use with
+ //     [MTLDevice newLibraryWithSource: <the .metal file's text, as UTF-8> options: {mathMode = Relaxed, preserveInvariance = YES,
+-//      languageVersion = 4.0 ONLY when the text contains "vertex_value<", else the default; no macros}]
++//      languageVersion = 4.0 ONLY when the text contains "vertex_value<", else the default; no macros;
++//      optimizationLevel = MTLLibraryOptimizationLevelSize since app/patches/0104, set in the host's src_compile at the same time}]
+ // and the system's compile cache, which works across launches of the SAME app (one library: 524.8 ms, then 1.4 ms), is keyed by the
+ // source text and those options. The host runs inside this app's process (a dylib), so this app's own call with the same text and the
+ // same options makes the same key. The options live in WarmCompile below: change them there and in nvn_mtl.m together, or the
+@@ -42,6 +43,7 @@
+ 
+ using System;
+ using System.Collections.Generic;
++using System.Globalization;
+ using System.IO;
+ using System.Linq;
+ using System.Security.Cryptography;
+@@ -114,12 +116,13 @@
+     public static string Header(string appBuild, string chain) => $"# warmed app_build {appBuild} chain {chain}";
+ 
+     /// The libraries warmed under this header ("name\tdigest" keys), from the file's text; empty when the header is another one.
++    /// Patch 0104: "another one" by ShaderCacheCheck.Holds (the app build and the chain, and the boot and OS build when `header` carries them).
+     public static HashSet<string> ParseWarmed(string text, string header)
+     {
+         var done = new HashSet<string>(StringComparer.Ordinal);
+         if (string.IsNullOrEmpty(text)) return done;
+         var lines = text.Split('\n');
+-        if (lines[0].TrimEnd('\r') != header) return done;
++        if (!ShaderCacheCheck.Holds(lines[0], header)) return done;
+         foreach (var raw in lines.Skip(1))
+         {
+             var c = raw.TrimEnd('\r').Split('\t');
+@@ -305,8 +308,9 @@
+     }
+ 
+     /// prepared.tsv: the first line names the app build and the chain (the same header as warmed.tsv); present and equal, the first-start preparation was done for this build.
++    /// Patch 0104: equal by ShaderCacheCheck.Holds (with the check on, a marker of another boot or OS build does not hold).
+     public static bool PreparedMatches(string preparedText, string header) =>
+-        !string.IsNullOrEmpty(preparedText) && preparedText.Split('\n')[0].TrimEnd('\r') == header;
++        !string.IsNullOrEmpty(preparedText) && ShaderCacheCheck.Holds(preparedText.Split('\n')[0], header);
+ 
+     /// "Preparing the game… 120 of 900", the line of the first-start preparation.
+     public static string FirstStartText(int done, int total) => $"Preparing the game (once)… {done} of {total}";
+@@ -479,6 +483,139 @@
+     public static string PausedLine(string name, int waiting) => "Shader preparation paused · " + name + MoreWaiting(waiting);
+ }
+ 
++/// Patch 0104 (W2): iOS's Metal shader cache (about 255 MB) is emptied at a reboot, a reinstall and an iOS update (developer.apple.com/forums/thread/659856). The markers (warmed.tsv,
++/// prepared.tsv) named only the app build and the chain, so after a reboot a game stayed "prepared" and its first Play compiled cold (1,061-1,708 s measured). Their first line now also names
++/// the boot (kern.boottime, seconds) and the OS build (kern.osversion) it was written under: "# warmed app_build <b> chain <c> boot <seconds> os <build>". With the setting "Check the shader
++/// cache" (on by default) a marker of another boot or OS build does not hold; off, only the app build and the chain count, as before. The epoch is always WRITTEN, whatever the setting.
++/// What the header cannot see (iOS emptied the cache for its own reasons) a probe at the warm-up's start sees: 3 libraries the markers say are done are compiled again and timed (Verdict).
++internal static class ShaderCacheCheck
++{
++    public const string SettingKey = "shader_cache_check";   // Documents/gameapp.settings.tsv, 1 (the default) or 0
++    public const string Title = "Check the shader cache";
++    public const string Note = "iOS empties its shader cache when the phone restarts or iOS is updated. On: a game prepared before that is prepared again, so its first play does not stop to compile.";
++
++    /// Two boot times this close are the same boot: iOS moves kern.boottime when it steps the clock (network time), never by a reboot's worth.
++    public const long BootSlackSeconds = 120;
++    /// A library the cache holds compiles in 1-4 ms (524.8 ms cold, then 1.4 ms, one library, iPhone 15 Pro); above this, every one of the probe, the cache was emptied.
++    public const double ColdMs = 50;
++    /// How many done libraries the probe compiles again (the first ones the markers name: the seed list's front, the first iOS keeps).
++    public const int ProbeCount = 3;
++    /// The file of games/<id>/ that says in which epoch the probe last reset the game's markers: a game found cold AGAIN in the same epoch is not reset again (iOS's cache may simply not
++    /// keep its libraries; resetting would prepare it for ever).
++    public const string ProbeFile = "cache_probe.tsv";
++
++    /// "boot 1763900000 os 23A341", or null when either is unknown (then nothing is checked against it).
++    public static string Epoch(long bootSeconds, string osBuild) =>
++        bootSeconds > 0 && !string.IsNullOrWhiteSpace(osBuild) && !osBuild.Trim().Contains(' ') ? $"boot {bootSeconds} os {osBuild.Trim()}" : null;
++
++    /// The header with the epoch after it (null epoch: the header as it is).
++    public static string WithEpoch(string header, string epoch) => epoch == null ? header : header + " " + epoch;
++
++    /// A marker's first line cut into the app build and chain part and the epoch part (null when it has none: a marker written before 0104).
++    public static (string Base, string Epoch) Split(string line)
++    {
++        line ??= "";
++        int i = line.LastIndexOf(" boot ", StringComparison.Ordinal);
++        return i < 0 ? (line, null) : (line.Substring(0, i), line.Substring(i + 1));
++    }
++
++    private static bool Parse(string epoch, out long boot, out string os)
++    {
++        boot = 0; os = null;
++        var p = (epoch ?? "").Split(' ');
++        if (p.Length != 4 || p[0] != "boot" || p[2] != "os" || !long.TryParse(p[1], NumberStyles.None, CultureInfo.InvariantCulture, out boot)) return false;
++        os = p[3];
++        return true;
++    }
++
++    /// Why a marker of epoch `was` does not hold now (`now`), or null when it does: "the phone restarted", "iOS was updated (23A341 to 23B82)", "it was written before the check".
++    public static string Changed(string was, string now)
++    {
++        if (now == null) return null;   // the epoch of this boot is unknown: nothing to check against
++        if (!Parse(was, out long b0, out string o0)) return "it was written before the check";
++        if (!Parse(now, out long b1, out string o1)) return null;
++        if (!string.Equals(o0, o1, StringComparison.Ordinal)) return $"iOS was updated ({o0} to {o1})";
++        return Math.Abs(b1 - b0) > BootSlackSeconds ? "the phone restarted" : null;
++    }
++
++    /// Whether a marker's first line holds for `expected` (GameWarm.MarkerHeader: the header, with this boot's epoch when the check is on). The app build and the chain must be the same; then,
++    /// when `expected` carries an epoch, the line's must be the same boot and OS build. Two lines without an epoch compare as before 0104 (equal or not).
++    public static bool Holds(string line, string expected)
++    {
++        var (lb, le) = Split((line ?? "").TrimEnd('\r'));
++        var (eb, ee) = Split(expected ?? "");
++        if (!string.Equals(lb, eb, StringComparison.Ordinal)) return false;
++        return ee == null || Changed(le, ee) == null;
++    }
++
++    /// Why a marker's first line does not hold for `expected` BECAUSE OF ITS EPOCH (the same app build and chain), or null (it holds, or another build or chain wrote it: not this check's doing).
++    public static string WhyCold(string line, string expected)
++    {
++        var (lb, le) = Split((line ?? "").TrimEnd('\r'));
++        var (eb, ee) = Split(expected ?? "");
++        if (!string.Equals(lb, eb, StringComparison.Ordinal) || ee == null) return null;
++        return Changed(le, ee);
++    }
++
++    /// The probe's rows: the first `count` libraries of warmed.tsv (its rows after the header) that were COMPILED (ms > 0: a skipped or shared one is 0, a failed one -1), as (name, digest).
++    public static List<(string Name, string Digest)> ProbeRows(string warmedText, int count)
++    {
++        var list = new List<(string, string)>();
++        if (string.IsNullOrEmpty(warmedText)) return list;
++        foreach (var raw in warmedText.Split('\n').Skip(1))
++        {
++            if (list.Count >= count) break;
++            var c = raw.TrimEnd('\r').Split('\t');
++            if (c.Length >= 3 && c[0].Length > 0 && c[1].Length > 0 && long.TryParse(c[2], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long ms) && ms > 0)
++                list.Add((c[0], c[1]));
++        }
++        return list;
++    }
++
++    public enum Probe { Warm, Cold, Unknown }
++
++    /// The probe's verdict from the times of the libraries it compiled again: Cold when EVERY one took more than ColdMs (the first compile of a process may pay for the compiler's start: one
++    /// slow library alone is not a cold cache), Warm otherwise, Unknown when none could be compiled.
++    public static Probe Verdict(IReadOnlyList<double> ms) =>
++        ms == null || ms.Count == 0 ? Probe.Unknown : ms.All(m => m > ColdMs) ? Probe.Cold : Probe.Warm;
++
++    /// What the probe does with a Cold verdict: reset the game's markers, unless the probe already reset them in this same epoch (ProbeFile holds it).
++    public static bool ResetOnCold(string probeFileText, string epoch) =>
++        epoch == null || !string.Equals((probeFileText ?? "").Split('\n')[0].TrimEnd('\r'), epoch, StringComparison.Ordinal);
++
++    /// The probe's times as the log says them: "1.4, 2.0, 1.1 ms".
++    public static string Times(IReadOnlyList<double> ms) => string.Join(", ", (ms ?? new List<double>()).Select(m => m.ToString("F1", CultureInfo.InvariantCulture))) + " ms";
++}
++
++/// Patch 0104 (W3): "Faster shader preparation" (off by default): the automatic run uses as many workers as Metal compiles at once on this device (MTLDevice.MaximumConcurrentCompilationTaskCount,
++/// 4 on an iPhone 15 Pro) in the foreground while the phone is cool (thermal Nominal or Fair), and Utility QoS instead of Background in the background while the phone charges.
++/// The rules of GameWarmLogic.AutoWorkers stay first: none at thermal Serious or Critical, one in the background, and a core count chosen in "Shader preparation" wins over this.
++internal static class FastWarm
++{
++    public const string SettingKey = "shader_prep_fast";   // Documents/gameapp.settings.tsv, 1 or 0 (the default)
++    public const string Title = "Faster shader preparation";
++    public const string Note = "Compiles as many shaders at once as the phone allows while it is cool, and keeps a faster pace in the background on a charger. Sooner ready, warmer phone. A core count chosen above wins.";
++
++    /// The device's limit as a worker count: at least one, at most the phone's cores (a device that answers 0, or more than it has cores, is not believed).
++    public static int DeviceWorkers(long deviceMax, int processors) => (int)Math.Max(1, Math.Min(deviceMax <= 0 ? 1 : deviceMax, Math.Max(1, processors)));
++
++    /// How many workers of the automatic run may compile now. Off, or a core count chosen (`choice` > 0), or in the background, or hot: GameWarmLogic.AutoWorkers as before. On, Auto, in the
++    /// foreground at thermal Nominal or Fair (or on a charger: the heat rule above still stops it at Serious): the device's limit, never fewer than Auto would give.
++    public static int Workers(bool fast, int choice, int thermal, bool background, bool charging, int processors, long deviceMax)
++    {
++        int auto = GameWarmLogic.AutoWorkers(choice, thermal, background, processors);
++        if (!fast || choice > 0 || background || auto == 0) return auto;
++        return thermal <= 1 || charging ? Math.Max(auto, DeviceWorkers(deviceMax, processors)) : auto;
++    }
++
++    /// The threads a run of every library starts: what the setting can ask for (GameWarmLogic.MaxCores), or the device's limit when this is on (the ones above the allowed count wait).
++    public static int Planned(bool fast, int processors, long deviceMax) =>
++        fast ? Math.Max(GameWarmLogic.MaxCores(processors), DeviceWorkers(deviceMax, processors)) : GameWarmLogic.MaxCores(processors);
++
++    /// Whether a worker in the background runs at Utility QoS (on, on a charger) rather than Background (always in the foreground: Utility, as before).
++    public static bool UtilityQos(bool fast, bool background, bool charging) => !background || (fast && charging);
++}
++
+ #if !WARM_LOGIC_ONLY
+ /// The warm-up itself: one run at a time, low-QoS threads, stoppable at any moment.
+ internal static class GameWarm
+@@ -525,6 +662,134 @@
+     /// Whether iBuilder is in the background (DidEnterBackground / WillEnterForeground, set on the main thread by the view controller): the automatic run drops to one worker at Background QoS.
+     public static volatile bool InBackground;
+ 
++    /// Patch 0104: the Settings switches the warm-up reads (set by the view controller at launch, at each start and when the owner changes them). "Check the shader cache" (on by default):
++    /// the markers hold only for this boot and OS build, and the probe runs (ShaderCacheCheck). "Faster shader preparation" (off by default): FastWarm.
++    public static volatile bool CheckCache = true;
++    public static volatile bool FastPrep;
++    /// Patch 0104: plugged in (charging or full), set on the main thread by the view controller (UIDevice's battery state, its notification): FastWarm's rule in the background.
++    public static volatile bool Charging;
++
++    // ---- patch 0104 (W2): the epoch of iOS's Metal shader cache, and what the markers are checked against ------------------------------------------------------------------------
++    [DllImport("libc", EntryPoint = "sysctlbyname")] private static extern int SysctlBytes(string name, byte[] oldp, ref nuint oldlen, IntPtr newp, nuint newlen);
++
++    /// "boot <kern.boottime seconds> os <kern.osversion>" of this boot, read once per process; null when iOS does not answer (then the markers are checked as before 0104).
++    private static string ReadEpoch()
++    {
++        try
++        {
++            var tv = new byte[16];   // struct timeval: tv_sec (64 bits), tv_usec
++            nuint tl = (nuint)tv.Length;
++            long boot = SysctlBytes("kern.boottime", tv, ref tl, IntPtr.Zero, 0) == 0 && tl >= 8 ? BitConverter.ToInt64(tv, 0) : 0;
++            var os = new byte[64];
++            nuint ol = (nuint)os.Length;
++            string build = SysctlBytes("kern.osversion", os, ref ol, IntPtr.Zero, 0) == 0 && ol > 0 ? Encoding.ASCII.GetString(os, 0, (int)Math.Min(ol, (nuint)os.Length)).TrimEnd('\0') : null;
++            return ShaderCacheCheck.Epoch(boot, build);
++        }
++        catch (Exception) { return null; }
++    }
++    private static readonly Lazy<string> epoch = new Lazy<string>(ReadEpoch);
++    public static string Epoch => epoch.Value;
++
++    /// What a marker's first line is checked against: the app build and the chain, and with "Check the shader cache" on this boot and OS build too (ShaderCacheCheck.Holds).
++    public static string MarkerHeader => ShaderCacheCheck.WithEpoch(GameWarmLogic.Header(CacheBuild, GameAppBuild.ShaderChain), CheckCache ? Epoch : null);
++    /// What a marker is written with: always this boot and OS build (so turning the check on later knows when each marker was made).
++    public static string WrittenHeader => ShaderCacheCheck.WithEpoch(GameWarmLogic.Header(CacheBuild, GameAppBuild.ShaderChain), Epoch);
++
++    private static readonly HashSet<string> cacheLooked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++    private static string ReadOrEmpty(string path) { try { return File.Exists(path) ? File.ReadAllText(path) : ""; } catch (Exception) { return ""; } }
++    private static string FirstLine(string text) => (text ?? "").Split('\n')[0].TrimEnd('\r');
++
++    /// Patch 0104 (W2): once per process and game, with "Check the shader cache" on: says when the game's markers are from another boot or OS build (they no longer hold: it is prepared
++    /// again), else compiles again the first ShaderCacheCheck.ProbeCount libraries its warmed.tsv says were compiled, timed: every one above ShaderCacheCheck.ColdMs means iOS's cache was
++    /// emptied, and the game's markers are reset (warmed.tsv to its header, prepared.tsv removed) so it is prepared again; not twice in the same epoch (ShaderCacheCheck.ProbeFile). Each
++    /// decision is one log line. `mayCompile` false: the probe is not run now (a build or a game has the phone), and the next call looks again. Worker thread only (it compiles).
++    public static void CheckCacheOnce(string titleId, string packRoot, Func<bool> mayCompile)
++    {
++        try
++        {
++            if (!CheckCache || string.IsNullOrEmpty(titleId)) return;
++            var now = Epoch;
++            if (now == null) return;
++            var tid = titleId.ToUpperInvariant();
++            lock (cacheLooked) if (cacheLooked.Contains(tid)) return;
++            var gameDir = Path.Combine(GameAppMain.Documents, "games", tid);
++            string warmedPath = Path.Combine(gameDir, "warmed.tsv"), preparedPath = Path.Combine(gameDir, "prepared.tsv"), probePath = Path.Combine(gameDir, ShaderCacheCheck.ProbeFile);
++            string warmedText = ReadOrEmpty(warmedPath), preparedText = ReadOrEmpty(preparedPath);
++            void Done() { lock (cacheLooked) cacheLooked.Add(tid); }
++            var expected = MarkerHeader;
++            // The header: a marker of this app build and chain, of another boot or OS build (it does not hold: FirstStartPending queues the game and its run starts from nothing)
++            var why = ShaderCacheCheck.WhyCold(FirstLine(preparedText.Length > 0 ? preparedText : warmedText), expected);
++            if (why != null)
++            {
++                Done();
++                Log($"shader cache: {tid} was prepared before {why}: iOS emptied its shader cache since, so the game is prepared again");
++                return;
++            }
++            // The probe: warmed.tsv of this app build and chain names libraries it compiled; are they still in the cache?
++            if (warmedText.Length == 0 || ShaderCacheCheck.Split(FirstLine(warmedText)).Base != ShaderCacheCheck.Split(expected).Base) { Done(); return; }
++            var rows = ShaderCacheCheck.ProbeRows(warmedText, ShaderCacheCheck.ProbeCount);
++            if (rows.Count == 0) { Done(); return; }
++            if (mayCompile != null && !mayCompile()) return;
++            Done();
++            var device = MTLDevice.SystemDefault;
++            if (device == null) return;
++            var chain = GameAppBuild.ShaderChain;
++            var pack = Directory.Exists(packRoot ?? "")
++                ? Directory.EnumerateDirectories(packRoot).FirstOrDefault(d => string.Equals(Path.GetFileName(d), tid, StringComparison.OrdinalIgnoreCase)) : null;
++            var image = pack != null ? Path.Combine(pack, "b-" + chain + ".img") : null;
++            var files = image != null && File.Exists(image) ? GameWarmLogic.ReadImageIndex(image) : null;
++            var learnedDir = Path.Combine(gameDir, "learned_shaders", "b-" + chain);
++            var times = new List<double>();
++            foreach (var (name, digest) in rows)
++            {
++                byte[] bytes = null;
++                try
++                {
++                    var f = files?.FirstOrDefault(x => x.Name == name);
++                    if (f != null)
++                    {
++                        bytes = new byte[f.Size];
++                        using var fs = new FileStream(image, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
++                        fs.Position = f.Offset;
++                        for (int got = 0; got < bytes.Length;) { int r = fs.Read(bytes, got, bytes.Length - got); if (r <= 0) throw new IOException("short read"); got += r; }
++                    }
++                    else if (File.Exists(Path.Combine(learnedDir, name))) bytes = File.ReadAllBytes(Path.Combine(learnedDir, name));
++                }
++                catch (Exception) { bytes = null; }
++                if (bytes == null || GameWarmLogic.Digest(bytes) != digest) continue;   // another text under that name now: not the library the marker names
++                string text;
++                try { text = new UTF8Encoding(false, true).GetString(bytes); } catch (Exception) { continue; }
++                using var pool = new NSAutoreleasePool();
++                var t0 = Stopwatch.GetTimestamp();
++                if (WarmCompile(device, text, out _) != null) times.Add(Stopwatch.GetElapsedTime(t0).TotalMilliseconds);
++            }
++            switch (ShaderCacheCheck.Verdict(times))
++            {
++                case ShaderCacheCheck.Probe.Unknown:
++                    Log($"shader cache: {tid}: none of the prepared libraries it names could be compiled again (its pack changed?): nothing decided");
++                    break;
++                case ShaderCacheCheck.Probe.Warm:
++                    Log($"shader cache: {tid}: {times.Count} prepared librar{(times.Count == 1 ? "y" : "ies")} compiled again in {ShaderCacheCheck.Times(times)}: iOS's cache holds them, the preparation stands");
++                    break;
++                default:
++                    if (!ShaderCacheCheck.ResetOnCold(ReadOrEmpty(probePath), now))
++                    {
++                        Log($"shader cache: [ORANGE] {tid}: {times.Count} prepared libraries compiled again in {ShaderCacheCheck.Times(times)}: still not in iOS's cache although it was prepared again "
++                            + "since this boot: iOS does not keep them; it is not prepared again (that would never end)");
++                        break;
++                    }
++                    Directory.CreateDirectory(gameDir);
++                    File.WriteAllText(warmedPath, WrittenHeader + "\n");
++                    if (File.Exists(preparedPath)) File.Delete(preparedPath);
++                    File.WriteAllText(probePath, now + "\n");
++                    Log($"shader cache: {tid}: {times.Count} prepared libraries compiled again in {ShaderCacheCheck.Times(times)} (a cached one takes 1-4 ms): iOS emptied its shader cache, "
++                        + "the game's markers are reset and it is prepared again");
++                    break;
++            }
++        }
++        catch (Exception error) { Log($"shader cache: [ORANGE] {titleId}: the check failed ({error.GetType().Name}: {error.Message}): nothing decided"); }
++    }
++
+     /// Whether a preparation is still owed: it has a library to compile and no prepared.tsv for this app build and chain (`all`: no prepared.tsv of the run of every library, the main app's
+     /// automatic run; else the seed-list run's, an exported player's first start). Reads a directory listing and a small file: call it off the main thread.
+     public static bool FirstStartPending(string titleId, string packRoot, bool all = false)
+@@ -533,7 +798,7 @@
+         {
+             if (!HasLibrary(titleId, packRoot)) return false;
+             var marker = Path.Combine(GameAppMain.Documents, "games", titleId.ToUpperInvariant(), "prepared.tsv");
+-            return !GameWarmLogic.PreparedDone(File.Exists(marker) ? File.ReadAllText(marker) : "", GameWarmLogic.Header(CacheBuild, GameAppBuild.ShaderChain), all);
++            return !GameWarmLogic.PreparedDone(File.Exists(marker) ? File.ReadAllText(marker) : "", MarkerHeader, all);   // patch 0104: this boot and OS build too
+         }
+         catch (Exception) { return false; }
+     }
+@@ -559,6 +824,7 @@
+         using var options = new MTLCompileOptions();
+         if (OperatingSystem.IsIOSVersionAtLeast(18)) options.MathMode = MTLMathMode.Relaxed;   // the host: o.mathMode = Relaxed (it targets iOS 26)
+         options.PreserveInvariance = true;
++        options.OptimizationLevel = MTLLibraryOptimizationLevel.Size;   // patch 0104 (W4): the host sets the same (nvn_mtl.m src_compile); one differing option and every warm-up misses the cache
+         if (GameWarmLogic.NeedsMsl4(text) && OperatingSystem.IsIOSVersionAtLeast(26)) options.LanguageVersion = MTLLanguageVersion.v4_0;
+         var lib = device.CreateLibrary(text, options, out NSError e);
+         if (lib == null) { error = e?.LocalizedDescription ?? "no library"; return null; }
+@@ -646,9 +912,10 @@
+ 
+     /// The threads a run starts. The seed-list run (an exported player's first start): four (the boot's own prepare used six) at UserInitiated. A manual run of the whole library: two at Utility.
+     /// The automatic run: as many as the setting can ask for (GameWarmLogic.MaxCores), each one compiling only while its number is below GameWarmLogic.AutoWorkers.
+-    private static int WorkersPlanned(GameWarmLogic.WarmKind kind) =>
++    /// Patch 0104: the automatic run plans for the device's compile limit too (FastWarm.Planned), so "Faster shader preparation" applies to a run that is going; the extra ones wait while it is off.
++    private static int WorkersPlanned(GameWarmLogic.WarmKind kind, long deviceMax = 0) =>
+         kind == GameWarmLogic.WarmKind.SeedList ? Math.Min(4, Math.Max(1, Environment.ProcessorCount - 2))
+-        : kind == GameWarmLogic.WarmKind.Everything ? GameWarmLogic.MaxCores(Environment.ProcessorCount)
++        : kind == GameWarmLogic.WarmKind.Everything ? FastWarm.Planned(true, Environment.ProcessorCount, deviceMax)
+         : Math.Min(2, Math.Max(1, Environment.ProcessorCount / 2));
+ 
+     /// Returns whether the run COMPLETED (every library of it done, and for the two automatic kinds prepared.tsv written).
+@@ -657,7 +924,7 @@
+         bool firstStart = kind == GameWarmLogic.WarmKind.SeedList;
+         bool everything = kind == GameWarmLogic.WarmKind.Everything;
+         bool seedFirst = GameWarmLogic.SeedFirst(kind);
+-        if (everything) SetQos(InBackground ? QosBackground : QosUtility);
++        if (everything) SetQos(FastWarm.UtilityQos(FastPrep, InBackground, Charging) ? QosUtility : QosBackground);   // patch 0104: Utility on a charger with the faster preparation
+         else NSThread.Current.QualityOfService = firstStart ? NSQualityOfService.UserInitiated : NSQualityOfService.Utility;
+         var documents = GameAppMain.Documents;
+         var chain = GameAppBuild.ShaderChain;
+@@ -697,7 +964,9 @@
+ 
+         var gameDir = Path.Combine(documents, "games", titleId.ToUpperInvariant());
+         var warmedPath = Path.Combine(gameDir, "warmed.tsv");
+-        var header = GameWarmLogic.Header(CacheBuild, chain);
++        // patch 0104: checked against this boot and OS build too (the setting), always written with them
++        var header = MarkerHeader;
++        var written = WrittenHeader;
+         string Stamp() => DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+         if (items.Count == 0)
+         {
+@@ -706,18 +975,24 @@
+             // An automatic run with nothing in it is done for this build too: without the marker every launch would read the pack again to find nothing
+             if (seedFirst && Current(mine) && pack != null)
+             {
+-                try { Directory.CreateDirectory(gameDir); File.WriteAllText(Path.Combine(gameDir, "prepared.tsv"), GameWarmLogic.PreparedText(header, everything, 0, Stamp())); return true; }
++                try { Directory.CreateDirectory(gameDir); File.WriteAllText(Path.Combine(gameDir, "prepared.tsv"), GameWarmLogic.PreparedText(written, everything, 0, Stamp())); return true; }
+                 catch (Exception) { }
+             }
+             return false;
+         }
++        // patch 0104 (W2): at the start of a run, the probe (once per process and game; a header of another boot or OS build is said too): what it resets is read as nothing done below
++        CheckCacheOnce(titleId, packRoot, () => Current(mine));
++        header = MarkerHeader;   // the setting may have changed meanwhile
+         HashSet<string> warmed;
+         try { warmed = GameWarmLogic.ParseWarmed(File.Exists(warmedPath) ? File.ReadAllText(warmedPath) : "", header); }
+         catch (Exception) { warmed = new HashSet<string>(); }
+         Directory.CreateDirectory(gameDir);
+-        if (warmed.Count == 0) File.WriteAllText(warmedPath, header + "\n");   // another build's rows are dropped here, with its header
++        if (warmed.Count == 0) File.WriteAllText(warmedPath, written + "\n");   // another build's rows are dropped here, with its header (0104: another boot's or OS build's too)
+         var device = MTLDevice.SystemDefault;
+         if (device == null) { Log("shader warm-up: no Metal device"); return false; }
++        // patch 0104 (W3): how many compiles Metal runs at once on this device (4 on an iPhone 15 Pro), for "Faster shader preparation"; the binding has it from iOS 26.1 (0 before: Auto's count)
++        long deviceMax = 0;
++        try { if (OperatingSystem.IsIOSVersionAtLeast(26, 1)) deviceMax = (long)device.MaximumConcurrentCompilationTaskCount; } catch (Exception) { deviceMax = 0; }
+ 
+         int total = items.Count, usedDone = 0, done = 0, compiled = 0, failed = 0, skipped = 0, next = -1, cacheNoted = 0, lastAllowed = -1;
+         Volatile.Write(ref progressTotal, total);
+@@ -755,16 +1030,18 @@
+             Log($"shader warm-up: {(why != null ? why + ": " : "")}all {total:N0} librar{(total == 1 ? "y" : "ies")} of {titleId} into Metal's cache, at low priority: {front:N0} of the seed list, the learned and the used first "
+                 + $"(the order the host asks for them), then every other library of the pack; cores: {GameWarmLogic.CoresLabel(CoresChoice)} (Utility QoS in the foreground, Background QoS and one worker in the background, "
+                 + "none at thermal Serious or Critical); what warmed.tsv already holds for this app build is skipped"
++                + (FastPrep ? $"; faster shader preparation on: up to {FastWarm.DeviceWorkers(deviceMax, Environment.ProcessorCount)} workers in the foreground while the phone is cool "
++                              + $"(Metal compiles {deviceMax} at once on this {GameAppUi.DeviceName}), Utility QoS in the background on a charger" : "")
+                 + (lowPower ? ". Low Power Mode is on: iOS runs the CPU slower, the preparation goes on (it does not pause for it)" : ""));
+         }
+         else if (firstStart)
+             Log($"shader warm-up: {(why != null ? why + ": " : "")}{total} librar{(total == 1 ? "y" : "ies")} of {titleId}'s seed list (cap {GameWarmLogic.WarmCap}; the list, the learned and the used ones name {front}) "
+-                + $"to compile into Metal's cache, {WorkersPlanned(kind)} workers; what warmed.tsv already holds for this app build is skipped");
++                + $"to compile into Metal's cache, {WorkersPlanned(kind, deviceMax)} workers; what warmed.tsv already holds for this app build is skipped");
+         else
+             Log($"shader warm-up: {(why != null ? why + ": " : "")}{total} librar{(total == 1 ? "y" : "ies")} of {titleId} to prepare so the first session finds them in Metal's cache ({played} used in earlier sessions, {learnedCount} learned while it ran; the other {total - front} wait for a charger or a cool phone)");
+         Report();
+ 
+-        int workers = WorkersPlanned(kind);
++        int workers = WorkersPlanned(kind, deviceMax);
+         int processors = Environment.ProcessorCount;
+         var threads = new List<Thread>();
+         for (int w = 0; w < workers; w++)
+@@ -774,7 +1051,7 @@
+             {
+                 try
+                 {
+-                    uint qos = InBackground ? QosBackground : QosUtility;
++                    uint qos = FastWarm.UtilityQos(FastPrep, InBackground, Charging) ? QosUtility : QosBackground;   // patch 0104
+                     if (everything) SetQos(qos);
+                     else NSThread.Current.QualityOfService = firstStart ? NSQualityOfService.UserInitiated : NSQualityOfService.Utility;
+                     while (Current(mine))
+@@ -788,10 +1065,15 @@
+                         {
+                             // The automatic run (0076): Utility QoS in the foreground, Background in the background; how many compile is GameWarmLogic.AutoWorkers (the setting, the heat, the
+                             // background), read before every library so a change of any of them applies now. Low Power Mode changes nothing (the owner's choice; iOS slows the CPU itself)
+-                            bool background = InBackground;
+-                            uint want = background ? QosBackground : QosUtility;
+-                            if (want != qos) { SetQos(want); qos = want; }
+-                            int allowed = GameWarmLogic.AutoWorkers(CoresChoice, (int)thermal, background, processors);
++                            // patch 0104 (W3): "Faster shader preparation" (FastWarm): the device's compile limit in the foreground while cool, Utility QoS in the background on a charger
++                            bool background = InBackground, charging = Charging, fast = FastPrep;
++                            uint want = FastWarm.UtilityQos(fast, background, charging) ? QosUtility : QosBackground;
++                            if (want != qos)
++                            {
++                                SetQos(want); qos = want;
++                                if (id == 0 && background && fast) Log(want == QosUtility ? "shader warm-up: in the background on a charger: Utility QoS (faster shader preparation)" : "shader warm-up: in the background off the charger: Background QoS");
++                            }
++                            int allowed = FastWarm.Workers(fast, CoresChoice, (int)thermal, background, charging, processors, deviceMax);
+                             if (id == 0)
+                             {
+                                 var reason = GameWarmLogic.PauseReason((int)thermal, lowMemory);
+@@ -799,7 +1081,8 @@
+                                 if (allowed != lastAllowed)
+                                 {
+                                     lastAllowed = allowed;
+-                                    Log($"shader warm-up: {allowed} worker{(allowed == 1 ? "" : "s")} now (cores: {GameWarmLogic.CoresLabel(CoresChoice)}, thermal {thermal}, {(background ? "in the background" : "in the foreground")})");
++                                    Log($"shader warm-up: {allowed} worker{(allowed == 1 ? "" : "s")} now (cores: {GameWarmLogic.CoresLabel(CoresChoice)}, thermal {thermal}, {(background ? "in the background" : "in the foreground")}"
++                                        + (fast ? $", faster preparation on: Metal compiles {deviceMax} at once{(charging ? ", charging" : "")}" : "") + ")");
+                                 }
+                             }
+                             if (lowMemory || id >= allowed) { Thread.Sleep(allowed == 0 || lowMemory ? 3000 : 2000); continue; }
+@@ -865,7 +1148,7 @@
+         bool complete = Current(mine) && finished >= total;
+         if (complete && seedFirst)
+         {
+-            try { File.WriteAllText(Path.Combine(gameDir, "prepared.tsv"), GameWarmLogic.PreparedText(header, everything, total, Stamp())); }
++            try { File.WriteAllText(Path.Combine(gameDir, "prepared.tsv"), GameWarmLogic.PreparedText(written, everything, total, Stamp())); }
+             catch (Exception error) { complete = false; Log($"shader warm-up: [ORANGE] prepared.tsv could not be written ({error.Message}): the next start goes over the libraries again (as hits)"); }
+         }
+         if (complete) Log(WarmDone.Line(finished, sw.Elapsed.TotalSeconds));   // patch 0086
+@@ -898,6 +1181,7 @@
+             GameWarm.Ended += WarmEnded;
+             GameWarm.CoresChoice = ReadCoresChoice();
+         }
++        ReadWarmSwitches();   // patch 0104
+         GameWarm.Start(tid, root, kind, why);
+         // The warm-up keeps going when the player leaves the app: a continued-processing task (iOS 26) with its own progress on the lock screen, fed once a second by its status. The system accepts
+         // the request only from the foreground: from the background it is asked when iBuilder is next in the foreground (EnsureWarmTask, DidBecomeActive)
+@@ -978,10 +1262,17 @@
+             if (t != null && !built.Any(b => b.Tid == t)) built.Add((t, g));
+         }
+         var root = WarmPackRoot();
++        // patch 0104 (W2): "Check the shader cache": each built game's markers against this boot and OS build, and the probe, once per process and game, before the queue is read. The probe
++        // compiles: only while nothing else has the phone and no preparation runs (else the next sync does it; a run probes its own game at its start)
++        ReadWarmSwitches();
++        GameWarm.Sink ??= line => BeginInvokeOnMainThread(() => Write(line));
++        bool probeFree = !WarmBusy() && !GameWarm.Active;
+         Task.Run(() =>
+         {
+             var owing = new List<string>();
+             foreach (var (t, _) in built)
++                try { GameWarm.CheckCacheOnce(t, root, () => probeFree && !GameWarm.Active); } catch (Exception) { }
++            foreach (var (t, _) in built)
+                 try { if (GameWarm.FirstStartPending(t, root, all: true)) owing.Add(t); } catch (Exception) { }
+             var counts = WarmCountsOf(owing, root);   // patch 0098: each game's "N of M" for the list (its warmed.tsv rows, its pack's libraries), on this worker
+             BeginInvokeOnMainThread(() =>
+@@ -1080,7 +1371,7 @@
+     private static List<(string Tid, (int Done, int Total) Count)> WarmCountsOf(IEnumerable<string> titles, string root)
+     {
+         var list = new List<(string, (int, int))>();
+-        var header = GameWarmLogic.Header(GameWarm.CacheBuild, GameAppBuild.ShaderChain);
++        var header = GameWarm.MarkerHeader;   // patch 0104: this boot and OS build too, with the check on
+         foreach (var t in titles)
+         {
+             int done = 0, total = -1;
+@@ -1225,8 +1516,33 @@
+             BeginInvokeOnMainThread(() => NSTimer.CreateScheduledTimer(2.0, __ => { warmHeldAtLaunch = false; WarmSync("you came back to iBuilder"); }));
+         }));
+         warmObservers.Add(centre.AddObserver(UIApplication.DidBecomeActiveNotification, _ => BeginInvokeOnMainThread(EnsureWarmTask)));
++        // patch 0104 (W3): plugged in or not, for "Faster shader preparation" in the background (UIDevice sends it only while battery monitoring is on: ReadWarmPower turns it on)
++        warmObservers.Add(centre.AddObserver(UIDevice.BatteryStateDidChangeNotification, _ => BeginInvokeOnMainThread(ReadWarmPower)));
++        ReadWarmPower();
+     }
+ 
++    /// Patch 0104: the warm-up's Settings switches (Documents/gameapp.settings.tsv): "Check the shader cache" (shader_cache_check, default on), "Faster shader preparation" (shader_prep_fast,
++    /// default off), and whether the phone is plugged in.
++    private static void ReadWarmSwitches()
++    {
++        var settings = ReadAppSettings();
++        GameWarm.CheckCache = GameAppUi.ShaderCacheCheckOn(settings);
++        GameWarm.FastPrep = GameAppUi.FastShaderPrepOn(settings);
++        ReadWarmPower();
++    }
++
++    /// Main thread: charging or full (UIDevice's battery state), for FastWarm.UtilityQos.
++    private static void ReadWarmPower()
++    {
++        try
++        {
++            var d = UIDevice.CurrentDevice;
++            d.BatteryMonitoringEnabled = true;
++            GameWarm.Charging = d.BatteryState is UIDeviceBatteryState.Charging or UIDeviceBatteryState.Full;
++        }
++        catch (Exception) { }
++    }
++
+     /// iBuilder is in the foreground and the automatic run goes without a background task (iOS refused it, ended it, or it started in the background): ask again now, while iOS accepts it.
+     private void EnsureWarmTask()
+     {
+@@ -1506,6 +1822,7 @@
+         WatchWarmAppState();
+         LoadWarmQueue();
+         GameWarm.CoresChoice = ReadCoresChoice();
++        ReadWarmSwitches();   // patch 0104
+         bool bootArmed = false;
+         if (File.Exists(BootOnlyPath))
+         {
+@@ -1591,6 +1908,43 @@
+               + (choice == 0 ? "two in the foreground at thermal Nominal, one at Fair or in the background, none at Serious or Critical"
+                              : $"{choice} in the foreground below thermal Serious, one in the background, none at Serious or Critical")
+               + (GameWarm.Active ? "; the run that is going follows it now)" : ")"));
++    }
++
++    // ---- patch 0104: Settings › Build: "Check the shader cache", "Faster shader preparation", "Optimized translator (experimental)" (Documents/gameapp.settings.tsv) ----------------
++
++    /// The three switches of the Build card (the Settings shelf and the older Build section); each saved at once and said in the log.
++    private UISwitch WarmCheckSwitch() => SettingSwitch(ShaderCacheCheck.SettingKey, GameAppUi.ShaderCacheCheckOn(ReadAppSettings()), "setting-shader-cache-check", on =>
++    {
++        GameWarm.CheckCache = on;
++        return on ? "shader cache: check on: a game prepared before the phone restarted or iOS was updated is prepared again, and a prepared game is probed once per launch (3 libraries compiled again)"
++                  : "shader cache: check off: a prepared game stays prepared after a restart or an iOS update (its first play may compile)";
++    });
++
++    private UISwitch WarmFastSwitch() => SettingSwitch(FastWarm.SettingKey, GameAppUi.FastShaderPrepOn(ReadAppSettings()), "setting-shader-prep-fast", on =>
++    {
++        GameWarm.FastPrep = on;
++        return on ? "shader warm-up: faster shader preparation on (as many workers as Metal compiles at once, in the foreground while the phone is cool; Utility QoS in the background on a charger; "
++                    + "a core count chosen in Shader preparation wins)" + (GameWarm.Active ? "; the run that is going follows it now" : "")
++                  : "shader warm-up: faster shader preparation off" + (GameWarm.Active ? "; the run that is going follows it now" : "");
++    });
++
++    private UISwitch XlateOptimizedSwitch() => SettingSwitch(XlateOptimized.SettingKey, GameAppUi.XlateOptimizedOn(ReadAppSettings()), "setting-xlate-optimized", on =>
++        on ? "build setting: optimized translator (experimental) on: smaller and faster shaders; it applies to the next build; turn it off and rebuild if a game looks wrong"
++           : "build setting: optimized translator (experimental) off: from the next build");
++
++    private UISwitch SettingSwitch(string key, bool on, string id, Func<bool, string> changed)
++    {
++        var toggle = new UISwitch { On = on, AccessibilityIdentifier = id, OnTintColor = Theme.Accent };
++        toggle.ValueChanged += (_, __) =>
++        {
++            try
++            {
++                File.WriteAllText(AppSettingsPath, GameAppUi.WithAppSetting(ReadAppSettings(), key, toggle.On ? "1" : "0"));
++                Write(changed(toggle.On));
++            }
++            catch (Exception error) { Write($"could not save the build setting: {error.Message}"); }
++        };
++        return toggle;
+     }
+ }
+ #endif

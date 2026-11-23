@@ -126,11 +126,14 @@ pub struct ToolOutput {
 }
 pub type ToolFn = Arc<dyn Fn(&[String]) -> ToolOutput + Send + Sync>;
 
-/// The two tools the shader chain calls (both third-party and staying so: the engine's `dmsh_xlate` over Ryujinx.Graphics.Shader, C#, and SPIRV-Cross, C).
+/// The tools the shader chain calls (all third-party and staying so: the engine's `dmsh_xlate` over Ryujinx.Graphics.Shader, C#, SPIRV-Cross, C, and for OpenGL games
+/// glslang, C++: `glslangValidator`'s command line, in the app `gameapp_glslang` of `app/c/glslang_cli.cpp`). `glslang: None`: an OpenGL game's GLSL cannot be compiled
+/// (`ibuilder_glvk::tools::NO_GLSLANG` per shader), every other game is unaffected.
 #[derive(Clone)]
 pub struct ShaderTools {
     pub xlate: ToolFn,
     pub spirv_cross: ToolFn,
+    pub glslang: Option<ToolFn>,
 }
 
 impl ShaderTools {
@@ -144,6 +147,7 @@ impl ShaderTools {
         ShaderTools {
             xlate: wrap(&self.xlate),
             spirv_cross: wrap(&self.spirv_cross),
+            glslang: self.glslang.as_ref().map(wrap),
         }
     }
 }
@@ -266,6 +270,39 @@ pub trait ShaderBackend: Send + Sync {
             "shader post-rewrites are not available in this build",
         ))
     }
+    // ---- games without NVN shaders: the host's GL / Vulkan layers (ibuilder-glvk; crate::layers) ----
+    /// The version of the layer libraries this backend writes (`ibuilder_glvk::layer_version`); `-`: it writes none.
+    fn layer_version(&self) -> String {
+        "-".to_string()
+    }
+    /// A game whose NVN split found no shader: `Ok(None)` when it draws with NVN (or this backend has no layer support), `Ok(Some)` when its GL / Vulkan layer
+    /// library was written into `req.out_dir` (`vk/` or `gl/`), `Err` when it is a GL / Vulkan game whose library could not be made.
+    fn build_layer(&self, _req: &LayerRequest<'_>, _log: &dyn Log) -> Result<Option<LayerResult>> {
+        Ok(None)
+    }
+}
+
+/// [`ShaderBackend::build_layer`]'s inputs: the roots the engine's NSP script gives `vk_shaders.py` / `gl_shaders.py`
+pub struct LayerRequest<'a> {
+    pub romfs: &'a Path,
+    pub main_nso: &'a Path,
+    pub dlc: &'a [PathBuf],
+    /// the pack folder being made: the library goes to `<out_dir>/vk/` or `<out_dir>/gl/`
+    pub out_dir: &'a Path,
+    /// scratch files of the tools
+    pub work: &'a Path,
+    pub jobs: usize,
+    /// SPIRV-Cross (gated); the GL layer's glslang is the backend's own
+    pub tools: &'a ShaderTools,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LayerResult {
+    /// `vk` or `gl`
+    pub api: String,
+    pub shaders: usize,
+    /// what the tools printed (failed shaders, skipped stages)
+    pub lines: Vec<String>,
 }
 
 // ---- stage 4: assemble and sign ----------------------------------------------------------------------------------------------

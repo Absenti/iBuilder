@@ -67,16 +67,16 @@ ctl = tf_ctl({0: ([0x20], [4], 16)}); ctl[0x6e8] = 129
 code = bytearray(rb(0x400)); code[:4] = GFX; add('', key16(), 'vs_data.bin', bytes(code), bytes(ctl), note='tf_count129')
 # VertexA + VertexB
 def vab(a_instr=48 + 32 * 2, b_instr=64, exits=(8,), bad=None, type0=True, c1_tail=0x100, a_len_adj=0, b_sph_adj=0, no_parts=False):
-    # code: 0x30 header, SPH A (0x50), A instructions, SPH B (0x50), B instructions, c1 tail
+    # code: 0x30 header, SPH A (0x50), A instructions, B's 0x30 header (at control +0x700's offset), SPH B (0x50), B instructions, c1 tail (Catherine: Full Body's layout)
     a_len = 0x50 + (a_instr // 32) * 32
     b_len = 0x50 + (b_instr // 32) * 32
-    code = bytearray(rb(0x30 + a_len + b_len + c1_tail)); code[:4] = GFX
+    code = bytearray(rb(0x30 + a_len + 0x30 + b_len + c1_tail)); code[:4] = GFX
     sa = [rng.getrandbits(32) for _ in range(20)]; sb = [rng.getrandbits(32) for _ in range(20)]
     sa[0] = sph_word(0) | (rng.getrandbits(32) & ~0x3fff & 0xffff0000 & ~(0xf << 10)); sa[0] = (sa[0] & ~0x3fff) | sph_word(0)
     sb[0] = (sb[0] & ~0x3fff) | sph_word(1)
     struct.pack_into('<20I', code, 0x30, *sa)
-    b_sph = 0x30 + a_len + b_sph_adj
-    struct.pack_into('<20I', code, 0x30 + a_len, *sb)
+    b_sph = 0x30 + a_len + 0x30 + b_sph_adj
+    struct.pack_into('<20I', code, 0x30 + a_len + 0x30, *sb)
     # EXIT-with-CC-T instructions in part A at offsets not divisible by 32
     aoff = 0x30 + 0x50
     for o in exits:
@@ -94,6 +94,28 @@ for nm, kw in {'vab_ok': {}, 'vab_ok_big': dict(a_instr=32 * 6, b_instr=32 * 5, 
                'vab_bad_a_len': dict(a_len_adj=8), 'vab_bad_b_sph': dict(b_sph_adj=32)}.items():
     code, ctl = vab(**kw)
     add('', key16(), 'vs_main.bin', code, ctl, note=nm)
+# VertexA + VertexB with c1 between the parts (Borderlands: control +0x700 gives c1's offset, before B's SPH) and the new checks (+0x700 outside A's end .. B's SPH, a part shorter than its SPH,
+# a part B followed by constants of its own)
+def vab_split(gap=0x100, c1o_adj=0, tail=b'', a_len=0x50 + 64, b_len=0x50 + 64, b_type=1):
+    code = bytearray(rb(0x30 + a_len + gap)); code[:4] = GFX
+    sa = [rng.getrandbits(32) for _ in range(20)]; sb = [rng.getrandbits(32) for _ in range(20)]
+    sa[0] = (sa[0] & ~0x3fff) | sph_word(0); sb[0] = (sb[0] & ~0x3fff) | sph_word(b_type)
+    struct.pack_into('<20I', code, 0x30, *sa)
+    if a_len >= 0x60: struct.pack_into('<Q', code, 0x30 + 0x50 + 8, (0xe30 << 52) | (rng.getrandbits(20) & ~0x1f) | 0xf)
+    b_sph = len(code)
+    part_b = bytearray(rb(max(b_len, 0x50))); struct.pack_into('<20I', part_b, 0, *sb)
+    code += part_b[:max(b_len, 0x50)] + tail
+    ctl = bytearray(rb(0x880)); ctl[:4] = CTL
+    struct.pack_into('<II', ctl, 0x700, 0x30 + a_len + c1o_adj, len(code))
+    struct.pack_into('<6I', ctl, 0x748, 0x30, a_len, 0, b_sph, b_len, 0)
+    return bytes(code), bytes(ctl)
+for nm, kw in {'vab_split_ok': {}, 'vab_split_zero_tail': dict(tail=bytes(0x40)), 'vab_split_dirty_tail': dict(tail=bytes(0x3f) + b'\x01'), 'vab_split_c1o_mid': dict(c1o_adj=0x40),
+               'vab_split_c1o_at_b': dict(c1o_adj=0x100), 'vab_split_c1o_in_a': dict(c1o_adj=-0x10), 'vab_split_c1o_past_b': dict(c1o_adj=0x110), 'vab_split_no_gap': dict(gap=0),
+               'vab_split_a_short': dict(a_len=0x30), 'vab_split_b_short': dict(b_len=0x30), 'vab_split_b_type0': dict(b_type=0)}.items():
+    code, ctl = vab_split(**kw)
+    add('', key16(), 'vs_main.bin', code, ctl, note=nm)
+# a part A shorter than its SPH in the Catherine layout ((a_len - 0x50) % 32 is 0 for a_len 0x30: only the new length check refuses it)
+code, ctl = vab(); ctl = bytearray(ctl); struct.pack_into('<I', ctl, 0x748 + 4, 0x30); add('', key16(), 'vs_main.bin', code, bytes(ctl), note='vab_a_len_0x30')
 # a vertex shader of type 1 (the usual) with the same control fields set: untouched
 code = bytearray(rb(0x400)); code[:4] = GFX; struct.pack_into('<I', code, 0x30, sph_word(1)); ctl = nvn1_ctl(0x300, 0x400); struct.pack_into('<6I', ctl, 0x748, 0x30, 0x100, 0, 0x130, 0x100, 0)
 add('', key16(), 'vs_main.bin', bytes(code), bytes(ctl), note='vs_type1_with_ab_fields')
@@ -155,6 +177,22 @@ for i in range(64):
 # a task / mesh record whose control section is too short for the fields, and one whose stage byte names neither (the Python crashes in both: struct.error / KeyError)
 code = rb(0x300); add('', key16(), 'ms_data.bin', code, bytes(nvn2_ctl(0x200, 0x200, 0x300, 0x300, stage_byte=7, n=0x60)), note='nvn2_ms_short_ctl')
 code = rb(0x300); add('', key16(), 'ms_data.bin', code, bytes(nvn2_ctl(0x200, 0x200, 0x300, 0x300, stage_byte=1)), note='nvn2_ms_wrong_byte')
+# a ray tracing record (NVN2 stage byte 8) on the ordinary path: the Python's ValueError; an NVN2 control section too short for the stage byte; an NVN1 section with byte 8 there
+for stage in ('vs', 'cs', 'ps', 'ms'):
+    code = rb(0x300); add('', key16(), f'{stage}_data.bin', code, bytes(nvn2_ctl(0x200, 0x200, 0x300, 0x300, stage_byte=8)), note=f'nvn2_rt_stage8_{stage}')
+code = rb(0x300); add('', key16(), 'vs_data.bin', code, bytes(nvn2_ctl(0x200, 0x200, 0x300, 0x300, n=0x56)), note='nvn2_vs_ctl_0x56')
+code = bytearray(rb(0x400)); code[:4] = GFX; struct.pack_into('<I', code, 0x30, sph_word(5)); ctl = nvn1_ctl(0x300, 0x400); ctl[0x56] = 8
+add('', key16(), 'ps_main.bin', bytes(code), bytes(ctl), note='nvn1_byte8')
+# task / mesh shaders whose payload exceeds Metal's 16 KB (dmsh_meshstage.payload_spill): a task-fed mesh shader's job gets stage_input_words, a task's stage memory has no input area
+for nm, (stage_name, payload, task) in {'pspill_ts_16384': ('ts', 16384, 0), 'pspill_ts_16385': ('ts', 16385, 0), 'pspill_ts_28000': ('ts', 28000, 0), 'pspill_ms_task_16384': ('ms', 16384, 1),
+                                        'pspill_ms_task_16385': ('ms', 16385, 1), 'pspill_ms_task_21508': ('ms', 21508, 1), 'pspill_ms_notask_21508': ('ms', 21508, 0),
+                                        'pspill_ms_task_65535': ('ms', 65535, 1), 'pspill_ts_small': ('ts', 100, 0)}.items():
+    code = bytearray(rb(0x300))
+    for off in range(0x34, 0x80): code[off] = rng.choice([0, 0, 0x0f, 0x30, 0xf0, 0xff, 0x01, 0x11])
+    ctl = nvn2_ctl(0x300, 0x300, 0x300, 0x300, stage_byte=6 if stage_name == 'ts' else 7)
+    struct.pack_into('<2H', ctl, 0x58, 32, payload); ctl[0x5e] = task; ctl[0x5f] = 3
+    struct.pack_into('<2H', ctl, 0x60, 64, 126); ctl[0x68] = 0
+    add('', key16(), f'{stage_name}_data.bin', bytes(code), bytes(ctl), note=f'nvn2_{nm}')
 # malformed: no control section / too short for the fields
 add('', key16(), 'ps_main.bin', rb(0x100), b'', note='no_ctl') if False else None
 out = os.path.join(OUT)
@@ -173,6 +211,8 @@ for nm, key, stage_name, rec, facts in cases:
         open(d + '/job.json', 'w').write(json.dumps(j)); open(d + '/code.bin', 'wb').write(open(j['code'], 'rb').read()); open(d + '/c1.bin', 'wb').write(c1)
     except SystemExit as e:
         open(d + '/exit.txt', 'w').write(str(e.code))
+    except ValueError as e:   # job_for's own ValueError (a ray tracing record on the ordinary path): the build stops
+        open(d + '/valueerror.txt', 'w').write(str(e))
     except Exception as e:   # the Python would crash here (a truncated record): the Rust port reports an error
         open(d + '/crash.txt', 'w').write(type(e).__name__ + ': ' + str(e))
     open(d + '/stdout.txt', 'w').write(buf.getvalue())

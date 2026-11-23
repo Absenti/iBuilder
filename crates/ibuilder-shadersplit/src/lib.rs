@@ -6,12 +6,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aes;
 pub mod apf;
 pub mod archive;
 pub mod bytes;
+pub mod casc;
+pub mod cpk;
+pub mod cra;
 pub mod ctl;
+pub mod easf;
 pub mod error;
 pub mod falcom;
+pub mod frostbite;
 pub mod game;
 pub mod glslc;
 pub mod image;
@@ -19,20 +25,34 @@ pub mod inflate;
 pub mod jobs;
 pub mod kit;
 pub mod live;
+pub mod lspk;
+pub mod lzma1;
 pub mod memo;
 pub mod mvgl;
 pub mod nvn;
+pub mod nxcx;
 pub mod nxsd;
+pub mod pdat;
 pub mod pyjson;
+pub mod rage_wad;
 pub mod record;
+pub mod redengine;
+pub mod rpf6;
 pub mod rt;
 pub mod scan;
 pub mod scan_types;
+pub mod sharc;
+pub mod smash_arc;
 pub mod source;
 pub mod spill;
 pub mod split;
+pub mod telltale;
+pub mod trinity;
+pub mod ttdat;
 pub mod uepak;
+pub mod uestore;
 pub mod unity;
+pub mod vbf;
 // generated file, kept exactly as tools/gen_known_trees.py writes it (rustfmt would reflow it, so a regeneration would not reproduce the committed text)
 #[rustfmt::skip]
 mod unity_trees;

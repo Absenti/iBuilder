@@ -1,0 +1,37 @@
+OK
+{}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+using namespace metal;
+
+template<typename P> static inline __attribute__((always_inline)) auto dm_buffer_read(constant P* p, uint i, uint c)
+{
+    uint b = reinterpret_cast<constant uint*>(reinterpret_cast<constant uchar*>(p) + p->bias)[i];
+    uint m = c + b;
+    return (&p->e[0])[i].read(m < b ? c : m);
+}
+template<typename P> static inline __attribute__((always_inline)) uint dm_buffer_width(constant P* p, uint i)
+{
+    uint b = reinterpret_cast<constant uint*>(reinterpret_cast<constant uchar*>(p) + p->bias)[i];
+    return (&p->e[0])[i].get_width() - b;
+}
+
+struct spvPool_fp_tb_cb7_2A
+{
+    uint n;
+    uint bias;
+    ulong seen;
+    array<texture_buffer<uint>, 1> e;
+};
+
+struct spvDescriptorSetBuffer0
+{
+    constant spvPool_fp_tb_cb7_2A* fp_tb_cb7_2A [[id(0)]];
+    const device _12* fp_s0 [[id(1)]];
+};
+
+kernel void main0(constant spvDescriptorSetBuffer0& sp

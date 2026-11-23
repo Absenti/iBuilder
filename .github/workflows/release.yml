@@ -20,7 +20,7 @@ name: Release
 # the run prints the link to open the pull request by hand.
 # A pull request opened with the job's GITHUB_TOKEN does NOT trigger the pull_request workflows (a GitHub rule against recursive runs), so ci.yml does not start on it by itself and
 # the required checks stay "Expected". The PR touches apps.json only; to get the checks: close and reopen the PR (as a person), or run  gh workflow run ci.yml --ref release/apps-json-<tag>
-# (a workflow_dispatch run on that branch reports its checks on the PR's head commit).
+# and  gh workflow run pr-title.yml --ref release/apps-json-<tag>  (a workflow_dispatch run on that branch reports its checks on the PR's head commit).
 #
 # Pre-releases are verified but not listed in the source (it is what everybody who added it is offered); run this workflow by hand with the tag to list one.
 
@@ -232,7 +232,7 @@ jobs:
         run: |
           set -euo pipefail
           branch="release/apps-json-$TAG"
-          title="apps.json: list $TAG"
+          title="chore(release): list $TAG in apps.json"   # the PR title rule (pr-title.yml): a Conventional Commits title of 72 characters at most
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git switch --create "$branch"
@@ -247,7 +247,7 @@ jobs:
           * date $PUBLISHED; version, build and minimum iOS read from the Info.plist of the IPA by \`scripts/update-source.py\`
 
           Merging publishes the update to everybody who added the source.
-          This PR was opened with the token of the workflow, so CI does not start by itself: close and reopen it, or run \`gh workflow run ci.yml --ref $branch\`.
+          This PR was opened with the token of the workflow, so CI does not start by itself: close and reopen it, or run \`gh workflow run ci.yml --ref $branch\` and \`gh workflow run pr-title.yml --ref $branch\`.
           EOF
           )"
           existing="$(gh pr list --repo "$REPO" --head "$branch" --base "$BASE" --state open --json number --jq '.[0].number // empty')"

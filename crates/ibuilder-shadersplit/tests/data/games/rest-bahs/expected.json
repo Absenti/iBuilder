@@ -1,0 +1,17 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "b145c309fb5cd558934c5b23010cde12167e692b42accb131e376bc9c1e92d21",
+  "pkg/ps_data.bin": "6c84ace54419138f4ed7e2fa1dab96c0256b9e2dca3641b504485a5a66a85e94",
+  "pkg/vs_data.bin": "ae519d6b829d61963ee115c71ea1860ec84dc46383eb8a26d8e11f55cfb50964",
+  "tables/pso_pairs.tsv": "8af7bbdd27ba984b412dcca2c4c962ca9cd972b5336e1886b598c0ac31f42c45",
+  "tables/shader_facts.tsv": "2ac6ef5642f3ba982c7e339cd7ea114b89d3f052d6330cefc03d9820cc02d71b",
+  "tables/shader_map.tsv": "a534e3882cccc3f9b670cbb4d61f0bfb5392af618530b47800ae2a8a096fa8f6",
+  "tables/shader_pairs.tsv": "5aa0373962553e0efbf27dc253b41c266a952c062b997b4f07f05d24b0e3e7a8"
+ },
+ "log": [
+  "shaders: 22 (compute 4, pixel 10, vertex 8); sources data 22; compute shader answers 4 rows; variation pairs 0"
+ ],
+ "shaders": 22,
+ "updates": []
+}

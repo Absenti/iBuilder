@@ -248,53 +248,81 @@ pub fn bahs_shaders(cx: &Ctx<'_>, d: &[u8], label: &str) -> Res<Vec<Shader>> {
             .take_while(|&&(lo, _)| lo + 0x880 > a)
             .any(|&(_, hi)| a < hi)
     };
-    let out: Vec<Shader> = found
+    let candidates: Vec<(usize, Shader)> = found
         .into_iter()
         .filter(|(a, _, _)| !inside(*a))
-        .map(|(_, _, s)| s)
+        .map(|(a, _, s)| (a, s))
         .collect();
-    let labels: Vec<String> = out.iter().map(|s| s.label.clone()).collect();
-    bahs_variations(cx, d, label, &labels)?;
-    Ok(out)
+    // A validated binary array is authoritative: descriptor-shaped words may also occur after the control header, inside a record's other payload (5df3dbe8: Mario Kart World 1.8.0's
+    // DrivePassShaderDefault has one outside its 2,580 record entries, pairing compute control with unrelated vertex code)
+    let mut offsets: BTreeSet<usize> = candidates.iter().map(|(a, _)| *a).collect();
+    if let Some((records, end)) = bahs_binary_records(d, region, &offsets)? {
+        let rec_at: BTreeSet<usize> = records.iter().map(|&(a, _)| a).collect();
+        offsets.retain(|a| rec_at.contains(a));
+        bahs_variations(cx, d, label, &offsets, &records, end)?;
+    }
+    Ok(candidates
+        .into_iter()
+        .filter(|(a, _)| offsets.contains(a))
+        .map(|(_, s)| s)
+        .collect())
 }
 
-/// `bahs_variations(d, label, entries)`: the variations of an agl BAHS file's programs, for `var_pairs` (see the Python's docstring)
-pub fn bahs_variations(cx: &Ctx<'_>, d: &[u8], label: &str, entries: &[String]) -> Res<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let mut taken: BTreeSet<usize> = BTreeSet::new();
-    for e in entries {
-        let h = e.rsplit_once('@').map(|x| x.1).unwrap_or("");
-        taken.insert(
-            usize::from_str_radix(h.trim_start_matches("0x"), 16)
-                .map_err(|_| Failure::Red(format!("bad BAHS label {e}")))?,
-        );
-    }
-    let first = *taken.iter().next().unwrap();
+/// (entry offset, kind) of each binary record, and the binary array's end
+pub type BinaryRecords = (Vec<(usize, u32)>, usize);
+
+/// `bahs_binary_records(d, region, taken)`: the validated binary array, (entry offset, kind) of each record and the array's end, or None for a layout it does not recognise
+pub fn bahs_binary_records(
+    d: &[u8],
+    region: usize,
+    taken: &BTreeSet<usize>,
+) -> Res<Option<BinaryRecords>> {
+    let Some(&first) = taken.iter().next() else {
+        return Ok(None);
+    };
     if first < 0x18 + 0x20 {
-        return Ok(());
+        return Ok(None);
     }
     let arr = first - 0x18;
     let (asz, acnt) = (u32le(d, arr)? as usize, u32le(d, arr + 4)? as usize);
-    if arr + asz + 8 > d.len() || acnt < taken.len().saturating_sub(1.max(taken.len() / 100)) {
-        return Ok(());
+    let end = arr + asz;
+    let strays = 1.max(taken.len() / 100);
+    if acnt == 0 || end > region || (acnt as i64) < taken.len() as i64 - strays as i64 {
+        return Ok(None);
     }
     let (mut o, mut recs) = (arr + 8, Vec::new());
     for _ in 0..acnt {
-        if o + 0x20 > arr + asz {
-            return Ok(());
+        if o + 0x20 > end {
+            return Ok(None);
         }
         let (rs, kind) = (u32le(d, o)? as usize, u32le(d, o + 4)?);
         if rs < 0x20 {
-            return Ok(());
+            return Ok(None);
         }
         recs.push((o + 0x10, kind));
         o += rs;
     }
+    // Every candidate is a record's entry, apart from stray scan matches (Donkey Kong Bananza's agl_common: 1,556 candidates, 1,555 records): one stray, or up to 1 % in larger arrays
     let rec_at: std::collections::HashSet<usize> = recs.iter().map(|&(a, _)| a).collect();
     let outside = taken.iter().filter(|t| !rec_at.contains(t)).count();
-    if o != arr + asz || outside > 1.max(taken.len() / 100) {
+    if o != end || outside > strays {
+        return Ok(None);
+    }
+    Ok(Some((recs, end)))
+}
+
+/// `bahs_variations(d, label, taken, recs, o)`: the variations of an agl BAHS file's programs, for `var_pairs` (see the Python's docstring); `o` is the binary array's end, where the program
+/// array starts
+pub fn bahs_variations(
+    cx: &Ctx<'_>,
+    d: &[u8],
+    label: &str,
+    taken: &BTreeSet<usize>,
+    recs: &[(usize, u32)],
+    o: usize,
+) -> Res<()> {
+    let acnt = recs.len();
+    if o + 8 > d.len() {
         return Ok(());
     }
     let (psz, pcnt) = (u32le(d, o)? as usize, u32le(d, o + 4)? as usize);

@@ -58,7 +58,7 @@ typedef void (*ibuilder_log_fn)(void *user, int stream, const char *line);
 typedef void (*ibuilder_progress_fn)(void *user, int stage_k, int stage_n, const char *text, double fraction);
 
 /* A native tool run in process, as gameapp_tool_fn in the shim: argv is the tool's command line, program name first; returns the return code and sets *out_stdout / *out_stderr to
- * malloc()ed NUL-terminated strings (or NULL); the library free()s them.  xlate is the engine's dmsh_xlate (C#), spirv_cross is SPIRV-Cross (C). */
+ * malloc()ed NUL-terminated strings (or NULL); the library free()s them.  xlate is the engine's dmsh_xlate (C#), spirv_cross is SPIRV-Cross (C), glslang is glslang (C++). */
 typedef int (*ibuilder_tool_fn)(int argc, const char **argv, char **out_stdout, char **out_stderr);
 
 /* Sign <framework_dir>/<exe> in process (zsign: ad hoc on the simulator, the device identity when the app carries embedded.mobileprovision).  Fill mode ("device(zsign, in-memory .p12)"),
@@ -92,6 +92,10 @@ typedef struct ibuilder_options {
      * buffers and rc as sign).  The build then succeeds for EXPORT ONLY: the framework stamp says "signature=adhoc-export", no boot starts from it (iOS refuses to map such a framework
      * from Documents on a device), and the app offers Export as its own app (the installer re-signs every executable of the IPA).  NULL: no fallback, rc 10-13 fail the build as before. */
     ibuilder_sign_fn sign_adhoc;
+    /* APPENDED 2026-11-23 (fields are only ever appended: a caller compiled against an older header passes its smaller struct_size, and every field past it reads as NULL).
+     * glslang's glslangValidator in process, for OpenGL games' GLSL (the app: gameapp_glslang, app/c/glslang_cli.cpp over glslang 16.6.0): the same ibuilder_tool_fn contract as
+     * spirv_cross, program name first.  NULL: an OpenGL game's shaders cannot be compiled (it is not supported); every other game is unaffected. */
+    ibuilder_tool_fn glslang;
 } ibuilder_options;
 
 uint32_t ibuilder_abi_version(void);          /* IBUILDER_ABI_VERSION of the library: compare with the header you compiled against */
@@ -99,7 +103,8 @@ const char *ibuilder_version(void);           /* crate version, static string */
 /* Copy the last error of this thread (a caught panic, a bad argument) into buf; returns the length needed.  "" when there is none. */
 int ibuilder_last_error(char *buf, int cap);
 
-/* Create a handle.  NULL on error with *err set (IBUILDER_E_BAD_ARG: a NULL option, a struct_size that is too small, or the mock flag in a build without it).  Installs the fatal-signal
+/* Create a handle.  NULL on error with *err set (IBUILDER_E_BAD_ARG: a NULL option, a struct_size smaller than the struct up to and including sign_adhoc (the fields before the appended ones), or the mock
+ * flag in a build without it).  Only struct_size bytes of *opts are read.  Installs the fatal-signal
  * logger and the panic hook (once per process). */
 ibuilder_t *ibuilder_create(const ibuilder_options *opts, int *err);
 void ibuilder_destroy(ibuilder_t *h);
@@ -123,6 +128,14 @@ void ibuilder_cancel(ibuilder_t *h);
 int ibuilder_request_stop(int kind);
 /* The request in effect now: 0 none, 1 pause, 2 cancel. */
 int ibuilder_stop_requested(void);
+
+/* ---- build mode ------------------------------------------------------------------------------------------------------------------------------------
+ * The build screen's "Mode": 1 = Fast (the build's workers keep the QoS of the thread that runs the chain: faster and hotter, the UI may lag), 0 = Cool (utility QoS: the UI keeps its priority).
+ * Process-wide, from any thread, at any time.  Each run starts from the app setting fast_build (gameapp.settings.tsv, default 0); a change during a run reaches the shader translation within a shader
+ * (the tool callbacks call ibuilder_qos_follow), the other stages from the next run.  Timing only, never a result. */
+void ibuilder_set_fast_build(int on);
+/* For the translator and SPIRV-Cross callbacks: the calling build worker moves to the mode in effect if it changed.  A no-op on any other thread. */
+void ibuilder_qos_follow(void);
 /* Run the chain (gameapp_run_chain): read the config, then profile -> rewrite -> shaders -> assemble -> sign -> (boot).  config_path NULL = <Documents>/gameapp.config.  Blocks until the chain
  * ends; with IBUILDER_FLAG_BOOT_IN_PROCESS the guest runs inside this call and the process may end (its own SIGTERM) without the call returning. */
 int ibuilder_run_chain(ibuilder_t *h, const char *config_path);

@@ -105,7 +105,13 @@ pub struct IbuilderOptions {
     pub flags: u32,
     /// Stage 4b's fallback when `sign` found no identity (rc 10, 12, 13): sign the framework ad hoc, for export only. Called with `sign_user`. NULL: no fallback (the build fails).
     pub sign_adhoc: SignFn,
+    /// Appended (ABI rule: fields are only ever appended; a caller whose `struct_size` ends before a field leaves it NULL): glslang's `glslangValidator` command line in process
+    /// (the app's `gameapp_glslang`, app/c/glslang_cli.cpp), for OpenGL games' GLSL. NULL: an OpenGL game's shaders cannot be compiled (the game is not supported); nothing else changes.
+    pub glslang: ToolCFn,
 }
+
+/// The smallest `struct_size` [`ibuilder_create`] takes: the struct before its appended fields (`glslang`), as the header of 2026-11-22 declared it
+pub const OPTIONS_MIN_SIZE: usize = std::mem::offset_of!(IbuilderOptions, glslang);
 
 #[repr(C)]
 pub struct IbuilderMem {
@@ -161,6 +167,7 @@ pub struct Ibuilder {
     sign_adhoc: SignFn,
     xlate: ToolCFn,
     spirv_cross: ToolCFn,
+    glslang: ToolCFn,
     live_notify: LiveNotifyFn,
     live_notify_user: UserPtr,
     flags: u32,
@@ -453,14 +460,26 @@ pub unsafe extern "C" fn ibuilder_create(
         if opts.is_null() {
             return fail(E_BAD_ARG, "ibuilder_create: opts is NULL");
         }
-        // SAFETY: non-NULL; the struct is read after checking its declared size.
-        let o = unsafe { &*opts };
-        if (o.struct_size as usize) < std::mem::size_of::<IbuilderOptions>() {
+        // SAFETY: non-NULL; struct_size is the first field of every version of the struct.
+        let size = unsafe { std::ptr::addr_of!((*opts).struct_size).read() } as usize;
+        if size < OPTIONS_MIN_SIZE {
             return fail(
                 E_BAD_ARG,
                 "ibuilder_create: struct_size is smaller than this library's ibuilder_options (ABI mismatch)",
             );
         }
+        // Only the caller's struct_size bytes are read; the fields appended after them stay zero (NULL). All-zero is a valid IbuilderOptions (NULL pointers, None callbacks).
+        // SAFETY: `opts` points to at least `size` readable bytes by contract, and at most size_of::<IbuilderOptions>() are copied into a zeroed struct of that size.
+        let copied = unsafe {
+            let mut c: IbuilderOptions = std::mem::zeroed();
+            std::ptr::copy_nonoverlapping(
+                opts as *const u8,
+                &mut c as *mut IbuilderOptions as *mut u8,
+                size.min(std::mem::size_of::<IbuilderOptions>()),
+            );
+            c
+        };
+        let o = &copied;
         // SAFETY: strings are NUL-terminated by contract.
         let (docs, bundle) = unsafe { (cstr(o.documents_dir), cstr(o.bundle_dir)) };
         let Some(docs) = docs.filter(|d| !d.is_empty()) else {
@@ -484,6 +503,7 @@ pub unsafe extern "C" fn ibuilder_create(
             sign_adhoc: o.sign_adhoc,
             xlate: o.xlate,
             spirv_cross: o.spirv_cross,
+            glslang: o.glslang,
             live_notify: o.live_notify,
             live_notify_user: UserPtr(o.live_notify_user),
             flags: o.flags,
@@ -538,6 +558,20 @@ pub extern "C" fn ibuilder_request_stop(kind: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn ibuilder_stop_requested() -> c_int {
     guard(E_PANIC, || stop::requested() as c_int)
+}
+
+/// The build mode (the build screen's "Mode"): `on` 1 = Fast (the workers keep the chain thread's QoS: faster and hotter), 0 = Cool (utility QoS). Process-wide, from any thread, at any time:
+/// a running build's shader translation follows within a shader, the other stages from the next build. Every run starts from the app setting `fast_build` (`ibuilder_run_chain`), so the app
+/// saves the setting too. Timing only, never a result.
+#[unsafe(no_mangle)]
+pub extern "C" fn ibuilder_set_fast_build(on: c_int) {
+    guard((), || sys::qos::set_fast_build(on != 0))
+}
+
+/// For the tool callbacks the app gives the chain (translator, SPIRV-Cross): the calling build worker moves to the build mode in effect if it changed. A no-op on any other thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn ibuilder_qos_follow() {
+    guard((), sys::qos::follow)
 }
 
 impl Ibuilder {
@@ -606,6 +640,7 @@ impl Ibuilder {
             a.tools = Some(ShaderTools {
                 xlate: tool_fn(x),
                 spirv_cross: tool_fn(s),
+                glslang: self.glslang.map(tool_fn),
             });
         }
         #[cfg(feature = "mock-stages")]
@@ -658,6 +693,21 @@ pub unsafe extern "C" fn ibuilder_run_chain(h: *mut Ibuilder, config_path: *cons
             .boot_enabled(h.flags & FLAG_BOOT_IN_PROCESS != 0)
             .gpu_without_bc(h.flags & FLAG_GPU_NO_BC != 0)
             .build();
+        // the app's "Fast build" setting (`fast_build 1` in gameapp.settings.tsv, default off), read at every run: the build's workers keep this thread's QoS instead of utility (sys/qos.rs)
+        sys::qos::set_fast_build(ibuilder_pipeline::shaders::fast_build_setting(&ctx));
+        sys::qos::record_caller_class();
+        // speed-up B9: the app's "Optimized translator (experimental)" setting (`xlate_optimized 1`, default off): the translator runs without its DebugMode for this run's builds
+        let optimized = ibuilder_pipeline::shaders::app_setting(&ctx, "xlate_optimized")
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "1" | "on" | "yes" | "true"
+                )
+            });
+        sys::qos::set_xlate_optimized(optimized);
+        if optimized {
+            ctx.log("chain: the optimized translator is on (experimental: the translator runs without its DebugMode; a game built so may show graphics errors)");
+        }
         ctx.cancel = h.cancel.clone();
         ctx.adapters = h.adapters(ctx.live.clone());
         if let Some(f) = h.live_notify {
@@ -1450,6 +1500,7 @@ mod tests {
             live_notify_user: std::ptr::null_mut(),
             flags: 0,
             sign_adhoc: None,
+            glslang: None,
         }
     }
 
@@ -1742,6 +1793,26 @@ mod tests {
                 ibuilder_create(&o, &mut err).is_null() && err == E_BAD_ARG,
                 "a struct from an older header is refused"
             );
+            // the header before glslang was appended: taken, and the field past its size is not read (it would be this tool otherwise)
+            o = opts(&docs, &bundle);
+            o.glslang = Some(echo_tool);
+            o.struct_size = OPTIONS_MIN_SIZE as u32;
+            let h = ibuilder_create(&o, &mut err);
+            assert!(
+                !h.is_null(),
+                "a struct without the appended glslang is taken"
+            );
+            assert!((*h).glslang.is_none(), "a field past struct_size is NULL");
+            ibuilder_destroy(h);
+            o.struct_size = OPTIONS_MIN_SIZE as u32 - 1;
+            assert!(ibuilder_create(&o, &mut err).is_null() && err == E_BAD_ARG);
+            o.struct_size = std::mem::size_of::<IbuilderOptions>() as u32;
+            let h = ibuilder_create(&o, &mut err);
+            assert!(
+                !h.is_null() && (*h).glslang.is_some(),
+                "the full struct passes glslang"
+            );
+            ibuilder_destroy(h);
             o = opts(&docs, &bundle);
             o.documents_dir = std::ptr::null();
             assert!(ibuilder_create(&o, &mut err).is_null());

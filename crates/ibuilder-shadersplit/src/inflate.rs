@@ -108,7 +108,7 @@ fn run_limited(data: &[u8], wrap: Wrap, max_out: Option<usize>) -> Result<Inflat
 
 /// `zlib.decompress(data)`: the whole stream or an error (bytes after the stream are ignored)
 pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    let r = run(data, Wrap::Zlib, None)?;
+    let r = run_as_zlib(data, Wrap::Zlib, None)?;
     if !r.eof {
         return Err("Error -5 while decompressing data: incomplete or truncated stream".into());
     }
@@ -121,4 +121,33 @@ pub fn gunzip(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     let mut r = flate2::read::MultiGzDecoder::new(data).take(limit as u64 + 1);
     r.read_to_end(&mut out).map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+/// `zlib.decompressobj(wbits).decompress(data, max_out)` with zlib's own result whenever the fast decoder refuses the stream: `miniz_oxide` reads ahead of its output and words its
+/// errors its own way, so a refusal is decoded again by the model of zlib (`zlibx`), whose answer (the bytes up to `max_out`, or zlib's error text) is the Python's
+pub fn run_as_zlib(data: &[u8], wrap: Wrap, max_out: Option<usize>) -> Result<Inflated, String> {
+    match run(data, wrap, max_out) {
+        Ok(r) if r.eof => Ok(r),
+        // a stream that did not end (cut, or stopped at `max_out`): zlib may have found an error the fast decoder did not reach
+        Ok(_) => zlib_model(data, wrap, max_out),
+        Err(e) if e.starts_with("Error -3") => zlib_model(data, wrap, max_out),
+        Err(e) => Err(e),
+    }
+}
+
+fn zlib_model(data: &[u8], wrap: Wrap, max_out: Option<usize>) -> Result<Inflated, String> {
+    let limit = max_out.unwrap_or(MAX_DECODED + 1);
+    let z = if wrap == Wrap::Zlib {
+        crate::zlibx::decompress(data, Some(limit))
+    } else {
+        crate::zlibx::decompress_raw(data, Some(limit))
+    }?;
+    if max_out.is_none() && z.out.len() > MAX_DECODED {
+        return Err(cap_error(MAX_DECODED));
+    }
+    Ok(Inflated {
+        out: z.out,
+        eof: z.eof,
+        used: z.used,
+    })
 }

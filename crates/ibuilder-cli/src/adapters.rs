@@ -586,6 +586,7 @@ pub mod shaders {
         ShaderTools {
             xlate: Arc::new(move |argv: &[String]| conv(a.xlate(&argv[1..]))),
             spirv_cross: Arc::new(move |argv: &[String]| conv(b.spirv_cross(&argv[1..]))),
+            glslang: None, // layer_tools: the Mac's glslangValidator ($GLSLANG or on PATH)
         }
     }
 
@@ -609,6 +610,47 @@ pub mod shaders {
         {
             let _ = (profile_dir, game_id, chain, pulling);
             Err("the per-shader finish (ibuilder_shader::finish) is not wired into this build (cargo feature shader-finish)".to_string())
+        }
+    }
+
+    /// GL / Vulkan games (ibuilder-glvk): SPIRV-Cross and glslang from the pipeline's tools (program name first, as `fn_tools` passes it). glslang is the app's
+    /// `gameapp_glslang` (`app/c/glslang_cli.cpp`, the `glslang` callback of `ibuilder_options`); a pipeline without one takes the Mac's `glslangValidator`
+    /// (`$GLSLANG` or on PATH) with feature `shader-host-tools`, else none: an OpenGL game's shaders each fail with `ibuilder_glvk::tools::NO_GLSLANG`.
+    #[cfg(feature = "glvk")]
+    pub fn layer_tools(t: &ShaderTools) -> ibuilder_glvk::tools::FnLayerTools {
+        use ibuilder_glvk::tools::{FnLayerTools, ToolCallback, ToolRun as LayerRun};
+        let named = |f: ToolFn, prog: &'static str| -> ToolCallback {
+            Arc::new(move |argv: &[String]| {
+                let mut full = Vec::with_capacity(argv.len() + 1);
+                full.push(prog.to_string());
+                full.extend_from_slice(argv);
+                let o = f(&full);
+                LayerRun {
+                    rc: o.rc,
+                    stdout: o.stdout,
+                    stderr: o.stderr,
+                }
+            })
+        };
+        let spirv_cross = named(t.spirv_cross.clone(), "spirv-cross");
+        let glslang: Option<ToolCallback> = match &t.glslang {
+            Some(g) => Some(named(g.clone(), "glslangValidator")),
+            None => {
+                #[cfg(feature = "shader-host-tools")]
+                {
+                    use ibuilder_glvk::LayerTools;
+                    let p = ibuilder_glvk::tools::ProcessLayerTools::from_env();
+                    Some(Arc::new(move |argv: &[String]| p.glslang(argv)) as ToolCallback)
+                }
+                #[cfg(not(feature = "shader-host-tools"))]
+                {
+                    None
+                }
+            }
+        };
+        FnLayerTools {
+            spirv_cross,
+            glslang,
         }
     }
 
@@ -786,6 +828,60 @@ pub mod shaders {
                 bad: r.bad,
                 files: r.files,
             })
+        }
+
+        // ---- GL / Vulkan games (ibuilder-glvk): their GLSL / SPIR-V -> the host layer's table + MSL; see ibuilder_pipeline::layers ----
+        fn layer_version(&self) -> String {
+            #[cfg(feature = "glvk")]
+            {
+                ibuilder_glvk::layer_version()
+            }
+            #[cfg(not(feature = "glvk"))]
+            {
+                "-".to_string()
+            }
+        }
+
+        fn build_layer(
+            &self,
+            req: &LayerRequest<'_>,
+            log: &dyn Log,
+        ) -> Result<Option<LayerResult>> {
+            #[cfg(feature = "glvk")]
+            {
+                super::build_pool();
+                let tools = layer_tools(req.tools);
+                let r = ibuilder_glvk::game::build_for_game(
+                    req.romfs,
+                    req.main_nso,
+                    req.dlc,
+                    &tools,
+                    req.work,
+                    req.jobs.max(1),
+                );
+                match r {
+                    Ok(None) => Ok(None),
+                    Ok(Some(layer)) => {
+                        layer.write(req.out_dir).map_err(|e| {
+                            PipelineError::failed(format!("{}: {e}", req.out_dir.display()))
+                        })?;
+                        Ok(Some(LayerResult {
+                            api: layer.api.dir().to_string(),
+                            shaders: layer.shaders,
+                            lines: layer.log,
+                        }))
+                    }
+                    Err(e) => {
+                        log.line(&format!("glvk: {e}"));
+                        Err(PipelineError::failed(e.0))
+                    }
+                }
+            }
+            #[cfg(not(feature = "glvk"))]
+            {
+                let _ = (req, log);
+                Ok(None)
+            }
         }
     }
 }

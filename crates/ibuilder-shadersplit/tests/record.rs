@@ -89,6 +89,11 @@ fn split_with_record(g: &Path) -> (String, PathBuf) {
     o.dlc = dlc.iter().map(|p| p.as_path()).collect();
     o.jobs = 2;
     o.record = Some(&rec);
+    // `DM_NRO_DIR` of the games that have one (a CRA archive's file table)
+    let nro = g.join("nro");
+    if nro.is_dir() {
+        o.nro_dir = Some(&nro);
+    }
     let r = split(&o, &Ruzstd, &NoGate, &|_| {});
     if r.is_err() {
         return (String::new(), tables.join("shader_map.tsv"));
@@ -152,23 +157,75 @@ fn which_synthetic_games_a_new_app_splits_again() {
     }
     let names: Vec<&str> = legacy_stale.iter().map(|(n, _)| n.as_str()).collect();
     eprintln!("split again from a library without a record: {legacy_stale:#?}");
-    // the readers that changed (falcom, mvgl, nxsd, unreal-pak are new; phyre finds more; snowdrop checks its block sizes) concern only the games that hold their files
+    // the readers that changed (casc, cpk, cra, d3cpk, falcom, frostbite, lspk, mvgl, nxsd, pdat, rpf6, smash-arc, trinity, ttdat are new; unreal-pak reads IoStore and
+    // encrypted paks; phyre finds more; snowdrop checks its block sizes) concern only the games that hold their files
     for n in &names {
         assert!(
             n.starts_with("sync-falcom")
                 || n.starts_with("sync-mvgl")
                 || n.starts_with("sync-nxsd")
                 || n.starts_with("ue-")
+                || n.starts_with("sync-casc")
+                || n.starts_with("sync-cpk")
+                || n.starts_with("sync-cra")
+                || n.starts_with("sync-d3cpk")
+                || n.starts_with("sync-frostbite")
+                || n.starts_with("sync-lspk")
+                || n.starts_with("sync-pdat")
+                || n.starts_with("sync-rpf6")
+                || n.starts_with("sync-smash")
+                || n.starts_with("sync-trinity")
+                || n.starts_with("sync-ttdat")
                 || n.starts_with("rebase")
                 || n.starts_with("snowdrop")
-                || n.contains("berg"),
+                || n.contains("berg")
+                // nxnative 033793f0: the new families (bahs, mtarc, nxcx, rage-wad, redengine, sharc, telltale, vbf) and ipk / ue3 / zip 2. bahs claims the containers agl BAHS
+                // files ship in (SARC, Yaz0, zstd: misc, rest-zstd) and is used by plain's BAHS shaders
+                || n.starts_with("rest-")
+                || *n == "misc"
+                || *n == "plain"
+                || *n == "zip",
             "{n} is split again: {legacy_stale:?}"
         );
     }
-    for must in ["sync-falcom", "sync-mvgl", "sync-nxsd", "ue-v8-kakarot"] {
+    for must in [
+        "rest-bahs",
+        "rest-ipk",
+        "rest-mtarc",
+        "rest-nxcx",
+        "rest-redengine",
+        "rest-sharc",
+        "rest-telltale",
+        "rest-ue3pad",
+        "rest-wad",
+        "plain",
+        "zip",
+        "sync-casc",
+        "sync-cpk",
+        "sync-cra",
+        "sync-cra2021",
+        "sync-d3cpk",
+        "sync-falcom",
+        "sync-frostbite",
+        "sync-lspk",
+        "sync-mvgl",
+        "sync-nxsd",
+        "sync-pdat",
+        "sync-rpf6",
+        "sync-rpf6-setup",
+        "sync-smash",
+        "sync-trinity",
+        "sync-ttdat",
+        "ue-aes-code",
+        "ue-aes-window",
+        "ue-io-bundles",
+        "ue-io-lib",
+        "ue-v8-kakarot",
+    ] {
         assert!(names.contains(&must), "{must}: {legacy_stale:?}");
     }
-    for keep in ["plain", "sync-registered", "kpka", "linkdata"] {
+    // plain holds agl BAHS shaders, whose reader changed (5df3dbe8): it is split again now
+    for keep in ["sync-registered", "kpka", "linkdata"] {
         assert!(!names.contains(&keep), "{keep}: {legacy_stale:?}");
     }
 }

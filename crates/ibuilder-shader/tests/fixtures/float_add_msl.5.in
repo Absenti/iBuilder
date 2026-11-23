@@ -1,0 +1,14 @@
+    bool _10;
+    do
+    {
+        float _11 = as_type<float>(b._m0[0]);
+        float _12 = spvFAdd(_11, v);
+        uint _13 = as_type<uint>(_11);
+        uint _14;
+        do
+        {
+            _14 = _13;
+        } while (!atomic_compare_exchange_weak_explicit((device atomic_uint*)&b._m0[0], &_14, as_type<uint>(_12), memory_order_relaxed, memory_order_relaxed) && _14 == _13);
+        uint _15 = _14;
+        _10 = int(_15) != as_type<int>(_11);
+    } while (_10);

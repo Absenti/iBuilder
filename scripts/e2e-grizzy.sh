@@ -14,7 +14,7 @@
 #   IBUILDER   the CLI binary                [target/release/ibuilder]        LIBDIFF   libdiff (ibuilder-shaderbuild)   [target/release/libdiff]
 #   E2E_ROOT   where the output folders go   [$TMPDIR/ibuilder-e2e]           IOSBUILDER  the checkout holding the Grizzy inputs, the host dylib, the oracle  [required: environment or scripts/local.env]
 #   ENGINE     the engine folder (dm/gfx/tools/{dmsh_xlate_bin,spirv_cross_bin} are RUN; dm/games and dm/host are READ as the profile bundle)   [$IOSBUILDER/engine]
-#   CHAIN      the host's shader chain       [b24b25240cad]                   PYLIB     the Python's full library image of Grizzy (21,990 shaders)  [none: (3) is skipped without it]
+#   CHAIN      the host's shader chain       [6c53446391cc]                   PYLIB     the Python's full library image of Grizzy (21,990 shaders)  [none: (3) is skipped without it]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 [ -f "$ROOT/scripts/local.env" ] && . "$ROOT/scripts/local.env"
@@ -23,7 +23,7 @@ BIN="${IBUILDER:-$ROOT/target/release/ibuilder}"
 LIBDIFF="${LIBDIFF:-$ROOT/target/release/libdiff}"
 E2E="${E2E_ROOT:-${TMPDIR:-/tmp}/ibuilder-e2e}"
 ENGINE="${ENGINE:-$IOS/engine}"
-CHAIN="${CHAIN:-b24b25240cad}"
+CHAIN="${CHAIN:-6c53446391cc}"
 TID=0100DFA027504000
 cmd="${1:-}"; shift || true
 

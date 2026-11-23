@@ -28,6 +28,7 @@ fn the_pipelines_tools_get_the_program_name_first_and_the_builds_do_not() {
             stdout: a.join(" "),
             stderr: String::new(),
         }),
+        glslang: None,
     };
     let b = fn_tools(&t);
     let r = b.xlate(&["jobs.json".into(), "out".into()]);
@@ -51,6 +52,7 @@ fn without_the_finish_port_the_build_refuses_in_words_not_with_a_stand_in_librar
     let tools = ShaderTools {
         xlate: Arc::new(|_: &[String]| ToolOutput::default()),
         spirv_cross: Arc::new(|_: &[String]| ToolOutput::default()),
+        glslang: None,
     };
     let p = Path::new("/nonexistent");
     let req = BuildRequest {
@@ -118,6 +120,7 @@ fn live_entries_the_host_got_wrong_are_refused_with_the_splits_messages() {
     let tools = ShaderTools {
         xlate: Arc::new(|_: &[String]| ToolOutput::default()),
         spirv_cross: Arc::new(|_: &[String]| ToolOutput::default()),
+        glslang: None,
     };
     let entries = vec![
         LiveEntry {
@@ -167,7 +170,7 @@ fn the_pipelines_cache_folder_is_the_one_the_build_makes() {
     let dir = std::env::temp_dir().join(format!("ibsb-cachename-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let chain = "b24b25240cad";
+    let chain = "6c53446391cc";
     let store = ibuilder_shaderbuild::cache::Store::open(&dir, chain, &dir.join("stage")).unwrap();
     assert_eq!(
         store.cache,
@@ -187,4 +190,48 @@ fn the_pipelines_cache_folder_is_the_one_the_build_makes() {
     );
     assert!(!other.exists() && store.cache.is_dir());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The GL / Vulkan layer tools: the pipeline's glslang (the app's `gameapp_glslang`) gets its program name first, as SPIRV-Cross does; without one, and without the
+/// Mac's child-process fallback, every glslang call is rc 127 with `NO_GLSLANG`
+#[cfg(feature = "glvk")]
+#[test]
+fn the_layer_tools_take_glslang_from_the_pipeline() {
+    use ibuilder_cli::adapters::shaders::layer_tools;
+    use ibuilder_glvk::LayerTools;
+    let echo = |rc: i32| -> ibuilder_pipeline::adapters::ToolFn {
+        Arc::new(move |a: &[String]| ToolOutput {
+            rc,
+            stdout: a.join(" "),
+            stderr: String::new(),
+        })
+    };
+    let mut t = ShaderTools {
+        xlate: echo(9),
+        spirv_cross: echo(0),
+        glslang: Some(echo(2)),
+    };
+    let l = layer_tools(&t);
+    let g = l.glslang(&["-E".into(), "-S".into(), "vert".into(), "a.in".into()]);
+    assert_eq!(
+        (g.rc, g.stdout.as_str()),
+        (2, "glslangValidator -E -S vert a.in")
+    );
+    assert_eq!(
+        l.spirv_cross(&["--revision".into()]).stdout,
+        "spirv-cross --revision"
+    );
+    t.glslang = None;
+    let g = layer_tools(&t).glslang(&["--version".into()]);
+    if cfg!(feature = "shader-host-tools") {
+        assert_ne!(
+            g.stdout, "glslangValidator --version",
+            "the Mac's own glslangValidator, not the pipeline's"
+        );
+    } else {
+        assert_eq!(
+            (g.rc, g.stderr.as_str()),
+            (127, ibuilder_glvk::tools::NO_GLSLANG)
+        );
+    }
 }

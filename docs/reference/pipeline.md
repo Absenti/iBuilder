@@ -102,7 +102,8 @@ and `keep_exefs`.
 `IBUILDER_ABI_VERSION` is 1 (`ibuilder_abi_version()`); 29 exported `ibuilder_*` functions (plus `ibuilder_test_panic`
 under `IBUILDER_TESTING`). Opaque handle `ibuilder_t*`; `ibuilder_options` starts with `struct_size` so it can grow.
 It carries the Documents and bundle directories, log callback (stream 0 `pipeline.stages.log`, 1 `gameapp.chain.log`),
-progress callback (stage k/n, text, bar fraction), a sign callback, the two tool callbacks (`xlate`, `spirv_cross`),
+progress callback (stage k/n, text, bar fraction), a sign callback, the tool callbacks (`xlate`, `spirv_cross`, and
+`glslang`, appended last: OpenGL games' GLSL; a caller whose `struct_size` ends before it leaves it NULL),
 a live-shader notify callback, and `flags` (`IBUILDER_FLAG_BOOT_IN_PROCESS`: stage 5 runs in the process; without it
 the chain only builds and the caller clears the run marker with `ibuilder_finish_run`).
 

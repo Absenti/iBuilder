@@ -1,0 +1,19 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_pack.bin": "d78bdb88c426ef3ad93c2fc9a3a68213223b4f6231fb999b9ec5567e0c695178",
+  "pkg/ps_pack.bin": "ec87b1e0c6e3642b56ede998db6cd1b0ca1c3ed109efab3d13105e8b4c69d97c",
+  "pkg/vs_pack.bin": "2144fd8d9a0c7af00b00d31a7a2a2d76d8fe02562cae0b207f7d65379df3949c",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "f8ed635f6195215d339de05866f7a31c16eda0d691d6a0296fd00cf74163a8eb",
+  "tables/shader_map.tsv": "723deb731261ba64f93e2089551defd1a85aa8bb30dfbcd08b83c44076f4f4fd",
+  "tables/shader_pairs.tsv": "88530f934d626d8f96c8851da3ac53232c2793c750c82d180e9ae95ebdfdb3b8"
+ },
+ "log": [
+  "[RED] /CPKs/ClientCommon.cpk 0x0..0x74a1: 1 control section(s) not followed by their code area in the same stream, left out (first: /CPKs/ClientCommon.cpk@0x5034+0x10)",
+  "single-stage programs: 2 vertex shaders are paired with a cover of 1 pixel shader(s) (626ca4d8dbdb5aef)",
+  "shaders: 6 (compute 1, pixel 2, vertex 3); sources pack 6; compute shader answers 1 rows; variation pairs 2"
+ ],
+ "shaders": 6,
+ "updates": []
+}

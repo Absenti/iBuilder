@@ -22,7 +22,7 @@ struct Fix {
 }
 
 fn fixture(name: &str) -> Option<Fix> {
-    let img = old("shader/runs/s300-j1/b-b24b25240cad.img");
+    let img = old("shader/runs/s300-j1/b-6c53446391cc.img");
     if !have(&img) || !have(&pkg()) || !have(&profile()) {
         return None;
     }

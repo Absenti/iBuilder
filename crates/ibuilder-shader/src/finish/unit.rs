@@ -1,6 +1,7 @@
 //! `dmsh_side.py` (`entries`, `entry`, `body`, `shared_body`, `calling`, `unit`) with `dmsh_alpha.py` and `dmsh_logic.py`: a pixel shader's compile unit with its alpha test and logic operation entry points.
 //! (`cut`, which splits a compiled Metal library, is not needed: source mode writes the unit's text under every library name.)
 //! A self-contained port over the regex crate; the chain's own `crate::side` (F1) keeps main0's shared body for `fs_uint` / `fs_dual`.
+use super::pyjson::J;
 use super::{abi, texts};
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -124,8 +125,14 @@ fn build(msl: &str, m: &regex::Captures) -> Result<Entry, String> {
 
 /// `entries(msl)`: the fragment entry points in source order; Err on a shape it does not know
 pub fn entries(msl: &str) -> Result<Vec<Entry>, String> {
+    entries_except(msl, &[])
+}
+
+/// `entries(msl, skip)`: the fragment entry points in source order but those named in `skip`; Err on a shape it does not know
+pub fn entries_except(msl: &str, skip: &[&str]) -> Result<Vec<Entry>, String> {
     RE_ENTRY
         .captures_iter(msl)
+        .filter(|m| !skip.contains(&m.get(3).unwrap().as_str()))
         .map(|m| build(msl, &m))
         .collect()
 }
@@ -188,7 +195,7 @@ re!(RE_STRUCT_MAIN0_OUT, r"(?s)struct main0_out\s*\{(.*?)\};");
 re!(RE_COLOR0_ANY, r"\[\[color\(0\)\]\]");
 re!(
     RE_COLOR0,
-    r"(?m)^\s*(float4|half4|uint4)\s+(\w+)\s*\[\[color\(0\)(?:, index\(0\))?(?:, function_constant\((\w+)\))?\]\];"
+    r"(?m)^\s*(float4|half4|uint4|int4)\s+(\w+)\s*\[\[color\(0\)(?:, index\(0\))?(?:, function_constant\((\w+)\))?\]\];"
 );
 
 fn colour0(msl: &str, strukt: &str) -> Vec<(String, String, Option<String>)> {
@@ -216,12 +223,13 @@ fn colour0(msl: &str, strukt: &str) -> Vec<(String, String, Option<String>)> {
         .collect()
 }
 
-fn alpha_refused(msl: &str) -> Option<String> {
+/// `dmsh_alpha.refused(msl)`: why the shader gets no alpha test, None when it does
+pub fn alpha_refused(msl: &str) -> Option<String> {
     let Some(st) = RE_STRUCT_MAIN0_OUT.captures(msl) else {
         return Some("no colour output".into());
     };
     let tys: Vec<String> = colour0(msl, "main0_out").into_iter().map(|c| c.0).collect();
-    if tys.is_empty() || tys == ["uint4"] {
+    if tys.is_empty() || tys == ["uint4"] || tys == ["int4"] {
         return Some(if RE_COLOR0_ANY.is_match(st.get(1).unwrap().as_str()) {
             "colour 0 has no float alpha".into()
         } else {
@@ -234,13 +242,32 @@ fn alpha_refused(msl: &str) -> Option<String> {
     None
 }
 
+/// `dmsh_alpha.test(msl, var)`: the test of main0's colour 0 alpha, main0_out held in `var`, as a statement; None when the shader gets none
+pub fn alpha_test(msl: &str, var: &str) -> Option<String> {
+    if alpha_refused(msl).is_some() {
+        return None;
+    }
+    let cols: Vec<(String, String)> = colour0(msl, "main0_out")
+        .into_iter()
+        .filter(|c| c.2.is_none())
+        .map(|c| (c.0, c.1))
+        .collect();
+    if cols.len() != 1 || !(cols[0].0 == "float4" || cols[0].0 == "half4") {
+        return None;
+    }
+    Some(format!(
+        "if (!dm_alpha_pass(float({var}.{}.w), dm_alpha)) discard_fragment();",
+        cols[0].1
+    ))
+}
+
 fn alpha_entry(msl: &str, e: &Entry) -> Option<String> {
     let cols = colour0(msl, &e.ret);
     if cols.is_empty() {
         return None;
     }
     let read = |ty: &str, nm: &str| {
-        if ty == "uint4" {
+        if ty == "uint4" || ty == "int4" {
             format!("as_type<float>(dm_r.{nm}.w)")
         } else {
             format!("float(dm_r.{nm}.w)")
@@ -278,7 +305,8 @@ re!(
     r"(?m)^\s*((?:uint|float)[234]?)\s+(\w+)\s*\[\[color\((\d+)\)(?:, function_constant\((\w+)\))?\]\];"
 );
 
-fn logic_refused(msl: &str) -> Option<String> {
+/// `dmsh_logic.refused(msl)`: why the shader gets no logic operation, None when it does
+pub fn logic_refused(msl: &str) -> Option<String> {
     if msl.contains(&format!("[[buffer({})]]", abi::LOGIC_BUFFER)) {
         return Some(format!("fragment buffer {} is taken", abi::LOGIC_BUFFER));
     }
@@ -288,7 +316,8 @@ fn logic_refused(msl: &str) -> Option<String> {
     None
 }
 
-fn logic_constants(targets: &BTreeSet<i64>) -> String {
+/// `dmsh_logic.constants(targets)`
+pub fn logic_constants(targets: &BTreeSet<i64>) -> String {
     targets
         .iter()
         .map(|n| {
@@ -300,18 +329,23 @@ fn logic_constants(targets: &BTreeSet<i64>) -> String {
         .collect()
 }
 
-fn logic_entry(msl: &str, e: &Entry) -> Option<(String, BTreeSet<i64>)> {
-    if e.name != "main0" && e.name != "main0_u" {
-        return None;
-    }
-    let r = super::rx::cached(&format!(
-        r"(?s)struct {}\s*\{{(.*?)\}};",
-        regex::escape(&e.ret)
-    ))
-    .ok()?;
-    let st = r.captures(msl)?;
+/// What `dmsh_logic.parts(members, var, gate)` returns: the logic operation on the colour outputs of an output struct's members, held in `var`
+pub struct LogicParts {
+    /// the constants each read depends on
+    pub consts: String,
+    /// the fetch parameters
+    pub fetch: Vec<String>,
+    /// the statements
+    pub apply: Vec<String>,
+    /// the colour outputs read
+    pub targets: BTreeSet<i64>,
+}
+
+/// `dmsh_logic.parts(members, var, gate)` over an output struct's text between its braces: None when it has no colour output. `gate`: a bool constant every read depends
+/// on too (main0_u's DMSH_TYPED_LOGIC_FC)
+pub fn logic_parts(members: &str, var: &str, gate: Option<&str>) -> Option<LogicParts> {
     let outs: Vec<(String, String, i64, Option<String>)> = RE_LOGIC_OUT
-        .captures_iter(st.get(1).unwrap().as_str())
+        .captures_iter(members)
         .map(|m| {
             (
                 m[1].to_string(),
@@ -333,18 +367,20 @@ fn logic_entry(msl: &str, e: &Entry) -> Option<(String, BTreeSet<i64>)> {
             "float"
         }
     };
-    let on = |n: i64, fc: &Option<String>| match fc {
-        Some(fc) => format!("dm_lfb{n}_{fc}"),
-        None => format!("dm_lfb{n}"),
+    let on = |n: i64, fc: &Option<String>| match (fc, gate) {
+        (Some(fc), _) => format!("dm_lfb{n}_{fc}"),
+        (None, Some(_)) => format!("dm_lfb{n}_on"),
+        (None, None) => format!("dm_lfb{n}"),
     };
     let consts: String = outs
         .iter()
-        .filter(|o| o.3.is_some())
+        .filter(|o| o.3.is_some() || gate.is_some())
         .map(|(_, _, n, fc)| {
             format!(
-                "constant bool {} = dm_lfb{n} && {};\n",
+                "constant bool {} = dm_lfb{n}{}{};\n",
                 on(*n, fc),
-                fc.as_ref().unwrap()
+                fc.as_ref().map(|f| format!(" && {f}")).unwrap_or_default(),
+                gate.map(|g| format!(" && {g}")).unwrap_or_default()
             )
         })
         .collect();
@@ -375,7 +411,7 @@ fn logic_entry(msl: &str, e: &Entry) -> Option<(String, BTreeSet<i64>)> {
             String::new()
         };
         apply.push(format!(
-            "if ({}) dm_r.{nm} = {ty}({}({s}4(dm_r.{nm}{pad}), {}, dm_lop, {n}u){sw});",
+            "if ({}) {var}.{nm} = {ty}({}({s}4({var}.{nm}{pad}), {}, dm_lop, {n}u){sw});",
             on(*n, fc),
             if s == "uint" {
                 "dm_logic"
@@ -385,14 +421,35 @@ fn logic_entry(msl: &str, e: &Entry) -> Option<(String, BTreeSet<i64>)> {
             on(*n, fc).replace("dm_lfb", "dm_fb")
         ));
     }
+    Some(LogicParts {
+        consts,
+        fetch,
+        apply,
+        targets: outs.iter().map(|o| o.2).collect(),
+    })
+}
+
+/// `dmsh_logic.entry(msl, e)`: main0's, in a shader without main0_u (whose own logic operation is in it)
+fn logic_entry(msl: &str, e: &Entry) -> Option<(String, BTreeSet<i64>)> {
+    if e.name != "main0" {
+        return None;
+    }
+    let r = super::rx::cached(&format!(
+        r"(?s)struct {}\s*\{{(.*?)\}};",
+        regex::escape(&e.ret)
+    ))
+    .ok()?;
+    let st = r.captures(msl)?;
+    let p = logic_parts(st.get(1).unwrap().as_str(), "dm_r", None)?;
     let mut ps = e.params.clone();
-    ps.extend(fetch);
+    ps.extend(p.fetch);
     ps.push(format!(
         "constant dm_logic_state& dm_lop [[buffer({})]]",
         abi::LOGIC_BUFFER
     ));
     let text = format!(
-        "{consts}{}fragment {} {}_l({})\n{{\n    {} dm_r = dm_body_{}({});\n    {}\n    return dm_r;\n}}\n",
+        "{}{}fragment {} {}_l({})\n{{\n    {} dm_r = dm_body_{}({});\n    {}\n    return dm_r;\n}}\n",
+        p.consts,
         e.attr,
         e.ret,
         e.name,
@@ -400,9 +457,9 @@ fn logic_entry(msl: &str, e: &Entry) -> Option<(String, BTreeSet<i64>)> {
         e.ret,
         e.name,
         e.args,
-        apply.join(" ")
+        p.apply.join(" ")
     );
-    Some((text, outs.iter().map(|o| o.2).collect()))
+    Some((text, p.targets))
 }
 
 // ------------------------------------------------------------------------------------------ unit
@@ -415,9 +472,26 @@ pub struct UnitInfo {
     pub why: Option<String>,
 }
 
-/// `unit(msl)` -> (the compile unit, info); None unit with `info.why`
+/// `dict[key] = value`: a new key goes last, a key already there keeps its place and takes the new value
+fn dict_set<V>(d: &mut Vec<(String, V)>, key: String, value: V) {
+    match d.iter_mut().find(|(k, _)| *k == key) {
+        Some(slot) => slot.1 = value,
+        None => d.push((key, value)),
+    }
+}
+
+re!(RE_TYPED, r"\bfragment\s+main0_out_u\s+main0_u\s*\(");
+
+/// Whether the source has the typed-output entry point main0_u (`dmsh_entry.fs_uint`)
+pub fn has_typed(msl: &str) -> bool {
+    RE_TYPED.is_match(msl)
+}
+
+/// `unit(msl)` -> (the compile unit, info); None unit with `info.why`. main0_u (`dmsh_entry.fs_uint`) holds its own alpha test and logic operation: it stays as it
+/// is, and main0 gets no logic operation entry point beside it
 pub fn unit(msl: &str) -> (Option<String>, UnitInfo) {
-    let es = match entries(msl) {
+    let typed = has_typed(msl);
+    let es = match entries_except(msl, &["main0_u"]) {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -439,11 +513,12 @@ pub fn unit(msl: &str) -> (Option<String>, UnitInfo) {
         );
     }
     let (no_alpha, no_logic) = (alpha_refused(msl), logic_refused(msl));
+    // the Python's dicts: one entry per name
     let mut alpha: Vec<(String, Option<String>)> = Vec::new();
     let mut no_alpha = no_alpha;
     if no_alpha.is_none() {
         for e in &es {
-            alpha.push((format!("{}_a", e.name), alpha_entry(msl, e)));
+            dict_set(&mut alpha, format!("{}_a", e.name), alpha_entry(msl, e));
         }
     }
     if !alpha.iter().all(|a| a.1.is_some()) {
@@ -452,11 +527,11 @@ pub fn unit(msl: &str) -> (Option<String>, UnitInfo) {
     }
     let mut logic: Vec<(String, (String, BTreeSet<i64>))> = Vec::new();
     for e in &es {
-        if no_logic.is_some() {
+        if no_logic.is_some() || (typed && e.name == "main0") {
             continue;
         }
         if let Some(o) = logic_entry(msl, e) {
-            logic.push((format!("{}_l", e.name), o));
+            dict_set(&mut logic, format!("{}_l", e.name), o);
         }
     }
     if alpha.is_empty() && logic.is_empty() {
@@ -489,8 +564,13 @@ pub fn unit(msl: &str) -> (Option<String>, UnitInfo) {
     }
     let mut out = String::with_capacity(msl.len() * 2);
     out.push_str(&msl[..es[0].start]);
-    out.push_str(texts::ALPHA_HELPER);
-    out.push_str(texts::LOGIC_HELPER);
+    // main0_u brings the helpers when it uses them
+    if !msl.contains("struct dm_alpha_state ") {
+        out.push_str(texts::ALPHA_HELPER);
+    }
+    if !msl.contains("struct dm_logic_state ") {
+        out.push_str(texts::LOGIC_HELPER);
+    }
     out.push_str(&logic_constants(&targets));
     out.push_str(&src);
     out.push_str(&msl[at..]);
@@ -517,6 +597,58 @@ pub fn unit(msl: &str) -> (Option<String>, UnitInfo) {
             why: None,
         },
     )
+}
+
+// ------------------------------------------------------------------------------------------ ps_libraries
+/// `dmsh_build.ps_libraries(key, msl, full, bindings)` as `shader_device.build` runs it (source mode): `compile_split` writes the compile unit under every cut name,
+/// so `<key>_bx` (the alpha test and logic operation entry points and the typed-output entry point main0_u) and `<key>_bf` (the readable-tile version main0_f) each
+/// hold the whole unit. `full`: the shader's source (with main0_u when fs_uint gave one); `om_only_ok`: the key is in bf_want.tsv. Returns those files and what the
+/// reflection says of them (`alpha`, `logic`, `fetch`, `entry_u_side`); no files when the shader gets neither library. `<key>_b` is not among them: the image holds
+/// the plain source under it whether or not the unit was cut (the caller writes it)
+pub fn ps_libraries(
+    key: &str,
+    full: &str,
+    bindings: &[J],
+    om_only_ok: bool,
+) -> (Vec<(String, Vec<u8>)>, J) {
+    let (src, info) = unit(full);
+    let typed = has_typed(full);
+    // side = (alpha + logic entry points if src) | {'main0_u'} if typed: a unit always has one of the first two
+    let side = src.is_some() || typed;
+    let folded = super::fetch::fold(src.as_deref().unwrap_or(full), bindings, om_only_ok);
+    let (text, fetch) = match folded {
+        Ok((f, m)) => (f, Some(m)),
+        Err(_) if side => (src.clone().unwrap_or_else(|| full.to_string()), None),
+        Err(_) => return (Vec::new(), J::obj()),
+    };
+    let mut files = Vec::new();
+    if side {
+        files.push((format!("{key}_bx.metal"), text.clone().into_bytes()));
+    }
+    if fetch.is_some() {
+        files.push((format!("{key}_bf.metal"), text.into_bytes()));
+    }
+    let mut r = J::obj();
+    if src.is_some() && side {
+        for (f, names) in [("alpha", &info.alpha), ("logic", &info.logic)] {
+            if !names.is_empty() {
+                r.set(
+                    f,
+                    J::obj().with(
+                        "entries",
+                        J::Arr(names.iter().map(|s| J::from(s.as_str())).collect()),
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(m) = fetch {
+        r.set("fetch", m);
+    }
+    if typed {
+        r.set("entry_u_side", true);
+    }
+    (files, r)
 }
 
 #[cfg(test)]

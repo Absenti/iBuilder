@@ -1,0 +1,15 @@
+OK
+{}
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+
+static inline __attribute__((always_inline))
+uint dmsh_raw_findx()
+{
+    return 0u;
+}

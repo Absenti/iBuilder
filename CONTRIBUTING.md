@@ -47,6 +47,11 @@ macOS's: it is for your own phone and must never be shared (see [NOTICE.md](NOTI
 ## Pull requests
 
 * **Small and focused**: one change, one PR. Say what it does and why.
+* **Title**: [Conventional Commits](https://www.conventionalcommits.org/) form, **72 characters at most**: `<type>(<optional scope>): <summary>`, with
+  a type among `feat`, `fix`, `chore`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `style`, `revert`, a lowercase scope, no final period, and
+  `!` after the type or scope for a breaking change. For example `feat(shaders): read EA EASF archives`, `fix: keep the cover after deleting a game`.
+  Main takes squash merges only, so the title becomes the commit's subject; the details go in the description. The required check `pr-title`
+  ([.github/workflows/pr-title.yml](.github/workflows/pr-title.yml)) refuses any other title.
 * **Tests**: a fix comes with a test that fails without it; a reader of untrusted input (a container, a module, a
   profile) comes with a test that feeds it truncated and extreme data and expects an `Err`, never a panic.
 * **The byte-compare oracle**: for every valid input, the output of a stage stays **byte-identical** to the reference

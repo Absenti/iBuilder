@@ -4,10 +4,10 @@ of the other stages (a wrong-stage text is a legitimate input of the function: b
 import json, os, random, sys
 cap, out = sys.argv[1], sys.argv[2]
 os.makedirs(out, exist_ok=True)
-ANY = ['check_msl', 'wide_atomics', 'precise', 'membar_fence', 'bit0_mask', 'select_guards', 'mul_extended', 'float_add_msl', 'gather_offsets', 'hmma_msl', 'shared_store_msl',
-       'pool_arrays', 'wide_loads', 'tg_fence', 'border_emu', 'uniform_tests', 'shared_body']
+ANY = ['check_msl', 'wide_atomics', 'precise', 'bit0_mask', 'select_guards', 'mul_extended', 'float_add_msl', 'gather_offsets', 'hmma_msl', 'shared_store_msl',
+       'pool_arrays', 'wide_loads', 'tg_fence', 'border_emu', 'uniform_tests', 'shared_body', 'raw_noinline', 'mesh_subgroup_noinline']
 PS = ['per_vertex', 'frag_z_snap', 'blend_zero', 'fs_uint', 'fs_dual']
-CS = ['first_store', 'tg_spill', 'max_threads']
+CS = ['first_store', 'tg_spill', 'compute_loops', 'max_threads']
 VS = ['vs_init', 'vs_layer', 'vs_base_instance', 'drop_point_size', 'vs_depth', 'vs_discard', 'vs_layer_entry', 'capture', 'vs_tf']
 rng = random.Random(7)
 keys = sorted(os.listdir(cap))

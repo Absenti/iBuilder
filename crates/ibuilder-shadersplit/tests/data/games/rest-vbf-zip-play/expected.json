@@ -1,0 +1,29 @@
+{
+ "dlc": [],
+ "files": {
+  "pkg/cs_data.bin": "0042a9d5e486443751c80d817c1d753954afb9e927309ade3fdf17d699711725",
+  "pkg/ps_data.bin": "b3938bb87ec3187b797b31cfeafa1d8b93331e42a11b6b53b5b07cbb2a3de530",
+  "pkg/vs_data.bin": "0d3801c1913699587673606c3fdf38fb48daf6dba72156d13d204ea811d65585",
+  "pkg/vs_other.bin": "e554017b7e0ac58637f174cc1a1c3601d941be094640081305623bf7c9d93ae1",
+  "tables/pso_pairs.tsv": "f7ff7877621c87f2aad2cfbdd8d307f55c6b02161dd3e80adb19a3eb2f668d57",
+  "tables/shader_facts.tsv": "634a3d4fdf8e35d6769a9d9160abdf73dc33bce2c0c3a6b4bd1d51112bc5ea8d",
+  "tables/shader_map.tsv": "9c72db6d91e456e4b0a5d8597cdef1b5fa0e664959d5b5f57d48172e47027353",
+  "tables/shader_pairs.tsv": "ae2aa4e7ad2f524bbc66925c539a383d9bdddf57a0558dd242b1d3c3c8ec1a0a"
+ },
+ "glslc_play": [
+  "play/a.glslc",
+  "play/b.glslc",
+  "play/missing.glslc"
+ ],
+ "log": [
+  "[RED] Pack/crc.zip: shader/c.bin: CRC mismatch after the LZ4 chunks (its shaders are left out)",
+  "[RED] Data/bad.vbf: ValueError: invalid VBF name offset (its shaders are left out)",
+  "[RED] 2 file(s) could not be read, their shaders are left out (first: Pack/crc.zip: shader/c.bin: CRC mismatch after the LZ4 chunks)",
+  "[RED] @GAME@/play/b.glslc: no complete GLSLC shader output",
+  "[RED] @GAME@/play/missing.glslc: could not read GLSLC capture: [Errno 2] No such file or directory: '@GAME@/play/missing.glslc'",
+  "single-stage programs: 3 vertex shaders are paired with a cover of 1 pixel shader(s) (047bc02561ad35ae)",
+  "shaders: 39 (compute 1, pixel 34, vertex 4); sources data 38, other 1; compute shader answers 1 rows; variation pairs 4"
+ ],
+ "shaders": 39,
+ "updates": []
+}
